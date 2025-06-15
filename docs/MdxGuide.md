@@ -1,3 +1,8 @@
+
+
+## MDX Guide from Astro
+
+
 ---
 title: 'Using MDX'
 description: 'Lorem ipsum dolor sit amet'
