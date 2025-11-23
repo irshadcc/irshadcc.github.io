@@ -1,0 +1,9 @@
+[
+  {
+    "id": 1,
+    "shortTitle" : "Magnus for Large Machine Learning Models",
+    "paperTitle": "Magnus: A Holistic Approach to Data Management for Large-Scale Machine Learning Workloads",
+    "link": "https://www.vldb.org/pvldb/vol18/p4964-song.pdf",
+    "conference" : "VLDB 2025"
+  }
+]

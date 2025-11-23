@@ -6,6 +6,15 @@
       "name": "github"
     },
     "text": "GitHub",
-    "link": "https://github.com/louisescher/spectre"
+    "link": "https://github.com/irshadcc"
+  },
+  {
+    "id": 2,
+    "icon": {
+      "type": "lucide",
+      "name": "linkedin"
+    },
+    "text": "Linkedin",
+    "link": "https://linkedin.com/in/irshadcc"
   }
 ]

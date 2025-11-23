@@ -68,16 +68,16 @@
 }
 
 .work-experience-duration {
-  font-size: .925rem;
+  font-size: .8rem;
 }
 
 .work-experience-company {
-  margin-top: .25rem;
-  margin-bottom: .5rem;
+  margin-top: 0.0002rem;
+  margin-bottom: .001rem;
 }
 
 .work-experience-role {
-  margin-bottom: .75rem;
+  margin-bottom: .1rem;
 }
 
 .socials-link {

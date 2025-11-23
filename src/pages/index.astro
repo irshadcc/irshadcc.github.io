@@ -12,11 +12,12 @@ import { getEntry } from 'astro:content';
 import { render } from 'astro:content';
 import { name, openGraph } from 'spectre:globals';
 
-const [posts, projects, about, workExperience, quickInfo, socials] = await Promise.all([
+const [posts, projects, about, workExperience, publications, quickInfo, socials] = await Promise.all([
 	getCollection('posts', (post) => post.data.draft !== true),
 	getCollection('projects'),
 	getEntry('other', 'about'),
 	getCollection('workExperience'),
+	getCollection('publications'),
 	getCollection('quickInfo'),
 	getCollection('socials')
 ]);
@@ -67,6 +68,7 @@ const { Content: About } = await render(about!);
 				<About />
 			</div>
 		</Card>
+{/* 
 		<Card>
 			<div class="header-container">
 				<Icon type='lucide' name="rss" width={24} height={24} class='glow-icon' />
@@ -101,6 +103,7 @@ const { Content: About } = await render(about!);
 				))}
 			</div>
 		</Card>
+ */}
 		<Card>
 			<div class="header-container">
 				<Icon type='lucide' name="briefcase-business" width={24} height={24} class='glow-icon' />
@@ -109,13 +112,31 @@ const { Content: About } = await render(about!);
 			<div class="work-experience-container">
 				{workExperience.reverse().map((entry) => (
 					<div class="work-experience-entry">
-						<span class="work-experience-duration">{entry.data.duration}</span>
+						<h3 class="work-experience-role">{entry.data.title}</h3>
+						<p class="work-experience-duration">{entry.data.duration}</p>
 						<h3 class="work-experience-company">{entry.data.company}</h3>
-						<span class="work-experience-role">{entry.data.title}</span>
 						<p class="work-experience-desc">{entry.data.description}</p>
 					</div>
 				))}
 			</div>
+		</Card>
+		<Card>
+			<div class="header-container">
+				<Icon type='lucide' name="scroll-text" width={24} height={24} class='glow-icon' />
+				<h2>Publications</h2>
+			</div>
+			<div class="publications-container">
+				{publications.reverse().map((entry) => (
+					<div class="publications-entry-container">
+						<div class="publications-entry">
+							<h4 class="publications-short-title">{entry.data.shortTitle}</h3>
+							<p class="publications-short-title">{entry.data.paperTitle}</p>
+							<p class="publications-conference">{entry.data.conference}</p>
+						</div>
+					</div>
+				))}
+			</div>
+
 		</Card>
 	</div>
 </Layout>

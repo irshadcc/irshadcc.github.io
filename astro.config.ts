@@ -32,18 +32,18 @@ const config = defineConfig({
     mdx(),
     sitemap(),
     spectre({
-      name: 'Spectre',
+      name: 'Irshad Kandy',
       openGraph: {
         home: {
-          title: 'Spectre',
-          description: 'A minimalistic theme for Astro.'
+          title: 'Irshad Kandy',
+          description: "Irshad's Page"
         },
         blog: {
           title: 'Blog',
-          description: 'News and guides for Spectre.'
+          description: 'My Blog.'
         },
         projects: {
-          title: 'My BLog'
+          title: ''
         }
       }
       // giscus: {

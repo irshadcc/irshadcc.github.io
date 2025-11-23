@@ -40,7 +40,7 @@ const tags = posts.flatMap((post) => post.data.tags.map((tag) => tag.id));
 				<h2>Latest Posts</h2>
 			</div>
 			<div class="content-container">
-				{posts.sort((a, b) => b.data.createdAt.getTime() - a.data.createdAt.getTime()).map((post) => (
+				<!-- {posts.sort((a, b) => b.data.createdAt.getTime() - a.data.createdAt.getTime()).map((post) => (
 					<a href={`/blog/${post.id}`} class="post-container" data-tags={post.data.tags.map((tag) => tag.id).join(",")}>
 						<div class="post-header">
 							<h3>{post.data.title}</h3>
@@ -48,7 +48,7 @@ const tags = posts.flatMap((post) => post.data.tags.map((tag) => tag.id));
 						</div>
 						<span>{post.data.description}</span>
 					</a>
-				))}
+				))} -->
 			</div>
 		</Card>
   </div>
