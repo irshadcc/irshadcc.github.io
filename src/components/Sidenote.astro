@@ -1,0 +1,8 @@
+---
+// Numbered note in the right margin. On narrow screens it collapses
+// behind its number, which can be tapped to expand it.
+// Usage in .mdx:  Some claim.<Sidenote>Supporting detail.</Sidenote>
+const id = `sn-${crypto.randomUUID().slice(0, 8)}`;
+---
+
+<label for={id} class="margin-toggle sidenote-number"></label><input type="checkbox" id={id} class="margin-toggle" /><span class="sidenote"><slot /></span>

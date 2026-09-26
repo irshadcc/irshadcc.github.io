@@ -1,0 +1,48 @@
+---
+import { getCollection } from "astro:content";
+import Layout from "../layouts/Layout.astro";
+import { SITE } from "../site";
+
+const [work, publications] = await Promise.all([
+	getCollection("workExperience"),
+	getCollection("publications"),
+]);
+work.sort((a, b) => b.data.id - a.data.id);
+publications.sort((a, b) => b.data.id - a.data.id);
+---
+
+<Layout title="About">
+	<h1>About</h1>
+	<p>
+		I'm {SITE.author}, a curious and highly passionate ML Systems Engineer who loves to solve
+		challenging real-world problems.
+	</p>
+
+	<h2>Work</h2>
+	<ul class="plain-list">
+		{work.map((entry) => (
+			<li>
+				<span class="entry-title">{entry.data.title}</span>, {entry.data.company}
+				<span class="entry-meta">{entry.data.duration}</span>
+				{entry.data.description}
+			</li>
+		))}
+	</ul>
+
+	<h2>Publications</h2>
+	<ul class="plain-list">
+		{publications.map((entry) => (
+			<li>
+				<a href={entry.data.link}>{entry.data.paperTitle}</a>
+				<span class="entry-meta">{entry.data.conference}</span>
+			</li>
+		))}
+	</ul>
+
+	<h2>Elsewhere</h2>
+	<ul class="plain-list">
+		{SITE.socials.map((social) => (
+			<li><a href={social.url}>{social.name}</a></li>
+		))}
+	</ul>
+</Layout>

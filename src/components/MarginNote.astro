@@ -1,0 +1,8 @@
+---
+// Unnumbered note in the right margin. On narrow screens it collapses
+// behind a ⊕ symbol, which can be tapped to expand it.
+// Usage in .mdx:  Some claim.<MarginNote>An aside.</MarginNote>
+const id = `mn-${crypto.randomUUID().slice(0, 8)}`;
+---
+
+<label for={id} class="margin-toggle">&#8853;</label><input type="checkbox" id={id} class="margin-toggle" /><span class="marginnote"><slot /></span>

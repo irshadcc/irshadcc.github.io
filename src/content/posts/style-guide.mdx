@@ -1,0 +1,46 @@
+---
+title: "Style Guide: Writing Posts for This Blog"
+description: "A reference post showing every formatting feature this theme supports: sidenotes, margin notes, math, code, tables and figures. It is a draft, so it only appears when running the dev server."
+date: 2026-09-26
+draft: true
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import MarginNote from "../../components/MarginNote.astro";
+
+Posts live in `src/content/posts/` as `.md` or `.mdx` files. Plain Markdown covers most
+needs; use `.mdx` when you want sidenotes.<Sidenote>Like this one. Sidenotes are numbered
+automatically and sit in the right margin. On a phone, tap the number to expand it.</Sidenote>
+Margin notes are the same thing without a number.<MarginNote>An unnumbered margin note.</MarginNote>
+
+## Headings and text
+
+Headings are set in Inter and body text in Source Serif 4, with
+[links](https://astro.build) in the accent color.
+
+### Math
+
+Inline math like $y = Wx + b$ works with single dollars. Display math uses double dollars:
+
+$$
+\text{softmax}(z)_i = \frac{e^{z_i}}{\sum_{j=1}^{K} e^{z_j}}
+$$
+
+### Code
+
+```python
+import torch
+
+x = torch.randn(1024, 1024, device="cuda")
+y = x @ x.T  # dispatched to a cuBLAS GEMM kernel
+```
+
+### Tables
+
+| Kernel        | GFLOPs/s | % of cuBLAS |
+| ------------- | -------: | ----------: |
+| Naive         |    309.0 |        1.3% |
+| Shared memory |   2980.3 |       12.8% |
+| cuBLAS        |  23249.6 |        100% |
+
+> Blockquotes get an accent rule and italics, for quoting papers or docs.

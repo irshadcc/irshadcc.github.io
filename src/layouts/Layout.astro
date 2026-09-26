@@ -1,78 +1,87 @@
 ---
-import '../styles/reset.css';
-import '../styles/globals.css';
+import "katex/dist/katex.min.css";
+import "../styles/site.css";
 
-import Background from '../components/Background.astro';
-import Navbar from '../components/Navbar.astro';
-import LayoutGrid from '../components/LayoutGrid.astro';
-import { name, themeColor, twitterHandle } from 'spectre:globals';
+import { SITE } from "../site";
 
 interface Props {
-	title: string;
+	title?: string;
 	description?: string;
-	image?: ImageMetadata;
-	pagefindIgnore?: boolean;
 	article?: {
-		createdAt: Date;
-		updatedAt?: Date;
+		date: Date;
+		updated?: Date;
 	};
 }
 
-const { title, description, image, pagefindIgnore, article } = Astro.props;
+const { title, description = SITE.description, article } = Astro.props;
+const pageTitle = title ? `${title} | ${SITE.title}` : SITE.title;
+const base = import.meta.env.BASE_URL.replace(/\/$/, "");
+const path = Astro.url.pathname.replace(base, "").replace(/\/$/, "") || "/";
+
+const nav = [
+	{ href: "/", label: "Blogs" },
+	{ href: "/about", label: "About" },
+];
+const isActive = (href: string) => (href === "/" ? path === "/" || path.startsWith("/blog") : path.startsWith(href));
 ---
 
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 	<head>
-		<link rel="preload" href="/fonts/Geist.woff2" as="font" type="font/woff2" crossorigin="">
-		<link rel="preload" href="/fonts/GeistMono.woff2" as="font" type="font/woff2" crossorigin="">
-
-		<meta charset="UTF-8" />
-		<meta name="viewport" content="width=device-width" />
-		<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<link rel="icon" type="image/svg+xml" href={`${base}/favicon.svg`} />
 		<meta name="generator" content={Astro.generator} />
 
-		<title>{title}</title>
-		{description && <meta name="description" content={description} />}
-		<meta name="theme-color" content={themeColor}>
-
+		<title>{pageTitle}</title>
+		<meta name="description" content={description} />
 		<link rel="canonical" href={Astro.url} />
 
-		<meta name="og:title" content={title} />
-		{description && <meta name="og:description" content={description} />}
-		<meta name="og:image" content={image?.src || '/img/og.png'} />
-		<meta name="og:url" content={Astro.site} />
-		{!article && <meta name="og:type" content="website" />}
-		<meta name="og:locale" content="en" />
+		<meta property="og:title" content={title ?? SITE.title} />
+		<meta property="og:description" content={description} />
+		<meta property="og:url" content={Astro.url} />
+		<meta property="og:type" content={article ? "article" : "website"} />
+		{article && <meta property="article:published_time" content={article.date.toISOString()} />}
+		{article?.updated && <meta property="article:modified_time" content={article.updated.toISOString()} />}
+		{article && <meta name="author" content={SITE.author} />}
+		<meta name="twitter:card" content="summary" />
 
-		{article && (
-			<meta name="og:type" content="article" />
-			<meta property="article:published_time" content={article.createdAt.toISOString()} />
-			<meta name="author" content={name} />
-		)}
-
-		{article && article.updatedAt && (
-			<meta property="article:modified_time" content={article.updatedAt.toISOString()} />
-		)}
-
-		<meta name="twitter:card" content="summary_large_image" />
-		{twitterHandle && (
-			<meta name="twitter:site" content={twitterHandle} />
-			<meta name="twitter:creator" content={twitterHandle} />
-		)}
-		<meta name="twitter:title" content={title} />
-		{description && <meta name="twitter:description" content={description} />}
-		<meta name="twitter:image" content={image?.src || '/img/og.png'} />
+		<link rel="preconnect" href="https://fonts.googleapis.com" />
+		<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+		<link
+			rel="stylesheet"
+			href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;650;700&family=JetBrains+Mono:wght@400;500&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap"
+		/>
 	</head>
 	<body>
-		<main data-pagefind-ignore={pagefindIgnore}>
-			<Navbar />
-			<LayoutGrid>
-				<slot name="left" slot="left" />
-				<slot name="right" slot="right" />
-			</LayoutGrid>
-			<slot name="404" />
+		<header class="site-header">
+			<div class="frame">
+				<a class="wordmark" href={`${base}/`}>
+					<strong>{SITE.author}</strong>
+				</a>
+				<nav class="site-nav">
+					{nav.map((item) => (
+						<a class={isActive(item.href) ? "active" : undefined} href={`${base}${item.href}`}>{item.label}</a>
+					))}
+				</nav>
+			</div>
+		</header>
+
+		<main>
+			<div class="frame">
+				<div class="column">
+					<slot />
+				</div>
+			</div>
 		</main>
-		<Background />
+
+		<footer class="site-footer">
+			<div class="frame">
+				<span>© {new Date().getFullYear()} {SITE.author}</span>
+				<nav>
+					{SITE.socials.map((social) => <a href={social.url}>{social.name}</a>)}
+				</nav>
+			</div>
+		</footer>
 	</body>
 </html>

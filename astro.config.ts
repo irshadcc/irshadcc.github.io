@@ -1,67 +1,21 @@
-import { loadEnv } from "vite";
-import { defineConfig } from 'astro/config';
-
-import expressiveCode from 'astro-expressive-code';
-import mdx from '@astrojs/mdx';
-import sitemap from '@astrojs/sitemap';
-import spectre from './package/src';
-
-import node from '@astrojs/node';
-import { spectreDark } from './src/ec-theme';
-
-const {
-  GISCUS_REPO,
-  GISCUS_REPO_ID,
-  GISCUS_CATEGORY,
-  GISCUS_CATEGORY_ID,
-  GISCUS_MAPPING,
-  GISCUS_STRICT,
-  GISCUS_REACTIONS_ENABLED,
-  GISCUS_EMIT_METADATA,
-  GISCUS_LANG
-} = loadEnv(process.env.NODE_ENV!, process.cwd(), "");
+import { defineConfig } from "astro/config";
+import mdx from "@astrojs/mdx";
+import sitemap from "@astrojs/sitemap";
+import { unified } from "@astrojs/markdown-remark";
+import remarkMath from "remark-math";
+import rehypeKatex from "rehype-katex";
 
 // https://astro.build/config
-const config = defineConfig({
-  site: 'https://irshadcc.github.io',
-  output: 'static',
-  integrations: [
-    expressiveCode({
-      themes: [spectreDark],
-    }),
-    mdx(),
-    sitemap(),
-    spectre({
-      name: 'Irshad Kandy',
-      openGraph: {
-        home: {
-          title: 'Irshad Kandy',
-          description: "Irshad's Page"
-        },
-        blog: {
-          title: 'Blog',
-          description: 'My Blog.'
-        },
-        projects: {
-          title: ''
-        }
-      }
-      // giscus: {
-      //   repository: GISCUS_REPO,
-      //   repositoryId: GISCUS_REPO_ID,
-      //   category: GISCUS_CATEGORY,
-      //   categoryId: GISCUS_CATEGORY_ID,
-      //   mapping: GISCUS_MAPPING as any,
-      //   strict: GISCUS_STRICT === "true",
-      //   reactionsEnabled: GISCUS_REACTIONS_ENABLED === "true",
-      //   emitMetadata: GISCUS_EMIT_METADATA === "true",
-      //   lang: GISCUS_LANG,
-      // }
-    })
-  ],
-  adapter: node({
-    mode: 'standalone'
-  })
+export default defineConfig({
+	site: "https://irshadcc.github.io",
+	output: "static",
+	integrations: [mdx(), sitemap()],
+	markdown: {
+		// remark/rehype pipeline so we can render $inline$ and $$block$$ math with KaTeX.
+		processor: unified({ remarkPlugins: [remarkMath], rehypePlugins: [rehypeKatex] }),
+		shikiConfig: {
+			themes: { light: "github-light", dark: "github-dark" },
+			wrap: false,
+		},
+	},
 });
-
-export default config;
