@@ -1,7 +1,10 @@
 ---
 // Plots one or more functions y = f(x) as lines on a shared x axis, drawn with Chart.js.
 // `x` returns the sample points; each series maps x -> y and gets its own line and colour.
-// The functions run at build time; only the sampled points are sent to the browser.
+// The functions run at build time; only the sampled points are sent to the browser, so the
+// view can only zoom within the sampled x range. With restrictRange={false} each function is
+// also sent as source and re-sampled in the browser, so any x range can be typed in; such
+// functions must be self-contained (use only x and globals like Math), which is checked here.
 // Usage in .mdx:
 //   <LineChart
 //     x={() => Array.from({ length: 101 }, (_, i) => i / 10)}
@@ -26,20 +29,62 @@ interface Props {
 	zoom?: boolean;
 	/** Show number inputs for the visible x min and x max. */
 	rangeInputs?: boolean;
+	/** Keep the view inside the sampled x range (default). Set false to allow any range. */
+	restrictRange?: boolean;
 }
 
-const { x, series, legend = series.length > 1, title, xLabel, yLabel, height = 320, zoom = false, rangeInputs = false } =
-	Astro.props;
+const {
+	x,
+	series,
+	legend = series.length > 1,
+	title,
+	xLabel,
+	yLabel,
+	height = 320,
+	zoom = false,
+	rangeInputs = false,
+	restrictRange = true,
+} = Astro.props;
 const xs = x();
-// NaN/±Infinity become null so Chart.js leaves a gap instead of drawing a spike.
 const axis = xLabel ?? "x";
+const fmtX = (v: number) => (Number.isInteger(v) ? `${v}` : Number(v.toPrecision(4)).toString());
+const validRange = restrictRange
+	? `Valid ${axis} range: ${fmtX(Math.min(...xs))} to ${fmtX(Math.max(...xs))}`
+	: `Any ${axis} value`;
+
+/** Source the browser can rebuild `fn` from; throws if the rebuilt copy disagrees with it. */
+function serialize(s: Series): string {
+	const native = Object.getOwnPropertyNames(Math).find((k) => (Math as unknown as Record<string, unknown>)[k] === s.fn);
+	if (native) return `Math.${native}`;
+	const src = s.fn.toString();
+	const x0 = Math.min(...xs);
+	const x1 = Math.max(...xs);
+	const w = x1 - x0 || 1;
+	const probes = [x0, (x0 + x1) / 2, x1, x0 - 3 * w, x1 + 3 * w];
+	try {
+		const rebuilt = new Function(`return (${src});`)();
+		if (probes.every((p) => Object.is(rebuilt(p), s.fn(p)))) return src;
+	} catch {
+		// Falls through to the error below (e.g. ReferenceError for a helper defined elsewhere).
+	}
+	throw new Error(
+		`LineChart: series "${s.name}" can't be re-sampled in the browser (restrictRange={false}). ` +
+			"Write it as a self-contained function of x that uses only globals such as Math, " +
+			"e.g. (x) => Math.exp(-x) * Math.sin(x).",
+	);
+}
+
+// NaN/±Infinity become null so Chart.js leaves a gap instead of drawing a spike.
 const data = {
 	legend,
 	title,
 	xLabel,
 	yLabel,
+	restrict: restrictRange,
+	samples: xs.length,
 	series: series.map((s) => ({
 		name: s.name,
+		src: restrictRange ? undefined : serialize(s),
 		points: xs.map((xv) => {
 			const y = s.fn(xv);
 			return { x: xv, y: Number.isFinite(y) ? y : null };
@@ -73,6 +118,7 @@ const data = {
 						<label>
 							{axis} max <input class="x-max" type="number" step="any" />
 						</label>
+						<span class="range-hint">{validRange}</span>
 						<button class="reset" type="button">Reset</button>
 					</div>
 				)}
@@ -82,6 +128,11 @@ const data = {
 </figure>
 
 <script>
+	// Client side of LineChart. Astro bundles this once per page, however many charts it has.
+	// For every <figure class="line-chart"> it:
+	//   1. reads the points computed at build time from the figure's data-chart JSON,
+	//   2. draws them with Chart.js, taking colours from the page's CSS variables,
+	//   3. wires the optional zoom bar and x min/max inputs (attachView) to one shared view.
 	import {
 		Chart,
 		type ChartOptions,
@@ -96,25 +147,41 @@ const data = {
 		type TooltipItem,
 	} from "chart.js";
 
+	// Chart.js is tree-shakeable: register only the pieces a line chart on a numeric x axis
+	// needs, so the rest of the library stays out of the bundle.
 	Chart.register(LineController, LineElement, PointElement, LinearScale, Legend, Title, Tooltip);
 
+	/** Shape of the data-chart JSON written by the frontmatter. */
 	interface ChartData {
 		legend: boolean;
 		title?: string;
 		xLabel?: string;
 		yLabel?: string;
-		series: { name: string; points: { x: number; y: number | null }[] }[];
+		/** restrictRange: keep the view inside the sampled x range. */
+		restrict: boolean;
+		/** How many x values were sampled; reused when re-sampling past the data. */
+		samples: number;
+		series: {
+			name: string;
+			/** Function source, present only when restrictRange is off. */
+			src?: string;
+			/** y is null where the function was NaN/±Infinity, which breaks the line there. */
+			points: { x: number; y: number | null }[];
+		}[];
 	}
 
 	// Vertical hairline at the hovered x, so the reader aims at an x rather than a 2px line.
+	// Runs after the lines are drawn; the tooltip's active points (all at the same x, because
+	// interaction mode is "index") give the pixel position to draw at.
 	const crosshair: Plugin<"line"> = {
 		id: "crosshair",
 		afterDatasetsDraw(chart) {
 			const active = chart.tooltip?.getActiveElements();
-			if (!active?.length) return;
+			if (!active?.length) return; // pointer is not over the chart
 			const { ctx, chartArea } = chart;
 			const px = active[0].element.x;
 			ctx.save();
+			// Same colour as the gridlines, so the hairline stays as quiet as the grid.
 			ctx.strokeStyle = String(chart.options.scales?.x?.grid?.color ?? "#999");
 			ctx.lineWidth = 1;
 			ctx.beginPath();
@@ -126,6 +193,8 @@ const data = {
 	};
 
 	// Lines up the zoom controls with the plot area, which is inset by the y-axis ticks.
+	// chartArea is only known after Chart.js lays out the axes, so this runs on every layout
+	// (first render, resize, and whenever the tick labels change width).
 	const alignControls: Plugin<"line"> = {
 		id: "alignControls",
 		afterLayout(chart) {
@@ -136,8 +205,13 @@ const data = {
 		},
 	};
 
+	/** Number for display: integers as-is, anything else to 4 significant digits (0.1 + 0.2 -> "0.3"). */
 	const fmt = (v: number) => (Number.isInteger(v) ? `${v}` : Number(v.toPrecision(4)).toString());
 
+	/**
+	 * Reads the colours and font from CSS. A canvas can't use CSS variables directly, so the
+	 * values are resolved here; the variables themselves switch for dark mode in <style>.
+	 */
 	function theme(el: HTMLElement) {
 		const css = getComputedStyle(el);
 		const v = (name: string) => css.getPropertyValue(name).trim();
@@ -151,18 +225,25 @@ const data = {
 		};
 	}
 
+	/** Chart.js options: axes, legend, title and tooltip, styled with the resolved theme. */
 	function options(d: ChartData, t: ReturnType<typeof theme>): ChartOptions<"line"> {
 		const xs = d.series[0]?.points.map((p) => p.x) ?? [];
 		const axisTitle = (text?: string) => ({ display: !!text, text, color: t.muted });
 		return {
+			// Fill the .plot box (its height comes from the `height` prop) and track its width.
 			responsive: true,
 			maintainAspectRatio: false,
+			// Zooming redraws on every pointer move; animating each redraw would lag behind.
 			animation: false,
+			// Hover picks the nearest x and reports every series there, so the pointer doesn't
+			// have to land exactly on a 2px line.
 			interaction: { mode: "index" as const, intersect: false },
 			font: { family: t.font },
 			scales: {
 				x: {
+					// Numeric axis: x values are positioned by value, so uneven spacing is fine.
 					type: "linear" as const,
+					// Start and end exactly at the data, not at Chart.js's rounded "nice" bounds.
 					min: Math.min(...xs),
 					max: Math.max(...xs),
 					title: axisTitle(d.xLabel),
@@ -170,6 +251,8 @@ const data = {
 					border: { color: t.grid },
 					ticks: { color: t.muted, callback: (v: string | number) => fmt(Number(v)) },
 				},
+				// No min/max: y fits whatever points are in the datasets, which attachView keeps
+				// to the visible x range.
 				y: {
 					title: axisTitle(d.yLabel),
 					grid: { color: t.grid },
@@ -191,6 +274,7 @@ const data = {
 					borderColor: t.grid,
 					borderWidth: 1,
 					usePointStyle: true,
+					// Tooltip reads "x = 1.5", then one row per series with the value first.
 					callbacks: {
 						title: (items: TooltipItem<"line">[]) => `x = ${fmt(items[0].parsed.x ?? 0)}`,
 						label: (item: TooltipItem<"line">) =>
@@ -201,57 +285,102 @@ const data = {
 		};
 	}
 
+	/** One Chart.js dataset per series; colours follow the series' position, in fixed order. */
 	function datasets(d: ChartData, t: ReturnType<typeof theme>) {
 		return d.series.map((s, i) => ({
 			label: s.name,
 			data: s.points,
 			borderColor: t.series[i % 8],
 			backgroundColor: t.series[i % 8],
-			pointStyle: "line" as const,
+			pointStyle: "line" as const, // legend/tooltip key is a short line, like the mark
 			borderWidth: 2,
+			// No dots on the line; only the hovered point shows one, ringed in the background
+			// colour so it stays visible where lines cross.
 			pointRadius: 0,
 			pointHoverRadius: 5,
 			pointHoverBorderWidth: 2,
 			pointHoverBorderColor: t.bg,
 			borderJoinStyle: "round" as const,
 			borderCapStyle: "round" as const,
-			spanGaps: false,
+			spanGaps: false, // leave a gap at null (undefined) values instead of bridging it
 		}));
 	}
 
 	const clamp = (v: number, a: number, b: number) => Math.min(b, Math.max(a, v));
 
 	/**
-	 * Wires the optional range bar and x min/max inputs to the chart. Both drive one view
-	 * (lo..hi as fractions of the full x range). Returns a function that re-applies it.
+	 * Wires the optional range bar and x min/max inputs to the chart. Both drive one view,
+	 * lo..hi as fractions of the domain d0..d1 the bar spans. The domain is the sampled x
+	 * range, and grows to cover a typed range past it when restrictRange is off.
+	 * Returns a function that re-applies the view.
+	 *
+	 * The flow is always the same: an interaction updates lo/hi (directly, or via setView
+	 * for values in x units), then apply() pushes that view into the chart, the bar and the
+	 * inputs. Nothing else writes to them, so the three controls cannot disagree.
+	 *
+	 *   0 ─────────── lo ═══════════ hi ─────── 1     fractions of the bar
+	 *   d0            a              b          d1    the same positions in x units
 	 */
 	function attachView(chart: Chart<"line">, d: ChartData, el: HTMLElement) {
 		const bar = el.querySelector<HTMLElement>(".zoom");
 		const inputs = el.querySelector<HTMLElement>(".range-inputs");
 		if (!bar && !inputs) return undefined;
 
+		// x0..x1 is the sampled data; every series was sampled at the same x values.
 		const xs = d.series[0]?.points.map((p) => p.x) ?? [];
 		const x0 = Math.min(...xs);
 		const x1 = Math.max(...xs);
-		const toX = (f: number) => x0 + f * (x1 - x0);
-		const toFrac = (v: number) => (v - x0) / (x1 - x0);
-		// Never zoom in past ~3 samples, or the lines stop meaning anything.
-		const minSpan = clamp(3 / Math.max(xs.length - 1, 1), 0.01, 1);
+		// Tolerance for float round-off when checking whether the view is inside x0..x1.
+		const eps = (x1 - x0) * 1e-9;
+		// Never zoom in past ~3 samples of the original spacing, or the lines stop meaning anything.
+		const minW = (x1 - x0) * clamp(3 / Math.max(xs.length - 1, 1), 0.01, 1);
+		// Rebuild each series' function from its source (only sent when restrictRange is off).
+		// The build already checked that the rebuilt copy matches the original.
+		const fns = d.series.map((s) =>
+			s.src ? (new Function(`return (${s.src});`)() as (x: number) => number) : undefined,
+		);
+		// The view state. d0..d1 only differs from x0..x1 after typing a range past the data.
+		let d0 = x0;
+		let d1 = x1;
 		let lo = 0;
 		let hi = 1;
+		// Converts a fraction of the bar to an x value.
+		const toX = (f: number) => d0 + f * (d1 - d0);
+		// The minimum width as a fraction of the bar; shrinks when the domain grows.
+		const minFrac = () => minW / (d1 - d0);
 
+		// Controls are optional; any of these may be missing and every use checks for that.
 		const track = bar?.querySelector<HTMLElement>(".track");
 		const win = bar?.querySelector<HTMLElement>(".window");
 		const [loH, hiH] = bar?.querySelectorAll<HTMLElement>(".handle") ?? [];
 		const minIn = inputs?.querySelector<HTMLInputElement>(".x-min");
 		const maxIn = inputs?.querySelector<HTMLInputElement>(".x-max");
 
+		/** Evaluates fn at evenly spaced x values across a..b, as many as the build sampled. */
+		const sample = (fn: (x: number) => number, a: number, b: number) => {
+			const n = Math.max(d.samples, 2);
+			return Array.from({ length: n }, (_, k) => {
+				const xv = a + ((b - a) * k) / (n - 1);
+				const y = fn(xv);
+				return { x: xv, y: Number.isFinite(y) ? y : null };
+			});
+		};
+
+		/** Pushes the current view (lo/hi) into the chart, the bar and the inputs, then redraws. */
 		const apply = () => {
 			const a = toX(lo);
 			const b = toX(hi);
-			// Keep only visible points (plus one past each edge so lines reach the frame),
-			// which also makes Chart.js refit the y axis to what is on screen.
+			const inside = a >= x0 - eps && b <= x1 + eps;
+			// 1. Data: give each dataset only the points the view needs.
 			chart.data.datasets.forEach((ds, i) => {
+				const fn = fns[i];
+				// Past the sampled range, re-sample the function over the view instead.
+				if (!inside && fn) {
+					ds.data = sample(fn, a, b);
+					return;
+				}
+				// Keep only visible points (plus one past each edge so lines reach the frame),
+				// which also makes Chart.js refit the y axis to what is on screen.
 				const pts = d.series[i].points;
 				let first = 0;
 				while (first < pts.length - 1 && pts[first + 1].x <= a) first++;
@@ -259,11 +388,13 @@ const data = {
 				while (last > 0 && pts[last - 1].x >= b) last--;
 				ds.data = pts.slice(first, last + 1);
 			});
+			// 2. Axis: show exactly a..b.
 			const scale = chart.options.scales?.x;
 			if (scale) {
 				scale.min = a;
 				scale.max = b;
 			}
+			// 3. Bar: position the window as percentages of the track, so it survives resizes.
 			if (win) {
 				win.style.left = `${lo * 100}%`;
 				win.style.width = `${(hi - lo) * 100}%`;
@@ -272,26 +403,44 @@ const data = {
 				[loH, a],
 				[hiH, b],
 			] as const) {
-				h?.setAttribute("aria-valuemin", fmt(x0));
-				h?.setAttribute("aria-valuemax", fmt(x1));
-				h?.setAttribute("aria-valuenow", fmt(v));
+				h?.setAttribute("aria-valuemin", fmt(d0));
+				h?.setAttribute("aria-valuemax", fmt(d1));
+				h?.setAttribute("aria-valuenow", fmt(v)); // what screen readers announce
 			}
+			// 4. Inputs.
 			// Never rewrite the box the user is typing in; it is normalised on commit.
 			if (minIn && document.activeElement !== minIn) minIn.value = fmt(a);
 			if (maxIn && document.activeElement !== maxIn) maxIn.value = fmt(b);
-			chart.update("none");
+			chart.update("none"); // "none" = redraw without animation
 		};
+		/** Shows a..b in x units, growing the domain past the data when that is allowed. */
+		const setView = (a: number, b: number) => {
+			if (!d.restrict) {
+				d0 = Math.min(x0, a);
+				d1 = Math.max(x1, b);
+			}
+			lo = (a - d0) / (d1 - d0);
+			hi = (b - d0) / (d1 - d0);
+			apply();
+		};
+		/** Back to the full sampled range (Reset button and double-click on the bar). */
 		const reset = () => {
+			d0 = x0;
+			d1 = x1;
 			lo = 0;
 			hi = 1;
 			apply();
 		};
 
+		// ---- Range bar: drag a handle to zoom, drag the window to pan, click the track to jump.
 		if (bar && track && win && loH && hiH) {
+			// What a gesture moves: one end of the window, or the whole window.
 			type Mode = "lo" | "hi" | "pan";
+			// Moves by dx (a fraction of the track) from the view the gesture started with.
+			// Measuring from the start, not the last event, keeps a drag from drifting.
 			const moveBy = (mode: Mode, from: { lo: number; hi: number }, dx: number) => {
-				if (mode === "lo") lo = clamp(from.lo + dx, 0, hi - minSpan);
-				else if (mode === "hi") hi = clamp(from.hi + dx, lo + minSpan, 1);
+				if (mode === "lo") lo = clamp(from.lo + dx, 0, hi - minFrac());
+				else if (mode === "hi") hi = clamp(from.hi + dx, lo + minFrac(), 1);
 				else {
 					const span = from.hi - from.lo;
 					lo = clamp(from.lo + dx, 0, 1 - span);
@@ -300,6 +449,7 @@ const data = {
 				apply();
 			};
 
+			// The drag in progress: where the pointer went down and the view at that moment.
 			let drag: { mode: Mode; x: number; lo: number; hi: number } | null = null;
 			const targets: [HTMLElement, Mode][] = [
 				[loH, "lo"],
@@ -308,8 +458,9 @@ const data = {
 			];
 			for (const [target, mode] of targets) {
 				target.addEventListener("pointerdown", (e) => {
-					e.preventDefault();
-					e.stopPropagation();
+					e.preventDefault(); // no text selection while dragging
+					e.stopPropagation(); // a handle sits inside the window; don't also start a pan
+					// Keep receiving moves even when the pointer leaves the element mid-drag.
 					target.setPointerCapture(e.pointerId);
 					drag = { mode, x: e.clientX, lo, hi };
 				});
@@ -321,6 +472,7 @@ const data = {
 				};
 				target.addEventListener("pointerup", end);
 				target.addEventListener("pointercancel", end);
+				// Keyboard: arrows move by 1% of the bar, Shift+arrows by 10%.
 				target.addEventListener("keydown", (e) => {
 					const dir = { ArrowLeft: -1, ArrowDown: -1, ArrowRight: 1, ArrowUp: 1 }[e.key];
 					if (!dir) return;
@@ -342,35 +494,45 @@ const data = {
 			win.addEventListener("dblclick", reset);
 		}
 
+		// ---- x min / x max inputs.
 		if (minIn && maxIn) {
 			for (const input of [minIn, maxIn]) {
-				input.min = fmt(x0);
-				input.max = fmt(x1);
+				// With restrictRange on, the browser's own min/max also limit the spinner arrows.
+				if (d.restrict) {
+					input.min = fmt(x0);
+					input.max = fmt(x1);
+				}
 				const isMin = input === minIn;
 				// `live` runs on every keystroke: it only takes values that fit as they are, so a
 				// half-typed number never shoves the other bound around. On commit (Enter or
-				// blur) a value past the other bound pushes it along, keeping the current width,
-				// and a value past the data is clamped to it.
+				// blur) a value past the other bound pushes it along, keeping the current width.
+				// With restrictRange on, a value past the sampled data is clamped to it.
 				const take = (live: boolean) => {
 					const v = Number.parseFloat(input.value);
 					if (!Number.isFinite(v)) {
+						// Empty or "-" while typing: wait. On commit: apply() restores the old value.
 						if (!live) apply();
 						return;
 					}
-					const f = toFrac(v);
-					const span = hi - lo;
-					if (live && (f < 0 || f > 1 || (isMin ? f > hi - minSpan : f < lo + minSpan))) return;
+					const r = d.restrict;
+					let a = toX(lo);
+					let b = toX(hi);
+					const span = b - a;
+					// While typing, skip values that would need clamping or pushing.
+					if (live && ((r && (v < x0 || v > x1)) || (isMin ? v > b - minW : v < a + minW))) return;
 					if (isMin) {
-						lo = clamp(f, 0, 1 - minSpan);
-						if (hi < lo + minSpan) hi = Math.min(1, lo + span);
+						a = r ? clamp(v, x0, x1 - minW) : v;
+						if (b < a + minW) b = r ? Math.min(x1, a + span) : a + span;
 					} else {
-						hi = clamp(f, minSpan, 1);
-						if (lo > hi - minSpan) lo = Math.max(0, hi - span);
+						b = r ? clamp(v, x0 + minW, x1) : v;
+						if (a > b - minW) a = r ? Math.max(x0, b - span) : b - span;
 					}
-					apply();
+					setView(a, b);
 				};
-				input.addEventListener("input", () => take(true));
+				input.addEventListener("input", () => take(true)); // every keystroke
 				input.addEventListener("change", () => {
+					// Enter or leaving the box. apply() skipped this box while it had focus, so
+					// write the final (possibly clamped) value into it now.
 					take(false);
 					input.value = fmt(toX(isMin ? lo : hi));
 				});
@@ -378,10 +540,11 @@ const data = {
 			inputs?.querySelector("button.reset")?.addEventListener("click", reset);
 		}
 
-		apply();
+		apply(); // sync the inputs and bar with the initial full view
 		return apply;
 	}
 
+	// ---- Set up every chart on the page.
 	for (const el of document.querySelectorAll<HTMLElement>(".line-chart")) {
 		const d: ChartData = JSON.parse(el.dataset.chart ?? "{}");
 		const canvas = el.querySelector("canvas");
@@ -394,7 +557,8 @@ const data = {
 			plugins: [crosshair, alignControls],
 		});
 		const reapplyView = attachView(chart, d, el);
-		// Canvas colours don't follow CSS, so repaint when the OS theme flips.
+		// Canvas colours don't follow CSS, so repaint when the OS theme flips. Rebuilding the
+		// datasets resets their data to the full range, so re-apply the view afterwards.
 		matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
 			const nt = theme(el);
 			chart.data.datasets = datasets(d, nt);
@@ -466,6 +630,15 @@ const data = {
 		background: var(--bg);
 		border: 1px solid var(--faint);
 		border-radius: 6px;
+	}
+	.range-hint {
+		padding: 0.15rem 0.5rem;
+		font-size: 0.72rem;
+		color: var(--muted);
+		background: var(--surface);
+		border: 1px solid var(--faint);
+		border-radius: 6px;
+		white-space: nowrap;
 	}
 	.range-inputs button {
 		margin-left: auto;

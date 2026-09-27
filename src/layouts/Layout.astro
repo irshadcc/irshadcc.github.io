@@ -21,8 +21,14 @@ const path = Astro.url.pathname.replace(base, "").replace(/\/$/, "") || "/";
 const nav = [
 	{ href: "/", label: "Blogs" },
 	{ href: "/about", label: "About" },
+	// Component demos are a dev aid; the link is left out of production builds.
+	...(import.meta.env.DEV ? [{ href: "/demos", label: "Demo Components" }] : []),
 ];
-const isActive = (href: string) => (href === "/" ? path === "/" || path.startsWith("/blog") : path.startsWith(href));
+const isActive = (href: string) => {
+	if (href === "/") return path === "/" || path.startsWith("/blog");
+	if (href === "/demos") return path === "/demos" || path.endsWith("-demo");
+	return path.startsWith(href);
+};
 ---
 
 <!doctype html>

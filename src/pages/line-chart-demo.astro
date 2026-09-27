@@ -60,4 +60,17 @@ const sigmoid = (x: number) => 1 / (1 + Math.exp(-x));
 		]}
 		rangeInputs
 	/>
+
+	<h2>Unrestricted range</h2>
+	<LineChart
+		x={range(-3, 3, 301)}
+		series={[
+			{ name: "tanh", fn: Math.tanh },
+			{ name: "softsign", fn: (x: number) => x / (1 + Math.abs(x)) },
+			{ name: "2·atan(x)/π", fn: (x: number) => (2 * Math.atan(x)) / Math.PI },
+		]}
+		zoom
+		rangeInputs
+		restrictRange={false}
+	/>
 </Layout>
