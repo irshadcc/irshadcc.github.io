@@ -1,6 +1,6 @@
 ---
-import Layout from "../layouts/Layout.astro";
-import LineChart from "../utils/charts/LineChart.astro";
+import Layout from "../../layouts/Layout.astro";
+import LineChart from "../../utils/charts/LineChart.astro";
 
 const range = (start: number, end: number, n: number) => () =>
 	Array.from({ length: n }, (_, i) => start + ((end - start) * i) / (n - 1));

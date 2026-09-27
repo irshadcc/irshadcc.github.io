@@ -1,8 +1,8 @@
 ---
-import Layout from "../layouts/Layout.astro";
+import Layout from "../../layouts/Layout.astro";
 
-// Every src/pages/*-demo.astro page, read as source so the list picks up new demos by itself.
-const sources = import.meta.glob<string>("./*-demo.astro", { query: "?raw", import: "default", eager: true });
+// Every other page in src/pages/demo, read as source so the list picks up new demos by itself.
+const sources = import.meta.glob<string>(["./*.astro", "!./index.astro"], { query: "?raw", import: "default", eager: true });
 const base = import.meta.env.BASE_URL.replace(/\/$/, "");
 
 const demos = Object.entries(sources)
@@ -10,7 +10,7 @@ const demos = Object.entries(sources)
 		const slug = file.replace(/^\.\//, "").replace(/\.astro$/, "");
 		const title = src.match(/<Layout[^>]*\btitle="([^"]+)"/)?.[1] ?? slug;
 		// Components the demo pulls in from src/utils, e.g. "utils/charts/LineChart.astro".
-		const components = [...src.matchAll(/from "\.\.\/(utils\/[^"]+\.astro)"/g)].map((m) => m[1]);
+		const components = [...src.matchAll(/from "\.\.\/\.\.\/(utils\/[^"]+\.astro)"/g)].map((m) => m[1]);
 		return { slug, title, components };
 	})
 	.sort((a, b) => a.title.localeCompare(b.title));
@@ -23,7 +23,7 @@ const demos = Object.entries(sources)
 		{
 			demos.map((demo) => (
 				<li>
-					<a class="entry-title" href={`${base}/${demo.slug}`}>
+					<a class="entry-title" href={`${base}/demo/${demo.slug}`}>
 						{demo.title}
 					</a>
 					<span class="entry-meta">{demo.components.join(", ") || `${demo.slug}.astro`}</span>
