@@ -1,0 +1,208 @@
+---
+title: "Working Backwards Through CuTe Layout Composition"
+description: "Composition is how CuTe builds new layouts out of old ones. This post runs it in reverse: given a layout A and the result R of composing it, we derive the layout B that makes A ∘ B = R, working out its strides and shape by hand and checking the answer with pycute."
+date: 2026-09-27
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import LayoutGrid from "../../components/LayoutGrid.astro";
+
+A CuTe layout is a pair of a *shape* and a *stride*, written $(S_0, S_1):(D_0, D_1)$. It is a
+function: it takes a coordinate $(c_0, c_1)$ and returns an integer index
+$c_0 D_0 + c_1 D_1$. Because layouts are functions, they compose. $A \circ B$ means "apply $B$,
+then apply $A$ to the result", and CuTe uses this to build things like tiled and partitioned
+layouts out of simpler ones.
+
+Usually you know $A$ and $B$ and ask CuTe for $A \circ B$. In this post I go the other way.
+Given $A$ and the result $R$, how do we find $B$?
+
+## The setup
+
+All the code here uses `pycute`, the Python reference implementation that ships with
+[CuTe](https://github.com/NVlabs/CuTe):
+
+```bash
+git clone https://github.com/NVlabs/CuTe.git && cd CuTe && pip install -e ".[viz]"
+```
+
+```python
+import pycute as cute
+
+layoutA = cute.Layout((4, 3), (1, 4))
+# layoutB = cute.Layout((s0, s1), (d0, d1))   <- unknown
+# layoutR = cute.composition(layoutA, layoutB)
+layoutR = cute.Layout((2, 6), (6, 1))
+```
+
+Each cell below shows the index a layout maps that coordinate to. Rows are $c_0$ and columns
+are $c_1$.
+
+<LayoutGrid name="A" shape={[4, 3]} stride={[1, 4]} />
+
+<LayoutGrid name="R" shape={[2, 6]} stride={[6, 1]} />
+
+## 1. An equation for the strides
+
+Write both layouts out in full:
+
+$$
+A = (S_{a0}, S_{a1}):(D_{a0}, D_{a1}), \qquad
+B = (S_{b0}, S_{b1}):(D_{b0}, D_{b1})
+$$
+
+We want $B$ such that
+
+$$
+A \circ B = R, \quad\text{that is,}\quad A(B(c)) = R(c) \text{ for every coordinate } c.
+$$
+
+Take an input coordinate $(c_0, c_1)$. Applying $B$ gives an integer:
+
+$$
+i_b = B(c_0, c_1) = c_0 D_{b0} + c_1 D_{b1}
+$$
+
+That integer is an index into the *domain* of $A$. Before $A$ can use it, it is converted back
+into a coordinate using $A$'s shape. CuTe's convention is column-major, so the first mode
+varies fastest:
+
+$$
+(a_0, a_1)
+= \operatorname{idx2crd}\big(i_b, (S_{a0}, S_{a1})\big)
+= \left(i_b \bmod S_{a0},\ \left\lfloor \frac{i_b}{S_{a0}} \right\rfloor\right)
+$$
+
+Now $A$ maps that coordinate to its index:
+
+$$
+A(i_b) = a_0 D_{a0} + a_1 D_{a1}
+$$
+
+Substituting $i_b$, $a_0$ and $a_1$, and setting the result equal to $R$, gives the constraint
+that $B$ must satisfy:
+
+$$
+\boxed{
+\big((c_0 D_{b0} + c_1 D_{b1}) \bmod S_{a0}\big)\, D_{a0}
++ \left\lfloor \frac{c_0 D_{b0} + c_1 D_{b1}}{S_{a0}} \right\rfloor D_{a1}
+= R(c_0, c_1)
+}
+$$
+
+## 2. What the composition has to produce
+
+Reading $R = (2,6):(6,1)$ off coordinate by coordinate gives every value $A(B(c))$ must hit:
+
+| $(c_0, c_1)$ | $R = A(B(c))$ | | $(c_0, c_1)$ | $R = A(B(c))$ |
+| :----------: | :-----------: |-| :----------: | :-----------: |
+| $(0,0)$ | 0 | | $(1,0)$ | 6 |
+| $(0,1)$ | 1 | | $(1,1)$ | 7 |
+| $(0,2)$ | 2 | | $(1,2)$ | 8 |
+| $(0,3)$ | 3 | | $(1,3)$ | 9 |
+| $(0,4)$ | 4 | | $(1,4)$ | 10 |
+| $(0,5)$ | 5 | | $(1,5)$ | 11 |
+
+and $A$ is known:
+
+$$
+A = (S_{a0}, S_{a1}):(D_{a0}, D_{a1}) = (4,3):(1,4)
+$$
+
+## 3. Solving for the strides of B
+
+The two unknown strides each show up alone when we plug in the unit coordinates $(1,0)$ and
+$(0,1)$, so those give one equation each.
+
+**Equation 1**, with $(c_0, c_1) = (1, 0)$:
+
+$$
+R(1,0) = (D_{b0} \bmod 4)\cdot 1 + \left\lfloor \frac{D_{b0}}{4} \right\rfloor \cdot 4 = 6
+$$
+
+**Equation 2**, with $(c_0, c_1) = (0, 1)$:
+
+$$
+R(0,1) = (D_{b1} \bmod 4)\cdot 1 + \left\lfloor \frac{D_{b1}}{4} \right\rfloor \cdot 4 = 1
+$$
+
+Both left-hand sides have the form $(x \bmod n) + n\lfloor x/n \rfloor$, which is just $x$ (the
+proof is in the [appendix](#appendix)). So the equations collapse to
+
+$$
+D_{b0} = 6, \qquad D_{b1} = 1.
+$$
+
+The collapse happens because this particular $A$ is *compact and column-major*:
+$D_{a0} = 1$ and $D_{a1} = S_{a0}$.<Sidenote>In other words, $A$ is the identity function on
+the indices $0 \dots 11$. That is why $B$ ends up identical to $R$ here. For an $A$ with
+gaps or a permuted order, the same boxed equation still holds, but solving it takes more
+than one identity.</Sidenote>
+
+## 4. Finding the shape of B
+
+The shape is not solved for. It is read off the *domain*. In $R = A \circ B$ the coordinate is
+fed to $B$ first, so $R$ takes its domain from $B$:
+
+$$
+\text{shape}(B) = \text{shape}(R)
+$$
+
+Counting the values each coordinate takes in the table above:
+
+$$
+c_0 \in \{0, 1\} \;\Rightarrow\; S_{b0} = 2, \qquad
+c_1 \in \{0, 1, 2, 3, 4, 5\} \;\Rightarrow\; S_{b1} = 6
+$$
+
+As a check, $S_{b0} \cdot S_{b1} = 2 \cdot 6 = 12$, which matches the 12 entries in the table.
+
+## 5. Result
+
+Putting the shape and strides together:
+
+$$
+B = (S_{b0}, S_{b1}):(D_{b0}, D_{b1}) = (2,6):(6,1)
+$$
+
+<LayoutGrid name="B" shape={[2, 6]} stride={[6, 1]} />
+
+## Verifying with pycute
+
+```python
+layoutA = cute.Layout((4, 3), (1, 4))
+layoutB = cute.Layout((2, 6), (6, 1))
+layoutR = cute.composition(layoutA, layoutB)
+print(f"A = {layoutA}")
+print(f"B = {layoutB}")
+print(f"R = {layoutR}")
+```
+
+```text
+A = (4, 3):(1, 4)
+B = (2, 6):(6, 1)
+R = (2, 6):(6, 1)
+```
+
+CuTe agrees: composing $A$ with our derived $B$ gives back $R$.
+
+## Appendix
+
+### Proof of $x = (x \bmod n) + n \left\lfloor \frac{x}{n} \right\rfloor$
+
+By the division algorithm, write $x = r + nq$ with $q \in \mathbb{Z}$ and $0 \le r < n$. The
+quotient and remainder are unique, so
+
+$$
+r = x \bmod n \qquad \text{and} \qquad q = \left\lfloor \frac{x}{n} \right\rfloor.
+$$
+
+Substituting back,
+
+$$
+(x \bmod n) + n \left\lfloor \frac{x}{n} \right\rfloor = r + nq = x.
+$$
+
+## References
+
+1. [CuTe Layout Representation and Algebra](https://arxiv.org/abs/2603.02298)
+2. [Categorical Foundations for CuTe Layouts](https://research.colfax-intl.com/categorical-foundations-for-cute-layouts/)

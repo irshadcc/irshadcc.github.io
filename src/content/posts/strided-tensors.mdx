@@ -1,0 +1,151 @@
+---
+title: "Strided Tensors"
+description: "How do you find where element (i, j) of a tensor lives in memory? Shape and strides turn that into a dot product. This post builds up the idea from a 6×6 matrix, shows how reshape, transpose, slicing and broadcasting become metadata-only operations, and extends it to tiled layouts with nested coordinates."
+date: 2026-01-18
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import rowMajor from "../../assets/strided-tensors/row-major-6x6.png";
+import strides from "../../assets/strided-tensors/strides.png";
+import tiling from "../../assets/strided-tensors/tiling.png";
+import { Image } from "astro:assets";
+
+## Problem
+
+Say we have a matrix $M$ of shape $(m, n)$, stored in memory in some pattern: row-major,
+column-major, or something more complicated for higher-dimensional tensors. Given a coordinate
+$(i, j)$, how do we compute its physical offset in memory?
+
+The most intuitive approach is to count the elements that come before it. Take the $6 \times 6$
+matrix below, stored row-major. To find the offset of $(2, 4)$ we walk past 2 full rows and then
+4 more elements, so its offset is 16:
+
+$$
+\text{offset}(M, (2, 4)) = 2 \cdot 6 + 4 = 16
+$$
+
+<figure class="sketch">
+	<Image src={rowMajor} alt="A 6×6 matrix holding the values 0 to 35 in row-major order, with shape (6,6) and stride (6,1)." />
+</figure>
+
+For a two-dimensional tensor that is easy. But for a tensor with many dimensions, stored in
+memory with "some pattern", counting quickly gets difficult.
+
+## Shape and strides
+
+> The **shape** defines the skeleton of the tensor. It tells you how many dimensions (axes) the
+> tensor has and how many elements are in each dimension.
+>
+> The **stride** is the recipe for navigating the flat memory. It tells the computer how many
+> steps to skip in the 1D memory array to move one position forward in a specific dimension.
+>
+> (Google Gemini)
+
+For example, to move from coordinate $(2, 4)$ to $(3, 4)$, how many elements do we skip?
+
+<figure class="sketch">
+	<Image src={strides} alt="The same 6×6 matrix. Moving from (2,4) to (3,4) skips 6 elements; moving from (2,4) to (2,5) skips 1 element. So the stride of this layout is (6,1)." />
+</figure>
+
+Moving down one row skips 6 elements, and moving right one column skips 1, so the strides are
+$(6, 1)$. To get the offset of $(2, 4)$ we now just take the dot product of the coordinate and
+the strides:
+
+$$
+\text{offset}\big((2, 4), (6, 1)\big) = 2 \cdot 6 + 4 \cdot 1 = 16
+$$
+
+### Generalization
+
+The same holds for a tensor of any rank. With a known shape and strides
+$(s_0, s_1, \dots, s_n)$, the offset of a coordinate $(i, j, \dots, k)$ is the dot product of the
+coordinate and the strides:
+
+$$
+\text{offset}\big((i, j, \dots, k), (s_0, s_1, \dots, s_n)\big) = i \cdot s_0 + j \cdot s_1 + \dots + k \cdot s_n
+$$
+
+Everything so far assumed the matrix is stored row-major. If it were stored column-major, the
+strides would be $(1, 6)$ instead.
+
+## Metadata-only operations
+
+Because shape and strides fully describe how to find each element, many operations can be done
+by changing only the shape and strides, without copying the tensor's data. Reshaping, reordering
+dimensions, slicing and expanding all work this way.<Sidenote>`reshape` returns a view like this
+whenever the new shape is compatible with the existing strides. When it isn't (for example,
+reshaping a transposed tensor), it falls back to copying.</Sidenote>
+
+```python
+import torch
+
+t = torch.tensor([
+    [0, 1, 2, 3, 4, 5],
+    [6, 7, 8, 9, 10, 11],
+    [12, 13, 14, 15, 16, 17],
+    [18, 19, 20, 21, 22, 23],
+    [24, 25, 26, 27, 28, 29],
+    [30, 31, 32, 33, 34, 35]
+])
+print(f"Shape : {t.shape}, Stride : {t.stride()}")
+# Shape : torch.Size([6, 6]), Stride : (6, 1)
+
+# Reshape
+t_reshaped = t.reshape(3, 2, 6)
+print(f"Shape : {t_reshaped.shape}, Stride : {t_reshaped.stride()}")
+# Shape : torch.Size([3, 2, 6]), Stride : (12, 6, 1)
+
+# Permute the two dimensions (a transpose for a 2D tensor)
+t_permuted = t.permute(1, 0)
+print(f"Shape : {t_permuted.shape}, Stride : {t_permuted.stride()}")
+# Shape : torch.Size([6, 6]), Stride : (1, 6)
+
+# Slice every other column
+t_sliced = t[:, ::2]
+print(f"Shape : {t_sliced.shape}, Stride : {t_sliced.stride()}")
+# Shape : torch.Size([6, 3]), Stride : (6, 2)
+
+# Broadcast along a new leading dimension
+t_expanded = t.expand(10, 6, 6)
+print(f"Shape : {t_expanded.shape}, Stride : {t_expanded.stride()}")
+# Shape : torch.Size([10, 6, 6]), Stride : (0, 6, 1)
+```
+
+Note the stride of 0 in the last example: every step along the new dimension lands on the same
+memory, which is how broadcasting avoids materializing ten copies.
+
+## Tiling
+
+We can build on the same idea to describe a *tiled* tensor, using nested tuples.
+
+Take the same matrix and divide it into $2 \times 2$ tiles. Each element now has a nested
+coordinate: (outer tile coordinate, inner coordinate within the tile). The outer tiles form a
+$3 \times 3$ grid, and each has its own shape and strides:
+
+| | Shape | Stride |
+| :--- | :---: | :---: |
+| Outer (which tile) | $(3, 3)$ | $(12, 2)$ |
+| Inner (within a tile) | $(2, 2)$ | $(6, 1)$ |
+
+<figure class="sketch">
+	<Image src={tiling} alt="The 6×6 matrix split into a 3×3 grid of 2×2 tiles. Moving from ((1,2),(0,1)) to ((2,2),(0,1)) traverses 12 elements. Outer tile shape (3,3), stride (12,2); inner tile shape (2,2), stride (6,1)." />
+</figure>
+
+Moving one tile down, from $((1,2), (0,1))$ to $((2,2), (0,1))$, skips 12 elements, which is the
+outer row stride. The offset is still a dot product, just taken level by level:
+
+$$
+\begin{aligned}
+\text{offset}\big((1,2), (0,1)\big)
+&= \text{dot}(\text{outer coord}, \text{outer stride}) + \text{dot}(\text{inner coord}, \text{inner stride}) \\
+&= (1 \cdot 12 + 2 \cdot 2) + (0 \cdot 6 + 1 \cdot 1) = 17
+\end{aligned}
+$$
+
+## Summary
+
+Strided tensors are a great way to represent dense tensors, because operations like slicing,
+transposing and broadcasting become cheap changes to metadata instead of expensive memory
+copies. For both plain and tiled tensors, the offset of an element is just the dot product of
+its coordinate and the strides. The examples here are 2D, but the same idea applies directly to
+tensors of any rank.

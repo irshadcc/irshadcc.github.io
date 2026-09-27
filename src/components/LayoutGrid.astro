@@ -1,0 +1,79 @@
+---
+// Draws a rank-2 CuTe layout (shape):(stride) as a grid of the indices it maps to.
+// Cells are tinted by index mod 8, like pycute's bank_color_8x.
+// Usage in .mdx:  <LayoutGrid name="A" shape={[4, 3]} stride={[1, 4]} />
+interface Props {
+	shape: [number, number];
+	stride: [number, number];
+	name?: string;
+}
+
+const { shape, stride, name } = Astro.props;
+const [rows, cols] = shape;
+const label = `(${shape.join(",")}):(${stride.join(",")})`;
+const hues = [210, 30, 140, 280, 0, 180, 60, 320];
+---
+
+<figure class="layout-grid">
+	<table>
+		<thead>
+			<tr>
+				<th></th>
+				{Array.from({ length: cols }, (_, j) => <th>{j}</th>)}
+			</tr>
+		</thead>
+		<tbody>
+			{
+				Array.from({ length: rows }, (_, i) => (
+					<tr>
+						<th>{i}</th>
+						{Array.from({ length: cols }, (_, j) => {
+							const idx = i * stride[0] + j * stride[1];
+							return <td style={`--hue: ${hues[idx % 8]}`}>{idx}</td>;
+						})}
+					</tr>
+				))
+			}
+		</tbody>
+	</table>
+	<figcaption>{name ? `${name} = ${label}` : label}</figcaption>
+</figure>
+
+<style>
+	.layout-grid {
+		margin: 1.5rem 0;
+		overflow-x: auto;
+	}
+	table {
+		border-collapse: collapse;
+		font-family: var(--mono);
+		font-size: 0.85rem;
+		margin: 0 auto;
+		width: auto;
+	}
+	th,
+	td {
+		width: 2.4rem;
+		height: 2.4rem;
+		padding: 0;
+		text-align: center;
+	}
+	th {
+		color: var(--muted);
+		font-weight: normal;
+		border: none;
+		background: none;
+	}
+	td {
+		border: 1px solid var(--faint);
+		background: color-mix(in oklch, oklch(0.7 0.12 var(--hue)) 30%, var(--bg));
+		color: var(--text);
+	}
+	figcaption {
+		text-align: center;
+		font-family: var(--mono);
+		font-size: 0.85rem;
+		color: var(--muted);
+		margin-top: 0.5rem;
+	}
+</style>
