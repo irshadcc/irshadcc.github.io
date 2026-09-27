@@ -1,0 +1,505 @@
+---
+// The physical network of a GPU cluster: servers (hosts) of GPUs, each GPU with its own NIC,
+// wired multi-rail to ToR switches, which connect to spines, which connect to cores: the
+// three-tier CLOS network MegaScale describes (§3.4, arXiv:2402.15627). See network.ts for
+// the wiring and routing rules.
+//
+// Selecting a GPU (hover, click, or Tab + Enter) recolours every other GPU by how far away it
+// is: NVLink in the same server, or 1, 3 or 5 switches through the network. The links the
+// selected GPU can use to leave its server (its rail's ToR, that ToR's spines and their cores)
+// are highlighted. With `values`, GPUs are otherwise coloured by that value (e.g. step time).
+// Usage in .mdx:
+//   <PhysicalClusterTopology servers={12} gpusPerServer={4} serversPerPod={3} spinesPerPod={4} />
+import { type ColorScaleSpec, colorScale } from "../colors/colorScales";
+import { ClusterNetwork, coreId, HOP_CLASSES, spineId, torId } from "./network";
+
+interface Props {
+	servers: number;
+	gpusPerServer?: number;
+	/** Servers under one set of ToR switches (a pod). */
+	serversPerPod?: number;
+	/** Spine switches per pod; also the number of core switches (one per plane). */
+	spinesPerPod?: number;
+	/** Link speeds for the labels, in Gb/s: GPU NIC -> ToR, and switch-to-switch. */
+	nicGbps?: number;
+	uplinkGbps?: number;
+	/** One value per GPU (index = GPU number); colours the GPU cells. */
+	values?: number[] | Record<number, number>;
+	colors?: ColorScaleSpec;
+	domain?: [number, number];
+	unit?: string;
+	valueLabel?: string;
+	/** Colour scale for the distance map (near -> far). */
+	distanceColors?: ColorScaleSpec;
+	/** GPU selected initially. */
+	selected?: number;
+	title?: string;
+}
+
+const {
+	servers,
+	gpusPerServer = 8,
+	serversPerPod = 4,
+	spinesPerPod = 4,
+	nicGbps = 200,
+	uplinkGbps = 400,
+	values,
+	colors = "paper",
+	domain: domainProp,
+	unit = "",
+	valueLabel = "value",
+	distanceColors = "purples",
+	selected,
+	title,
+} = Astro.props;
+
+const net = new ClusterNetwork({ gpusPerServer, serversPerPod, spinesPerPod });
+const G = gpusPerServer;
+const N = servers * G;
+const pods = Math.ceil(servers / serversPerPod);
+
+// ---- GPU values.
+const valueOf = (gpu: number): number | undefined => {
+	const v = Array.isArray(values) ? values[gpu] : values?.[gpu];
+	return typeof v === "number" && Number.isFinite(v) ? v : undefined;
+};
+const known = Array.from({ length: N }, (_, g) => valueOf(g)).filter((v): v is number => v !== undefined);
+const valueDomain: [number, number] = domainProp ?? [Math.min(...known), Math.max(...known)];
+const valueScale = known.length ? colorScale(colors, valueDomain) : undefined;
+const fmt = (v: number) => (Number.isInteger(v) ? `${v}` : Number(v.toPrecision(3)).toString());
+const withUnit = (v: number) => (unit ? `${fmt(v)} ${unit}` : fmt(v));
+
+// Distance colours, near (NVLink) -> far (core), taken from the top of the scale down so the
+// nearest GPUs are the most saturated.
+const distScale = colorScale(distanceColors, [0, HOP_CLASSES.length]);
+const distFill = HOP_CLASSES.map((_, i) => distScale.color(HOP_CLASSES.length - i));
+const distInk = HOP_CLASSES.map((_, i) => distScale.text(HOP_CLASSES.length - i));
+
+// ---- Geometry (px). Rows top to bottom: core, spine, ToR, servers; pods side by side.
+const CELL = 14;
+const SPAD = 4;
+const SGAP = 8;
+const PGAP = 26;
+const MARGIN = 16;
+const serverW = G * CELL + 2 * SPAD;
+const podW = serversPerPod * serverW + (serversPerPod - 1) * SGAP;
+const W = 2 * MARGIN + pods * podW + (pods - 1) * PGAP;
+const ROW = { core: MARGIN + 26, spine: MARGIN + 96, tor: MARGIN + 166, server: MARGIN + 222 };
+const serverH = SPAD + CELL + 16;
+const H = ROW.server + serverH + 26;
+const SW_H = 16;
+const podX = (p: number) => MARGIN + p * (podW + PGAP);
+const spread = (x0: number, width: number, n: number, i: number) => x0 + ((i + 0.5) * width) / n;
+const swW = (spacing: number) => Math.max(22, Math.min(40, spacing - 6));
+
+type Tier = "core" | "spine" | "tor";
+const switches: { id: string; tier: Tier; label: string; pod?: number; x: number; y: number; w: number }[] = [
+	...Array.from({ length: spinesPerPod }, (_, s) => ({
+		id: coreId(s),
+		tier: "core" as const,
+		label: `C${s}`,
+		x: spread(MARGIN, W - 2 * MARGIN, spinesPerPod, s),
+		y: ROW.core,
+		w: swW((W - 2 * MARGIN) / spinesPerPod),
+	})),
+	...Array.from({ length: pods }, (_, p) => [
+		...Array.from({ length: spinesPerPod }, (_, s) => ({
+			id: spineId(p, s),
+			tier: "spine" as const,
+			label: `S${s}`,
+			pod: p,
+			x: spread(podX(p), podW, spinesPerPod, s),
+			y: ROW.spine,
+			w: swW(podW / spinesPerPod),
+		})),
+		...Array.from({ length: G }, (_, r) => ({
+			id: torId(p, r),
+			tier: "tor" as const,
+			label: `R${r}`,
+			pod: p,
+			x: spread(podX(p), podW, G, r),
+			y: ROW.tor,
+			w: swW(podW / G),
+		})),
+	]).flat(),
+];
+const sw = new Map(switches.map((s) => [s.id, s]));
+
+const gpus = Array.from({ length: N }, (_, gpu) => {
+	const pl = net.place(gpu);
+	const x = podX(pl.pod) + (pl.server % serversPerPod) * (serverW + SGAP) + SPAD + pl.rail * CELL;
+	const v = valueOf(gpu);
+	return {
+		gpu,
+		...pl,
+		x,
+		y: ROW.server + SPAD,
+		cx: x + CELL / 2,
+		value: v,
+		fill: v !== undefined && valueScale ? valueScale.color(v) : undefined,
+		ink: v !== undefined && valueScale ? valueScale.text(v) : undefined,
+	};
+});
+const serverBoxes = Array.from({ length: servers }, (_, s) => ({
+	id: s,
+	x: podX(Math.floor(s / serversPerPod)) + (s % serversPerPod) * (serverW + SGAP),
+	y: ROW.server,
+}));
+
+// ---- Links. Each carries the GPUs whose "way out" it is part of, so selecting a GPU can light
+// up its NIC link, its ToR's spine links and those spines' core links.
+type Link = { x1: number; y1: number; x2: number; y2: number; owners: string };
+const links: Link[] = [];
+const podGpus = (p: number, rail?: number) =>
+	gpus.filter((g) => g.pod === p && (rail === undefined || g.rail === rail)).map((g) => g.gpu);
+for (const g of gpus) {
+	const t = sw.get(torId(g.pod, g.rail));
+	if (t) links.push({ x1: g.cx, y1: g.y, x2: t.x, y2: t.y + SW_H / 2, owners: `${g.gpu}` });
+}
+for (let p = 0; p < pods; p++) {
+	for (let r = 0; r < G; r++) {
+		const t = sw.get(torId(p, r));
+		const owners = podGpus(p, r).join(",");
+		for (let s = 0; s < spinesPerPod; s++) {
+			const sp = sw.get(spineId(p, s));
+			if (t && sp) links.push({ x1: t.x, y1: t.y - SW_H / 2, x2: sp.x, y2: sp.y + SW_H / 2, owners });
+		}
+	}
+	for (let s = 0; s < spinesPerPod; s++) {
+		const sp = sw.get(spineId(p, s));
+		const c = sw.get(coreId(s));
+		if (sp && c) links.push({ x1: sp.x, y1: sp.y - SW_H / 2, x2: c.x, y2: c.y + SW_H / 2, owners: podGpus(p).join(",") });
+	}
+}
+
+const counts = {
+	tor: pods * G,
+	spine: pods * spinesPerPod,
+	core: spinesPerPod,
+};
+const TIER_LABEL: Record<Tier, string> = {
+	core: "Core",
+	spine: `Spine · ${uplinkGbps}G links`,
+	tor: `ToR, one per rail · ${nicGbps}G per NIC`,
+};
+const hash = [...JSON.stringify(Astro.props)].reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7).toString(36);
+---
+
+<figure
+	class="phys"
+	data-selected={selected}
+	data-dist-fill={distFill.join(",")}
+	data-dist-ink={distInk.join(",")}
+	data-id={hash}
+>
+	{title && <figcaption class="title">{title}</figcaption>}
+	<div class="legend">
+		{
+			valueScale && (
+				<span class="key">
+					{valueLabel}: {withUnit(valueDomain[0])}
+					<span class="bar" style={`background: ${valueScale.gradient()}`} />
+					{withUnit(valueDomain[1])}
+				</span>
+			)
+		}
+		<span class="key dist-key">
+			Distance from selected GPU:
+			{
+				HOP_CLASSES.map((c, i) => (
+					<span class="chip">
+						<span class="swatch" style={`background: ${distFill[i]}`} />
+						{c.id === "nvlink" ? "NVLink" : `${c.switches} sw`}
+					</span>
+				))
+			}
+		</span>
+	</div>
+
+	<div class="canvas">
+		<svg
+			viewBox={`0 0 ${W} ${H}`}
+			width={W}
+			height={H}
+			style={`min-width: ${Math.round(W * 0.7)}px`}
+			role="group"
+			aria-label={title ?? `${N} GPUs on ${servers} servers in ${pods} pods`}
+		>
+			{
+				(["core", "spine", "tor"] as const).map((tier) => (
+					<text class="tier" x={MARGIN} y={ROW[tier] - SW_H / 2 - 6}>
+						{TIER_LABEL[tier]}
+					</text>
+				))
+			}
+			<g class="links">
+				{links.map((l) => <line x1={l.x1} y1={l.y1} x2={l.x2} y2={l.y2} data-owners={l.owners} />)}
+			</g>
+			{
+				switches.map((s) => (
+					<g class={`switch ${s.tier}`}>
+						<title>{`${s.tier === "tor" ? `ToR for rail ${s.label.slice(1)}` : s.tier === "spine" ? "Spine" : "Core"} ${s.label}${s.pod !== undefined ? `, pod ${s.pod}` : ""}`}</title>
+						<rect x={s.x - s.w / 2} y={s.y - SW_H / 2} width={s.w} height={SW_H} rx="4" />
+						<text x={s.x} y={s.y + 3.5}>
+							{s.label}
+						</text>
+					</g>
+				))
+			}
+			{
+				serverBoxes.map((b) => (
+					<g class="server">
+						<rect x={b.x} y={b.y} width={serverW} height={serverH} rx="4" />
+						<text x={b.x + serverW / 2} y={b.y + serverH - 4}>
+							host {b.id}
+						</text>
+					</g>
+				))
+			}
+			{
+				Array.from({ length: pods }, (_, p) => (
+					<text class="pod" x={podX(p) + podW / 2} y={H - 8}>
+						pod {p}
+					</text>
+				))
+			}
+			{
+				gpus.map((g) => (
+					<g
+						class="gpu"
+						data-gpu={g.gpu}
+						data-server={g.server}
+						data-rail={g.rail}
+						data-pod={g.pod}
+						data-fill={g.fill}
+						data-ink={g.ink}
+						data-value={g.value !== undefined ? withUnit(g.value) : undefined}
+						tabindex="0"
+						role="button"
+						aria-label={`GPU ${g.gpu}`}
+					>
+						<title>{`GPU ${g.gpu} · host ${g.server}, rail ${g.rail}, pod ${g.pod}${g.value !== undefined ? ` · ${valueLabel} ${withUnit(g.value)}` : ""}`}</title>
+						<rect x={g.x} y={g.y} width={CELL} height={CELL} style={g.fill && `fill: ${g.fill}`} />
+						<text x={g.cx} y={g.y + CELL / 2 + 3} style={g.ink && `fill: ${g.ink}`}>
+							{g.gpu}
+						</text>
+					</g>
+				))
+			}
+		</svg>
+	</div>
+	<p class="info" aria-live="polite">Hover or click a GPU to see how far every other GPU is from it.</p>
+	<p class="summary">
+		{N} GPUs · {servers} servers · {pods} pods · {counts.tor} ToR, {counts.spine} spine and {counts.core} core switches
+	</p>
+</figure>
+
+<script>
+	// Distance map. The class of every other GPU follows network.ts: same server -> NVLink,
+	// same pod and rail -> 1 switch, same pod -> 3, otherwise 5. GPU cells are recoloured by
+	// class while a GPU is selected and restored (to their value colour) afterwards.
+	const CLASS_NAMES = ["over NVLink", "under the same ToR (1 switch)", "via a spine (3 switches)", "via the core (5 switches)"];
+	for (const fig of document.querySelectorAll<HTMLElement>(".phys")) {
+		const info = fig.querySelector<HTMLElement>(".info");
+		const hint = info?.textContent ?? "";
+		const fills = (fig.dataset.distFill ?? "").split(",");
+		const inks = (fig.dataset.distInk ?? "").split(",");
+		const gpus = [...fig.querySelectorAll<SVGGElement>(".gpu")].map((el) => ({
+			el,
+			rect: el.querySelector("rect"),
+			text: el.querySelector("text"),
+			server: Number(el.dataset.server),
+			rail: Number(el.dataset.rail),
+			pod: Number(el.dataset.pod),
+		}));
+		const links = [...fig.querySelectorAll<SVGLineElement>(".links line")].map((el) => ({
+			el,
+			owners: new Set((el.dataset.owners ?? "").split(",").map(Number)),
+		}));
+		const initial = Number.parseInt(fig.dataset.selected ?? "", 10);
+		let pinned: number | null = Number.isInteger(initial) ? initial : null;
+
+		const distance = (a: (typeof gpus)[number], b: (typeof gpus)[number]) =>
+			a.server === b.server ? 0 : a.pod !== b.pod ? 3 : a.rail === b.rail ? 1 : 2;
+
+		const show = (sel: number | null) => {
+			fig.classList.toggle("tracing", sel !== null);
+			const s = sel === null ? undefined : gpus[sel];
+			const tally = [0, 0, 0, 0];
+			gpus.forEach((g, i) => {
+				g.el.classList.toggle("selected", i === sel);
+				g.el.setAttribute("aria-pressed", String(i === pinned));
+				if (!s) {
+					g.rect?.style.setProperty("fill", g.el.dataset.fill ?? "");
+					g.text?.style.setProperty("fill", g.el.dataset.ink ?? "");
+					return;
+				}
+				const d = distance(s, g);
+				if (i !== sel) tally[d]++;
+				g.rect?.style.setProperty("fill", fills[d]);
+				g.text?.style.setProperty("fill", inks[d]);
+			});
+			for (const l of links) l.el.classList.toggle("on", sel !== null && l.owners.has(sel));
+			if (!info) return;
+			if (!s || sel === null) {
+				info.textContent = hint;
+				return;
+			}
+			const head = `GPU ${sel}: host ${s.server}, rail ${s.rail}, pod ${s.pod}${s.el.dataset.value ? ` · ${s.el.dataset.value}` : ""}`;
+			const parts = tally.map((n, d) => (n ? `${n} ${CLASS_NAMES[d]}` : "")).filter(Boolean);
+			info.textContent = `${head} · other GPUs: ${parts.join(", ")}`;
+		};
+		const toggle = (i: number) => {
+			pinned = pinned === i ? null : i;
+			show(pinned);
+		};
+		gpus.forEach((g, i) => {
+			g.el.addEventListener("pointerenter", () => show(i));
+			g.el.addEventListener("pointerleave", () => show(pinned));
+			g.el.addEventListener("focus", () => show(i));
+			g.el.addEventListener("blur", () => show(pinned));
+			g.el.addEventListener("click", () => toggle(i));
+			g.el.addEventListener("keydown", (e) => {
+				if (e.key !== "Enter" && e.key !== " ") return;
+				e.preventDefault();
+				toggle(i);
+			});
+		});
+		show(pinned);
+	}
+</script>
+
+<style>
+	.phys {
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+	}
+	.title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.5rem;
+	}
+	.legend {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		align-items: center;
+		gap: 0.35rem 1.2rem;
+		margin-bottom: 0.4rem;
+		font-size: 0.75rem;
+		color: var(--muted);
+	}
+	.key,
+	.chip {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.35rem;
+	}
+	.dist-key {
+		gap: 0.6rem;
+	}
+	.swatch {
+		width: 0.8rem;
+		height: 0.8rem;
+		border-radius: 3px;
+		border: 1px solid var(--faint);
+	}
+	.bar {
+		display: inline-block;
+		width: 6rem;
+		height: 0.7rem;
+		border-radius: 3px;
+		border: 1px solid var(--faint);
+	}
+	.canvas {
+		overflow-x: auto;
+		margin-top: 0.4rem;
+	}
+	svg {
+		display: block;
+		max-width: 100%;
+		height: auto;
+		margin: 0 auto;
+	}
+	.tier,
+	.pod {
+		font-size: 10px;
+		font-weight: 600;
+		fill: var(--muted);
+	}
+	.pod {
+		text-anchor: middle;
+	}
+	.links line {
+		stroke: var(--muted);
+		stroke-width: 0.8;
+		stroke-opacity: 0.35;
+		transition:
+			stroke-opacity 150ms ease,
+			stroke 150ms ease;
+	}
+	.tracing .links line {
+		stroke-opacity: 0.1;
+	}
+	.tracing .links line.on {
+		stroke: var(--accent);
+		stroke-width: 1.8;
+		stroke-opacity: 0.9;
+	}
+	.switch rect {
+		fill: var(--surface);
+		stroke: color-mix(in oklch, var(--text) 55%, var(--bg));
+	}
+	.switch text {
+		font-family: var(--mono);
+		font-size: 9px;
+		text-anchor: middle;
+		fill: var(--text);
+	}
+	.server rect {
+		fill: var(--bg);
+		stroke: color-mix(in oklch, var(--text) 70%, var(--bg));
+		stroke-width: 1.1;
+	}
+	.server text {
+		font-size: 9.5px;
+		text-anchor: middle;
+		fill: var(--muted);
+	}
+	.gpu {
+		cursor: pointer;
+		outline: none;
+	}
+	.gpu rect {
+		fill: var(--surface);
+		stroke: color-mix(in oklch, var(--text) 70%, var(--bg));
+		stroke-width: 0.7;
+		transition: fill 120ms ease;
+	}
+	.gpu text {
+		font-family: var(--mono);
+		font-size: 7.5px;
+		text-anchor: middle;
+		fill: var(--text);
+		pointer-events: none;
+	}
+	.gpu.selected rect,
+	.gpu:focus-visible rect {
+		stroke: var(--text);
+		stroke-width: 2;
+	}
+	.info,
+	.summary {
+		margin: 0.5rem 0 0;
+		font-size: 0.8rem;
+		text-align: center;
+		color: var(--muted);
+	}
+	.info {
+		min-height: 1.4em;
+	}
+	.summary {
+		font-size: 0.72rem;
+	}
+</style>

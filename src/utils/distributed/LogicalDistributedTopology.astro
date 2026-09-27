@@ -1,0 +1,741 @@
+---
+// A 3D-parallel training job laid out by its parallel coordinates rather than by host.
+// Inspired by MegaScale's performance heat-map (Figure 7, arXiv:2402.15627), which draws ranks
+// inside their hosts, so TP, DP and PP groups scatter and need dashed connectors. Here:
+//
+//   columns = pipeline stages (PP), left to right in the direction activations flow
+//   rows    = data-parallel replicas (DP)
+//   cells   = tensor-parallel groups (TP), one square per shard
+//
+// so every group is a straight line: a TP group is one cell, a DP group is a vertical line
+// through the same square of every row, and a pipeline is a horizontal line through the same
+// square of every column. Distribution strips along the top (per stage) and right (per
+// replica) show every rank's value and mark the slowest, since synchronous training runs at
+// the pace of its slowest rank. A toggle recolours squares by idle time: how long each rank
+// waits for the slowest one per step.
+//
+// With `network` (see network.ts; rank r runs on GPU r), cells name their hosts and each
+// group's link is labelled with the switches its traffic crosses.
+// Usage in .mdx:
+//   <LogicalDistributedTopology parallel={{ tp: 4, dp: 3, pp: 4 }} values={times} unit="s"
+//     network={{ gpusPerServer: 4, serversPerPod: 3, spinesPerPod: 4 }} />
+import { type ColorScaleSpec, colorScale } from "../colors/colorScales";
+import { ClusterNetwork, type HopClass, type NetworkShape } from "./network";
+import { DIM_NAMES, DIMS, type Dim, ParallelLayout } from "./parallelism";
+
+interface Props {
+	parallel: Record<Dim, number>;
+	/** Rank numbering, fastest-varying dimension first (Megatron-LM default: tp, dp, pp). */
+	order?: [Dim, Dim, Dim];
+	/** One value per rank, e.g. compute time per step. */
+	values?: number[] | Record<number, number>;
+	/** Colour scale for the values (see colorScales.ts). */
+	colors?: ColorScaleSpec;
+	/** Colour scale for idle time. */
+	idleColors?: ColorScaleSpec;
+	domain?: [number, number];
+	unit?: string;
+	valueLabel?: string;
+	/** Physical cluster shape; adds host names and hop counts. */
+	network?: NetworkShape;
+	/** Rank selected initially. */
+	selected?: number;
+	/** Override the TP / DP / PP colours. */
+	commColors?: Partial<Record<Dim, string>>;
+	title?: string;
+}
+
+const {
+	parallel,
+	order = ["tp", "dp", "pp"],
+	values,
+	colors = "paper",
+	idleColors = "blues",
+	domain: domainProp,
+	unit = "",
+	valueLabel = "time",
+	network,
+	selected,
+	commColors = {},
+	title,
+} = Astro.props;
+
+const layout = new ParallelLayout(parallel, order);
+const N = layout.size;
+const { tp: T, dp: D, pp: P } = parallel;
+const net = network ? new ClusterNetwork(network) : undefined;
+
+// ---- Values: compute time, and idle time relative to the slowest rank.
+const valueOf = (rank: number): number | undefined => {
+	const v = Array.isArray(values) ? values[rank] : values?.[rank];
+	return typeof v === "number" && Number.isFinite(v) ? v : undefined;
+};
+const vals = Array.from({ length: N }, (_, r) => valueOf(r));
+const known = vals.filter((v): v is number => v !== undefined);
+const hasValues = known.length > 0;
+const valueDomain: [number, number] = domainProp ?? [Math.min(...known), Math.max(...known)];
+const scale = hasValues ? colorScale(colors, valueDomain) : undefined;
+const maxV = hasValues ? Math.max(...known) : 0;
+const slowest = vals.indexOf(maxV);
+const idleOf = (r: number) => (vals[r] === undefined ? undefined : maxV - (vals[r] as number));
+const maxIdle = hasValues ? Math.max(...known.map((v) => maxV - v)) : 0;
+const idleScale = hasValues ? colorScale(idleColors, [0, maxIdle || 1]) : undefined;
+const fmt = (v: number) => (Number.isInteger(v) ? `${v}` : Number(v.toPrecision(3)).toString());
+const withUnit = (v: number) => (unit ? `${fmt(v)} ${unit}` : fmt(v));
+
+// ---- Geometry (px).
+const S = 24; // square per TP shard
+const CP = 6; // cell padding
+const tpCols = Math.min(T, 4);
+const tpRows = Math.ceil(T / tpCols);
+const BADGE = net ? 13 : 0; // host line under the squares
+const cellW = tpCols * S + 2 * CP;
+const cellH = tpRows * S + 2 * CP + BADGE;
+const COL_GAP = 34;
+const ROW_GAP = 18;
+const MARGIN = 12;
+const LEFT = 70; // row labels
+const STRIP_H = hasValues ? 38 : 0; // per-stage strips above the grid
+const HEADER = 20;
+const gridX0 = MARGIN + LEFT;
+const gridY0 = MARGIN + STRIP_H + HEADER;
+const cellX = (p: number) => gridX0 + p * (cellW + COL_GAP);
+const cellY = (d: number) => gridY0 + d * (cellH + ROW_GAP);
+const gridRight = cellX(P - 1) + cellW;
+const gridBottom = cellY(D - 1) + cellH;
+const RS_X = gridRight + 26; // per-replica strips right of the grid
+const RS_W = 96;
+const W = hasValues ? RS_X + RS_W + 56 + MARGIN : gridRight + MARGIN;
+const H = gridBottom + MARGIN;
+
+const squares = Array.from({ length: N }, (_, rank) => {
+	const c = layout.coordOf(rank);
+	const x = cellX(c.pp) + CP + (c.tp % tpCols) * S;
+	const y = cellY(c.dp) + CP + Math.floor(c.tp / tpCols) * S;
+	const v = vals[rank];
+	const idle = idleOf(rank);
+	return {
+		rank,
+		c,
+		x,
+		y,
+		cx: x + S / 2,
+		cy: y + S / 2,
+		fill: v !== undefined && scale ? scale.color(v) : undefined,
+		ink: v !== undefined && scale ? scale.text(v) : undefined,
+		idleFill: idle !== undefined && idleScale ? idleScale.color(idle) : undefined,
+		idleInk: idle !== undefined && idleScale ? idleScale.text(idle) : undefined,
+	};
+});
+
+// ---- Hosts and hops (only with `network`).
+const serverOf = (r: number) => net?.place(r).server;
+const hopOf = (a: number, b: number): HopClass | undefined => net?.route(a, b).cls;
+const HOP_SHORT: Record<HopClass, string> = { nvlink: "NVLink", tor: "1 switch", spine: "3 switches", core: "5 switches" };
+const hostLabel = (ranks: number[]) => {
+	const hs = [...new Set(ranks.map(serverOf))].filter((h): h is number => h !== undefined).sort((a, b) => a - b);
+	if (!hs.length) return "";
+	return hs.length === 1 ? `host ${hs[0]}` : `hosts ${hs[0]}–${hs[hs.length - 1]}`;
+};
+
+// ---- Cells (one per TP group) and the DP / PP group lines.
+const cells = Array.from({ length: D * P }, (_, i) => {
+	const d = Math.floor(i / P);
+	const p = i % P;
+	const ranks = layout.groupOf("tp", layout.rankOf({ tp: 0, dp: d, pp: p }));
+	return { d, p, ranks, x: cellX(p), y: cellY(d), host: hostLabel(ranks) };
+});
+const dpLines = layout.groups("dp").map((g) => ({
+	ranks: g,
+	segs: g.slice(1).map((b, i) => {
+		const sa = squares[g[i]];
+		const sb = squares[b];
+		// Hop label sits in the gap above b's cell, clear of any squares.
+		return { x: sa.cx, y1: sa.y + S, y2: sb.y, ly: cellY(sb.c.dp) - ROW_GAP / 2 + 3, hop: hopOf(g[i], b) };
+	}),
+}));
+const ppLines = layout.groups("pp").map((g) => ({
+	ranks: g,
+	segs: g.slice(1).map((b, i) => {
+		const sa = squares[g[i]];
+		const sb = squares[b];
+		return { x1: cellX(sa.c.pp) + cellW, x2: cellX(sb.c.pp), y: sa.cy, hop: hopOf(g[i], b) };
+	}),
+}));
+
+// ---- Distribution strips: every rank's value on a small axis, slowest marked.
+const sx = (x0: number, w: number, v: number) => {
+	const [lo, hi] = valueDomain;
+	const t = hi === lo ? 0.5 : Math.min(1, Math.max(0, (v - lo) / (hi - lo)));
+	return x0 + t * w;
+};
+const strip = (ranks: number[]) => {
+	const vs = ranks.map((r) => ({ r, v: vals[r] })).filter((x): x is { r: number; v: number } => x.v !== undefined);
+	const worst = vs.reduce((m, x) => (x.v > m.v ? x : m), vs[0]);
+	return { vs, worst };
+};
+const stageStrips = hasValues
+	? Array.from({ length: P }, (_, p) => ({ p, ...strip(squares.filter((s) => s.c.pp === p).map((s) => s.rank)) }))
+	: [];
+const replicaStrips = hasValues
+	? Array.from({ length: D }, (_, d) => ({ d, ...strip(squares.filter((s) => s.c.dp === d).map((s) => s.rank)) }))
+	: [];
+
+// ---- Text: per-rank description (info line) and the bottleneck summary.
+const info = squares.map((s) => {
+	const r = s.rank;
+	const parts = [`Rank ${r}: stage ${s.c.pp}, replica ${s.c.dp}, TP shard ${s.c.tp}`];
+	const host = serverOf(r);
+	if (host !== undefined) parts[0] += `, host ${host}`;
+	const v = vals[r];
+	if (v !== undefined) {
+		parts.push(r === slowest ? `${withUnit(v)}, the slowest rank` : `${withUnit(v)}, idles ${withUnit(maxV - v)} waiting for rank ${slowest}`);
+	}
+	for (const dim of DIMS) {
+		if (parallel[dim] < 2) continue;
+		const g = layout.groupOf(dim, r);
+		const i = g.indexOf(r);
+		const peers = dim === "pp" ? [g[i - 1], g[i + 1]].filter((p) => p !== undefined) : g.filter((p) => p !== r);
+		const name = (p: number) => (dim === "pp" ? `${p < r ? "←" : "→"} ${p}` : `${p}`);
+		if (!net) {
+			parts.push(`${dim.toUpperCase()}: ${peers.map(name).join(", ")}`);
+			continue;
+		}
+		const byHop = new Map<HopClass, number[]>();
+		for (const p of peers) {
+			const h = hopOf(r, p) as HopClass;
+			byHop.set(h, [...(byHop.get(h) ?? []), p]);
+		}
+		parts.push(`${dim.toUpperCase()}: ${[...byHop].map(([h, ps]) => `${ps.map(name).join(", ")} (${HOP_SHORT[h]})`).join("; ")}`);
+	}
+	return parts.join(" · ");
+});
+const sorted = [...known].sort((a, b) => a - b);
+const median = sorted[Math.floor(sorted.length / 2)];
+const idleHeavy = known.filter((v) => (maxV - v) / maxV > 0.1).length;
+const summary = hasValues
+	? `Slowest rank ${slowest} (stage ${squares[slowest].c.pp}, replica ${squares[slowest].c.dp}) takes ${withUnit(maxV)}. ` +
+		`Synchronous training waits for it every step: the median rank (${withUnit(median)}) idles ${withUnit(maxV - median)} ` +
+		`(${Math.round(((maxV - median) / maxV) * 100)}%), and ${idleHeavy} of ${N} ranks idle more than 10%.`
+	: "";
+
+const hash = [...JSON.stringify(Astro.props)].reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7).toString(36);
+const arrowId = `lg-arrow-${hash}`;
+const commStyle = DIMS.filter((d) => commColors[d])
+	.map((d) => `--${d}: ${commColors[d]}`)
+	.join("; ");
+---
+
+<figure class="logical" style={commStyle || undefined} data-selected={selected}>
+	{title && <figcaption class="title">{title}</figcaption>}
+	<div class="legend">
+		{
+			DIMS.filter((d) => parallel[d] > 1).map((d) => (
+				<span class="key">
+					<span class={`swatch-line ${d}`} />
+					{DIM_NAMES[d]} ({d.toUpperCase()} = {parallel[d]})
+				</span>
+			))
+		}
+	</div>
+	{
+		hasValues && scale && idleScale && (
+			<div class="legend">
+				<span class="modes" role="group" aria-label="Colour by">
+					<button type="button" data-mode="compute" aria-pressed="true">
+						{valueLabel}
+					</button>
+					<button type="button" data-mode="idle" aria-pressed="false">
+						idle time
+					</button>
+				</span>
+				<span class="key scale-compute">
+					{withUnit(valueDomain[0])}
+					<span class="bar" style={`background: ${scale.gradient()}`} />
+					{withUnit(valueDomain[1])}
+				</span>
+				<span class="key scale-idle" hidden>
+					{withUnit(0)}
+					<span class="bar" style={`background: ${idleScale.gradient()}`} />
+					{withUnit(maxIdle)}
+				</span>
+			</div>
+		)
+	}
+
+	<div class="canvas">
+		<svg
+			viewBox={`0 0 ${W} ${H}`}
+			width={W}
+			height={H}
+			style={`min-width: ${Math.round(W * 0.75)}px`}
+			role="group"
+			aria-label={title ?? `${N} ranks: ${P} pipeline stages × ${D} data-parallel replicas × ${T} tensor-parallel shards`}
+		>
+			<defs>
+				<marker
+					id={arrowId}
+					viewBox="0 0 8 8"
+					refX="8"
+					refY="4"
+					markerWidth="6"
+					markerHeight="6"
+					orient="auto-start-reverse"
+				>
+					<path class="arrowhead" d="M0,0.5 L8,4 L0,7.5 z" />
+				</marker>
+			</defs>
+
+			<!-- Stage headers, with the direction of the pipeline between them. -->
+			{
+				Array.from({ length: P }, (_, p) => (
+					<text class="header" x={cellX(p) + cellW / 2} y={gridY0 - 7}>
+						stage {p}
+					</text>
+				))
+			}
+			{
+				Array.from({ length: P - 1 }, (_, p) => (
+					<text class="flow" x={cellX(p) + cellW + COL_GAP / 2} y={gridY0 - 7}>
+						→
+					</text>
+				))
+			}
+			{
+				Array.from({ length: D }, (_, d) => (
+					<text class="row-label" x={MARGIN} y={cellY(d) + cellH / 2 + 4}>
+						replica {d}
+					</text>
+				))
+			}
+
+			<!-- Distribution strips: a tick per rank, the slowest marked with a dot and its value. -->
+			{
+				stageStrips.map((st) => {
+					const x0 = cellX(st.p) + 6;
+					const w = cellW - 12;
+					const base = MARGIN + STRIP_H - 6;
+					const wx = sx(x0, w, st.worst.v);
+					return (
+						<g class={`strip${st.worst.r === slowest ? " worst" : ""}`}>
+							<line class="axis" x1={x0} y1={base} x2={x0 + w} y2={base} />
+							{st.vs.map((x) => (
+								<line class="tick" x1={sx(x0, w, x.v)} y1={base - 7} x2={sx(x0, w, x.v)} y2={base} />
+							))}
+							<circle cx={wx} cy={base - 3.5} r="3.5" style={scale && `fill: ${scale.color(st.worst.v)}`} />
+							<text class="max" x={Math.min(Math.max(wx, x0 + 16), x0 + w - 16)} y={base - 11}>
+								{withUnit(st.worst.v)}
+							</text>
+						</g>
+					);
+				})
+			}
+			{
+				hasValues && (
+					<text class="strip-caption" x={MARGIN} y={MARGIN + STRIP_H - 16}>
+						<tspan x={MARGIN}>slowest</tspan>
+						<tspan x={MARGIN} dy="11">per stage</tspan>
+					</text>
+				)
+			}
+			{
+				replicaStrips.map((st) => {
+					const base = cellY(st.d) + cellH / 2 + 4;
+					const wx = sx(RS_X, RS_W, st.worst.v);
+					return (
+						<g class={`strip${st.worst.r === slowest ? " worst" : ""}`}>
+							<line class="axis" x1={RS_X} y1={base} x2={RS_X + RS_W} y2={base} />
+							{st.vs.map((x) => (
+								<line class="tick" x1={sx(RS_X, RS_W, x.v)} y1={base - 7} x2={sx(RS_X, RS_W, x.v)} y2={base} />
+							))}
+							<circle cx={wx} cy={base - 3.5} r="3.5" style={scale && `fill: ${scale.color(st.worst.v)}`} />
+							<text class="max end" x={RS_X + RS_W + 8} y={base}>
+								{withUnit(st.worst.v)}
+							</text>
+						</g>
+					);
+				})
+			}
+			{hasValues && <text class="strip-caption" x={RS_X} y={gridY0 - 7}>slowest per replica</text>}
+
+			<!-- TP cells. -->
+			{
+				cells.map((c) => (
+					<g class="cell">
+						<rect x={c.x} y={c.y} width={cellW} height={cellH} rx="6" />
+						{c.host && (
+							<text x={c.x + cellW / 2} y={c.y + cellH - 5}>
+								{c.host}
+							</text>
+						)}
+					</g>
+				))
+			}
+
+			<!-- Group overlays, hidden until a member is selected. -->
+			{
+				cells.map((c) => (
+					<g class="grp tp" data-dim="tp" data-ranks={c.ranks.join(",")}>
+						<rect x={c.x - 3} y={c.y - 3} width={cellW + 6} height={cellH + 6} rx="8" />
+					</g>
+				))
+			}
+			{
+				dpLines.map((g) => (
+					<g class="grp dp" data-dim="dp" data-ranks={g.ranks.join(",")}>
+						{g.segs.map((s) => (
+							<>
+								<line x1={s.x} y1={s.y1} x2={s.x} y2={s.y2} />
+								{s.hop && (
+									<text class="hop" x={s.x + 5} y={s.ly}>
+										{HOP_SHORT[s.hop]}
+									</text>
+								)}
+							</>
+						))}
+					</g>
+				))
+			}
+			{
+				ppLines.map((g) => (
+					<g class="grp pp" data-dim="pp" data-ranks={g.ranks.join(",")}>
+						{g.segs.map((s) => (
+							<>
+								<line x1={s.x1 + 2} y1={s.y} x2={s.x2 - 2} y2={s.y} marker-end={`url(#${arrowId})`} />
+								{s.hop && (
+									<text class="hop mid" x={(s.x1 + s.x2) / 2} y={s.y - 5}>
+										{HOP_SHORT[s.hop].replace(" switches", " sw").replace(" switch", " sw")}
+									</text>
+								)}
+							</>
+						))}
+					</g>
+				))
+			}
+
+			<!-- One square per rank. -->
+			{
+				squares.map((s) => (
+					<g
+						class={`rank${s.rank === slowest ? " slowest" : ""}`}
+						data-rank={s.rank}
+						data-fill-compute={s.fill}
+						data-ink-compute={s.ink}
+						data-fill-idle={s.idleFill}
+						data-ink-idle={s.idleInk}
+						tabindex="0"
+						role="button"
+						aria-label={`Rank ${s.rank}`}
+					>
+						<title>{info[s.rank]}</title>
+						<rect x={s.x + 1} y={s.y + 1} width={S - 2} height={S - 2} rx="3" style={s.fill && `fill: ${s.fill}`} />
+						<text x={s.cx} y={s.cy + 3.5} style={s.ink && `fill: ${s.ink}`}>
+							{s.rank}
+						</text>
+					</g>
+				))
+			}
+		</svg>
+	</div>
+
+	<p class="info" aria-live="polite">Hover or click a rank to see its tensor-, data- and pipeline-parallel groups.</p>
+	<div class="info-store" hidden>{info.map((t) => <span>{t}</span>)}</div>
+	{summary && <p class="summary">{summary}</p>}
+</figure>
+
+<script>
+	// Selection highlights the rank's three groups (its cell, its vertical DP line and its
+	// horizontal pipeline) and fades every rank outside them. The mode buttons swap each
+	// square's colour between the value scale and the idle-time scale.
+	for (const fig of document.querySelectorAll<HTMLElement>(".logical")) {
+		const info = fig.querySelector<HTMLElement>(".info");
+		const hint = info?.textContent ?? "";
+		const texts = [...fig.querySelectorAll<HTMLElement>(".info-store span")].map((s) => s.textContent ?? "");
+		const ranks = [...fig.querySelectorAll<SVGGElement>(".rank")];
+		const groups = [...fig.querySelectorAll<SVGGElement>(".grp")].map((el) => ({
+			el,
+			dim: el.dataset.dim ?? "",
+			ranks: new Set((el.dataset.ranks ?? "").split(",").map(Number)),
+		}));
+		const initial = Number.parseInt(fig.dataset.selected ?? "", 10);
+		let pinned: number | null = Number.isInteger(initial) ? initial : null;
+
+		const show = (sel: number | null) => {
+			fig.classList.toggle("tracing", sel !== null);
+			const peer = new Map<number, string>();
+			for (const g of groups) {
+				const on = sel !== null && g.ranks.has(sel);
+				g.el.classList.toggle("on", on);
+				if (on) for (const r of g.ranks) if (!peer.has(r)) peer.set(r, g.dim);
+			}
+			ranks.forEach((el, r) => {
+				el.classList.toggle("selected", r === sel);
+				el.classList.toggle("peer", peer.has(r));
+				el.setAttribute("aria-pressed", String(r === pinned));
+			});
+			if (info) info.textContent = sel === null ? hint : texts[sel];
+		};
+		const toggle = (r: number) => {
+			pinned = pinned === r ? null : r;
+			show(pinned);
+		};
+		ranks.forEach((el, r) => {
+			el.addEventListener("pointerenter", () => show(r));
+			el.addEventListener("pointerleave", () => show(pinned));
+			el.addEventListener("focus", () => show(r));
+			el.addEventListener("blur", () => show(pinned));
+			el.addEventListener("click", () => toggle(r));
+			el.addEventListener("keydown", (e) => {
+				if (e.key !== "Enter" && e.key !== " ") return;
+				e.preventDefault();
+				toggle(r);
+			});
+		});
+
+		const buttons = [...fig.querySelectorAll<HTMLButtonElement>(".modes button")];
+		const setMode = (mode: string) => {
+			for (const b of buttons) b.setAttribute("aria-pressed", String(b.dataset.mode === mode));
+			const key = mode === "idle" ? "Idle" : "Compute";
+			for (const el of ranks) {
+				el.querySelector("rect")?.style.setProperty("fill", el.dataset[`fill${key}`] ?? "");
+				el.querySelector("text")?.style.setProperty("fill", el.dataset[`ink${key}`] ?? "");
+			}
+			fig.querySelector<HTMLElement>(".scale-compute")?.toggleAttribute("hidden", mode === "idle");
+			fig.querySelector<HTMLElement>(".scale-idle")?.toggleAttribute("hidden", mode !== "idle");
+		};
+		for (const b of buttons) b.addEventListener("click", () => setMode(b.dataset.mode ?? "compute"));
+		show(pinned);
+	}
+</script>
+
+<style>
+	.logical {
+		--tp: #4caf50;
+		--dp: #a86ad8;
+		--pp: #c99a1e;
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+	}
+	@media (prefers-color-scheme: dark) {
+		.logical {
+			--tp: #66c26a;
+			--dp: #b98ae3;
+			--pp: #d8ad3a;
+		}
+	}
+	.title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.5rem;
+	}
+	.legend {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		align-items: center;
+		gap: 0.4rem 1.2rem;
+		margin-bottom: 0.45rem;
+		font-size: 0.75rem;
+		color: var(--muted);
+	}
+	.key {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.4rem;
+	}
+	.key[hidden] {
+		display: none;
+	}
+	.swatch-line {
+		width: 1.2rem;
+		height: 3px;
+		border-radius: 2px;
+	}
+	.swatch-line.tp {
+		background: var(--tp);
+	}
+	.swatch-line.dp {
+		background: var(--dp);
+	}
+	.swatch-line.pp {
+		background: var(--pp);
+	}
+	.bar {
+		display: inline-block;
+		width: 6rem;
+		height: 0.7rem;
+		border-radius: 3px;
+		border: 1px solid var(--faint);
+	}
+	.modes {
+		display: inline-flex;
+		border: 1px solid var(--faint);
+		border-radius: 6px;
+		overflow: hidden;
+	}
+	.modes button {
+		padding: 0.2rem 0.65rem;
+		font: inherit;
+		color: var(--muted);
+		background: var(--bg);
+		border: 0;
+		cursor: pointer;
+	}
+	.modes button + button {
+		border-left: 1px solid var(--faint);
+	}
+	.modes button[aria-pressed="true"] {
+		color: var(--text);
+		background: var(--surface);
+		font-weight: 600;
+	}
+	.modes button:focus-visible {
+		outline: 2px solid var(--accent);
+		outline-offset: -2px;
+	}
+	.canvas {
+		overflow-x: auto;
+		margin-top: 0.3rem;
+	}
+	svg {
+		display: block;
+		max-width: 100%;
+		height: auto;
+		margin: 0 auto;
+	}
+
+	.header,
+	.row-label {
+		font-size: 11px;
+		font-weight: 600;
+		fill: var(--text);
+	}
+	.header,
+	.flow {
+		text-anchor: middle;
+	}
+	.flow {
+		font-size: 12px;
+		fill: var(--muted);
+	}
+	.strip-caption {
+		font-size: 9.5px;
+		fill: var(--muted);
+	}
+	.strip .axis {
+		stroke: var(--faint);
+	}
+	.strip .tick {
+		stroke: var(--muted);
+		stroke-opacity: 0.55;
+	}
+	.strip circle {
+		stroke: var(--text);
+		stroke-width: 1;
+	}
+	.strip .max {
+		font-size: 9.5px;
+		text-anchor: middle;
+		fill: var(--muted);
+	}
+	.strip .max.end {
+		text-anchor: start;
+	}
+	.strip.worst .max {
+		font-weight: 700;
+		fill: var(--text);
+	}
+
+	.cell rect {
+		fill: var(--surface);
+		stroke: var(--faint);
+	}
+	.cell text {
+		font-size: 9px;
+		text-anchor: middle;
+		fill: var(--muted);
+	}
+
+	.rank {
+		cursor: pointer;
+		outline: none;
+		transition: opacity 120ms ease;
+	}
+	.rank rect {
+		fill: var(--bg);
+		stroke: color-mix(in oklch, var(--text) 35%, var(--bg));
+		stroke-width: 0.8;
+		transition: fill 150ms ease;
+	}
+	.rank text {
+		font-family: var(--mono);
+		font-size: 9.5px;
+		text-anchor: middle;
+		fill: var(--text);
+		pointer-events: none;
+	}
+	.rank.slowest rect {
+		stroke: var(--text);
+		stroke-width: 1.6;
+	}
+	.rank.selected rect,
+	.rank:focus-visible rect {
+		stroke: var(--text);
+		stroke-width: 2.4;
+	}
+	.tracing .rank:not(.peer) {
+		opacity: 0.3;
+	}
+
+	.grp {
+		opacity: 0;
+		pointer-events: none;
+		transition: opacity 120ms ease;
+	}
+	.grp.on {
+		opacity: 1;
+	}
+	.grp.tp rect {
+		fill: none;
+		stroke: var(--tp);
+		stroke-width: 2.2;
+	}
+	.grp.dp line {
+		stroke: var(--dp);
+		stroke-width: 2.4;
+		stroke-linecap: round;
+	}
+	.grp.pp line {
+		stroke: var(--pp);
+		stroke-width: 2.2;
+	}
+	.arrowhead {
+		fill: var(--pp);
+	}
+	.hop {
+		font-size: 9px;
+		fill: var(--text);
+		paint-order: stroke;
+		stroke: var(--bg);
+		stroke-width: 3px;
+	}
+	.hop.mid {
+		text-anchor: middle;
+	}
+
+	.info,
+	.summary {
+		margin: 0.5rem 0 0;
+		font-size: 0.8rem;
+		text-align: center;
+		color: var(--muted);
+	}
+	.info {
+		min-height: 1.4em;
+	}
+	.summary {
+		font-size: 0.78rem;
+		color: var(--text);
+	}
+</style>

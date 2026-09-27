@@ -1,0 +1,42 @@
+---
+import Layout from "../layouts/Layout.astro";
+import PhysicalClusterTopology from "../utils/distributed/PhysicalClusterTopology.astro";
+
+// Deterministic pseudo-random noise so the page is stable between builds.
+let seed = 5;
+const rand = () => {
+	seed = (seed * 1664525 + 1013904223) % 2 ** 32;
+	return seed / 2 ** 32;
+};
+// GPU temperatures (°C), with one hot server.
+const temps = Array.from({ length: 48 }, (_, g) => 62 + rand() * 8 + (Math.floor(g / 4) === 7 ? 14 : 0));
+---
+
+<Layout title="PhysicalClusterTopology demo">
+	<h1>PhysicalClusterTopology demo</h1>
+	<p>
+		The three-tier network MegaScale describes (§3.4): every GPU has its own NIC, NIC <em>i</em> of every server is
+		wired to ToR switch <em>i</em> of its pod ("multi-rail"), ToRs connect to every spine in the pod, and spine
+		<em>s</em> of every pod connects to core <em>s</em>. Hover or click a GPU to colour every other GPU by how many
+		switches its traffic would cross.
+	</p>
+
+	<h2>12 servers of 4 GPUs, pods of 3</h2>
+	<PhysicalClusterTopology servers={12} gpusPerServer={4} serversPerPod={3} spinesPerPod={4} selected={20} />
+
+	<h2>With per-GPU values</h2>
+	<PhysicalClusterTopology
+		servers={12}
+		gpusPerServer={4}
+		serversPerPod={3}
+		spinesPerPod={4}
+		values={temps}
+		colors="inferno"
+		unit="°C"
+		valueLabel="GPU temperature"
+		distanceColors="greens"
+	/>
+
+	<h2>8-GPU servers</h2>
+	<PhysicalClusterTopology servers={8} gpusPerServer={8} serversPerPod={4} spinesPerPod={4} nicGbps={400} />
+</Layout>

@@ -1,0 +1,120 @@
+---
+import Layout from "../layouts/Layout.astro";
+import { COLOR_SCALES, type ColorScaleName, colorScale } from "../utils/colors/colorScales";
+import LogicalDistributedTopology from "../utils/distributed/LogicalDistributedTopology.astro";
+
+// Deterministic pseudo-random noise so the page is stable between builds.
+let seed = 3;
+const rand = () => {
+	seed = (seed * 1664525 + 1013904223) % 2 ** 32;
+	return seed / 2 ** 32;
+};
+
+// ---- The job from MegaScale's Figure 7: 48 ranks = TP 4 × DP 3 × PP 4 on 12 servers of 4
+// GPUs. Most ranks take ~2.1 s per step; ranks 32, 40 and 41 are computational stragglers.
+// (Illustrative numbers: the paper doesn't publish per-rank times.)
+const fig7 = Array.from({ length: 48 }, () => 2.06 + rand() * 0.06);
+Object.assign(fig7, { 32: 2.46, 40: 2.44, 41: 2.43, 16: 2.17, 18: 2.18, 26: 2.19, 24: 2.02, 22: 2.02, 47: 2.02 });
+const megascaleNet = { gpusPerServer: 4, serversPerPod: 3, spinesPerPod: 4 };
+
+// ---- 128 ranks = TP 8 × DP 4 × PP 4 on 8-GPU servers; one slow GPU in stage 2.
+const big = Array.from({ length: 128 }, () => 1.8 + rand() * 0.06);
+big[77] = 2.2;
+
+const scaleNames = Object.keys(COLOR_SCALES) as ColorScaleName[];
+---
+
+<Layout title="LogicalDistributedTopology demo">
+	<h1>LogicalDistributedTopology demo</h1>
+	<p>
+		A training job laid out by its parallel coordinates instead of by host: columns are pipeline stages, rows are
+		data-parallel replicas and each cell is a tensor-parallel group, so every group is a straight line. Hover or
+		click a rank; switch to <em>idle time</em> to see who waits for the stragglers.
+	</p>
+
+	<h2>MegaScale's Figure 7 job</h2>
+	<LogicalDistributedTopology
+		parallel={{ tp: 4, dp: 3, pp: 4 }}
+		values={fig7}
+		domain={[2.0, 2.5]}
+		unit="s"
+		valueLabel="compute time"
+		network={megascaleNet}
+		selected={20}
+		title="48 ranks: 4 stages × 3 replicas × 4 TP shards"
+	/>
+
+	<h2>Rank order tp, pp, dp on the same cluster</h2>
+	<p>
+		The groups look identical here (the logical view doesn't change), but the hop labels do: data-parallel peers are
+		now 5 switches apart instead of 1.
+	</p>
+	<LogicalDistributedTopology
+		parallel={{ tp: 4, dp: 3, pp: 4 }}
+		order={["tp", "pp", "dp"]}
+		values={fig7}
+		domain={[2.0, 2.5]}
+		unit="s"
+		valueLabel="compute time"
+		network={megascaleNet}
+		selected={20}
+	/>
+
+	<h2>128 ranks, TP 8 per server</h2>
+	<LogicalDistributedTopology
+		parallel={{ tp: 8, dp: 4, pp: 4 }}
+		values={big}
+		colors="viridis"
+		idleColors="oranges"
+		unit="s"
+		valueLabel="compute time"
+		network={{ gpusPerServer: 8, serversPerPod: 4, spinesPerPod: 4 }}
+		commColors={{ tp: "#e8590c", dp: "#1971c2", pp: "#2f9e44" }}
+		selected={77}
+	/>
+
+	<h2>Without values or a network</h2>
+	<LogicalDistributedTopology parallel={{ tp: 2, dp: 4, pp: 3 }} selected={9} />
+
+	<h2>Colour scales</h2>
+	<p>
+		Pass any of these as <code>colors</code> or <code>idleColors</code>, or an array of hex stops such as
+		<code>{`["#e0f2fe", "#1e3a8a"]`}</code>.
+	</p>
+	<ul class="scales">
+		{
+			scaleNames.map((name) => (
+				<li>
+					<code>{name}</code>
+					<span class="swatch" style={`background: ${colorScale(name, [0, 1]).gradient()}`} />
+				</li>
+			))
+		}
+	</ul>
+</Layout>
+
+<style>
+	.scales {
+		list-style: none;
+		padding: 0;
+		display: grid;
+		grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr));
+		gap: 0.5rem 1.5rem;
+	}
+	.scales li {
+		display: flex;
+		align-items: center;
+		gap: 0.75rem;
+		margin: 0;
+	}
+	.scales code {
+		width: 4.5rem;
+		font-size: 0.8rem;
+	}
+	.swatch {
+		flex: 1;
+		height: 0.9rem;
+		border-radius: 3px;
+		border: 1px solid var(--faint);
+	}
+</style>
