@@ -18,4 +18,9 @@ export default defineConfig({
 			wrap: false,
 		},
 	},
+	vite: {
+		// Pre-bundle client-only deps at startup; otherwise Vite discovers them on first
+		// page load, re-optimizes, and force-reloads the page mid-session.
+		optimizeDeps: { include: ["chart.js"] },
+	},
 });
