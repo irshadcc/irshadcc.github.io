@@ -1,0 +1,138 @@
+---
+// Draws a rank-2 CuteLayout as a grid. Mode 0 indexes rows, mode 1 indexes columns
+// (nested modes are flattened colexicographically, and headers show the nested coordinate). Each cell looks up its offset in
+// `data` for the value and in `labels` for a small grey label underneath.
+// Cells sharing a label share a hue; without labels, the hue cycles with offset mod 8.
+// Usage in .mdx:
+//   <Matrix2D layout={new CuteLayout([4, [2, 2]], [2, [1, 8]])} data={{ 0: "a" }} labels={{ 0: "T0" }} />
+import { type CuteLayout, formatTuple } from "./CuteLayout";
+
+interface Props {
+	layout: CuteLayout;
+	data?: Record<number, string | number>;
+	labels?: Record<number, string>;
+	name?: string;
+}
+
+const { layout, data = {}, labels = {}, name } = Astro.props;
+if (layout.rank !== 2) {
+	throw new Error(`Matrix2D needs a rank-2 layout, got ${layout} (rank ${layout.rank})`);
+}
+const rowMode = layout.mode(0);
+const colMode = layout.mode(1);
+const rows = rowMode.size;
+const cols = colMode.size;
+const caption = name ? `${name} = ${layout}` : `${layout}`;
+
+// Golden-angle steps keep neighbouring groups visually distinct.
+const hueOf = (k: number) => (25 + k * 137.508) % 360;
+const labelKeys = new Map<string, number>();
+for (let off = 0; off < layout.size; off++) {
+	const l = labels[layout.offset(off)];
+	if (l !== undefined && !labelKeys.has(l)) labelKeys.set(l, labelKeys.size);
+}
+const cellHue = (off: number) => {
+	const l = labels[off];
+	return hueOf(l !== undefined ? (labelKeys.get(l) ?? 0) : off % 8);
+};
+---
+
+<figure class="matrix-2d">
+	<table>
+		<thead>
+			<tr>
+				<th></th>
+				{Array.from({ length: cols }, (_, j) => <th title={`column ${j}`}>{formatTuple(colMode.coord(j))}</th>)}
+			</tr>
+		</thead>
+		<tbody>
+			{
+				Array.from({ length: rows }, (_, i) => (
+					<tr>
+						<th title={`row ${i}`}>{formatTuple(rowMode.coord(i))}</th>
+						{Array.from({ length: cols }, (_, j) => {
+							const off = layout.offset(i, j);
+							return (
+								<td title={`offset ${off}`} style={`--hue: ${cellHue(off).toFixed(1)}`}>
+									<span class="value">{data[off]}</span>
+									{labels[off] !== undefined && <span class="label">{labels[off]}</span>}
+								</td>
+							);
+						})}
+					</tr>
+				))
+			}
+		</tbody>
+	</table>
+	<figcaption>{caption}</figcaption>
+</figure>
+
+<style>
+	.matrix-2d {
+		margin: 1.75rem 0;
+		overflow-x: auto;
+	}
+	table {
+		border-collapse: separate;
+		border-spacing: 3px;
+		font-family: var(--mono);
+		font-size: 0.85rem;
+		margin: 0 auto;
+		width: auto;
+	}
+	th,
+	td {
+		min-width: 2.7rem;
+		height: 2.7rem;
+		padding: 0.2rem 0.35rem;
+		text-align: center;
+		line-height: 1.15;
+	}
+	th {
+		white-space: nowrap;
+		color: var(--muted);
+		font-size: 0.7rem;
+		font-weight: normal;
+		border: none;
+		background: none;
+	}
+	td {
+		--tint: oklch(0.72 0.15 var(--hue));
+		border: 1px solid color-mix(in oklch, var(--tint) 55%, var(--bg));
+		border-radius: 6px;
+		background: linear-gradient(
+			160deg,
+			color-mix(in oklch, var(--tint) 30%, var(--bg)),
+			color-mix(in oklch, var(--tint) 16%, var(--bg))
+		);
+		color: var(--text);
+		transition:
+			transform 120ms ease,
+			box-shadow 120ms ease;
+	}
+	td:hover {
+		transform: translateY(-1px) scale(1.06);
+		box-shadow: 0 3px 10px -3px color-mix(in oklch, var(--tint) 70%, transparent);
+		position: relative;
+		z-index: 1;
+	}
+	.value,
+	.label {
+		display: block;
+	}
+	.value {
+		font-weight: 500;
+	}
+	.label {
+		font-size: 0.62rem;
+		color: color-mix(in oklch, var(--tint) 45%, var(--muted));
+		margin-top: 0.1rem;
+	}
+	figcaption {
+		text-align: center;
+		font-family: var(--mono);
+		font-size: 0.85rem;
+		color: var(--muted);
+		margin-top: 0.6rem;
+	}
+</style>

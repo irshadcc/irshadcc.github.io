@@ -1,0 +1,46 @@
+---
+import Layout from "../layouts/Layout.astro";
+import { CuteLayout } from "../utils/matrix/CuteLayout";
+import Matrix2D from "../utils/matrix/Matrix2D.astro";
+
+// Row-major 4x8: value = offset, no labels.
+const rowMajor = new CuteLayout([4, 8], [8, 1]);
+const offsets = Object.fromEntries(Array.from({ length: rowMajor.size }, (_, i) => [i, i]));
+
+// Nested layout: 8x8 tile split into 2x2 blocks of 4x4, values from a 64-element buffer,
+// labelled with the thread that owns each element (4 elements per thread).
+const nested = new CuteLayout(
+	[
+		[4, 2],
+		[4, 2],
+	],
+	[
+		[1, 16],
+		[4, 32],
+	],
+);
+const values = Object.fromEntries(
+	Array.from({ length: nested.size }, (_, off) => [off, (off * 0.25).toFixed(2)]),
+);
+const threads = Object.fromEntries(
+	Array.from({ length: nested.size }, (_, off) => [off, `T${Math.floor(off / 4)}`]),
+);
+
+// Compact column-major default stride; only some offsets have data.
+const sparse = new CuteLayout([3, 5]);
+const sparseData = { 0: "a", 4: "b", 8: "c", 12: "d" };
+const sparseLabels = { 0: "diag", 4: "diag", 8: "diag", 12: "diag" };
+---
+
+<Layout title="Matrix2D demo">
+	<h1>Matrix2D demo</h1>
+
+	<h2>Row-major</h2>
+	<Matrix2D name="A" layout={rowMajor} data={offsets} />
+
+	<h2>Nested with labels</h2>
+	<Matrix2D name="B" layout={nested} data={values} labels={threads} />
+
+	<h2>Default stride, sparse data</h2>
+	<Matrix2D name="C" layout={sparse} data={sparseData} labels={sparseLabels} />
+</Layout>
