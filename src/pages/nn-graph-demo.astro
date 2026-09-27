@@ -1,0 +1,114 @@
+---
+import Layout from "../layouts/Layout.astro";
+import { NNGraph } from "../utils/neuralnetwork/NNGraph";
+import NeuralNetworkGraph from "../utils/neuralnetwork/NeuralNetworkGraph.astro";
+
+// ---- DLRM (Naumov et al., 2019), MLPerf Criteo Terabyte configuration: 13 dense features,
+// 26 categorical features with 128-d embeddings, dot-product feature interaction.
+const dlrm = new NNGraph();
+{
+	const g = dlrm;
+	const dense = g.node("input", "Dense features", { detail: "13 continuous values", shape: "B×13" });
+	const bottom = g.node("linear", "Bottom MLP", { from: dense, detail: "13 → 512 → 256 → 128", shape: "B×128" });
+	const tables = g.group("26 embedding tables (3 shown)");
+	const embs = [1, 2, 26].map((i) => {
+		const cat = g.node("input", `Categorical ${i}`, { detail: "sparse ids" });
+		return g.node("embedding", `Embedding table ${i}`, {
+			from: cat,
+			detail: "EmbeddingBag, dim 128",
+			shape: "B×128",
+			group: tables,
+		});
+	});
+	const inter = g.node("op", "Feature interaction", {
+		from: [bottom, ...embs],
+		detail: "pairwise dot products of 27 vectors",
+		shape: "B×351",
+	});
+	const cat = g.node("op", "Concat", { from: [inter, bottom], detail: "interactions + dense", shape: "B×479" });
+	const top = g.node("linear", "Top MLP", { from: cat, detail: "479 → 1024 → 1024 → 512 → 256 → 1", shape: "B×1" });
+	const sig = g.node("activation", "Sigmoid", { from: top });
+	g.node("output", "Click probability", { from: sig });
+}
+
+// ---- Transformer, base model (Vaswani et al., 2017): d_model 512, 8 heads, d_ff 2048,
+// 6 encoder and 6 decoder layers. Each sub-layer is wrapped in a residual + LayerNorm.
+const transformer = new NNGraph();
+{
+	const g = transformer;
+	const src = g.node("input", "Input tokens", { shape: "n" });
+	const srcEmb = g.node("embedding", "Input embedding", { from: src, detail: "d_model = 512", shape: "n×512" });
+	const srcPe = g.node("other", "Positional encoding", { detail: "sinusoidal" });
+	const srcIn = g.node("op", "+", { from: [srcEmb, srcPe] });
+
+	const enc = g.group("Encoder layer × 6");
+	const selfAttn = g.node("attention", "Multi-head attention", { from: srcIn, detail: "8 heads, self", group: enc });
+	const enc1 = g.node("norm", "Add & Norm", { from: [selfAttn, srcIn], group: enc });
+	const encFf = g.node("linear", "Feed forward", { from: enc1, detail: "512 → 2048 → 512, ReLU", group: enc });
+	const encOut = g.node("norm", "Add & Norm", { from: [encFf, enc1], shape: "n×512", group: enc });
+
+	const tgt = g.node("input", "Output tokens", { detail: "shifted right", shape: "m" });
+	const tgtEmb = g.node("embedding", "Output embedding", { from: tgt, detail: "d_model = 512", shape: "m×512" });
+	const tgtPe = g.node("other", "Positional encoding", { detail: "sinusoidal" });
+	const tgtIn = g.node("op", "+", { from: [tgtEmb, tgtPe] });
+
+	const dec = g.group("Decoder layer × 6");
+	const masked = g.node("attention", "Masked multi-head attention", {
+		from: tgtIn,
+		detail: "8 heads, causal self",
+		group: dec,
+	});
+	const dec1 = g.node("norm", "Add & Norm", { from: [masked, tgtIn], group: dec });
+	const cross = g.node("attention", "Multi-head attention", { from: dec1, detail: "8 heads, cross", group: dec });
+	g.edge(encOut, cross, "K, V");
+	const dec2 = g.node("norm", "Add & Norm", { from: [cross, dec1], group: dec });
+	const decFf = g.node("linear", "Feed forward", { from: dec2, detail: "512 → 2048 → 512, ReLU", group: dec });
+	const dec3 = g.node("norm", "Add & Norm", { from: [decFf, dec2], shape: "m×512", group: dec });
+
+	const lin = g.node("linear", "Linear", { from: dec3, detail: "512 → vocabulary" });
+	const soft = g.node("activation", "Softmax", { from: lin });
+	g.node("output", "Output probabilities", { from: soft, shape: "m×vocab" });
+}
+
+// ---- AlexNet (Krizhevsky et al., 2012), as one tower (the paper splits it across two GPUs).
+// Every conv and hidden FC layer is followed by ReLU; LRN follows conv1 and conv2.
+const alexnet = new NNGraph();
+{
+	const g = alexnet;
+	const img = g.node("input", "Image", { detail: "RGB (paper says 224; 227 fits the maths)", shape: "227×227×3" });
+	const features = g.group("Features");
+	const conv = (label: string, from: string, detail: string, shape: string) =>
+		g.node("conv", label, { from, detail, shape, group: features });
+	const pool = (from: string, shape: string) =>
+		g.node("pool", "Max pool", { from, detail: "3×3, stride 2", shape, group: features });
+	const c1 = conv("Conv1", img, "96 × 11×11, stride 4 · ReLU, LRN", "55×55×96");
+	const p1 = pool(c1, "27×27×96");
+	const c2 = conv("Conv2", p1, "256 × 5×5, pad 2 · ReLU, LRN", "27×27×256");
+	const p2 = pool(c2, "13×13×256");
+	const c3 = conv("Conv3", p2, "384 × 3×3, pad 1 · ReLU", "13×13×384");
+	const c4 = conv("Conv4", c3, "384 × 3×3, pad 1 · ReLU", "13×13×384");
+	const c5 = conv("Conv5", c4, "256 × 3×3, pad 1 · ReLU", "13×13×256");
+	const p3 = pool(c5, "6×6×256");
+
+	const classifier = g.group("Classifier");
+	const fc6 = g.node("linear", "FC6", { from: p3, detail: "9216 → 4096 · ReLU, dropout 0.5", group: classifier });
+	const fc7 = g.node("linear", "FC7", { from: fc6, detail: "4096 → 4096 · ReLU, dropout 0.5", group: classifier });
+	const fc8 = g.node("linear", "FC8", { from: fc7, detail: "4096 → 1000", group: classifier });
+	const soft = g.node("activation", "Softmax", { from: fc8 });
+	g.node("output", "Class probabilities", { from: soft, shape: "1000" });
+}
+---
+
+<Layout title="NeuralNetworkGraph demo">
+	<h1>NeuralNetworkGraph demo</h1>
+	<p>Hover or tab to a layer to highlight what feeds it and what it feeds.</p>
+
+	<h2>DLRM</h2>
+	<NeuralNetworkGraph graph={dlrm} title="Deep Learning Recommendation Model (MLPerf configuration)" />
+
+	<h2>Transformer</h2>
+	<NeuralNetworkGraph graph={transformer} title="Transformer, base model" />
+
+	<h2>AlexNet</h2>
+	<NeuralNetworkGraph graph={alexnet} title="AlexNet" />
+</Layout>

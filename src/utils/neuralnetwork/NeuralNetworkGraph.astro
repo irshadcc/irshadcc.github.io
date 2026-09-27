@@ -1,0 +1,440 @@
+---
+// Draws a neural network architecture (an NNGraph) as a diagram of layers and data flow.
+// The layout is computed at build time with dagre, which ranks the nodes along the flow
+// direction and routes edges around them; the result is a static SVG. Nodes are coloured by
+// kind (legend above the diagram), groups are drawn as boxes around their nodes, and
+// hovering or focusing a node highlights its inputs and outputs.
+// Usage in .mdx:
+//   <NeuralNetworkGraph graph={alexnet} title="AlexNet" />
+import { graphlib, layout, type Point } from "@dagrejs/dagre";
+import type { NNGraph, NodeKind } from "./NNGraph";
+
+interface Props {
+	graph: NNGraph;
+	/** Flow direction: top-to-bottom (default), bottom-to-top, left-to-right, right-to-left. */
+	direction?: "TB" | "BT" | "LR" | "RL";
+	title?: string;
+	/** Show the legend of node kinds. */
+	legend?: boolean;
+}
+
+const { graph, direction = "TB", title, legend = true } = Astro.props;
+
+// Legend order and names. Kinds with a colour slot use the categorical palette (see <style>);
+// input, output and other stay neutral so the layers themselves carry the colour.
+const KINDS: { kind: NodeKind; name: string }[] = [
+	{ kind: "input", name: "Input / output" },
+	{ kind: "embedding", name: "Embedding" },
+	{ kind: "linear", name: "Linear / MLP" },
+	{ kind: "conv", name: "Convolution" },
+	{ kind: "pool", name: "Pooling" },
+	{ kind: "attention", name: "Attention" },
+	{ kind: "norm", name: "Normalization" },
+	{ kind: "activation", name: "Activation" },
+	{ kind: "op", name: "Operation" },
+	{ kind: "other", name: "Other" },
+];
+const legendKind = (k: NodeKind): NodeKind => (k === "output" ? "input" : k);
+const present = new Set(graph.nodes.map((n) => legendKind(n.kind)));
+const legendItems = KINDS.filter((k) => present.has(k.kind));
+
+// ---- Node sizes. SVG text can't be measured at build time, so widths are estimated from
+// character counts at the font sizes used in <style> (generous, so text never overflows).
+const LINE = { label: 16, detail: 14, shape: 14 };
+const CHAR = { label: 7.3, detail: 6.1, shape: 6.4 };
+const isCircle = (n: { kind: NodeKind; label: string }) => n.kind === "op" && [...n.label].length <= 2;
+const lines = (n: NNGraph["nodes"][number]) =>
+	[
+		{ cls: "label", text: n.label },
+		{ cls: "detail", text: n.detail },
+		{ cls: "shape", text: n.shape },
+	].filter((l): l is { cls: "label" | "detail" | "shape"; text: string } => !!l.text);
+const size = (n: NNGraph["nodes"][number]) => {
+	if (isCircle(n)) return { width: 30, height: 30 };
+	const ls = lines(n);
+	const width = Math.max(72, ...ls.map((l) => [...l.text].length * CHAR[l.cls] + 24));
+	const height = ls.reduce((h, l) => h + LINE[l.cls], 14);
+	return { width: Math.round(width), height };
+};
+
+// ---- Layout with dagre. Groups become compound (parent) nodes so dagre keeps their members
+// together and reports a bounding box for each.
+const g = new graphlib.Graph({ compound: true, multigraph: true });
+g.setGraph({ rankdir: direction, nodesep: 22, ranksep: 34, edgesep: 14, marginx: 12, marginy: 12 });
+g.setDefaultEdgeLabel(() => ({}));
+for (const grp of graph.groups) g.setNode(grp.id, { width: 0, height: 0 });
+for (const n of graph.nodes) {
+	g.setNode(n.id, size(n));
+	if (n.group) g.setParent(n.id, n.group);
+}
+// Edge labels get no room in the layout (reserving it bends the edge around a phantom box);
+// they are drawn beside the middle of the finished curve instead, see `edges` below.
+graph.edges.forEach((e, i) => g.setEdge(e.from, e.to, {}, `e${i}`));
+// Keep the inputs of each node in the order they were listed in `from` (left to right, or top
+// to bottom for LR), instead of whatever order dagre's crossing minimisation settles on.
+const constraints = graph.nodes.flatMap((n) => {
+	const ins = graph.edges.filter((e) => e.to === n.id && !e.label).map((e) => e.from);
+	return ins.slice(1).map((right, i) => ({ left: ins[i], right }));
+});
+layout(g, { constraints });
+
+// Group boxes: dagre's box plus room for the label along the top edge.
+const GROUP_PAD = { side: 8, top: 20, bottom: 8 };
+const groups = graph.groups.map((grp) => {
+	const b = g.node(grp.id);
+	return {
+		...grp,
+		x: b.x! - b.width / 2 - GROUP_PAD.side,
+		y: b.y! - b.height / 2 - GROUP_PAD.top,
+		w: b.width + 2 * GROUP_PAD.side,
+		h: b.height + GROUP_PAD.top + GROUP_PAD.bottom,
+	};
+});
+
+const nodes = graph.nodes.map((n) => {
+	const b = g.node(n.id);
+	return { ...n, x: b.x!, y: b.y!, w: b.width, h: b.height, circle: isCircle(n), lines: lines(n) };
+});
+
+/**
+ * Smooth path through dagre's bend points: a uniform B-spline (d3's curveBasis). Unlike a
+ * Catmull-Rom spline it never overshoots, so closely spaced bend points can't make loops.
+ * It passes through the first and last points, which is where the edge meets the nodes.
+ */
+const r1 = (v: number) => Math.round(v * 10) / 10;
+function curve(p: Point[]): string {
+	const pt = (x: number, y: number) => `${r1(x)},${r1(y)}`;
+	if (p.length < 3) return `M${p.map((q) => pt(q.x, q.y)).join(" L")}`;
+	let d = `M${pt(p[0].x, p[0].y)} L${pt((5 * p[0].x + p[1].x) / 6, (5 * p[0].y + p[1].y) / 6)}`;
+	// Each segment is a cubic Bézier built from three consecutive points a, b, c.
+	const seg = (a: Point, b: Point, c: Point) =>
+		` C${pt((2 * a.x + b.x) / 3, (2 * a.y + b.y) / 3)} ${pt((a.x + 2 * b.x) / 3, (a.y + 2 * b.y) / 3)} ${pt(
+			(a.x + 4 * b.x + c.x) / 6,
+			(a.y + 4 * b.y + c.y) / 6,
+		)}`;
+	for (let i = 2; i < p.length; i++) d += seg(p[i - 2], p[i - 1], p[i]);
+	const [a, b] = [p[p.length - 2], p[p.length - 1]];
+	d += seg(a, b, b);
+	return `${d} L${pt(b.x, b.y)}`;
+}
+const edges = graph.edges.map((e, i) => {
+	const pts = g.edge({ v: e.from, w: e.to, name: `e${i}` }).points ?? [];
+	// Label anchor: the middle bend point, nudged off the line (right of it for vertical
+	// flows, above it for horizontal ones) so the text doesn't sit on the stroke.
+	const mid = pts[Math.floor(pts.length / 2)];
+	const vertical = direction === "TB" || direction === "BT";
+	return {
+		...e,
+		d: curve(pts),
+		lx: mid && (vertical ? mid.x + 6 : mid.x),
+		ly: mid && (vertical ? mid.y + 4 : mid.y - 6),
+		anchor: vertical ? "start" : "middle",
+	};
+});
+
+// The SVG's extent: dagre's size, widened for the group label padding added above.
+const gl = g.graph();
+const minX = Math.min(0, ...groups.map((b) => b.x));
+const minY = Math.min(0, ...groups.map((b) => b.y));
+const maxX = Math.max(gl.width ?? 0, ...groups.map((b) => b.x + b.w));
+const maxY = Math.max(gl.height ?? 0, ...groups.map((b) => b.y + b.h));
+const W = Math.ceil(maxX - minX);
+const H = Math.ceil(maxY - minY);
+
+// Ids inside an SVG are page-global; derive the arrowhead marker's id from the graph so two
+// diagrams on one page don't share (and restyle) each other's marker.
+const hash = [...JSON.stringify(graph)].reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7);
+const arrowId = `nn-arrow-${hash.toString(36)}`;
+---
+
+<figure class="nn-graph">
+	{title && <figcaption class="title">{title}</figcaption>}
+	{
+		legend && legendItems.length > 1 && (
+			<ul class="legend">
+				{legendItems.map((k) => (
+					<li>
+						<span class={`swatch k-${k.kind}`} />
+						{k.name}
+					</li>
+				))}
+			</ul>
+		)
+	}
+	<div class="canvas">
+		<svg
+			viewBox={`${minX} ${minY} ${W} ${H}`}
+			width={W}
+			height={H}
+			style={`min-width: ${Math.round(W * 0.75)}px`}
+			role="img"
+			aria-label={title ?? "Neural network architecture"}
+		>
+			<defs>
+				<marker
+					id={arrowId}
+					viewBox="0 0 8 8"
+					refX="8"
+					refY="4"
+					markerWidth="7"
+					markerHeight="7"
+					orient="auto-start-reverse"
+				>
+					<path class="arrowhead" d="M0,0.5 L8,4 L0,7.5 z" />
+				</marker>
+			</defs>
+
+			{
+				groups.map((b) => (
+					<g class="group">
+						<rect x={b.x} y={b.y} width={b.w} height={b.h} rx="10" />
+						<text x={b.x + 10} y={b.y + 14}>
+							{b.label}
+						</text>
+					</g>
+				))
+			}
+
+			{
+				edges.map((e) => (
+					<g class="edge" data-from={e.from} data-to={e.to}>
+						<path d={e.d} marker-end={`url(#${arrowId})`} />
+						{e.label && e.lx !== undefined && e.ly !== undefined && (
+							<text class="edge-label" x={e.lx} y={e.ly} text-anchor={e.anchor}>
+								{e.label}
+							</text>
+						)}
+					</g>
+				))
+			}
+
+			{
+				nodes.map((n) => {
+					// Stack the text lines around the node's centre.
+					const total = n.lines.reduce((h, l) => h + LINE[l.cls], 0);
+					let y = n.y - total / 2;
+					return (
+						<g class={`node k-${legendKind(n.kind)}`} data-id={n.id} tabindex="0">
+							<title>{[n.label, n.detail, n.shape && `output ${n.shape}`].filter(Boolean).join(" · ")}</title>
+							{n.circle ? (
+								<circle cx={n.x} cy={n.y} r={n.w / 2} />
+							) : (
+								<rect x={n.x - n.w / 2} y={n.y - n.h / 2} width={n.w} height={n.h} rx="7" />
+							)}
+							{n.lines.map((l) => {
+								y += LINE[l.cls];
+								return (
+									<text class={l.cls} x={n.x} y={y - 4}>
+										{l.text}
+									</text>
+								);
+							})}
+						</g>
+					);
+				})
+			}
+		</svg>
+	</div>
+</figure>
+
+<script>
+	// Hover or focus a node to highlight it, its incoming and outgoing edges, and the nodes at
+	// their other ends; everything else fades. Edges carry data-from/data-to node ids.
+	for (const svg of document.querySelectorAll<SVGSVGElement>(".nn-graph svg")) {
+		const nodes = [...svg.querySelectorAll<SVGGElement>(".node")];
+		const edges = [...svg.querySelectorAll<SVGGElement>(".edge")];
+		const focus = (id: string | null) => {
+			svg.classList.toggle("focusing", id !== null);
+			const near = new Set([id]);
+			for (const e of edges) {
+				const hot = id !== null && (e.dataset.from === id || e.dataset.to === id);
+				e.classList.toggle("hot", hot);
+				if (hot) near.add(e.dataset.from ?? null).add(e.dataset.to ?? null);
+			}
+			for (const n of nodes) n.classList.toggle("hot", near.has(n.dataset.id ?? null));
+		};
+		for (const n of nodes) {
+			const id = n.dataset.id ?? null;
+			n.addEventListener("pointerenter", () => focus(id));
+			n.addEventListener("pointerleave", () => focus(null));
+			n.addEventListener("focus", () => focus(id));
+			n.addEventListener("blur", () => focus(null));
+		}
+	}
+</script>
+
+<style>
+	/* Categorical slots in fixed order (same palette as LineChart); dark steps for the dark surface. */
+	.nn-graph {
+		--s1: #2a78d6;
+		--s2: #eb6834;
+		--s3: #1baf7a;
+		--s4: #eda100;
+		--s5: #e87ba4;
+		--s6: #008300;
+		--s7: #4a3aa7;
+		--s8: #e34948;
+		margin: 1.75rem 0;
+	}
+	@media (prefers-color-scheme: dark) {
+		.nn-graph {
+			--s1: #3987e5;
+			--s2: #d95926;
+			--s3: #199e70;
+			--s4: #c98500;
+			--s5: #d55181;
+			--s6: #008300;
+			--s7: #9085e9;
+			--s8: #e66767;
+		}
+	}
+	/* Kind -> colour. */
+	.k-input,
+	.k-other {
+		--c: var(--muted);
+	}
+	.k-embedding {
+		--c: var(--s1);
+	}
+	.k-linear {
+		--c: var(--s2);
+	}
+	.k-conv {
+		--c: var(--s3);
+	}
+	.k-pool {
+		--c: var(--s4);
+	}
+	.k-attention {
+		--c: var(--s5);
+	}
+	.k-norm {
+		--c: var(--s6);
+	}
+	.k-activation {
+		--c: var(--s7);
+	}
+	.k-op {
+		--c: var(--s8);
+	}
+
+	.title {
+		font-family: var(--sans);
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.5rem;
+	}
+	.legend {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.3rem 1rem;
+		list-style: none;
+		padding: 0;
+		margin: 0 0 0.75rem;
+		font-family: var(--sans);
+		font-size: 0.75rem;
+		color: var(--muted);
+	}
+	.legend li {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.35rem;
+		margin: 0;
+	}
+	.swatch {
+		width: 0.8rem;
+		height: 0.8rem;
+		border-radius: 3px;
+		background: color-mix(in oklch, var(--c) 22%, var(--bg));
+		border: 1.5px solid color-mix(in oklch, var(--c) 75%, var(--bg));
+	}
+	/* Wide diagrams shrink to fit, but no further than 75% (min-width on the svg); past that
+	   they scroll sideways rather than shrink the text into illegibility. */
+	.canvas {
+		overflow-x: auto;
+	}
+	svg {
+		display: block;
+		max-width: 100%;
+		height: auto;
+		margin: 0 auto;
+		font-family: var(--sans);
+	}
+
+	.group rect {
+		fill: color-mix(in oklch, var(--surface) 70%, transparent);
+		stroke: var(--faint);
+	}
+	.group text {
+		font-size: 11px;
+		font-weight: 600;
+		fill: var(--muted);
+	}
+
+	.edge path {
+		fill: none;
+		stroke: var(--muted);
+		stroke-width: 1.3;
+		stroke-opacity: 0.75;
+	}
+	.arrowhead {
+		fill: var(--muted);
+	}
+	.edge-label {
+		font-size: 10px;
+		fill: var(--muted);
+		/* A halo in the background colour keeps the label readable where it crosses a line. */
+		paint-order: stroke;
+		stroke: var(--bg);
+		stroke-width: 3px;
+	}
+
+	.node {
+		cursor: default;
+		outline: none;
+	}
+	.node rect,
+	.node circle {
+		fill: color-mix(in oklch, var(--c) 16%, var(--bg));
+		stroke: color-mix(in oklch, var(--c) 75%, var(--bg));
+		stroke-width: 1.5;
+	}
+	.node text {
+		text-anchor: middle;
+		fill: var(--text);
+	}
+	.node .label {
+		font-size: 12.5px;
+		font-weight: 500;
+	}
+	.node .detail {
+		font-size: 10.5px;
+		fill: var(--muted);
+	}
+	.node .shape {
+		font-family: var(--mono);
+		font-size: 10px;
+		fill: var(--muted);
+	}
+	.node:focus-visible rect,
+	.node:focus-visible circle {
+		stroke-width: 2.5;
+	}
+
+	/* Hover/focus highlighting (toggled by the script). */
+	.edge,
+	.node {
+		transition: opacity 120ms ease;
+	}
+	.focusing .edge:not(.hot),
+	.focusing .node:not(.hot) {
+		opacity: 0.2;
+	}
+	.focusing .edge.hot path {
+		stroke: var(--text);
+		stroke-opacity: 1;
+		stroke-width: 1.8;
+	}
+</style>
