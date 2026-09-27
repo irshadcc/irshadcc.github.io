@@ -1,0 +1,173 @@
+---
+title: "Why You Should Never Modify Environment Variables"
+description: "Libraries often read their configuration from environment variables, and some change them with setenv. In a multithreaded program, that can crash any other thread that happens to be calling getenv. This post looks at where the environment lives, and reproduces the crash in C++ and Python."
+date: 2024-11-15
+---
+
+import libraryThreads from "../../assets/modify-env-vars/library-threads.png";
+import dlSysdep from "../../assets/modify-env-vars/dl-sysdep-parse-arguments.png";
+import gdbWatchEnviron from "../../assets/modify-env-vars/gdb-watch-environ.png";
+import startArgsLayout from "../../assets/modify-env-vars/start-args-layout.png";
+import gdbCrashThreads from "../../assets/modify-env-vars/gdb-crash-threads.png";
+import addToEnviron from "../../assets/modify-env-vars/add-to-environ-realloc.png";
+import gdbPythonSetenv from "../../assets/modify-env-vars/gdb-python-setenv.png";
+import { Image } from "astro:assets";
+
+## Background
+
+Many libraries read their configuration from environment variables. When a program or library
+wants to change how one of its dependencies behaves, it sometimes calls `setenv` to change that
+configuration.
+
+Modifying the environment is a serious problem for everyone else using the process, because it
+can break any other thread that calls `getenv`. Suppose your program uses two libraries directly,
+and library X calls `setenv`. Any other thread calling `getenv` at the same time can crash with a
+SEGFAULT.
+
+<figure class="sketch">
+	<Image src={libraryThreads} alt="A program runs two threads. Thread 1 calls Library X, which uses setenv to change Library Z's configuration. Thread 2 calls Library Y, which uses getenv." />
+	<figcaption>Library X calls `setenv` on one thread while Library Y calls `getenv` on another.</figcaption>
+</figure>
+
+## Environment variables
+
+> An environment variable is a user-definable value that can affect the way running processes
+> will behave on a computer. Environment variables are part of the environment in which a process
+> runs. ([Wikipedia](https://en.wikipedia.org/wiki/Environment_variable))
+
+So where does a process's environment actually live? In glibc, the dynamic loader sets the global
+`__environ` pointer while the program starts:
+
+<figure>
+	<Image src={dlSysdep} alt="glibc source of _dl_sysdep_parse_arguments. An arrow points at the line _environ = _dl_argv + _dl_argc + 1." />
+	<figcaption>`_dl_sysdep_parse_arguments` in glibc sets `_environ`.</figcaption>
+</figure>
+
+A hardware watchpoint on `__environ` catches the moment it is written:
+
+<figure>
+	<Image src={gdbWatchEnviron} alt="GDB hardware watchpoint on __environ fires in _dl_sysdep_parse_arguments, changing it from 0x0 to 0x7fffffffdcb8. The backtrace goes through _dl_sysdep_start, _dl_start_final, _dl_start and _start." />
+	<figcaption>`__environ` goes from `0x0` to a stack address, set from inside `_dl_start`.</figcaption>
+</figure>
+
+When the program starts, the kernel passes a single address to `_dl_start` (the `arg` in frame 3).
+That address points to an array holding `argc`, the command-line arguments and the environment
+variables, one after another. Both the arguments and the environment are handed to the kernel by
+the `exec` system call that started the process.
+
+<figure class="sketch">
+	<Image src={startArgsLayout} alt="Memory layout starting at start_addr: argc, then argv, then environ." />
+	<figcaption>`argc`, `argv` and `environ` sit next to each other, starting at the address the kernel passes in.</figcaption>
+</figure>
+
+## Reproducing the crash in C++
+
+The program below starts one thread that calls `getenv` in a loop and another that calls
+`setenv` in a loop with random keys and values:
+
+```cpp
+#include <cstdlib>
+#include <thread>
+#include <bits/stdc++.h>
+
+std::string GenerateRandomString(int len) {
+    std::stringstream sstream;
+    for (int i = 0 ; i < len ; i++) {
+        int random = rand() % 26;
+        char ch = static_cast<char>('a' + random);
+        sstream << ch;
+    }
+
+    return sstream.str();
+}
+
+void getter() {
+    while (true) {
+        char* env = std::getenv("RandomKey");
+    }
+}
+
+void setter() {
+    while (true) {
+        int random_len = random() % 45;
+        std::string key = GenerateRandomString(random_len);
+        std::string value = GenerateRandomString(random_len);
+        setenv(key.c_str(), value.c_str(), 1);
+    }
+}
+
+int main() {
+
+    std::vector<std::thread> set_threads;
+    std::vector<std::thread> get_threads;
+
+    int no_get_threads = 1;
+    int no_set_threads = 1;
+    for (int i = 0 ; i < no_set_threads; i++) {
+        set_threads.push_back(std::thread(setter));
+    }
+
+    for (int i = 0 ; i < no_get_threads; i++) {
+        get_threads.push_back(std::thread(getter));
+    }
+
+    for (auto &thread : set_threads) {
+        thread.join();
+    }
+
+    for (auto& thread : get_threads) {
+        thread.join();
+    }
+
+}
+```
+
+It crashes quickly. Here are the two threads at the moment of the crash:
+
+<figure>
+	<Image src={gdbCrashThreads} alt="GDB backtraces of two threads. Thread 3 is in __add_to_environ called from setenv in setter(). Thread 2 is in getenv called from getter()." />
+	<figcaption>One thread is inside `setenv` (`__add_to_environ`) while the other is inside `getenv`.</figcaption>
+</figure>
+
+Adding a new variable means the `environ` array has to grow. glibc's `__add_to_environ` does
+this with `realloc`, then points `__environ` at the new array:
+
+<figure>
+	<Image src={addToEnviron} alt="glibc source of __add_to_environ: new_environ is reallocated to size + 2 pointers, the old entries are copied in with memcpy, and last_environ and __environ are set to new_environ." />
+	<figcaption>`__add_to_environ` reallocates the array and swaps `__environ` to point at it.</figcaption>
+</figure>
+
+`getenv` walks `__environ` without taking the lock that `setenv` holds. If `realloc` moves the
+array while `getenv` is still reading it, `getenv` ends up reading freed memory and the process
+crashes.
+
+## Python is unsafe too
+
+```python
+import os
+os.environ["TEST"] = "RANDOM_VALUE"
+```
+
+Assigning to `os.environ` changes the real process environment. Under the hood it calls the same
+libc `setenv`:
+
+<figure>
+	<Image src={gdbPythonSetenv} alt="GDB backtrace with __setenv(name=TEST, value=RANDOM_VALUE) at the top, called from the Python interpreter's evaluation loop." />
+	<figcaption>`os.environ["TEST"] = ...` ends up in libc's `setenv`.</figcaption>
+</figure>
+
+So a Python library that sets `os.environ` can crash a native extension that calls `getenv` from
+another thread.
+
+## Related GitHub issues
+
+1. [systemd/systemd#26688](https://github.com/systemd/systemd/issues/26688)
+2. [OpenMathLib/OpenBLAS#716](https://github.com/OpenMathLib/OpenBLAS/issues/716)
+
+## Key takeaways
+
+1. Don't modify environment variables inside a library. The library's functions may be running
+   on any thread, and `getenv` calls are common enough that a `setenv` can crash the user's
+   program with a SEGFAULT.
+2. Only the main program should modify environment variables, and only once it is sure no other
+   thread can be calling `getenv`, for example at startup before any threads are created.

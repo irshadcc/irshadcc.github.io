@@ -1,0 +1,122 @@
+---
+title: "Storing an Embedding Table in a HashMap"
+description: "Embedding tables in recommendation models can hold hundreds of billions of rows, far too many to keep in memory. But backpropagation only touches the rows that were looked up, so we only need to store those. This post works through the gradient of an embedding lookup to show why."
+date: 2026-02-07
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+
+## Background
+
+In large-scale recommendation systems like DLRM, embedding tables make up most of the parameter
+count. These tables hold an embedding for every value of a categorical feature, such as a user ID
+or an item ID. Those IDs are usually hashed into a huge, sparse key space, so a dense table with a
+row for every possible key could have hundreds of billions of rows. Storing a table that size can
+take tens to hundreds of terabytes of memory, which is infeasible for most systems. In practice,
+though, training only ever sees a small fraction of those keys.
+
+## Embedding table as a HashMap
+
+During training, an embedding operation is a key-value lookup: given some indices, it returns the
+matching rows of the table. So a natural question is: do rows that were never looked up take part
+in computing gradients during backpropagation?
+
+They don't. **Backpropagation only produces non-zero gradients for the rows that were looked
+up.**<Sidenote>Whether the other rows stay unchanged depends on the optimizer. Dense weight decay
+shrinks every row on every step, and dense Adam or momentum keeps moving a row after it leaves the
+batch. Embedding tables are usually trained with a sparse or row-wise optimizer (e.g. SparseAdam or
+row-wise Adagrad), which only updates the rows in the batch.</Sidenote> A row whose key never
+appears in training keeps its initial value forever, so there is no need to store it. We only need
+rows for the keys we have actually seen, and a hash map keyed by ID is a natural way to store
+them.<Sidenote>A row that has never been looked up can be created lazily, e.g. with its initial
+random value, the first time its key appears.</Sidenote>
+
+To see why, let's work through the forward and backward pass of a tiny example.
+
+## Forward propagation
+
+An embedding lookup can be written as a matrix product. To select the second row of an
+embedding matrix $E$, multiply it by a one-hot vector $x$:
+
+$$
+x = \begin{bmatrix} 0 & 1 \end{bmatrix}
+\qquad
+E = \begin{bmatrix}
+e_{00} & e_{01} & e_{02} \\
+e_{10} & e_{11} & e_{12}
+\end{bmatrix}
+$$
+
+$$
+\begin{aligned}
+e &= xE \\
+  &= \begin{bmatrix}
+     (e_{00} \cdot 0 + e_{10} \cdot 1) &
+     (e_{01} \cdot 0 + e_{11} \cdot 1) &
+     (e_{02} \cdot 0 + e_{12} \cdot 1)
+     \end{bmatrix} \\
+  &= \begin{bmatrix} e_{10} & e_{11} & e_{12} \end{bmatrix}
+\end{aligned}
+$$
+
+The result $e$ is just the second row of $E$.
+
+## Backward propagation
+
+To keep things simple, use a loss that sums the elements of the embedding vector:
+
+$$
+L = f(e) = e_{10} + e_{11} + e_{12}
+$$
+
+The gradient of the loss with respect to the table has one entry per element of $E$:
+
+$$
+\frac{\partial L}{\partial E} =
+\begin{bmatrix}
+\dfrac{\partial L}{\partial e_{00}} & \dfrac{\partial L}{\partial e_{01}} & \dfrac{\partial L}{\partial e_{02}} \\[1.2em]
+\dfrac{\partial L}{\partial e_{10}} & \dfrac{\partial L}{\partial e_{11}} & \dfrac{\partial L}{\partial e_{12}}
+\end{bmatrix}
+=
+\begin{bmatrix}
+0 & 0 & 0 \\
+1 & 1 & 1
+\end{bmatrix}
+$$
+
+$L$ doesn't depend on the first row at all, so its gradient is 0. The second row, the one we
+looked up, has a gradient of 1. The same holds for any loss: rows that weren't looked up never
+appear in $e$, so their gradient is always zero.
+
+## Code
+
+We can check this with PyTorch:
+
+```python
+import torch
+
+input = torch.tensor([[1]], requires_grad=False)
+
+embedding_weight = torch.tensor([
+    [1, 2, 3],
+    [4, 5, 6]
+], dtype=torch.float32, requires_grad=True)
+
+e = torch.nn.functional.embedding(input, embedding_weight)
+l = e.sum()
+l.backward()
+print("Embedding grad")
+print("--------------------")
+print(embedding_weight.grad)
+```
+
+```text
+Embedding grad
+--------------------
+tensor([[0., 0., 0.],
+        [1., 1., 1.]])
+```
+
+Only the row at index 1 receives a gradient. Each training step reads and updates only the rows
+in its batch, and a key that never shows up never needs a row at all. So the hash map grows with
+the number of distinct keys seen in training, not with the size of the key space.

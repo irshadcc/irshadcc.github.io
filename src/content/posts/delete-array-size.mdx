@@ -1,0 +1,111 @@
+---
+title: "How Does delete[] Know the Size of the Array?"
+description: "When you call delete[] on a pointer, C++ runs a destructor for every element, yet you never told it how many there are. This post steps through new[] and delete[] in GDB to find where that count is hidden."
+date: 2026-02-07
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import newArrayGdb from "../../assets/delete-array-size/new-array-gdb.png";
+import deleteArrayGdb from "../../assets/delete-array-size/delete-array-gdb.png";
+import memoryLayout from "../../assets/delete-array-size/memory-layout.jpeg";
+import { Image } from "astro:assets";
+
+## Background
+
+While writing C++ at work, I started wondering how `delete[]` manages to call the destructor for
+every object in an array. All we pass it is a pointer; nothing tells it how many objects live at
+that address. This post finds out where the count comes from by stepping through the program in
+GDB.
+
+## Source code
+
+```cpp
+#include <iostream>
+#include <sstream>
+
+class Point {
+
+public:
+    int x;
+    int y;
+
+    Point(): x(0), y(0) {}
+
+    ~Point() {
+        std::cout << "Destructor called for " << to_string() << std::endl;
+    }
+
+    std::string to_string() {
+        std::stringstream sstream;
+        sstream << "(" << x << "," << y << ")";
+        return sstream.str();
+    }
+};
+
+void delete_points(Point* points) {
+    delete[] points;
+}
+
+int main() {
+    Point* points = new Point[100]();
+    std::cout << "Address is " << points << std::endl;
+    delete_points(points);
+    return 0;
+}
+```
+
+`delete_points` only receives a `Point*`. By the time we get there, the `100` from `main` is
+nowhere in sight.
+
+## GDB analysis
+
+### 1. The `new[]` operator
+
+Setting a breakpoint on `malloc` shows how many bytes `new[]` asks for:
+
+<figure>
+	<Image src={newArrayGdb} alt="GDB stopped at a breakpoint in __libc_malloc, showing the argument bytes=808." />
+	<figcaption>`new Point[100]` calls `malloc` with 808 bytes.</figcaption>
+</figure>
+
+A `Point` is two `int`s, so 100 of them need 800 bytes. `new[]` allocates 8 more:
+
+$$
+100 \cdot \texttt{sizeof(Point)} + 8 = 100 \cdot 8 + 8 = 808
+$$
+
+Those extra 8 bytes are where the count goes.
+
+### 2. The `delete[]` operator
+
+Now step through the disassembly of `delete_points`:
+
+<figure>
+	<Image src={deleteArrayGdb} alt="GDB disassembly of delete_points with three instructions highlighted, and the rax register showing 0x64, which is 100." />
+	<figcaption>After three instructions, `rax` holds `0x64`, which is 100.</figcaption>
+</figure>
+
+```text
+<delete_points+24>:  mov  -0x18(%rbp),%rax
+<delete_points+28>:  sub  $0x8,%rax
+<delete_points+32>:  mov  (%rax),%rax
+```
+
+1. `+24` moves `points` (the address of the array) into `rax`.
+2. `+28` **subtracts 8 from `points`**.
+3. `+32` loads the 8-byte value stored at that address into `rax`.
+
+Printing `rax` afterwards gives `0x64`, which is 100.
+
+So the number of objects is stored in the 8 bytes just before the address that `new[]` returns.
+`new[]` allocates room for the count plus the elements, writes the count first, and hands you a
+pointer past it. `delete[]` walks back 8 bytes to read the count, runs that many destructors, and
+frees the whole block.<Sidenote>This hidden prefix is called an *array cookie*. Its layout comes
+from the Itanium C++ ABI used by GCC and Clang on Linux; other ABIs differ. The compiler only adds
+it when the element type has a non-trivial destructor. For something like `new int[100]` there is
+nothing to call per element, so no count is stored.</Sidenote>
+
+<figure class="sketch">
+	<Image src={memoryLayout} alt="Memory layout: a cell holding 100, followed by Point 0 through Point 99. The points pointer points at Point 0, just past the count." />
+	<figcaption>The count sits right before the first element.</figcaption>
+</figure>
