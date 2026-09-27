@@ -1,0 +1,41 @@
+---
+import Layout from "../layouts/Layout.astro";
+import SelfAttention from "../utils/neuralnetwork/SelfAttention.astro";
+
+// Deterministic pseudo-random values so the page is stable between builds.
+let seed = 11;
+const rand = () => {
+	seed = (seed * 1664525 + 1013904223) % 2 ** 32;
+	return (seed / 2 ** 32) * 2 - 1;
+};
+const matrix = (rows: number, cols: number, s = 1) =>
+	Array.from({ length: rows }, () =>
+		Array.from({ length: cols }, () => rand() * s),
+	);
+
+const sentence = ["the", "cat", "sat", "on", "the", "mat"];
+const x = matrix(sentence.length, 8);
+const wq = matrix(4, 8, 1.5);
+const wk = matrix(4, 8, 1.5);
+const wv = matrix(4, 8);
+
+// A "previous-token head": keys are one-hot positions and each query looks for the position before it.
+const seq = ["A", "B", "C", "D", "E"];
+const oneHot = (i: number, n: number, s = 1) =>
+	Array.from({ length: n }, (_, j) => (j === i ? s : 0));
+const k = seq.map((_, j) => oneHot(j, seq.length));
+const q = seq.map((_, i) => oneHot(Math.max(i - 1, 0), seq.length, 12));
+---
+
+<Layout title="SelfAttention demo">
+	<h1>SelfAttention demo</h1>
+
+	<h2>From embeddings and projection weights</h2>
+	<SelfAttention tokens={sentence} x={x} wq={wq} wk={wk} wv={wv} />
+
+	<h2>Causal mask</h2>
+	<SelfAttention tokens={sentence} x={x} wq={wq} wk={wk} wv={wv} causal />
+
+	<h2>Q and K given directly: previous-token head</h2>
+	<SelfAttention tokens={seq} q={q} k={k} causal title="Each token attends to the one before it" />
+</Layout>

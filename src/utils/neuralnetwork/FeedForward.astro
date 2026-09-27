@@ -1,0 +1,369 @@
+---
+// Draws a fully connected feed-forward network from its weight matrices, as an SVG built at build time.
+// `weights[k]` is layer k's matrix in the PyTorch nn.Linear convention: shape [out, in], so
+// weights[k][j][i] connects neuron i of layer k to neuron j of layer k+1. Consecutive matrices must chain
+// (the `in` of one equals the `out` of the previous).
+// Edge colour is the sign of the weight and its width and opacity scale with |w|. Optional `biases[k]`
+// (length `out`) tint the neurons of layer k+1 the same way. Hover or focus a neuron to isolate its
+// connections; hover an edge or neuron to read its value.
+// Usage in .mdx:
+//   <FeedForward
+//     weights={[[[0.5, -1.2], [0.8, 0.3], [-0.4, 1.0]], [[1.1, -0.7, 0.2]]]}
+//     labels={["x", "h", "y"]}
+//   />
+interface Props {
+	weights: number[][][];
+	biases?: number[][];
+	/** One name per layer of neurons (weights.length + 1). Defaults to input, hidden 1.., output. */
+	labels?: string[];
+	/** Scale |w| against the largest weight in the whole network, or in each layer separately. */
+	normalize?: "global" | "layer";
+	title?: string;
+}
+
+const {
+	weights,
+	biases,
+	labels: labelProp,
+	normalize = "global",
+	title,
+} = Astro.props;
+
+if (weights.length === 0)
+	throw new Error("FeedForward needs at least one weight matrix");
+const sizes = [weights[0][0]?.length ?? 0];
+weights.forEach((w, k) => {
+	const cols = w[0]?.length ?? 0;
+	if (w.length === 0 || cols === 0)
+		throw new Error(`FeedForward: weights[${k}] is empty`);
+	if (w.some((row) => row.length !== cols))
+		throw new Error(`FeedForward: weights[${k}] rows differ in length`);
+	if (cols !== sizes[k]) {
+		throw new Error(
+			`FeedForward: weights[${k}] is ${w.length}x${cols} but layer ${k} has ${sizes[k]} neurons (expected [out, ${sizes[k]}])`,
+		);
+	}
+	sizes.push(w.length);
+});
+biases?.forEach((b, k) => {
+	if (b && b.length !== sizes[k + 1]) {
+		throw new Error(
+			`FeedForward: biases[${k}] has length ${b.length}, expected ${sizes[k + 1]}`,
+		);
+	}
+});
+
+const layerCount = sizes.length;
+const labels =
+	labelProp ??
+	sizes.map((_, l) =>
+		l === 0
+			? "input"
+			: l === layerCount - 1
+				? "output"
+				: layerCount > 3
+					? `hidden ${l}`
+					: "hidden",
+	);
+if (labels.length !== layerCount)
+	throw new Error(
+		`FeedForward: expected ${layerCount} labels, got ${labels.length}`,
+	);
+
+const fmt = (v: number) =>
+	Number.isInteger(v) ? `${v}` : Number(v.toPrecision(3)).toString();
+const maxAbs = (xs: number[]) =>
+	xs.reduce((m, v) => Math.max(m, Math.abs(v)), 0) || 1;
+const layerMax = weights.map((w) => maxAbs(w.flat()));
+const globalMax = Math.max(...layerMax);
+const biasMax = maxAbs(biases?.flat().filter((v) => v !== undefined) ?? []);
+
+// Geometry, in SVG user units. Columns are centred vertically against the tallest layer.
+const r = 14;
+const rowGap = 46;
+const colGap = 170;
+const padX = 40;
+const padTop = 28;
+const padBottom = 56;
+const tallest = Math.max(...sizes);
+const width = padX * 2 + colGap * (layerCount - 1);
+const height = padTop + padBottom + rowGap * (tallest - 1);
+const cx = (l: number) => padX + l * colGap;
+const cy = (l: number, j: number) =>
+	padTop + (rowGap * (tallest - 1)) / 2 + (j - (sizes[l] - 1) / 2) * rowGap;
+
+// Heaviest edges drawn last so they sit on top.
+const edges = weights
+	.flatMap((w, k) =>
+		w.flatMap((row, j) =>
+			row.map((v, i) => {
+				const s =
+					Math.abs(v) / (normalize === "layer" ? layerMax[k] : globalMax);
+				return { k, i, j, v, s };
+			}),
+		),
+	)
+	.sort((a, b) => a.s - b.s);
+
+const neurons = sizes.flatMap((n, l) =>
+	Array.from({ length: n }, (_, j) => {
+		const b = l > 0 ? biases?.[l - 1]?.[j] : undefined;
+		return { l, j, b, s: b === undefined ? 0 : Math.abs(b) / biasMax };
+	}),
+);
+
+const shape = sizes.join(" → ");
+const params = weights.reduce(
+	(n, w, k) => n + w.length * w[0].length + (biases?.[k]?.length ?? 0),
+	0,
+);
+---
+
+<figure class="ffn">
+	{title && <div class="title">{title}</div>}
+	<div class="canvas">
+		<svg
+			viewBox={`0 0 ${width} ${height}`}
+			style={`max-width: ${width}px; min-width: ${Math.min(width, 520)}px`}
+			role="img"
+			aria-label={`Feed-forward network ${shape}${title ? `: ${title}` : ""}`}
+		>
+			<g class="edges">
+				{
+					edges.map((e) => (
+						<line
+							class:list={["edge", e.v < 0 ? "neg" : "pos"]}
+							x1={cx(e.k)}
+							y1={cy(e.k, e.i)}
+							x2={cx(e.k + 1)}
+							y2={cy(e.k + 1, e.j)}
+							stroke-width={(0.6 + 3.4 * e.s).toFixed(2)}
+							stroke-opacity={(0.18 + 0.72 * e.s).toFixed(2)}
+							data-from={`${e.k}:${e.i}`}
+							data-to={`${e.k + 1}:${e.j}`}
+							data-tip={`W${e.k + 1}[${e.j}, ${e.i}] = ${fmt(e.v)}`}
+						/>
+					))
+				}
+			</g>
+			<g class="nodes">
+				{
+					neurons.map((n) => (
+						<circle
+							class:list={["node", n.b !== undefined && (n.b < 0 ? "neg" : "pos")]}
+							cx={cx(n.l)}
+							cy={cy(n.l, n.j)}
+							r={r}
+							style={n.b !== undefined ? `--s: ${(n.s * 100).toFixed(0)}%` : undefined}
+							tabindex="0"
+							data-id={`${n.l}:${n.j}`}
+							data-tip={`${labels[n.l]}[${n.j}]${n.b !== undefined ? `, b = ${fmt(n.b)}` : ""}`}
+							aria-label={`${labels[n.l]} neuron ${n.j}${n.b !== undefined ? `, bias ${fmt(n.b)}` : ""}`}
+						/>
+					))
+				}
+			</g>
+			<g class="labels">
+				{
+					sizes.map((n, l) => (
+						<text x={cx(l)} y={height - 14} text-anchor="middle">
+							{labels[l]} ({n})
+						</text>
+					))
+				}
+			</g>
+		</svg>
+		<div class="tip" role="status" hidden></div>
+	</div>
+	<figcaption>
+		<span>{shape} · {params} parameters</span>
+		<span class="key"><i class="swatch pos"></i>positive <i class="swatch neg"></i>negative · width ∝ |w|</span>
+	</figcaption>
+</figure>
+
+<script>
+	for (const fig of document.querySelectorAll<HTMLElement>(".ffn")) {
+		const svg = fig.querySelector("svg");
+		const tip = fig.querySelector<HTMLElement>(".tip");
+		const canvas = fig.querySelector<HTMLElement>(".canvas");
+		if (!svg || !tip || !canvas) continue;
+		const edges = [...svg.querySelectorAll<SVGLineElement>(".edge")];
+		const nodes = new Map([...svg.querySelectorAll<SVGCircleElement>(".node")].map((n) => [n.dataset.id, n]));
+
+		// Lights up one neuron, its edges and the neurons at their far ends; dims everything else.
+		const isolate = (id?: string) => {
+			svg.classList.toggle("isolating", !!id);
+			for (const n of nodes.values()) n.classList.toggle("lit", n.dataset.id === id);
+			for (const e of edges) {
+				const on = !!id && (e.dataset.from === id || e.dataset.to === id);
+				e.classList.toggle("lit", on);
+				if (on) nodes.get(e.dataset.from === id ? e.dataset.to : e.dataset.from)?.classList.add("lit");
+			}
+		};
+
+		const show = (el: Element, x: number, y: number) => {
+			const text = (el as SVGElement).dataset.tip;
+			if (!text) return;
+			const box = canvas.getBoundingClientRect();
+			tip.textContent = text;
+			tip.hidden = false;
+			// Keep the tip inside the figure: flip it left of the pointer near the right edge.
+			const left = x - box.left + 12;
+			tip.style.left = `${Math.min(left, box.width - tip.offsetWidth - 4)}px`;
+			tip.style.top = `${y - box.top + 14}px`;
+		};
+		const hide = () => {
+			tip.hidden = true;
+		};
+
+		svg.addEventListener("pointermove", (e) => {
+			const t = e.target as SVGElement;
+			if (t.classList.contains("edge") || t.classList.contains("node")) show(t, e.clientX, e.clientY);
+			else hide();
+		});
+		svg.addEventListener("pointerover", (e) => {
+			const t = e.target as SVGElement;
+			if (t.classList.contains("node")) isolate(t.dataset.id);
+		});
+		svg.addEventListener("pointerout", (e) => {
+			const t = e.target as SVGElement;
+			if (t.classList.contains("node") && !svg.contains(document.activeElement)) isolate();
+		});
+		svg.addEventListener("pointerleave", () => {
+			hide();
+			if (!svg.contains(document.activeElement)) isolate();
+		});
+		for (const n of nodes.values()) {
+			n.addEventListener("focus", () => {
+				isolate(n.dataset.id);
+				const r = n.getBoundingClientRect();
+				show(n, r.right, r.top);
+			});
+			n.addEventListener("blur", () => {
+				isolate();
+				hide();
+			});
+		}
+	}
+</script>
+
+<style>
+	/* Diverging pair: blue for positive, red for negative; dark steps tuned for the dark surface. */
+	.ffn {
+		--pos: #2a78d6;
+		--neg: #e34948;
+		margin: 1.75rem 0;
+	}
+	@media (prefers-color-scheme: dark) {
+		.ffn {
+			--pos: #3987e5;
+			--neg: #e66767;
+		}
+	}
+	.title {
+		font-family: var(--sans);
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.4rem;
+	}
+	.canvas {
+		position: relative;
+		overflow-x: auto;
+	}
+	svg {
+		display: block;
+		width: 100%;
+		height: auto;
+		margin: 0 auto;
+	}
+	.edge {
+		stroke-linecap: round;
+		transition: stroke-opacity 120ms ease;
+	}
+	.edge.pos {
+		stroke: var(--pos);
+	}
+	.edge.neg {
+		stroke: var(--neg);
+	}
+	.node {
+		fill: var(--surface);
+		stroke: var(--muted);
+		stroke-width: 1.5;
+		cursor: pointer;
+		transition:
+			opacity 120ms ease,
+			stroke-width 120ms ease;
+	}
+	.node.pos {
+		fill: color-mix(in oklch, var(--pos) var(--s), var(--bg));
+		stroke: var(--pos);
+	}
+	.node.neg {
+		fill: color-mix(in oklch, var(--neg) var(--s), var(--bg));
+		stroke: var(--neg);
+	}
+	.node:focus {
+		outline: none;
+	}
+	.node:focus-visible,
+	.node.lit {
+		stroke-width: 2.5;
+	}
+	.isolating .edge:not(.lit) {
+		stroke-opacity: 0.04;
+	}
+	.isolating .edge.lit {
+		stroke-opacity: 1;
+	}
+	.isolating .node:not(.lit) {
+		opacity: 0.35;
+	}
+	.labels text {
+		font-family: var(--mono);
+		font-size: 12px;
+		fill: var(--muted);
+	}
+	.tip {
+		position: absolute;
+		pointer-events: none;
+		white-space: nowrap;
+		padding: 0.2rem 0.5rem;
+		font-family: var(--mono);
+		font-size: 0.75rem;
+		color: var(--text);
+		background: var(--bg);
+		border: 1px solid var(--faint);
+		border-radius: 6px;
+		z-index: 2;
+	}
+	figcaption {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.3rem 1.2rem;
+		font-family: var(--mono);
+		font-size: 0.8rem;
+		color: var(--muted);
+		margin-top: 0.6rem;
+	}
+	.key {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.35rem;
+	}
+	.swatch {
+		display: inline-block;
+		width: 1.1rem;
+		height: 3px;
+		border-radius: 2px;
+	}
+	.swatch.pos {
+		background: var(--pos);
+	}
+	.swatch.neg {
+		background: var(--neg);
+		margin-left: 0.4rem;
+	}
+</style>

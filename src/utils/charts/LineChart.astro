@@ -1,0 +1,530 @@
+---
+// Plots one or more functions y = f(x) as lines on a shared x axis, drawn with Chart.js.
+// `x` returns the sample points; each series maps x -> y and gets its own line and colour.
+// The functions run at build time; only the sampled points are sent to the browser.
+// Usage in .mdx:
+//   <LineChart
+//     x={() => Array.from({ length: 101 }, (_, i) => i / 10)}
+//     series={[{ name: "sin", fn: Math.sin }, { name: "cos", fn: Math.cos }]}
+//   />
+export interface Series {
+	name: string;
+	fn: (x: number) => number;
+}
+
+interface Props {
+	x: () => number[];
+	series: Series[];
+	/** Show the legend. Defaults to on for two or more series. */
+	legend?: boolean;
+	title?: string;
+	xLabel?: string;
+	yLabel?: string;
+	/** Plot height in px. */
+	height?: number;
+	/** Show a range bar under the plot to zoom and pan the x axis. */
+	zoom?: boolean;
+	/** Show number inputs for the visible x min and x max. */
+	rangeInputs?: boolean;
+}
+
+const { x, series, legend = series.length > 1, title, xLabel, yLabel, height = 320, zoom = false, rangeInputs = false } =
+	Astro.props;
+const xs = x();
+// NaN/±Infinity become null so Chart.js leaves a gap instead of drawing a spike.
+const axis = xLabel ?? "x";
+const data = {
+	legend,
+	title,
+	xLabel,
+	yLabel,
+	series: series.map((s) => ({
+		name: s.name,
+		points: xs.map((xv) => {
+			const y = s.fn(xv);
+			return { x: xv, y: Number.isFinite(y) ? y : null };
+		}),
+	})),
+};
+---
+
+<figure class="line-chart" data-chart={JSON.stringify(data)}>
+	<div class="plot" style={`height: ${height}px`}>
+		<canvas role="img" aria-label={title ?? `Line chart of ${series.map((s) => s.name).join(", ")}`}></canvas>
+	</div>
+	{
+		(zoom || rangeInputs) && (
+			<div class="controls">
+				{zoom && (
+					<div class="zoom" title="Drag the ends to zoom, the middle to pan; double-click to reset">
+						<div class="track">
+							<div class="window" tabindex="0" aria-label="Visible x range (arrow keys pan)">
+								<span class="handle lo" role="slider" tabindex="0" aria-label="Start of visible x range" />
+								<span class="handle hi" role="slider" tabindex="0" aria-label="End of visible x range" />
+							</div>
+						</div>
+					</div>
+				)}
+				{rangeInputs && (
+					<div class="range-inputs">
+						<label>
+							{axis} min <input class="x-min" type="number" step="any" />
+						</label>
+						<label>
+							{axis} max <input class="x-max" type="number" step="any" />
+						</label>
+						<button class="reset" type="button">Reset</button>
+					</div>
+				)}
+			</div>
+		)
+	}
+</figure>
+
+<script>
+	import {
+		Chart,
+		type ChartOptions,
+		Legend,
+		LinearScale,
+		LineController,
+		LineElement,
+		type Plugin,
+		PointElement,
+		Title,
+		Tooltip,
+		type TooltipItem,
+	} from "chart.js";
+
+	Chart.register(LineController, LineElement, PointElement, LinearScale, Legend, Title, Tooltip);
+
+	interface ChartData {
+		legend: boolean;
+		title?: string;
+		xLabel?: string;
+		yLabel?: string;
+		series: { name: string; points: { x: number; y: number | null }[] }[];
+	}
+
+	// Vertical hairline at the hovered x, so the reader aims at an x rather than a 2px line.
+	const crosshair: Plugin<"line"> = {
+		id: "crosshair",
+		afterDatasetsDraw(chart) {
+			const active = chart.tooltip?.getActiveElements();
+			if (!active?.length) return;
+			const { ctx, chartArea } = chart;
+			const px = active[0].element.x;
+			ctx.save();
+			ctx.strokeStyle = String(chart.options.scales?.x?.grid?.color ?? "#999");
+			ctx.lineWidth = 1;
+			ctx.beginPath();
+			ctx.moveTo(px, chartArea.top);
+			ctx.lineTo(px, chartArea.bottom);
+			ctx.stroke();
+			ctx.restore();
+		},
+	};
+
+	// Lines up the zoom controls with the plot area, which is inset by the y-axis ticks.
+	const alignControls: Plugin<"line"> = {
+		id: "alignControls",
+		afterLayout(chart) {
+			const bar = chart.canvas.closest(".line-chart")?.querySelector<HTMLElement>(".controls");
+			if (!bar) return;
+			bar.style.marginLeft = `${chart.chartArea.left}px`;
+			bar.style.marginRight = `${chart.width - chart.chartArea.right}px`;
+		},
+	};
+
+	const fmt = (v: number) => (Number.isInteger(v) ? `${v}` : Number(v.toPrecision(4)).toString());
+
+	function theme(el: HTMLElement) {
+		const css = getComputedStyle(el);
+		const v = (name: string) => css.getPropertyValue(name).trim();
+		return {
+			series: Array.from({ length: 8 }, (_, i) => v(`--series-${i + 1}`)),
+			text: v("--text"),
+			muted: v("--muted"),
+			grid: v("--faint"),
+			bg: v("--bg"),
+			font: v("--sans"),
+		};
+	}
+
+	function options(d: ChartData, t: ReturnType<typeof theme>): ChartOptions<"line"> {
+		const xs = d.series[0]?.points.map((p) => p.x) ?? [];
+		const axisTitle = (text?: string) => ({ display: !!text, text, color: t.muted });
+		return {
+			responsive: true,
+			maintainAspectRatio: false,
+			animation: false,
+			interaction: { mode: "index" as const, intersect: false },
+			font: { family: t.font },
+			scales: {
+				x: {
+					type: "linear" as const,
+					min: Math.min(...xs),
+					max: Math.max(...xs),
+					title: axisTitle(d.xLabel),
+					grid: { color: t.grid },
+					border: { color: t.grid },
+					ticks: { color: t.muted, callback: (v: string | number) => fmt(Number(v)) },
+				},
+				y: {
+					title: axisTitle(d.yLabel),
+					grid: { color: t.grid },
+					border: { color: t.grid },
+					ticks: { color: t.muted, callback: (v: string | number) => fmt(Number(v)) },
+				},
+			},
+			plugins: {
+				title: { display: !!d.title, text: d.title, color: t.text, font: { size: 14, weight: 600 } },
+				legend: {
+					display: d.legend,
+					align: "start" as const,
+					labels: { color: t.text, usePointStyle: true, pointStyle: "line" as const, boxWidth: 18 },
+				},
+				tooltip: {
+					backgroundColor: t.bg,
+					titleColor: t.muted,
+					bodyColor: t.text,
+					borderColor: t.grid,
+					borderWidth: 1,
+					usePointStyle: true,
+					callbacks: {
+						title: (items: TooltipItem<"line">[]) => `x = ${fmt(items[0].parsed.x ?? 0)}`,
+						label: (item: TooltipItem<"line">) =>
+							`${item.parsed.y === null ? "–" : fmt(item.parsed.y)}  ${item.dataset.label}`,
+					},
+				},
+			},
+		};
+	}
+
+	function datasets(d: ChartData, t: ReturnType<typeof theme>) {
+		return d.series.map((s, i) => ({
+			label: s.name,
+			data: s.points,
+			borderColor: t.series[i % 8],
+			backgroundColor: t.series[i % 8],
+			pointStyle: "line" as const,
+			borderWidth: 2,
+			pointRadius: 0,
+			pointHoverRadius: 5,
+			pointHoverBorderWidth: 2,
+			pointHoverBorderColor: t.bg,
+			borderJoinStyle: "round" as const,
+			borderCapStyle: "round" as const,
+			spanGaps: false,
+		}));
+	}
+
+	const clamp = (v: number, a: number, b: number) => Math.min(b, Math.max(a, v));
+
+	/**
+	 * Wires the optional range bar and x min/max inputs to the chart. Both drive one view
+	 * (lo..hi as fractions of the full x range). Returns a function that re-applies it.
+	 */
+	function attachView(chart: Chart<"line">, d: ChartData, el: HTMLElement) {
+		const bar = el.querySelector<HTMLElement>(".zoom");
+		const inputs = el.querySelector<HTMLElement>(".range-inputs");
+		if (!bar && !inputs) return undefined;
+
+		const xs = d.series[0]?.points.map((p) => p.x) ?? [];
+		const x0 = Math.min(...xs);
+		const x1 = Math.max(...xs);
+		const toX = (f: number) => x0 + f * (x1 - x0);
+		const toFrac = (v: number) => (v - x0) / (x1 - x0);
+		// Never zoom in past ~3 samples, or the lines stop meaning anything.
+		const minSpan = clamp(3 / Math.max(xs.length - 1, 1), 0.01, 1);
+		let lo = 0;
+		let hi = 1;
+
+		const track = bar?.querySelector<HTMLElement>(".track");
+		const win = bar?.querySelector<HTMLElement>(".window");
+		const [loH, hiH] = bar?.querySelectorAll<HTMLElement>(".handle") ?? [];
+		const minIn = inputs?.querySelector<HTMLInputElement>(".x-min");
+		const maxIn = inputs?.querySelector<HTMLInputElement>(".x-max");
+
+		const apply = () => {
+			const a = toX(lo);
+			const b = toX(hi);
+			// Keep only visible points (plus one past each edge so lines reach the frame),
+			// which also makes Chart.js refit the y axis to what is on screen.
+			chart.data.datasets.forEach((ds, i) => {
+				const pts = d.series[i].points;
+				let first = 0;
+				while (first < pts.length - 1 && pts[first + 1].x <= a) first++;
+				let last = pts.length - 1;
+				while (last > 0 && pts[last - 1].x >= b) last--;
+				ds.data = pts.slice(first, last + 1);
+			});
+			const scale = chart.options.scales?.x;
+			if (scale) {
+				scale.min = a;
+				scale.max = b;
+			}
+			if (win) {
+				win.style.left = `${lo * 100}%`;
+				win.style.width = `${(hi - lo) * 100}%`;
+			}
+			for (const [h, v] of [
+				[loH, a],
+				[hiH, b],
+			] as const) {
+				h?.setAttribute("aria-valuemin", fmt(x0));
+				h?.setAttribute("aria-valuemax", fmt(x1));
+				h?.setAttribute("aria-valuenow", fmt(v));
+			}
+			// Never rewrite the box the user is typing in; it is normalised on commit.
+			if (minIn && document.activeElement !== minIn) minIn.value = fmt(a);
+			if (maxIn && document.activeElement !== maxIn) maxIn.value = fmt(b);
+			chart.update("none");
+		};
+		const reset = () => {
+			lo = 0;
+			hi = 1;
+			apply();
+		};
+
+		if (bar && track && win && loH && hiH) {
+			type Mode = "lo" | "hi" | "pan";
+			const moveBy = (mode: Mode, from: { lo: number; hi: number }, dx: number) => {
+				if (mode === "lo") lo = clamp(from.lo + dx, 0, hi - minSpan);
+				else if (mode === "hi") hi = clamp(from.hi + dx, lo + minSpan, 1);
+				else {
+					const span = from.hi - from.lo;
+					lo = clamp(from.lo + dx, 0, 1 - span);
+					hi = lo + span;
+				}
+				apply();
+			};
+
+			let drag: { mode: Mode; x: number; lo: number; hi: number } | null = null;
+			const targets: [HTMLElement, Mode][] = [
+				[loH, "lo"],
+				[hiH, "hi"],
+				[win, "pan"],
+			];
+			for (const [target, mode] of targets) {
+				target.addEventListener("pointerdown", (e) => {
+					e.preventDefault();
+					e.stopPropagation();
+					target.setPointerCapture(e.pointerId);
+					drag = { mode, x: e.clientX, lo, hi };
+				});
+				target.addEventListener("pointermove", (e) => {
+					if (drag?.mode === mode) moveBy(mode, drag, (e.clientX - drag.x) / track.clientWidth);
+				});
+				const end = () => {
+					drag = null;
+				};
+				target.addEventListener("pointerup", end);
+				target.addEventListener("pointercancel", end);
+				target.addEventListener("keydown", (e) => {
+					const dir = { ArrowLeft: -1, ArrowDown: -1, ArrowRight: 1, ArrowUp: 1 }[e.key];
+					if (!dir) return;
+					e.preventDefault();
+					e.stopPropagation();
+					moveBy(mode, { lo, hi }, dir * (e.shiftKey ? 0.1 : 0.01));
+				});
+			}
+
+			// Clicking the bare track centres the window there.
+			track.addEventListener("pointerdown", (e) => {
+				if (e.target !== track) return;
+				const r = track.getBoundingClientRect();
+				const span = hi - lo;
+				lo = clamp((e.clientX - r.left) / r.width - span / 2, 0, 1 - span);
+				hi = lo + span;
+				apply();
+			});
+			win.addEventListener("dblclick", reset);
+		}
+
+		if (minIn && maxIn) {
+			for (const input of [minIn, maxIn]) {
+				input.min = fmt(x0);
+				input.max = fmt(x1);
+				const isMin = input === minIn;
+				// `live` runs on every keystroke: it only takes values that fit as they are, so a
+				// half-typed number never shoves the other bound around. On commit (Enter or
+				// blur) a value past the other bound pushes it along, keeping the current width,
+				// and a value past the data is clamped to it.
+				const take = (live: boolean) => {
+					const v = Number.parseFloat(input.value);
+					if (!Number.isFinite(v)) {
+						if (!live) apply();
+						return;
+					}
+					const f = toFrac(v);
+					const span = hi - lo;
+					if (live && (f < 0 || f > 1 || (isMin ? f > hi - minSpan : f < lo + minSpan))) return;
+					if (isMin) {
+						lo = clamp(f, 0, 1 - minSpan);
+						if (hi < lo + minSpan) hi = Math.min(1, lo + span);
+					} else {
+						hi = clamp(f, minSpan, 1);
+						if (lo > hi - minSpan) lo = Math.max(0, hi - span);
+					}
+					apply();
+				};
+				input.addEventListener("input", () => take(true));
+				input.addEventListener("change", () => {
+					take(false);
+					input.value = fmt(toX(isMin ? lo : hi));
+				});
+			}
+			inputs?.querySelector("button.reset")?.addEventListener("click", reset);
+		}
+
+		apply();
+		return apply;
+	}
+
+	for (const el of document.querySelectorAll<HTMLElement>(".line-chart")) {
+		const d: ChartData = JSON.parse(el.dataset.chart ?? "{}");
+		const canvas = el.querySelector("canvas");
+		if (!canvas) continue;
+		const t = theme(el);
+		const chart = new Chart(canvas, {
+			type: "line",
+			data: { datasets: datasets(d, t) },
+			options: options(d, t),
+			plugins: [crosshair, alignControls],
+		});
+		const reapplyView = attachView(chart, d, el);
+		// Canvas colours don't follow CSS, so repaint when the OS theme flips.
+		matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+			const nt = theme(el);
+			chart.data.datasets = datasets(d, nt);
+			chart.options = options(d, nt);
+			if (reapplyView) reapplyView();
+			else chart.update();
+		});
+	}
+</script>
+
+<style>
+	/* Categorical slots in fixed order; the dark steps are tuned for the dark surface. */
+	.line-chart {
+		--series-1: #2a78d6;
+		--series-2: #eb6834;
+		--series-3: #1baf7a;
+		--series-4: #eda100;
+		--series-5: #e87ba4;
+		--series-6: #008300;
+		--series-7: #4a3aa7;
+		--series-8: #e34948;
+		margin: 1.75rem 0;
+	}
+	@media (prefers-color-scheme: dark) {
+		.line-chart {
+			--series-1: #3987e5;
+			--series-2: #d95926;
+			--series-3: #199e70;
+			--series-4: #c98500;
+			--series-5: #d55181;
+			--series-6: #008300;
+			--series-7: #9085e9;
+			--series-8: #e66767;
+		}
+	}
+	.plot {
+		position: relative;
+		width: 100%;
+	}
+	.controls {
+		margin-top: 0.6rem;
+		display: flex;
+		flex-direction: column;
+		gap: 0.6rem;
+	}
+	.zoom {
+		padding: 0.25rem 0;
+	}
+	.range-inputs {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 0.5rem 1rem;
+		font-family: var(--sans);
+		font-size: 0.8rem;
+		color: var(--muted);
+	}
+	.range-inputs label {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.4rem;
+	}
+	.range-inputs input {
+		width: 6.5rem;
+		padding: 0.25rem 0.45rem;
+		font: inherit;
+		font-family: var(--mono);
+		color: var(--text);
+		background: var(--bg);
+		border: 1px solid var(--faint);
+		border-radius: 6px;
+	}
+	.range-inputs button {
+		margin-left: auto;
+		padding: 0.25rem 0.7rem;
+		font: inherit;
+		color: var(--text);
+		background: var(--surface);
+		border: 1px solid var(--faint);
+		border-radius: 6px;
+		cursor: pointer;
+	}
+	.range-inputs input:focus-visible,
+	.range-inputs button:focus-visible {
+		outline: 2px solid var(--accent);
+		outline-offset: 1px;
+	}
+	.track {
+		position: relative;
+		height: 0.9rem;
+		border-radius: 999px;
+		background: var(--surface);
+		border: 1px solid var(--faint);
+		cursor: pointer;
+		touch-action: none;
+	}
+	.window {
+		position: absolute;
+		top: -1px;
+		bottom: -1px;
+		border-radius: 999px;
+		background: color-mix(in oklch, var(--accent) 20%, transparent);
+		border: 1px solid color-mix(in oklch, var(--accent) 55%, transparent);
+		cursor: grab;
+		touch-action: none;
+	}
+	.window:active {
+		cursor: grabbing;
+	}
+	.handle {
+		position: absolute;
+		top: 50%;
+		width: 0.55rem;
+		height: 1.4rem;
+		margin-top: -0.7rem;
+		border-radius: 999px;
+		background: var(--bg);
+		border: 1.5px solid var(--accent);
+		cursor: ew-resize;
+		touch-action: none;
+	}
+	.handle.lo {
+		left: -0.3rem;
+	}
+	.handle.hi {
+		right: -0.3rem;
+	}
+	.window:focus-visible,
+	.handle:focus-visible {
+		outline: 2px solid var(--accent);
+		outline-offset: 2px;
+	}
+</style>

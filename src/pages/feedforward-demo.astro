@@ -1,0 +1,40 @@
+---
+import Layout from "../layouts/Layout.astro";
+import FeedForward from "../utils/neuralnetwork/FeedForward.astro";
+
+// Deterministic pseudo-random weights so the page is stable between builds.
+let seed = 7;
+const rand = () => {
+	seed = (seed * 1664525 + 1013904223) % 2 ** 32;
+	return (seed / 2 ** 32) * 2 - 1;
+};
+const matrix = (out: number, inp: number) =>
+	Array.from({ length: out }, () => Array.from({ length: inp }, rand));
+const vector = (n: number) => Array.from({ length: n }, rand);
+
+// XOR solved by a 2-2-1 network (hidden units act as OR and NAND, output as AND).
+const xor = [
+	[
+		[20, 20],
+		[-20, -20],
+	],
+	[[20, 20]],
+];
+const xorBias = [[-10, 30], [-30]];
+
+const mlp = [matrix(5, 3), matrix(6, 5), matrix(4, 6), matrix(2, 4)];
+const mlpBias = [vector(5), vector(6), vector(4), vector(2)];
+---
+
+<Layout title="FeedForward demo">
+	<h1>FeedForward demo</h1>
+
+	<h2>Single layer</h2>
+	<FeedForward weights={[matrix(3, 4)]} />
+
+	<h2>XOR with biases</h2>
+	<FeedForward weights={xor} biases={xorBias} labels={["x", "h", "y"]} title="XOR" />
+
+	<h2>Deeper MLP, per-layer scaling</h2>
+	<FeedForward weights={mlp} biases={mlpBias} normalize="layer" />
+</Layout>

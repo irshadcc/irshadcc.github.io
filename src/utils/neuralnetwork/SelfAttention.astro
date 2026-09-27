@@ -1,0 +1,426 @@
+---
+// Visualises single-head scaled dot-product self-attention over a sequence of tokens, computed at build time.
+// Give either the projections directly (`q`, `k`, optional `v`, each [tokens, d]) or the token embeddings `x`
+// [tokens, d_model] with nn.Linear-style weights `wq`, `wk`, optional `wv` (each [d, d_model], so Q = X Wqᵀ).
+// Left panel: each query token (left) linked to every key token (right), line weight ∝ attention.
+// Right panel: the attention matrix softmax(QKᵀ/√d) as a heatmap, plus the output AV when V is known.
+// Hover a token, line or cell to isolate it and read its value.
+// Usage in .mdx:
+//   <SelfAttention tokens={["the", "cat", "sat"]} x={X} wq={Wq} wk={Wk} wv={Wv} causal />
+import {
+	type Matrix,
+	attentionWeights,
+	linear,
+	matmul,
+	shape,
+} from "./attention";
+
+interface Props {
+	tokens: string[];
+	q?: Matrix;
+	k?: Matrix;
+	v?: Matrix;
+	x?: Matrix;
+	wq?: Matrix;
+	wk?: Matrix;
+	wv?: Matrix;
+	/** Query i only attends to keys 0..i. */
+	causal?: boolean;
+	/** Score scale. Defaults to 1/√d_k. */
+	scale?: number;
+	/** Print the weights in the heatmap cells. Defaults to on for up to 8 tokens. */
+	values?: boolean;
+	title?: string;
+}
+
+const { tokens, x, wq, wk, wv, causal = false, scale, title } = Astro.props;
+const n = tokens.length;
+const project = (
+	given: Matrix | undefined,
+	w: Matrix | undefined,
+	name: string,
+) => {
+	if (given) return given;
+	if (x && w) return linear(x, w);
+	if (name === "V") return undefined;
+	throw new Error(
+		`SelfAttention: pass ${name.toLowerCase()}, or x with w${name.toLowerCase()}`,
+	);
+};
+const Q = project(Astro.props.q, wq, "Q") as Matrix;
+const K = project(Astro.props.k, wk, "K") as Matrix;
+const V = project(Astro.props.v, wv, "V");
+for (const [name, m] of [
+	["Q", Q],
+	["K", K],
+	["V", V],
+] as const) {
+	if (m && m.length !== n)
+		throw new Error(
+			`SelfAttention: ${name} has ${m.length} rows but there are ${n} tokens`,
+		);
+}
+const { scores, weights } = attentionWeights(Q, K, { causal, scale });
+const out = V ? matmul(weights, V) : undefined;
+const showValues = Astro.props.values ?? n <= 8;
+
+const fmt = (v: number) =>
+	Number.isInteger(v) ? `${v}` : Number(v.toPrecision(3)).toString();
+const tok = (i: number) => `“${tokens[i]}”`;
+const masked = (i: number, j: number) => !Number.isFinite(scores[i][j]);
+
+// Geometry, in SVG user units. Tokens are set in 12px mono, about 7.4 units per character.
+const charW = 7.4;
+// At least as wide as the "query" header above the tokens.
+const labelW = Math.max(5, ...tokens.map((t) => t.length)) * charW;
+
+const rowGap = 28;
+const linesTop = 30;
+const qx = 8 + labelW;
+const kx = qx + 170;
+const linesW = kx + labelW + 8;
+const linesH = linesTop + (n - 1) * rowGap + 16;
+const ty = (i: number) => linesTop + i * rowGap;
+const lines = weights
+	.flatMap((row, i) => row.map((a, j) => ({ i, j, a })))
+	.filter(({ i, j }) => !masked(i, j))
+	.sort((p, r) => p.a - r.a);
+
+const cell = 34;
+const mapLeft = labelW + 12;
+const mapTop = labelW * 0.64 + 26;
+const outLeft = mapLeft + n * cell + 28;
+const dv = out ? shape(out)[1] : 0;
+const outMax = out
+	? out.flat().reduce((m, v) => Math.max(m, Math.abs(v)), 0) || 1
+	: 1;
+const mapW = (out ? outLeft + dv * cell : mapLeft + n * cell) + 4;
+const mapH = mapTop + n * cell + 4;
+---
+
+<figure class="attn">
+	{title && <div class="title">{title}</div>}
+	<div class="canvas">
+		<div class="panels">
+			<svg
+				class="lines"
+				viewBox={`0 0 ${linesW} ${linesH}`}
+				style={`max-width: ${linesW}px`}
+				role="img"
+				aria-label={`Attention from each query token to each key token over: ${tokens.join(" ")}`}
+			>
+				<text class="head" x={qx} y="12" text-anchor="end">query</text>
+				<text class="head" x={kx} y="12">key</text>
+				{
+					lines.map(({ i, j, a }) => (
+						<line
+							class="ix link"
+							x1={qx + 8}
+							y1={ty(i)}
+							x2={kx - 8}
+							y2={ty(j)}
+							stroke-width={(0.5 + 4 * a).toFixed(2)}
+							stroke-opacity={a.toFixed(3)}
+							data-q={i}
+							data-k={j}
+							data-tip={`${tok(i)} → ${tok(j)}: ${fmt(a)}`}
+						/>
+					))
+				}
+				{
+					tokens.map((t, i) => (
+						<text class="ix token" x={qx} y={ty(i)} text-anchor="end" data-q={i} tabindex="0">
+							{t}
+						</text>
+					))
+				}
+				{
+					tokens.map((t, j) => (
+						<text class="ix token" x={kx} y={ty(j)} data-k={j}>
+							{t}
+						</text>
+					))
+				}
+			</svg>
+			<svg
+				class="map"
+				viewBox={`0 0 ${mapW} ${mapH}`}
+				style={`max-width: ${mapW}px`}
+				role="img"
+				aria-label="Attention weight matrix, rows are queries and columns are keys"
+			>
+				{
+					tokens.map((t, j) => (
+						<text
+							class="ix token"
+							transform={`translate(${mapLeft + (j + 0.5) * cell + 4} ${mapTop - 8}) rotate(-40)`}
+							data-k={j}
+						>
+							{t}
+						</text>
+					))
+				}
+				{
+					tokens.map((t, i) => (
+						<text class="ix token" x={mapLeft - 8} y={mapTop + (i + 0.5) * cell} text-anchor="end" data-q={i}>
+							{t}
+						</text>
+					))
+				}
+				{
+					weights.map((row, i) =>
+						row.map((a, j) =>
+							masked(i, j) ? (
+								<rect class="masked" x={mapLeft + j * cell + 1} y={mapTop + i * cell + 1} width={cell - 2} height={cell - 2} />
+							) : (
+								<g class="ix" data-q={i} data-k={j} data-tip={`${tok(i)} → ${tok(j)}: ${fmt(a)}  (score ${fmt(scores[i][j])})`}>
+									<rect
+										class="cell"
+										x={mapLeft + j * cell + 1}
+										y={mapTop + i * cell + 1}
+										width={cell - 2}
+										height={cell - 2}
+										style={`--s: ${(a * 100).toFixed(1)}%`}
+									/>
+									{showValues && (
+										<text
+											class:list={["val", a > 0.55 && "on-dark"]}
+											x={mapLeft + (j + 0.5) * cell}
+											y={mapTop + (i + 0.5) * cell}
+											text-anchor="middle"
+										>
+											{a.toFixed(2).replace(/^0/, "")}
+										</text>
+									)}
+								</g>
+							),
+						),
+					)
+				}
+				{
+					out && (
+						<>
+							<text class="head" x={outLeft + (dv * cell) / 2} y={mapTop - 30} text-anchor="middle">
+								output AV
+							</text>
+							{Array.from({ length: dv }, (_, d) => (
+								<text class="head" x={outLeft + (d + 0.5) * cell} y={mapTop - 8} text-anchor="middle">
+									{d}
+								</text>
+							))}
+							{out.map((row, i) =>
+								row.map((v, d) => (
+									<rect
+										class:list={["ix", "cell", v < 0 ? "neg" : "pos"]}
+										x={outLeft + d * cell + 1}
+										y={mapTop + i * cell + 1}
+										width={cell - 2}
+										height={cell - 2}
+										style={`--s: ${((Math.abs(v) / outMax) * 85).toFixed(1)}%`}
+										data-q={i}
+										data-tip={`out[${tok(i)}, ${d}] = ${fmt(v)}`}
+									/>
+								)),
+							)}
+						</>
+					)
+				}
+			</svg>
+		</div>
+		<div class="tip" role="status" hidden></div>
+	</div>
+	<figcaption>
+		<span>
+			softmax(QKᵀ{scale === undefined ? `/√${shape(K)[1]}` : ` · ${fmt(scale)}`}){causal && " · causal"} · {n} tokens
+		</span>
+		<span class="key">rows sum to 1 · hover a token to isolate it</span>
+	</figcaption>
+</figure>
+
+<script>
+	// Every interactive element (.ix) carries data-q (query index), data-k (key index) or both.
+	// Hovering one lights up the elements whose shared indices all agree with it, and dims the rest.
+	type Spec = { q?: string; k?: string };
+	const matches = (el: HTMLElement | SVGElement, s: Spec) => {
+		let compared = 0;
+		for (const key of ["q", "k"] as const) {
+			const mine = el.dataset[key];
+			if (mine === undefined || s[key] === undefined) continue;
+			if (mine !== s[key]) return false;
+			compared++;
+		}
+		return compared > 0;
+	};
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".attn")) {
+		const tip = fig.querySelector<HTMLElement>(".tip");
+		const canvas = fig.querySelector<HTMLElement>(".canvas");
+		if (!tip || !canvas) continue;
+		const items = [...fig.querySelectorAll<SVGElement>(".ix")];
+
+		const isolate = (s?: Spec) => {
+			fig.classList.toggle("isolating", !!s);
+			for (const el of items) el.classList.toggle("lit", !!s && matches(el, s));
+		};
+		const show = (el: SVGElement, x: number, y: number) => {
+			const text = el.dataset.tip;
+			if (!text) return hide();
+			const box = canvas.getBoundingClientRect();
+			tip.textContent = text;
+			tip.hidden = false;
+			const left = x - box.left + 12;
+			tip.style.left = `${Math.max(4, Math.min(left, box.width - tip.offsetWidth - 4))}px`;
+			tip.style.top = `${y - box.top + 14}px`;
+		};
+		const hide = () => {
+			tip.hidden = true;
+		};
+		const itemOf = (t: EventTarget | null) => (t as Element | null)?.closest<SVGElement>(".ix") ?? null;
+
+		canvas.addEventListener("pointermove", (e) => {
+			const el = itemOf(e.target);
+			if (el) show(el, e.clientX, e.clientY);
+			else hide();
+		});
+		canvas.addEventListener("pointerover", (e) => {
+			const el = itemOf(e.target);
+			if (el) isolate({ q: el.dataset.q, k: el.dataset.k });
+		});
+		canvas.addEventListener("pointerout", (e) => {
+			if (itemOf(e.target) && !itemOf(e.relatedTarget) && !canvas.contains(document.activeElement)) isolate();
+		});
+		canvas.addEventListener("pointerleave", () => {
+			hide();
+			if (!canvas.contains(document.activeElement)) isolate();
+		});
+		for (const el of fig.querySelectorAll<SVGElement>(".token[tabindex]")) {
+			el.addEventListener("focus", () => isolate({ q: el.dataset.q }));
+			el.addEventListener("blur", () => isolate());
+		}
+	}
+</script>
+
+<style>
+	/* Weights use one sequential hue; the output uses the diverging pair from FeedForward. */
+	.attn {
+		--weight: var(--accent);
+		--pos: #2a78d6;
+		--neg: #e34948;
+		margin: 1.75rem 0;
+	}
+	@media (prefers-color-scheme: dark) {
+		.attn {
+			--pos: #3987e5;
+			--neg: #e66767;
+		}
+	}
+	.title {
+		font-family: var(--sans);
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.4rem;
+	}
+	.canvas {
+		position: relative;
+		overflow-x: auto;
+	}
+	.panels {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		align-items: flex-start;
+		gap: 1rem 1.5rem;
+	}
+	svg {
+		display: block;
+		height: auto;
+		flex: 1 1 auto;
+	}
+	svg.lines {
+		width: min(100%, 17rem);
+	}
+	svg.map {
+		width: min(100%, 23rem);
+	}
+	text {
+		font-family: var(--mono);
+		font-size: 12px;
+		dominant-baseline: central;
+	}
+	.token {
+		fill: var(--text);
+		cursor: default;
+	}
+	.token:focus {
+		outline: none;
+	}
+	.token:focus-visible {
+		text-decoration: underline;
+	}
+	.head {
+		fill: var(--muted);
+		font-size: 11px;
+	}
+	.link {
+		stroke: var(--weight);
+		stroke-linecap: round;
+	}
+	.cell {
+		fill: color-mix(in oklch, var(--weight) var(--s), var(--bg));
+		stroke: var(--faint);
+		stroke-width: 0.5;
+	}
+	.cell.pos {
+		fill: color-mix(in oklch, var(--pos) var(--s), var(--bg));
+	}
+	.cell.neg {
+		fill: color-mix(in oklch, var(--neg) var(--s), var(--bg));
+	}
+	.masked {
+		fill: none;
+		stroke: var(--faint);
+		stroke-width: 0.5;
+		stroke-dasharray: 2 2;
+	}
+	.val {
+		font-size: 10px;
+		fill: var(--text);
+		pointer-events: none;
+	}
+	.val.on-dark {
+		fill: var(--bg);
+	}
+	.ix {
+		transition: opacity 120ms ease;
+	}
+	.isolating .ix:not(.lit) {
+		opacity: 0.12;
+	}
+	.isolating .token.lit {
+		font-weight: 700;
+	}
+	.tip {
+		position: absolute;
+		pointer-events: none;
+		white-space: nowrap;
+		padding: 0.2rem 0.5rem;
+		font-family: var(--mono);
+		font-size: 0.75rem;
+		color: var(--text);
+		background: var(--bg);
+		border: 1px solid var(--faint);
+		border-radius: 6px;
+		z-index: 2;
+	}
+	figcaption {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.3rem 1.2rem;
+		font-family: var(--mono);
+		font-size: 0.8rem;
+		color: var(--muted);
+		margin-top: 0.6rem;
+	}
+</style>

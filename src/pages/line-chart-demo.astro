@@ -1,0 +1,63 @@
+---
+import Layout from "../layouts/Layout.astro";
+import LineChart from "../utils/charts/LineChart.astro";
+
+const range = (start: number, end: number, n: number) => () =>
+	Array.from({ length: n }, (_, i) => start + ((end - start) * i) / (n - 1));
+
+const gelu = (x: number) => 0.5 * x * (1 + Math.tanh(Math.sqrt(2 / Math.PI) * (x + 0.044715 * x ** 3)));
+const sigmoid = (x: number) => 1 / (1 + Math.exp(-x));
+---
+
+<Layout title="LineChart demo">
+	<h1>LineChart demo</h1>
+
+	<h2>Single series (no legend)</h2>
+	<LineChart title="sin(x)" x={range(0, 4 * Math.PI, 200)} series={[{ name: "sin(x)", fn: Math.sin }]} />
+
+	<h2>Activation functions</h2>
+	<LineChart
+		x={range(-4, 4, 161)}
+		series={[
+			{ name: "ReLU", fn: (x: number) => Math.max(0, x) },
+			{ name: "GELU", fn: gelu },
+			{ name: "SiLU", fn: (x: number) => x * sigmoid(x) },
+			{ name: "tanh", fn: Math.tanh },
+		]}
+		xLabel="x"
+		yLabel="activation(x)"
+	/>
+
+	<h2>Legend turned off, gaps where f is undefined</h2>
+	<LineChart
+		x={range(-2, 2, 81)}
+		series={[
+			{ name: "1/x", fn: (x: number) => (Math.abs(x) < 0.2 ? Number.NaN : 1 / x) },
+			{ name: "x³", fn: (x: number) => x ** 3 },
+		]}
+		legend={false}
+		height={260}
+	/>
+
+	<h2>Zoomable x axis</h2>
+	<LineChart
+		x={range(0, 60, 2401)}
+		series={[
+			{ name: "e^(−x/15)·sin(2x)", fn: (x: number) => Math.exp(-x / 15) * Math.sin(2 * x) },
+			{ name: "envelope", fn: (x: number) => Math.exp(-x / 15) },
+		]}
+		xLabel="x"
+		zoom
+		rangeInputs
+	/>
+
+	<h2>Range inputs only</h2>
+	<LineChart
+		x={range(-4, 4, 161)}
+		series={[
+			{ name: "GELU", fn: gelu },
+			{ name: "SiLU", fn: (x: number) => x * sigmoid(x) },
+		]}
+		rangeInputs
+	/>
+</Layout>
