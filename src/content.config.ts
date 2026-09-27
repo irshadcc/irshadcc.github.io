@@ -32,6 +32,8 @@ const publications = defineCollection({
 		paperTitle: z.string(),
 		link: z.string(),
 		conference: z.string(),
+		// e.g. "Acknowledged contributor (not an author)"
+		note: z.string().optional(),
 	}),
 });
 

@@ -34,7 +34,10 @@ publications.sort((a, b) => b.data.id - a.data.id);
 		{publications.map((entry) => (
 			<li>
 				<a href={entry.data.link}>{entry.data.paperTitle}</a>
-				<span class="entry-meta">{entry.data.conference}</span>
+				<span class="entry-meta">
+					{entry.data.conference}
+					{entry.data.note && <> · {entry.data.note}</>}
+				</span>
 			</li>
 		))}
 	</ul>

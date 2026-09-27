@@ -1,9 +1,17 @@
 [
   {
     "id": 1,
-    "shortTitle" : "Magnus for Large Machine Learning Models",
+    "shortTitle": "Magnus for Large Machine Learning Models",
     "paperTitle": "Magnus: A Holistic Approach to Data Management for Large-Scale Machine Learning Workloads",
     "link": "https://www.vldb.org/pvldb/vol18/p4964-song.pdf",
-    "conference" : "VLDB 2025"
+    "conference": "VLDB 2025"
+  },
+  {
+    "id": 2,
+    "shortTitle": "Primus for Large-Scale Recommendation Models",
+    "paperTitle": "Primus: Unified Training System for Large-Scale Deep Learning Recommendation Models",
+    "link": "https://www.usenix.org/system/files/atc25-shan-jixi.pdf",
+    "conference": "USENIX ATC 2025",
+    "note": "Acknowledged contributor (not an author)"
   }
 ]
