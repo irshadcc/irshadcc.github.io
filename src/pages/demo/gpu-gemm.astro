@@ -1,0 +1,56 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import GpuGemmDataflow from "../../utils/gpu/GpuGemmDataflow.astro";
+import { CuteLayout } from "../../utils/matrix/CuteLayout";
+
+// Column-major B (16×32) in global memory, kept K-major in shared memory.
+const gBColMajor = new CuteLayout([16, 32], [1, 16]);
+const sBColMajor = new CuteLayout([8, 16], [1, 8]);
+
+// Row-major 16×16 sA with 16 banks per row: column k of every row sits in bank k. Swizzle<3,0,4>
+// XORs the row (bits 4-6 of the offset) into the column (bits 0-2), spreading a column over
+// eight banks.
+const sA = new CuteLayout([16, 16], [16, 1]);
+---
+
+<Layout title="GpuGemmDataflow demo">
+	<h1>GpuGemmDataflow demo</h1>
+	<p>
+		One SM computing one tile of <em>C = A·B</em>. Step through the kernel: <code>cp.async</code> copies tiles of A
+		and B from global memory through L2 into shared memory, <code>ldmatrix</code> copies each warp's fragments into
+		registers, <code>mma.sync</code> runs on the tensor cores, and the epilogue runs on the CUDA cores before
+		<code>st.global</code> writes C back. Pick a <code>blockIdx</code> to move to another tile of C and a
+		<code>threadIdx.x</code> to outline the elements that one thread copies, holds and stores. Hover any cell for
+		its coordinate, offset and bank.
+	</p>
+
+	<h2>Row-major everything</h2>
+	<GpuGemmDataflow thread={5} />
+
+	<h2>Column-major B</h2>
+	<p>
+		B is stored column-major in global memory, <code>(16,32):(1,16)</code>, and kept that way in shared memory. Each
+		16-byte <code>cp.async</code> now copies part of a column of B instead of part of a row.
+	</p>
+	<GpuGemmDataflow gB={gBColMajor} sB={sBColMajor} block={[0, 1]} thread={40} step={1} />
+
+	<h2>Swizzled shared memory</h2>
+	<p>
+		With <code>BK = 16</code> and a row-major sA, column <em>k</em> of every row sits in bank <em>k</em>, so the
+		16 rows a warp reads for one column all hit the same bank. <code>Swizzle&lt;3,0,4&gt;</code> XORs the row
+		(mod 8) into the column, spreading each column over eight banks: compare where the highlighted slice and the
+		thread's own elements land.
+	</p>
+	<GpuGemmDataflow BK={16} sA={sA} swizzle={{ bits: 3, base: 0, shift: 4 }} step={3} />
+
+	<h2>TMA (Hopper)</h2>
+	<p>
+		With <code>copy="tma"</code> the SM gets a Tensor Memory Accelerator. Instead of every thread issuing 16-byte
+		<code>cp.async</code> copies, thread 0 arms an <code>mbarrier</code> with the bytes it expects and issues one
+		<code>cp.async.bulk.tensor</code> per tile; the TMA generates the addresses from a tensor map and writes the tile
+		into shared memory, and every thread then waits on the mbarrier. The result leaves the same way: each thread
+		writes its accumulators to a C tile in shared memory (<code>stmatrix</code>), and thread 0 issues one TMA store
+		to global memory. Try another <code>threadIdx.x</code>: only thread 0 takes part in the copies.
+	</p>
+	<GpuGemmDataflow copy="tma" step={1} />
+</Layout>
