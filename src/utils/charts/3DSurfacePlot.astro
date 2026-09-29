@@ -1,0 +1,939 @@
+---
+// Plots a function z = f(x, y) as a shaded 3D surface, drawn as SVG with d3.
+// `fn` is sampled on a regular grid over the `x` and `y` ranges at build time; only the grid
+// of z values is sent to the browser. There the grid is projected orthographically inside a
+// box with gridded back walls, drawn back to front (painter's algorithm), and coloured by z.
+// Drag (or use the arrow keys) to rotate, double-click to reset; hover to read a point.
+// With rangeSliders, a two-handle slider per axis sets the visible x and y ranges. By default
+// the sliders span the sampled ranges and the view is cut from the build-time grid. With
+// restrictRange={false} they reach one range-width past each end, and `fn` is also sent as
+// source and re-sampled in the browser; the function must then be self-contained (use only
+// x, y and globals like Math), which is checked here.
+// Usage in .mdx:
+//   <SurfacePlot
+//     fn={(x, y) => Math.sin(x) * Math.cos(y)}
+//     x={[-Math.PI, Math.PI]}
+//     y={[-Math.PI, Math.PI]}
+//   />
+interface Props {
+	fn: (x: number, y: number) => number;
+	/** x range as [min, max]. */
+	x: [number, number];
+	/** y range as [min, max]. */
+	y: [number, number];
+	/** Grid points per axis, or [x points, y points]. More is smoother but heavier to rotate. */
+	samples?: number | [number, number];
+	title?: string;
+	xLabel?: string;
+	yLabel?: string;
+	zLabel?: string;
+	/** Plot height in px. */
+	height?: number;
+	/** Initial rotation about the vertical axis, in degrees. */
+	yaw?: number;
+	/** Initial elevation of the viewer above the x-y plane, in degrees (0 = side on, 90 = top down). */
+	pitch?: number;
+	/** Colour by sign: blue below zero, grey at zero, red above. For signed functions. */
+	diverging?: boolean;
+	/** Outline every grid cell in the background colour, so the mesh shows. */
+	mesh?: boolean;
+	/** Show a slider per axis to set the visible x and y ranges. */
+	rangeSliders?: boolean;
+	/**
+	 * Keep the ranges inside the sampled x and y ranges (default). Set false to let the sliders
+	 * reach one range-width past each end, re-sampling `fn` in the browser.
+	 */
+	restrictRange?: boolean;
+}
+
+const {
+	fn,
+	x,
+	y,
+	samples = 41,
+	title,
+	xLabel = "x",
+	yLabel = "y",
+	zLabel = "z",
+	height = 440,
+	yaw = 35,
+	pitch = 28,
+	diverging = false,
+	mesh = true,
+	rangeSliders = false,
+	restrictRange = true,
+} = Astro.props;
+
+const [nx, ny] = typeof samples === "number" ? [samples, samples] : samples;
+const grid = (lo: number, hi: number, n: number) => Array.from({ length: n }, (_, i) => lo + ((hi - lo) * i) / (n - 1));
+const xs = grid(x[0], x[1], Math.max(nx, 2));
+const ys = grid(y[0], y[1], Math.max(ny, 2));
+// z[j][i] = f(xs[i], ys[j]); NaN/±Infinity become null and leave a hole in the surface.
+const z = ys.map((yv) =>
+	xs.map((xv) => {
+		const v = fn(xv, yv);
+		return Number.isFinite(v) ? v : null;
+	}),
+);
+
+const sliders = [
+	{ axis: "x", label: xLabel },
+	{ axis: "y", label: yLabel },
+];
+
+/** Source the browser can rebuild `fn` from; throws if the rebuilt copy disagrees with it. */
+function serialize(): string {
+	const native = Object.getOwnPropertyNames(Math).find((k) => (Math as unknown as Record<string, unknown>)[k] === fn);
+	if (native) return `Math.${native}`;
+	const src = fn.toString();
+	const probes = (lo: number, hi: number) => {
+		const w = hi - lo || 1;
+		return [lo, (lo + hi) / 2, hi, lo - 3 * w, hi + 3 * w];
+	};
+	const px = probes(x[0], x[1]);
+	const py = probes(y[0], y[1]);
+	try {
+		const rebuilt = new Function(`return (${src});`)();
+		if (px.every((a) => py.every((b) => Object.is(rebuilt(a, b), fn(a, b))))) return src;
+	} catch {
+		// Falls through to the error below (e.g. ReferenceError for a helper defined elsewhere).
+	}
+	throw new Error(
+		"SurfacePlot: fn can't be re-sampled in the browser (restrictRange={false}). " +
+			"Write it as a self-contained function of x and y that uses only globals such as Math, " +
+			"e.g. (x, y) => Math.sin(x) * Math.cos(y).",
+	);
+}
+
+const data = {
+	title,
+	xLabel,
+	yLabel,
+	zLabel,
+	xs,
+	ys,
+	z,
+	yaw,
+	pitch,
+	diverging,
+	mesh,
+	restrict: restrictRange,
+	src: restrictRange ? undefined : serialize(),
+};
+---
+
+<figure class="surface-plot" data-surface={JSON.stringify(data)}>
+	{title && <figcaption class="title">{title}</figcaption>}
+	<div class="plot" style={`height: ${height}px`}>
+		<svg
+			tabindex="0"
+			role="img"
+			aria-label={`${title ?? `Surface plot of ${zLabel}`} over ${xLabel} and ${yLabel}. Drag or use the arrow keys to rotate.`}
+		>
+			<g class="box"></g>
+			<g class="surface"></g>
+			<g class="probe"></g>
+			<g class="axes"></g>
+		</svg>
+		<div class="tooltip" hidden></div>
+	</div>
+	<div class="footer">
+		<div class="legend">
+			<span class="legend-label">{zLabel}</span>
+			<div class="legend-scale">
+				<div class="legend-bar"></div>
+				<div class="legend-ticks"></div>
+			</div>
+		</div>
+		<span class="hint">Drag to rotate · double-click to reset</span>
+	</div>
+	{
+		rangeSliders && (
+			<div class="range-sliders">
+				{sliders.map((s) => (
+					<div class="range-slider" data-axis={s.axis}>
+						<span class="slider-label">{s.label}</span>
+						<span class="slider-value lo" />
+						<div class="track" title="Drag the ends to set the range, the middle to pan">
+							<div class="window" tabindex="0" aria-label={`Visible ${s.label} range (arrow keys pan)`}>
+								<span class="handle lo" role="slider" tabindex="0" aria-label={`${s.label} min`} />
+								<span class="handle hi" role="slider" tabindex="0" aria-label={`${s.label} max`} />
+							</div>
+						</div>
+						<span class="slider-value hi" />
+					</div>
+				))}
+				<button class="reset" type="button">Reset range</button>
+			</div>
+		)
+	}
+</figure>
+
+<script>
+	// Client side of SurfacePlot. Astro bundles this once per page, however many plots it has.
+	// For every <figure class="surface-plot"> it:
+	//   1. reads the z grid computed at build time from the figure's data-surface JSON,
+	//   2. maps the data into a box [-1, 1] × [-1, 1] × [-H, H] and projects it for the current
+	//      yaw/pitch, drawing the box, the surface cells (farthest first) and the axes,
+	//   3. redraws on drag, arrow keys, resize and OS theme changes.
+	import { drag, interpolateRgbBasis, scaleLinear, scaleSequential, select } from "d3";
+
+	/** Shape of the data-surface JSON written by the frontmatter. */
+	interface SurfaceData {
+		title?: string;
+		xLabel: string;
+		yLabel: string;
+		zLabel: string;
+		xs: number[];
+		ys: number[];
+		/** z[j][i] is the value at (xs[i], ys[j]); null where the function was undefined. */
+		z: (number | null)[][];
+		yaw: number;
+		pitch: number;
+		diverging: boolean;
+		mesh: boolean;
+		/** restrictRange: keep the x/y ranges inside the sampled grid. */
+		restrict: boolean;
+		/** Function source, present only when restrictRange is off. */
+		src?: string;
+	}
+
+	type Axis = "x" | "y";
+	type Vec3 = [number, number, number];
+	/** A projected point: screen position in px and depth (larger = farther from the viewer). */
+	interface Screen {
+		px: number;
+		py: number;
+		depth: number;
+	}
+	/** One grid cell of the surface, ready to draw. */
+	interface Cell {
+		key: string;
+		/** Grid indices of the cell's four corners, in drawing order. */
+		corners: [number, number][];
+		points: Screen[];
+		depth: number;
+		z: number;
+	}
+
+	/** Half the height of the box, relative to its half-width of 1. */
+	const H = 0.72;
+	const deg = Math.PI / 180;
+	const clamp = (v: number, a: number, b: number) => Math.min(b, Math.max(a, v));
+	/** Number for display: integers as-is, anything else to 4 significant digits. */
+	const fmt = (v: number) => (Number.isInteger(v) ? `${v}` : Number(v.toPrecision(4)).toString());
+
+	/** Reads colours from CSS; the variables switch for dark mode in <style>. */
+	function theme(el: HTMLElement) {
+		const css = getComputedStyle(el);
+		const v = (name: string) => css.getPropertyValue(name).trim();
+		return {
+			ramp: v("--ramp").split(/\s+/),
+			diverging: v("--diverging").split(/\s+/),
+			text: v("--text"),
+			muted: v("--muted"),
+			grid: v("--faint"),
+			bg: v("--bg"),
+		};
+	}
+
+	function setup(el: HTMLElement) {
+		const d: SurfaceData = JSON.parse(el.dataset.surface ?? "{}");
+		const plot = el.querySelector<HTMLElement>(".plot");
+		const svgEl = el.querySelector("svg");
+		const tip = el.querySelector<HTMLElement>(".tooltip");
+		if (!plot || !svgEl || !tip) return;
+		const svg = select(svgEl);
+		const gBox = svg.select<SVGGElement>("g.box");
+		const gSurface = svg.select<SVGGElement>("g.surface");
+		const gProbe = svg.select<SVGGElement>("g.probe");
+		const gAxes = svg.select<SVGGElement>("g.axes");
+
+		// ---- Visible range. `base` is the sampled grid's range; `range` is what is on screen.
+		const baseGrid: Record<Axis, number[]> = { x: d.xs, y: d.ys };
+		const base: Record<Axis, [number, number]> = {
+			x: [d.xs[0], d.xs[d.xs.length - 1]],
+			y: [d.ys[0], d.ys[d.ys.length - 1]],
+		};
+		const range: Record<Axis, [number, number]> = { x: [...base.x], y: [...base.y] };
+		// Rebuild the function from its source (only sent when restrictRange is off).
+		// The build already checked that the rebuilt copy matches the original.
+		const f = d.src ? (new Function(`return (${d.src});`)() as (x: number, y: number) => number) : undefined;
+		/** Tolerance for float round-off when comparing x or y values. */
+		const eps = (a: Axis) => (base[a][1] - base[a][0]) * 1e-9;
+		/**
+		 * Narrowest allowed range. Cut from the grid, it keeps at least 3 samples; re-sampled,
+		 * 2% of the sampled range, so the slider handles never meet.
+		 */
+		const minW = (a: Axis) => {
+			const [b0, b1] = base[a];
+			return d.restrict || !f ? (2 * (b1 - b0)) / Math.max(baseGrid[a].length - 1, 1) : (b1 - b0) * 0.02;
+		};
+
+		// ---- Data for the visible range, and its mapping into box coordinates. load() refills
+		// these whenever the range changes; render() only reads them.
+		let xs: number[] = [];
+		let ys: number[] = [];
+		let z: (number | null)[][] = [];
+		let z0 = 0;
+		let z1 = 1;
+		let pos: (Vec3 | null)[][] = [];
+		const sx = scaleLinear().range([-1, 1]);
+		const sy = scaleLinear().range([-1, 1]);
+		const sz = scaleLinear().range([-H, H]);
+
+		/** Indices of the base grid values inside lo..hi. */
+		const slice = (a: Axis): [number, number] => {
+			const g = baseGrid[a];
+			const [lo, hi] = range[a];
+			let i0 = 0;
+			while (i0 < g.length - 2 && g[i0] < lo - eps(a)) i0++;
+			let i1 = g.length - 1;
+			while (i1 > i0 + 1 && g[i1] > hi + eps(a)) i1--;
+			return [i0, i1];
+		};
+		const isBase = (a: Axis) =>
+			Math.abs(range[a][0] - base[a][0]) <= eps(a) && Math.abs(range[a][1] - base[a][1]) <= eps(a);
+
+		function load() {
+			if (f && !(isBase("x") && isBase("y"))) {
+				// Re-sample over the range, as densely as the build did.
+				const grid = (a: Axis) => {
+					const [lo, hi] = range[a];
+					const n = baseGrid[a].length;
+					return Array.from({ length: n }, (_, k) => lo + ((hi - lo) * k) / (n - 1));
+				};
+				xs = grid("x");
+				ys = grid("y");
+				z = ys.map((yv) =>
+					xs.map((xv) => {
+						const v = f(xv, yv);
+						return Number.isFinite(v) ? v : null;
+					}),
+				);
+			} else {
+				// Cut the range out of the build-time grid, and snap the range to the grid.
+				const [i0, i1] = slice("x");
+				const [j0, j1] = slice("y");
+				xs = d.xs.slice(i0, i1 + 1);
+				ys = d.ys.slice(j0, j1 + 1);
+				z = d.z.slice(j0, j1 + 1).map((row) => row.slice(i0, i1 + 1));
+				range.x = [xs[0], xs[xs.length - 1]];
+				range.y = [ys[0], ys[ys.length - 1]];
+			}
+
+			// Fit z to what is visible.
+			const zVals = z.flat().filter((v): v is number => v !== null);
+			z0 = zVals.length ? Math.min(...zVals) : 0;
+			z1 = zVals.length ? Math.max(...zVals) : 1;
+			if (z0 === z1) {
+				z0 -= 1;
+				z1 += 1;
+			}
+			if (d.diverging) {
+				// Symmetric about zero, so grey always means zero.
+				const m = Math.max(Math.abs(z0), Math.abs(z1));
+				z0 = -m;
+				z1 = m;
+			}
+			sx.domain(range.x);
+			sy.domain(range.y);
+			sz.domain([z0, z1]).nice();
+			// .nice() may widen the z domain; the box follows it so ticks land on the box edges.
+			[z0, z1] = sz.domain();
+			pos = z.map((row, j) => row.map((v, i) => (v === null ? null : [sx(xs[i]), sy(ys[j]), sz(v)])));
+			probe = null; // grid indices from the old data no longer apply
+			syncSliders();
+		}
+
+		// ---- View state.
+		let yaw = d.yaw * deg;
+		let pitch = clamp(d.pitch, 0, 90) * deg;
+		let dragging = false;
+		/** Grid indices of the point under the pointer, if any. */
+		let probe: [number, number] | null = null;
+		/** Projection and theme from the last full render, reused to redraw just the probe. */
+		let view: { P: (p: Vec3) => Screen; t: ReturnType<typeof theme> } | null = null;
+
+		/** Builds the projection for the current view and plot size. */
+		function camera(w: number, h: number) {
+			const [cy, syw, cp, sp] = [Math.cos(yaw), Math.sin(yaw), Math.cos(pitch), Math.sin(pitch)];
+			// Leave room around the box for tick labels and axis titles.
+			const scale = Math.min(w / 2 - 40, h / 2 - 20) / 1.55;
+			return ([x, y, zz]: Vec3): Screen => {
+				// Rotate about the vertical axis, then tilt the viewer up by `pitch`.
+				const xr = x * cy - y * syw;
+				const yr = x * syw + y * cy;
+				const up = zz * cp + yr * sp;
+				return { px: w / 2 + xr * scale, py: h / 2 - up * scale, depth: yr * cp - zz * sp };
+			};
+		}
+
+		function render() {
+			if (!plot || !tip) return;
+			const w = plot.clientWidth;
+			const h = plot.clientHeight;
+			svg.attr("viewBox", `0 0 ${w} ${h}`);
+			const t = theme(el);
+			const color = scaleSequential(interpolateRgbBasis(d.diverging ? t.diverging : t.ramp)).domain([z0, z1]);
+			const P = camera(w, h);
+			const line = (pts: Screen[]) => `M${pts.map((p) => `${p.px},${p.py}`).join("L")}`;
+
+			// Which side of the box is farther away: the walls go there, the axes on the near side.
+			const backX = P([1, 0, 0]).depth > P([-1, 0, 0]).depth ? 1 : -1;
+			const backY = P([0, 1, 0]).depth > P([0, -1, 0]).depth ? 1 : -1;
+			const xTicks = sx.ticks(5);
+			const yTicks = sy.ticks(5);
+			const zTicks = sz.ticks(5);
+
+			// ---- Box: floor and the two back walls, each with gridlines at the ticks.
+			const boxLines: Screen[][] = [];
+			for (const v of xTicks) {
+				boxLines.push([P([sx(v), -1, -H]), P([sx(v), 1, -H])]); // floor
+				boxLines.push([P([sx(v), backY, -H]), P([sx(v), backY, H])]); // back wall y = backY
+			}
+			for (const v of yTicks) {
+				boxLines.push([P([-1, sy(v), -H]), P([1, sy(v), -H])]);
+				boxLines.push([P([backX, sy(v), -H]), P([backX, sy(v), H])]);
+			}
+			for (const v of zTicks) {
+				boxLines.push([P([-1, backY, sz(v)]), P([1, backY, sz(v)])]);
+				boxLines.push([P([backX, -1, sz(v)]), P([backX, 1, sz(v)])]);
+			}
+			gBox
+				.selectAll("path.grid")
+				.data(boxLines)
+				.join("path")
+				.attr("class", "grid")
+				.attr("d", line)
+				.attr("stroke", t.grid)
+				.attr("stroke-opacity", 0.6);
+			const panes: Vec3[][] = [
+				[[-1, -1, -H], [1, -1, -H], [1, 1, -H], [-1, 1, -H]],
+				[[-1, backY, -H], [1, backY, -H], [1, backY, H], [-1, backY, H]],
+				[[backX, -1, -H], [backX, 1, -H], [backX, 1, H], [backX, -1, H]],
+			];
+			gBox
+				.selectAll("path.pane")
+				.data(panes)
+				.join("path")
+				.attr("class", "pane")
+				.attr("d", (p) => `${line(p.map(P))}Z`)
+				.attr("stroke", t.grid)
+				.attr("fill", "none");
+
+			// ---- Surface: project every grid point once, then build cells and sort far to near.
+			const screen = pos.map((row) => row.map((p) => (p ? P(p) : null)));
+			const cells: Cell[] = [];
+			for (let j = 0; j < ys.length - 1; j++) {
+				for (let i = 0; i < xs.length - 1; i++) {
+					const corners: [number, number][] = [
+						[i, j],
+						[i + 1, j],
+						[i + 1, j + 1],
+						[i, j + 1],
+					];
+					const points = corners.map(([a, b]) => screen[b][a]);
+					if (points.some((p) => !p)) continue; // hole where f is undefined
+					const pts = points as Screen[];
+					cells.push({
+						key: `${i},${j}`,
+						corners,
+						points: pts,
+						depth: (pts[0].depth + pts[1].depth + pts[2].depth + pts[3].depth) / 4,
+						z: corners.reduce((s, [a, b]) => s + (z[b][a] as number), 0) / 4,
+					});
+				}
+			}
+			cells.sort((a, b) => b.depth - a.depth);
+			gSurface
+				.selectAll<SVGPathElement, Cell>("path")
+				.data(cells, (c) => c.key)
+				.join("path")
+				.attr("d", (c) => `${line(c.points)}Z`)
+				.attr("fill", (c) => color(c.z))
+				// With the mesh off, a stroke in the cell's own colour hides the hairline seams
+				// that anti-aliasing leaves between neighbouring cells.
+				.attr("stroke", (c) => (d.mesh ? t.bg : color(c.z)))
+				.attr("stroke-width", d.mesh ? 0.6 : 0.5)
+				.attr("stroke-opacity", d.mesh ? 0.55 : 1)
+				.order();
+
+			// ---- Axes on the near edges of the floor; z on whichever side edge is leftmost.
+			const tickSel = (cls: string, items: { p: Screen; text: string; anchor: string }[]) =>
+				gAxes
+					.selectAll<SVGTextElement, unknown>(`text.${cls}`)
+					.data(items)
+					.join("text")
+					.attr("class", cls)
+					.attr("x", (a) => a.p.px)
+					.attr("y", (a) => a.p.py)
+					.attr("text-anchor", (a) => a.anchor)
+					.attr("dominant-baseline", "middle")
+					.text((a) => a.text);
+			// Anchor labels away from the box: left of centre -> end, right of centre -> start.
+			const anchor = (p: Screen) => (Math.abs(p.px - w / 2) < 12 ? "middle" : p.px < w / 2 ? "end" : "start");
+			const frontY = -backY;
+			const frontX = -backX;
+			tickSel(
+				"tick",
+				[
+					...xTicks.map((v) => ({ p: P([sx(v), frontY * 1.14, -H]), text: fmt(v) })),
+					...yTicks.map((v) => ({ p: P([frontX * 1.14, sy(v), -H]), text: fmt(v) })),
+				].map((a) => ({ ...a, anchor: anchor(a.p) })),
+			);
+			// The vertical edge that sits leftmost on screen carries the z ticks.
+			const sides: [number, number][] = [
+				[backX, frontY],
+				[frontX, backY],
+			];
+			const [zxc, zyc] = sides.sort((a, b) => P([a[0], a[1], 0]).px - P([b[0], b[1], 0]).px)[0];
+			tickSel(
+				"ztick",
+				zTicks.map((v) => {
+					const p = P([zxc, zyc, sz(v)]);
+					return { p: { ...p, px: p.px - 8 }, text: fmt(v), anchor: "end" };
+				}),
+			);
+			const xt = P([0, frontY * 1.42, -H]);
+			const yt = P([frontX * 1.42, 0, -H]);
+			const zt = P([zxc, zyc, H]);
+			tickSel("axis-title", [
+				{ p: xt, text: d.xLabel, anchor: anchor(xt) },
+				{ p: yt, text: d.yLabel, anchor: anchor(yt) },
+				{ p: { ...zt, py: zt.py - 16 }, text: d.zLabel, anchor: "middle" },
+			]);
+			gAxes.selectAll("text").attr("fill", t.muted);
+			gAxes.selectAll("text.axis-title").attr("fill", t.text);
+
+			view = { P, t };
+			renderProbe();
+			renderLegend(t, color);
+		}
+
+		/** Draws the hovered grid point with a drop line to the floor, or clears it. */
+		function renderProbe() {
+			if (!view || !tip) return;
+			const { P, t } = view;
+			const hit = probe && !dragging ? pos[probe[1]][probe[0]] : null;
+			const probeData = hit ? [{ top: P(hit), foot: P([hit[0], hit[1], -H]) }] : [];
+			gProbe
+				.selectAll("line")
+				.data(probeData)
+				.join("line")
+				.attr("x1", (p) => p.top.px)
+				.attr("y1", (p) => p.top.py)
+				.attr("x2", (p) => p.foot.px)
+				.attr("y2", (p) => p.foot.py)
+				.attr("stroke", t.text)
+				.attr("stroke-dasharray", "3 3");
+			gProbe
+				.selectAll("circle")
+				.data(probeData)
+				.join("circle")
+				.attr("cx", (p) => p.top.px)
+				.attr("cy", (p) => p.top.py)
+				.attr("r", 4.5)
+				.attr("fill", t.text)
+				.attr("stroke", t.bg)
+				.attr("stroke-width", 2);
+			if (!hit) tip.hidden = true;
+		}
+
+		/** Colour bar under the plot: the z ramp with its tick values. */
+		function renderLegend(t: ReturnType<typeof theme>, color: (v: number) => string) {
+			const bar = el.querySelector<HTMLElement>(".legend-bar");
+			const ticks = el.querySelector<HTMLElement>(".legend-ticks");
+			if (!bar || !ticks) return;
+			const stops = Array.from({ length: 11 }, (_, k) => color(z0 + ((z1 - z0) * k) / 10));
+			bar.style.background = `linear-gradient(to right, ${stops.join(", ")})`;
+			select(ticks)
+				.selectAll("span")
+				.data(sz.ticks(5))
+				.join("span")
+				.style("left", (v) => `${((v - z0) / (z1 - z0)) * 100}%`)
+				.style("color", t.muted)
+				.text(fmt);
+		}
+
+		// ---- Hover: find the cell under the pointer, then its nearest corner.
+		gSurface.on("pointermove", (e: PointerEvent) => {
+			if (dragging) return;
+			const cell = select<Element, Cell>(e.target as Element).datum();
+			if (!cell) return;
+			const r = svgEl.getBoundingClientRect();
+			const mx = e.clientX - r.left;
+			const my = e.clientY - r.top;
+			let best = 0;
+			cell.points.forEach((p, k) => {
+				const q = cell.points[best];
+				if ((p.px - mx) ** 2 + (p.py - my) ** 2 < (q.px - mx) ** 2 + (q.py - my) ** 2) best = k;
+			});
+			const [i, j] = cell.corners[best];
+			probe = [i, j];
+			tip.innerHTML =
+				`<div><span>${d.xLabel}</span> ${fmt(xs[i])}</div>` +
+				`<div><span>${d.yLabel}</span> ${fmt(ys[j])}</div>` +
+				`<div><strong>${fmt(z[j][i] as number)}</strong> <span>${d.zLabel}</span></div>`;
+			tip.hidden = false;
+			// Keep the tooltip inside the plot: flip to the left of the pointer near the right edge.
+			const left = mx + 14 + tip.offsetWidth > r.width ? mx - 14 - tip.offsetWidth : mx + 14;
+			tip.style.left = `${left}px`;
+			tip.style.top = `${clamp(my - tip.offsetHeight / 2, 0, r.height - tip.offsetHeight)}px`;
+			renderProbe();
+		});
+		gSurface.on("pointerleave", () => {
+			probe = null;
+			renderProbe();
+		});
+
+		// ---- Rotate: drag anywhere on the plot, arrow keys when focused, double-click to reset.
+		const rotate = (dYaw: number, dPitch: number) => {
+			yaw += dYaw * deg;
+			pitch = clamp(pitch + dPitch * deg, 0, 90 * deg);
+			render();
+		};
+		svg.call(
+			drag<SVGSVGElement, unknown>()
+				.on("start", () => {
+					dragging = true;
+					probe = null;
+					svgEl.classList.add("dragging");
+				})
+				.on("drag", (e) => rotate(e.dx * 0.5, e.dy * 0.5))
+				.on("end", () => {
+					dragging = false;
+					svgEl.classList.remove("dragging");
+				}),
+		);
+		svg.on("dblclick", () => {
+			yaw = d.yaw * deg;
+			pitch = clamp(d.pitch, 0, 90) * deg;
+			render();
+		});
+		svg.on("keydown", (e: KeyboardEvent) => {
+			const step = e.shiftKey ? 15 : 5;
+			const move = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, step], ArrowDown: [0, -step] }[
+				e.key
+			];
+			if (!move) return;
+			e.preventDefault();
+			rotate(move[0], move[1]);
+		});
+
+		// ---- Range sliders: one per axis. Drag a handle to move that end, drag the window to
+		// pan, click the bare track to centre the window there; arrow keys move by 1% of the
+		// track (Shift: 10%). Each slider spans its axis's sampled range, or with restrictRange
+		// off, one range-width past each end.
+		const span = (a: Axis): [number, number] => {
+			const [b0, b1] = base[a];
+			return d.restrict ? [b0, b1] : [b0 - (b1 - b0), b1 + (b1 - b0)];
+		};
+		const sliders = [...el.querySelectorAll<HTMLElement>(".range-slider")].map((s) => ({
+			axis: s.dataset.axis as Axis,
+			track: s.querySelector<HTMLElement>(".track"),
+			win: s.querySelector<HTMLElement>(".window"),
+			loH: s.querySelector<HTMLElement>(".handle.lo"),
+			hiH: s.querySelector<HTMLElement>(".handle.hi"),
+			loV: s.querySelector<HTMLElement>(".slider-value.lo"),
+			hiV: s.querySelector<HTMLElement>(".slider-value.hi"),
+		}));
+
+		/** Positions each window and writes its values (snapped to the grid when cut from it). */
+		function syncSliders() {
+			for (const s of sliders) {
+				const [s0, s1] = span(s.axis);
+				const [lo, hi] = range[s.axis];
+				const frac = (v: number) => ((v - s0) / (s1 - s0)) * 100;
+				if (s.win) {
+					s.win.style.left = `${frac(lo)}%`;
+					s.win.style.width = `${frac(hi) - frac(lo)}%`;
+				}
+				if (s.loV) s.loV.textContent = fmt(lo);
+				if (s.hiV) s.hiV.textContent = fmt(hi);
+				for (const [h, v] of [
+					[s.loH, lo],
+					[s.hiH, hi],
+				] as const) {
+					h?.setAttribute("aria-valuemin", fmt(s0));
+					h?.setAttribute("aria-valuemax", fmt(s1));
+					h?.setAttribute("aria-valuenow", fmt(v)); // what screen readers announce
+				}
+			}
+		}
+
+		// What a gesture moves: one end of the window, or the whole window.
+		type Mode = "lo" | "hi" | "pan";
+		/** Moves by dv (x or y units) from the range the gesture started with, then redraws. */
+		function moveBy(a: Axis, mode: Mode, from: [number, number], dv: number) {
+			const [s0, s1] = span(a);
+			const w = minW(a);
+			let [lo, hi] = from;
+			if (mode === "lo") lo = clamp(lo + dv, s0, hi - w);
+			else if (mode === "hi") hi = clamp(hi + dv, lo + w, s1);
+			else {
+				const width = hi - lo;
+				lo = clamp(lo + dv, s0, s1 - width);
+				hi = lo + width;
+			}
+			range[a] = [lo, hi];
+			load();
+			render();
+		}
+
+		for (const s of sliders) {
+			const { axis: a, track, win, loH, hiH } = s;
+			if (!track || !win || !loH || !hiH) continue;
+			const [s0, s1] = span(a);
+			// Pixels on the track -> x or y units.
+			const toUnits = (px: number) => (px / track.clientWidth) * (s1 - s0);
+			// The drag in progress: where the pointer went down and the range at that moment.
+			// Measuring from the start, not the last event, keeps a drag from drifting (and from
+			// sticking when the range snaps to the grid).
+			let gesture: { mode: Mode; x: number; from: [number, number] } | null = null;
+			const targets: [HTMLElement, Mode][] = [
+				[loH, "lo"],
+				[hiH, "hi"],
+				[win, "pan"],
+			];
+			for (const [target, mode] of targets) {
+				target.addEventListener("pointerdown", (e) => {
+					e.preventDefault(); // no text selection while dragging
+					e.stopPropagation(); // a handle sits inside the window; don't also start a pan
+					// Keep receiving moves even when the pointer leaves the element mid-drag.
+					target.setPointerCapture(e.pointerId);
+					gesture = { mode, x: e.clientX, from: [...range[a]] };
+				});
+				target.addEventListener("pointermove", (e) => {
+					if (gesture?.mode === mode) moveBy(a, mode, gesture.from, toUnits(e.clientX - gesture.x));
+				});
+				const end = () => {
+					gesture = null;
+				};
+				target.addEventListener("pointerup", end);
+				target.addEventListener("pointercancel", end);
+				target.addEventListener("keydown", (e) => {
+					const dir = { ArrowLeft: -1, ArrowDown: -1, ArrowRight: 1, ArrowUp: 1 }[e.key];
+					if (!dir) return;
+					e.preventDefault();
+					e.stopPropagation();
+					moveBy(a, mode, [...range[a]], dir * (e.shiftKey ? 0.1 : 0.01) * (s1 - s0));
+				});
+			}
+			// Clicking the bare track centres the window there.
+			track.addEventListener("pointerdown", (e) => {
+				if (e.target !== track) return;
+				const r = track.getBoundingClientRect();
+				const [lo, hi] = range[a];
+				const at = s0 + toUnits(e.clientX - r.left);
+				moveBy(a, "pan", [lo, hi], at - (lo + hi) / 2);
+			});
+		}
+		el.querySelector("button.reset")?.addEventListener("click", () => {
+			range.x = [...base.x];
+			range.y = [...base.y];
+			load();
+			render();
+		});
+
+		new ResizeObserver(render).observe(plot);
+		matchMedia("(prefers-color-scheme: dark)").addEventListener("change", render);
+		load();
+		render();
+	}
+
+	for (const el of document.querySelectorAll<HTMLElement>(".surface-plot")) setup(el);
+</script>
+
+<style>
+	/* Sequential: one blue hue, light (low) to dark (high); diverging: blue, grey at zero, red. */
+	.surface-plot {
+		--ramp: #cde2fb #86b6ef #3987e5 #256abf #104281;
+		--diverging: #2a78d6 #86b6ef #f0efec #ef9a8c #e34948;
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+	}
+	@media (prefers-color-scheme: dark) {
+		/* On the dark surface the low end recedes toward it, so the ramp runs dark to light. */
+		.surface-plot {
+			--ramp: #104281 #256abf #3987e5 #86b6ef #cde2fb;
+			--diverging: #3987e5 #255a96 #383835 #9a3c3c #e66767;
+		}
+	}
+	.title {
+		margin-bottom: 0.4rem;
+		font-size: 0.9rem;
+		font-weight: 600;
+		color: var(--text);
+	}
+	.plot {
+		position: relative;
+		width: 100%;
+	}
+	svg {
+		display: block;
+		width: 100%;
+		height: 100%;
+		cursor: grab;
+		touch-action: none;
+		user-select: none;
+		font-size: 11px;
+	}
+	svg.dragging {
+		cursor: grabbing;
+	}
+	svg :global(.probe),
+	svg :global(.axes) {
+		pointer-events: none;
+	}
+	svg:focus-visible {
+		outline: 2px solid var(--accent);
+		outline-offset: 2px;
+		border-radius: 6px;
+	}
+	svg :global(.axis-title) {
+		font-size: 12px;
+		font-weight: 600;
+	}
+	svg :global(.grid),
+	svg :global(.pane) {
+		fill: none;
+		stroke-width: 1;
+	}
+	.tooltip {
+		position: absolute;
+		pointer-events: none;
+		padding: 0.35rem 0.55rem;
+		font-size: 0.75rem;
+		line-height: 1.45;
+		font-family: var(--mono);
+		color: var(--text);
+		background: var(--bg);
+		border: 1px solid var(--faint);
+		border-radius: 6px;
+		white-space: nowrap;
+	}
+	.tooltip :global(span) {
+		color: var(--muted);
+	}
+	.footer {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		justify-content: space-between;
+		gap: 0.5rem 1.5rem;
+		margin-top: 0.4rem;
+		font-size: 0.75rem;
+		color: var(--muted);
+	}
+	.legend {
+		display: flex;
+		align-items: flex-start;
+		gap: 0.6rem;
+	}
+	.legend-label {
+		line-height: 0.6rem;
+		color: var(--text);
+	}
+	.legend-scale {
+		width: 12rem;
+	}
+	.legend-bar {
+		height: 0.6rem;
+		border-radius: 3px;
+	}
+	.legend-ticks {
+		position: relative;
+		height: 1.1rem;
+	}
+	.range-sliders {
+		display: flex;
+		flex-direction: column;
+		gap: 0.7rem;
+		margin-top: 0.8rem;
+		font-size: 0.8rem;
+		color: var(--muted);
+	}
+	.range-slider {
+		display: grid;
+		grid-template-columns: 2.5rem 4rem 1fr 4rem;
+		align-items: center;
+		gap: 0.6rem;
+	}
+	.slider-label {
+		color: var(--text);
+	}
+	.slider-value {
+		font-family: var(--mono);
+		font-size: 0.75rem;
+	}
+	.slider-value.lo {
+		text-align: right;
+	}
+	.range-sliders button {
+		align-self: flex-end;
+		padding: 0.25rem 0.7rem;
+		font: inherit;
+		color: var(--text);
+		background: var(--surface);
+		border: 1px solid var(--faint);
+		border-radius: 6px;
+		cursor: pointer;
+	}
+	.range-sliders button:focus-visible {
+		outline: 2px solid var(--accent);
+		outline-offset: 1px;
+	}
+	.track {
+		position: relative;
+		height: 0.9rem;
+		border-radius: 999px;
+		background: var(--surface);
+		border: 1px solid var(--faint);
+		cursor: pointer;
+		touch-action: none;
+	}
+	.window {
+		position: absolute;
+		top: -1px;
+		bottom: -1px;
+		border-radius: 999px;
+		background: color-mix(in oklch, var(--accent) 20%, transparent);
+		border: 1px solid color-mix(in oklch, var(--accent) 55%, transparent);
+		cursor: grab;
+		touch-action: none;
+	}
+	.window:active {
+		cursor: grabbing;
+	}
+	.handle {
+		position: absolute;
+		top: 50%;
+		width: 0.55rem;
+		height: 1.4rem;
+		margin-top: -0.7rem;
+		border-radius: 999px;
+		background: var(--bg);
+		border: 1.5px solid var(--accent);
+		cursor: ew-resize;
+		touch-action: none;
+	}
+	.handle.lo {
+		left: -0.3rem;
+	}
+	.handle.hi {
+		right: -0.3rem;
+	}
+	.window:focus-visible,
+	.handle:focus-visible {
+		outline: 2px solid var(--accent);
+		outline-offset: 2px;
+	}
+	.legend-ticks :global(span) {
+		position: absolute;
+		top: 0.15rem;
+		transform: translateX(-50%);
+		font-family: var(--mono);
+		font-size: 0.68rem;
+	}
+</style>

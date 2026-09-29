@@ -16,6 +16,7 @@
     "@dagrejs/dagre": "^3.1.1",
     "astro": "^7.3.5",
     "chart.js": "^4.5.1",
+    "d3": "^7.9.0",
     "katex": "~0.16.47",
     "rehype-katex": "^7.0.1",
     "remark-math": "^6.0.0",
@@ -24,6 +25,7 @@
   "devDependencies": {
     "@astrojs/check": "^0.9.10",
     "@biomejs/biome": "^1.9.4",
+    "@types/d3": "^7.4.3",
     "typescript": "^5.9.3"
   }
 }
