@@ -1,0 +1,1725 @@
+---
+// A general GPU and one SM running a tiled GEMM, C = A·B, one instruction at a time.
+//
+// One row, left to right, the way the data flows: global memory (HBM) holding A, B and C; L2;
+// and one SM: its shared memory, drawn as rows of banks with each element at the offset its CuTe
+// layout gives it, then its sub-partitions, one warp each, with the warp's register fragments,
+// tensor core and CUDA cores. Stepping through the kernel lights up the units and data paths
+// each instruction uses and the cells it reads and writes: cp.async (global → shared), ldmatrix
+// (shared → registers), mma.sync (tensor cores), the epilogue (CUDA cores) and st.global.
+// Register cells show real values, so the accumulators build up the product.
+//
+// The reader picks blockIdx (which tile of C) and threadIdx.x; the chosen thread's own elements
+// are outlined in every step. The schedule is rebuilt in the browser, see gemmSchedule.ts.
+// Usage in .mdx:
+//   <GpuGemmDataflow M={32} N={32} K={16} BM={16} BN={16} BK={8} warps={[1, 2]} />
+import { CuteLayout } from "../matrix/CuteLayout";
+import {
+	type CopyEngine,
+	type GemmLayouts,
+	type StepKind,
+	type Swizzle,
+	WARP,
+	buildSchedule,
+	isPtxAtom,
+	kernelCode,
+} from "./gemmSchedule";
+
+interface Props {
+	M?: number;
+	N?: number;
+	K?: number;
+	BM?: number;
+	BN?: number;
+	BK?: number;
+	/** Warp grid over the C tile; one warp per SM sub-partition. */
+	warps?: [number, number];
+	/** MMA atom [m, n, k]; [16, 8, 8] and [16, 8, 16] use the PTX fragment layouts. */
+	mma?: [number, number, number];
+	/** Initial blockIdx [x, y]: x walks tiles along M, y along N. */
+	block?: [number, number];
+	/** Initial threadIdx.x. */
+	thread?: number;
+	/** Global-memory layouts; row-major (M,K):(K,1), (K,N):(N,1), (M,N):(N,1) by default. */
+	gA?: CuteLayout;
+	gB?: CuteLayout;
+	gC?: CuteLayout;
+	/** Shared-memory layouts; row-major (BM,BK):(BK,1), (BK,BN):(BN,1) by default. */
+	sA?: CuteLayout;
+	sB?: CuteLayout;
+	swizzle?: Swizzle;
+	/** Shared-memory banks per drawn row. */
+	banks?: number;
+	/** Elements per cp.async. */
+	vec?: number;
+	/** Global → shared copy engine: per-thread cp.async (Ampere) or TMA (Hopper). */
+	copy?: CopyEngine;
+	/** Seed for the small integer entries of A and B. */
+	seed?: number;
+	/** Step shown first. */
+	step?: number;
+	title?: string;
+}
+
+const {
+	M = 32,
+	N = 32,
+	K = 16,
+	BM = 16,
+	BN = 16,
+	BK = 8,
+	warps: [warpsM, warpsN] = [1, 2],
+	mma: [mmaM, mmaN, mmaK] = [16, 8, 8],
+	block: [blockM, blockN] = [1, 0],
+	thread = 0,
+	banks = 16,
+	vec = 8,
+	copy = "cp.async",
+	seed = 7,
+	step = 0,
+	title,
+} = Astro.props;
+
+const layouts: GemmLayouts = {
+	gA: Astro.props.gA ?? new CuteLayout([M, K], [K, 1]),
+	gB: Astro.props.gB ?? new CuteLayout([K, N], [N, 1]),
+	gC: Astro.props.gC ?? new CuteLayout([M, N], [N, 1]),
+	sA: Astro.props.sA ?? new CuteLayout([BM, BK], [BK, 1]),
+	sB: Astro.props.sB ?? new CuteLayout([BK, BN], [BN, 1]),
+	swizzle: Astro.props.swizzle,
+};
+
+// Small integers 0..2, so every product fits in a cell.
+let s = seed >>> 0;
+const rand = () => {
+	s = (s * 1664525 + 1013904223) >>> 0;
+	return Math.floor((s / 2 ** 32) * 3);
+};
+const A = Array.from({ length: M }, () => Array.from({ length: K }, rand));
+const B = Array.from({ length: K }, () => Array.from({ length: N }, rand));
+
+// Built here to validate the configuration; the browser rebuilds it for each input.
+const shape = { M, N, K, BM, BN, BK, warpsM, warpsN, mmaM, mmaN, mmaK, blockM, blockN, vec, copy };
+const tma = copy === "tma";
+const { steps, smem, WM, WN, warps, threads } = buildSchedule(shape, layouts, A, B, thread);
+const config = { shape, layouts, A, B };
+
+/** The instruction behind each kind of step, e.g. "TMA" or "cp.async" for g2s. */
+const opOf = (k: StepKind) => steps.find((st) => st.kind === k)?.op ?? k;
+const KIND_LEGEND: [StepKind, string][] = [
+	["g2s", "global → shared"],
+	["sync", tma ? "wait for the tiles" : "barrier"],
+	["s2r", "shared → registers"],
+	["mma", "tensor cores"],
+	["epilogue", "CUDA cores"],
+	...(tma
+		? ([
+				["r2s", "registers → shared"],
+				["s2g", "shared → global"],
+			] as [StepKind, string][])
+		: ([["r2g", "registers → global"]] as [StepKind, string][])),
+];
+
+// ---- Geometry (px). One row of cards: global memory, L2, SM.
+const CG = Math.max(6, Math.min(14, Math.floor(480 / (K + N))));
+const CS = 14;
+const CR = Math.max(8, Math.min(14, Math.floor(160 / Math.max(WM, WN, mmaK))));
+const PAD = 16;
+const IN = 14;
+const HEAD = 42;
+const SUBHEAD = 36;
+const LBL = 16;
+const MGAP = 16;
+const COLGAP = 48;
+const L2W = 40;
+const BUS = 40;
+const values = CG >= 10;
+const top = PAD;
+
+// Global memory: B above C, A to the left of C, like the GEMM it holds.
+const gX = PAD;
+const gmemW = IN + K * CG + MGAP + N * CG + IN;
+const gmemH = HEAD + LBL + K * CG + MGAP + LBL + M * CG + IN;
+const gx = gX + IN;
+const mat = {
+	gB: { x: gx + K * CG + MGAP, y: top + HEAD + LBL },
+	gA: { x: gx, y: top + HEAD + LBL + K * CG + MGAP + LBL },
+	gC: { x: gx + K * CG + MGAP, y: top + HEAD + LBL + K * CG + MGAP + LBL },
+};
+
+const l2X = gX + gmemW + COLGAP;
+
+// SM: shared-memory panel, then the sub-partitions.
+const smX = l2X + L2W + COLGAP;
+// With TMA, the SM gets a TMA unit between L2 and shared memory.
+const TMAW = 40;
+const tmaX = smX + IN;
+const smemPX = tma ? tmaX + TMAW + 28 : smX + IN;
+const smemPY = top + HEAD;
+const smemRows = Math.ceil(smem.size / banks);
+const smemW = banks * CS;
+const smemH = smemRows * CS;
+const smemPW = Math.max(IN + smemW + IN, 214);
+const sx = smemPX + (smemPW - smemW) / 2;
+const sy = smemPY + SUBHEAD + 14;
+const legendY = sy + smemH + 20;
+// With TMA the legend has an extra row for sC.
+const legendC = tma ? 30 : 0;
+const smemPH = SUBHEAD + 14 + smemH + 20 + 124 + legendC;
+
+// Sub-partition: register fragments arranged like a small GEMM (rB above acc, rA to its left),
+// then the scheduler, tensor core and CUDA cores to the right.
+const regsW = mmaK * CR + 6 + WN * CR;
+const regsH = LBL + mmaK * CR + 6 + WM * CR;
+const SIDE = 88;
+const TCH = 50;
+const CORE = 8;
+const CORE_COLS = 8;
+const CORE_ROWS = 4;
+const PH = 34;
+const partW = 12 + regsW + 8 + 16 + SIDE + 12;
+const sideH = 26 + TCH + 24 + CORE_ROWS * (CORE + 2);
+const partH = PH + Math.max(regsH + 8, sideH) + 14;
+const partRows = warps <= 2 ? warps : 2;
+const partCols = Math.ceil(warps / partRows);
+const partsW = partCols * partW + (partCols - 1) * 12;
+const partsH = partRows * partH + (partRows - 1) * 12;
+const pX0 = smemPX + smemPW + COLGAP - 8;
+
+const smW = smemPX - smX + smemPW + COLGAP - 8 + partsW + IN;
+const rowH = Math.max(gmemH, HEAD + Math.max(smemPH, partsH) + IN);
+const W = smX + smW + PAD;
+const busY = top + rowH + BUS / 2 + 4;
+const H = top + rowH + BUS + PAD;
+
+const parts = Array.from({ length: warps }, (_, w) => {
+	const x = pX0 + Math.floor(w / partRows) * (partW + 12);
+	const y = top + HEAD + (w % partRows) * (partH + 12);
+	const rx = x + 12;
+	const ry = y + PH;
+	const side = rx + regsW + 4 + 16;
+	return {
+		w,
+		x,
+		y,
+		rB: { x: rx + mmaK * CR + 6, y: ry + LBL },
+		rA: { x: rx, y: ry + LBL + mmaK * CR + 6 },
+		acc: { x: rx + mmaK * CR + 6, y: ry + LBL + mmaK * CR + 6 },
+		regs: { x: rx - 4, y: ry - 4, w: regsW + 8, h: regsH + 8 },
+		sched: { x: side, y: ry },
+		tc: { x: side, y: ry + 26 },
+		cores: { x: side, y: ry + 26 + TCH + 24 },
+	};
+});
+
+/** A card's header band: a rectangle with only its top corners rounded. */
+const band = (x: number, y: number, w: number, h: number, r = 10) =>
+	`M${x},${y + h} V${y + r} Q${x},${y} ${x + r},${y} H${x + w - r} Q${x + w},${y} ${x + w},${y + r} V${y + h} Z`;
+
+// ---- Cells.
+const gmemCells = [
+	...A.flatMap((row, i) =>
+		row.map((v, k) => ({
+			g: "gA",
+			r: i,
+			c: k,
+			x: mat.gA.x + k * CG,
+			y: mat.gA.y + i * CG,
+			text: `${v}`,
+			tip: `A(${i},${k}) = ${v} · offset ${layouts.gA.offset(i, k)}`,
+			tone: "a",
+		})),
+	),
+	...B.flatMap((row, k) =>
+		row.map((v, j) => ({
+			g: "gB",
+			r: k,
+			c: j,
+			x: mat.gB.x + j * CG,
+			y: mat.gB.y + k * CG,
+			text: `${v}`,
+			tip: `B(${k},${j}) = ${v} · offset ${layouts.gB.offset(k, j)}`,
+			tone: "b",
+		})),
+	),
+	...Array.from({ length: M * N }, (_, idx) => {
+		const i = Math.floor(idx / N);
+		const j = idx % N;
+		return {
+			g: "gC",
+			r: i,
+			c: j,
+			x: mat.gC.x + j * CG,
+			y: mat.gC.y + i * CG,
+			text: "",
+			tip: `C(${i},${j}) · offset ${layouts.gC.offset(i, j)}`,
+			tone: "c other",
+		};
+	}),
+];
+
+const slots: ({ g: "sA" | "sB" | "sC"; r: number; c: number } | undefined)[] = Array(smem.size).fill(undefined);
+smem.sA.forEach((row, i) =>
+	row.forEach((off, k) => {
+		slots[off] = { g: "sA", r: i, c: k };
+	}),
+);
+smem.sB.forEach((row, k) =>
+	row.forEach((off, j) => {
+		slots[off] = { g: "sB", r: k, c: j };
+	}),
+);
+smem.sC?.forEach((row, i) =>
+	row.forEach((off, j) => {
+		slots[off] = { g: "sC", r: i, c: j };
+	}),
+);
+const smemCells = slots.map((cell, off) => ({
+	off,
+	x: sx + (off % banks) * CS,
+	y: sy + Math.floor(off / banks) * CS,
+	cell,
+}));
+
+const regCells = parts.flatMap((p) => [
+	...Array.from({ length: WM * mmaK }, (_, idx) => ({
+		w: p.w,
+		g: "rA",
+		r: Math.floor(idx / mmaK),
+		c: idx % mmaK,
+		idx,
+		x: p.rA.x + (idx % mmaK) * CR,
+		y: p.rA.y + Math.floor(idx / mmaK) * CR,
+		tone: "a",
+	})),
+	...Array.from({ length: mmaK * WN }, (_, idx) => ({
+		w: p.w,
+		g: "rB",
+		r: Math.floor(idx / WN),
+		c: idx % WN,
+		idx: WM * mmaK + idx,
+		x: p.rB.x + (idx % WN) * CR,
+		y: p.rB.y + Math.floor(idx / WN) * CR,
+		tone: "b",
+	})),
+	...Array.from({ length: WM * WN }, (_, idx) => ({
+		w: p.w,
+		g: "acc",
+		r: Math.floor(idx / WN),
+		c: idx % WN,
+		idx: WM * mmaK + mmaK * WN + idx,
+		x: p.acc.x + (idx % WN) * CR,
+		y: p.acc.y + Math.floor(idx / WN) * CR,
+		tone: "c",
+	})),
+]);
+
+// ---- Data paths, left to right, plus the store bus back along the bottom.
+const yF = sy + smemH / 2;
+const gCx = mat.gC.x + (N * CG) / 2;
+const curve = (x1: number, y1: number, x2: number, y2: number) => {
+	const dx = (x2 - x1) / 2;
+	return `M${x1},${y1} C${x1 + dx},${y1} ${x2 - dx},${y2} ${x2},${y2}`;
+};
+const flows: { id: string; d: string; len: number; both?: boolean; cmd?: boolean }[] = [
+	{ id: "g2l2", d: `M${gX + gmemW},${yF} H${l2X - 3}`, len: COLGAP },
+	...(tma
+		? [
+				{ id: "l22t", d: `M${l2X + L2W},${yF} H${tmaX - 3}`, len: COLGAP + IN },
+				{ id: "t2s", d: `M${tmaX + TMAW},${yF} H${smemPX - 3}`, len: 28 },
+				// Thread 0 (warp 0) issuing the bulk copies: along the top of the shared-memory panel.
+				{
+					id: "issue",
+					d: `M${pX0 + 40},${top + HEAD - 1} V${top + HEAD - 4} H${tmaX + TMAW / 2} V${smemPY - 1}`,
+					len: pX0 + 40 - tmaX,
+					cmd: true,
+				},
+			]
+		: [{ id: "l22s", d: `M${l2X + L2W},${yF} H${smemPX - 3}`, len: COLGAP + IN }]),
+	// The TMA store's way back, just below the way in.
+	...(tma
+		? [
+				{ id: "s2t", d: `M${smemPX},${yF + 16} H${tmaX + TMAW + 3}`, len: 28 },
+				{ id: "t2l", d: `M${tmaX},${yF + 16} H${l2X + L2W + 3}`, len: COLGAP + IN },
+				{ id: "l2g", d: `M${l2X},${yF + 16} H${gX + gmemW + 3}`, len: COLGAP },
+			]
+		: []),
+	...parts.flatMap((p) => {
+		const x1 = smemPX + smemPW;
+		const y1 = yF + (p.w - (warps - 1) / 2) * 14;
+		const y2 = p.regs.y + p.regs.h / 2;
+		const right = p.regs.x + p.regs.w;
+		return [
+			{ id: `s2r${p.w}`, d: curve(x1, y1, p.x - 3, y2), len: Math.hypot(p.x - x1, y2 - y1) },
+			{ id: `r2s${p.w}`, d: curve(p.x, y2 + 12, x1 + 3, y1 + 16), len: Math.hypot(p.x - x1, y2 - y1) },
+			{ id: `r2tc${p.w}`, d: `M${right + 1},${p.tc.y + TCH / 2} H${p.tc.x - 3}`, len: 16, both: true },
+			{
+				id: `r2cc${p.w}`,
+				d: `M${right + 1},${p.cores.y + (CORE_ROWS * (CORE + 2)) / 2} H${p.cores.x - 3}`,
+				len: 16,
+			},
+		];
+	}),
+	...(tma
+		? []
+		: [
+				{
+					id: "cc2g",
+					d: `M${pX0 + partsW / 2},${top + rowH} V${busY} H${gCx} V${mat.gC.y + M * CG + 3}`,
+					len: pX0 + partsW / 2 - gCx,
+				},
+			]),
+];
+
+const hash = [...JSON.stringify(Astro.props)].reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 11).toString(36);
+const id = (name: string) => `gg-${hash}-${name}`;
+const start = Math.max(0, Math.min(steps.length - 1, step));
+// [code, comment] per line; the <pre> is written on one line so no template whitespace leaks in.
+const codeLines = kernelCode(copy).code.map((line) => {
+	const at = line.indexOf("//");
+	return at < 0 ? [line, ""] : [line.slice(0, at), line.slice(at)];
+});
+---
+
+<figure class="gpu-gemm" data-start={start}>
+	{title && <figcaption class="title">{title}</figcaption>}
+	<script type="application/json" set:html={JSON.stringify(config)} />
+
+	<div class="canvas-wrap">
+		<span class="scroll-hint" aria-hidden="true">scroll →</span>
+		<div class="canvas">
+		<svg
+			viewBox={`0 0 ${W} ${H}`}
+			width={W}
+			height={H}
+			role="img"
+			aria-label={title ?? `An SM computing one ${BM}×${BN} tile of a ${M}×${N}×${K} GEMM`}
+		>
+			<defs>
+				<marker id={id("arrow")} viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+					<path d="M0,0 L8,4 L0,8 z" class="arrowhead" />
+				</marker>
+				<marker id={id("arrow-on")} viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+					<path d="M0,0 L8,4 L0,8 z" class="arrowhead on" />
+				</marker>
+				<filter id={id("shadow")} x="-5%" y="-5%" width="110%" height="110%">
+					<feDropShadow dx="0" dy="1.5" stdDeviation="2" flood-color="#000" flood-opacity="0.12" />
+				</filter>
+			</defs>
+
+			<!-- Global memory -->
+			<g class="card mem" data-unit="gmem" style="--tint: 250">
+				<rect class="card-bg" x={gX} y={top} width={gmemW} height={rowH} rx="10" filter={`url(#${id("shadow")})`} />
+				<path class="card-band" d={band(gX, top, gmemW, HEAD - 8)} />
+				<text class="card-title" x={gX + IN} y={top + 16}>GLOBAL MEMORY</text>
+				<text class="card-spec" x={gX + IN} y={top + 28}>HBM · e.g. H100: 80 GB at ~3.35 TB/s</text>
+			</g>
+			<g class="notes">
+				<text class="eq" x={gx} y={top + HEAD + LBL + 4}>C = A · B</text>
+				<text class="note" x={gx} y={top + HEAD + LBL + 24}>gA {`${layouts.gA}`}</text>
+				<text class="note" x={gx} y={top + HEAD + LBL + 37}>gB {`${layouts.gB}`}</text>
+				<text class="note" x={gx} y={top + HEAD + LBL + 50}>gC {`${layouts.gC}`}</text>
+				<text class="note strong" x={gx} y={top + HEAD + LBL + 72}>this CTA</text>
+				<text class="note cta-note" x={gx} y={top + HEAD + LBL + 85}></text>
+			</g>
+			<g class="mat-label">
+				<text x={mat.gA.x} y={mat.gA.y - 5}><tspan class="ml a">A</tspan> {M}×{K}</text>
+				<text x={mat.gB.x} y={mat.gB.y - 5}><tspan class="ml b">B</tspan> {K}×{N}</text>
+				<text x={mat.gC.x} y={mat.gC.y - 5}><tspan class="ml c">C</tspan> {M}×{N}</text>
+			</g>
+			<g class="cells">
+				{
+					gmemCells.map((c) => (
+						<g class={`cell ${c.tone}`} data-g={c.g} data-r={c.r} data-c={c.c}>
+							<title>{c.tip}</title>
+							<rect x={c.x + 0.5} y={c.y + 0.5} width={CG - 1} height={CG - 1} rx="1.5" />
+							{values && (
+								<text x={c.x + CG / 2} y={c.y + CG / 2 + CG * 0.21} style={`font-size: ${CG * 0.58}px`}>
+									{c.text}
+								</text>
+							)}
+						</g>
+					))
+				}
+			</g>
+			<rect
+				class="cta-tile"
+				data-x0={mat.gC.x}
+				data-y0={mat.gC.y}
+				data-cg={CG}
+				x={mat.gC.x - 1}
+				y={mat.gC.y - 1}
+				width={BN * CG + 2}
+				height={BM * CG + 2}
+				rx="3"
+			/>
+
+			<!-- L2 -->
+			<g class="card cache" data-unit="l2" style="--tint: 200">
+				<rect class="card-bg" x={l2X} y={top} width={L2W} height={rowH} rx="10" filter={`url(#${id("shadow")})`} />
+				<text
+					class="card-title"
+					x={l2X + L2W / 2 + 4}
+					y={top + rowH / 2}
+					text-anchor="middle"
+					transform={`rotate(-90 ${l2X + L2W / 2 + 4} ${top + rowH / 2})`}
+				>
+					L2 CACHE · SHARED BY ALL SMs · e.g. 50 MB
+				</text>
+			</g>
+
+			<!-- SM -->
+			<g class="card sm" style="--tint: 295">
+				<rect class="card-bg" x={smX} y={top} width={smW} height={rowH} rx="12" filter={`url(#${id("shadow")})`} />
+				<path class="card-band" d={band(smX, top, smW, HEAD - 8, 12)} />
+				<text class="card-title" x={smX + IN} y={top + 16}>STREAMING MULTIPROCESSOR (SM)</text>
+				<text class="card-spec sm-note" x={smX + IN} y={top + 28}></text>
+			</g>
+
+			<g class="card panel" data-unit="smem" style="--tint: 275">
+				<rect class="card-bg" x={smemPX} y={smemPY} width={smemPW} height={rowH - HEAD - IN} rx="8" />
+				<text class="card-title" x={smemPX + 12} y={smemPY + 16}>SHARED MEMORY</text>
+				<text class="card-spec" x={smemPX + 12} y={smemPY + 28}>e.g. up to 228 KB per SM · 32 banks</text>
+			</g>
+			{
+				tma && (
+					<g class="unit mbar" data-unit="mbar">
+						<rect x={smemPX + smemPW - 64} y={smemPY + 6} width="54" height="14" rx="7" />
+						<text x={smemPX + smemPW - 37} y={smemPY + 15.5}>
+							mbarrier
+						</text>
+					</g>
+				)
+			}
+			{
+				tma && (
+					<g class="card tma-unit" data-unit="tma" style="--tint: 25">
+						<rect class="card-bg" x={tmaX} y={smemPY} width={TMAW} height={rowH - HEAD - IN} rx="8" />
+						<text
+							class="card-title"
+							x={tmaX + TMAW / 2 + 4}
+							y={smemPY + (rowH - HEAD - IN) / 2}
+							text-anchor="middle"
+							transform={`rotate(-90 ${tmaX + TMAW / 2 + 4} ${smemPY + (rowH - HEAD - IN) / 2})`}
+						>
+							TMA · TENSOR MEMORY ACCELERATOR
+						</text>
+					</g>
+				)
+			}
+			<g class="bank-index">
+				{
+					Array.from({ length: banks }, (_, b) => (
+						<text x={sx + b * CS + CS / 2} y={sy - 4}>
+							{b}
+						</text>
+					))
+				}
+			</g>
+			<g class="cells">
+				{
+					smemCells.map((c) =>
+						c.cell ? (
+							<g class={`cell ${{ sA: "a", sB: "b", sC: "c" }[c.cell.g]} empty`} data-g={c.cell.g} data-r={c.cell.r} data-c={c.cell.c}>
+								<title>{`${c.cell.g}(${c.cell.r},${c.cell.c}) · smem offset ${c.off} · bank ${c.off % banks}`}</title>
+								<rect x={c.x + 0.5} y={c.y + 0.5} width={CS - 1} height={CS - 1} rx="2" />
+							</g>
+						) : (
+							<rect class="unused" x={c.x + 0.5} y={c.y + 0.5} width={CS - 1} height={CS - 1} rx="2" />
+						),
+					)
+				}
+			</g>
+			<g class="smem-legend">
+				<text class="legend-cap" x={smemPX + 12} y={legendY}>{banks} banks per drawn row · hover for bank</text>
+				<rect class="swatch a" x={smemPX + 12} y={legendY + 10} width="10" height="10" rx="2" />
+				<text x={smemPX + 27} y={legendY + 19}>sA(m,k) · {BM}×{BK}</text>
+				<text class="dim" x={smemPX + 27} y={legendY + 31}>{`${layouts.sA}`}</text>
+				<rect class="swatch b" x={smemPX + 12} y={legendY + 40} width="10" height="10" rx="2" />
+				<text x={smemPX + 27} y={legendY + 49}>sB(k,n) · {BK}×{BN}</text>
+				<text class="dim" x={smemPX + 27} y={legendY + 61}>{`${layouts.sB}`}</text>
+				{
+					tma && (
+						<>
+							<rect class="swatch c" x={smemPX + 12} y={legendY + 70} width="10" height="10" rx="2" />
+							<text x={smemPX + 27} y={legendY + 79}>
+								sC(m,n) · {BM}×{BN}, for the TMA store
+							</text>
+							<text class="dim" x={smemPX + 27} y={legendY + 91}>
+								({BM},{BN}):({BN},1)
+							</text>
+						</>
+					)
+				}
+				{
+					layouts.swizzle && (
+						<text class="dim" x={smemPX + 27} y={legendY + 75 + legendC}>
+							∘ Swizzle&lt;{layouts.swizzle.bits},{layouts.swizzle.base},{layouts.swizzle.shift}&gt;
+						</text>
+					)
+				}
+				<text class="legend-cap" x={smemPX + 12} y={legendY + 95 + legendC}>resident tiles</text>
+				<text class="dim smem-label" x={smemPX + 12} y={legendY + 108 + legendC}></text>
+				<text class="dim smem-label" x={smemPX + 12} y={legendY + 120 + legendC}></text>
+			</g>
+
+			{
+				parts.map((p) => (
+					<g class="part" data-w={p.w}>
+						<rect class="part-bg" x={p.x} y={p.y} width={partW} height={partH} rx="8" />
+						<text class="part-title" x={p.x + 12} y={p.y + 15}>
+							WARP {p.w} · SUB-PARTITION {p.w}
+						</text>
+						<text class="card-spec part-sub" data-w={p.w} x={p.x + 12} y={p.y + 26} />
+						<g class="unit regs" data-unit={`rf${p.w}`}>
+							<rect x={p.regs.x} y={p.regs.y} width={p.regs.w} height={p.regs.h} rx="5" />
+						</g>
+						<text class="tiny" x={p.regs.x + 5} y={p.regs.y + 11}>
+							REGISTERS
+						</text>
+						<text class="tiny frag" x={p.rB.x} y={p.rB.y - 3}>
+							rB
+						</text>
+						<text class="tiny frag" x={p.rA.x} y={p.rA.y - 3}>
+							rA
+						</text>
+						<text class="tiny frag" x={p.acc.x} y={p.acc.y - 3}>
+							acc
+						</text>
+						<g class="chip">
+							<rect x={p.sched.x} y={p.sched.y} width={SIDE} height="17" rx="8.5" />
+							<text x={p.sched.x + SIDE / 2} y={p.sched.y + 11.5}>
+								warp scheduler
+							</text>
+						</g>
+						<g class="unit tc" data-unit={`tc${p.w}`}>
+							<rect x={p.tc.x} y={p.tc.y} width={SIDE} height={TCH} rx="6" />
+							<text class="tc-title" x={p.tc.x + SIDE / 2} y={p.tc.y + 20}>
+								Tensor Core
+							</text>
+							<text class="tc-sub" x={p.tc.x + SIDE / 2} y={p.tc.y + 34}>
+								m{mmaM}n{mmaN}k{mmaK} · f16→f32
+							</text>
+						</g>
+						<text class="tiny" x={p.cores.x} y={p.cores.y - 6}>
+							CUDA CORES · 32 FP32
+						</text>
+						<g class="unit cores" data-unit={`cc${p.w}`}>
+							{Array.from({ length: CORE_ROWS * CORE_COLS }, (_, i) => (
+								<rect
+									x={p.cores.x + (i % CORE_COLS) * (CORE + 2) + 3}
+									y={p.cores.y + Math.floor(i / CORE_COLS) * (CORE + 2)}
+									width={CORE}
+									height={CORE}
+									rx="2"
+									style={`transition-delay: ${(i % CORE_COLS) * 20}ms`}
+								/>
+							))}
+						</g>
+					</g>
+				))
+			}
+			<g class="cells">
+				{
+					regCells.map((c) => (
+						<g class={`cell reg ${c.tone} empty`} data-g={c.g} data-w={c.w} data-r={c.r} data-c={c.c} data-idx={c.idx}>
+							<title>{`warp ${c.w} · ${c.g}(${c.r},${c.c})`}</title>
+							<rect x={c.x + 0.5} y={c.y + 0.5} width={CR - 1} height={CR - 1} rx="1.5" />
+							<text x={c.x + CR / 2} y={c.y + CR / 2 + CR * 0.2} style={`font-size: ${CR * 0.55}px`} />
+						</g>
+					))
+				}
+			</g>
+
+			<g class="flows">
+				{
+					flows.map((f) => (
+						<g class={`flow${f.both ? " both" : ""}${f.cmd ? " cmd" : ""}`} data-flow={f.id}>
+							<path
+								id={id(f.id)}
+								d={f.d}
+								style={`--m: url(#${id("arrow")}); --m-on: url(#${id("arrow-on")})`}
+							/>
+							{[0, 1, 2].map((k) => (
+								<circle r="2.6">
+									<animateMotion
+										dur={`${Math.max(0.6, f.len / 110).toFixed(2)}s`}
+										begin={`${(-k * Math.max(0.6, f.len / 110)) / 3}s`}
+										repeatCount="indefinite"
+									>
+										<mpath href={`#${id(f.id)}`} />
+									</animateMotion>
+								</circle>
+							))}
+						</g>
+					))
+				}
+			</g>
+			<g class="flow-labels">
+				<text x={gX + gmemW + COLGAP / 2} y={yF - 8}>{tma ? "bulk" : "cp.async"}</text>
+				<text x={l2X + L2W + COLGAP / 2 + IN / 2} y={yF - 8}>{tma ? "tensor" : "16 B"}</text>
+				<text x={smemPX + smemPW + (COLGAP - 8) / 2} y={yF - 16}>ldmatrix</text>
+				{!tma && (
+					<text x={(gCx + pX0 + partsW / 2) / 2} y={busY - 5}>st.global · results back to C</text>
+				)}
+			</g>
+		</svg>
+		</div>
+	</div>
+
+	<div class="details">
+		<div class="step" aria-live="polite">
+			<p class="step-head">
+				<span class="badge"></span>
+				<span class="loop"></span>
+			</p>
+			<p class="step-title"></p>
+			<p class="step-text"></p>
+			<p class="mine-text"></p>
+		</div>
+		<pre class="code">{codeLines.map(([code, comment], i) => <span class="ln" data-line={i}><span class="no">{i + 1}</span>{code}{comment && <span class="cm">{comment}</span>}</span>)}</pre>
+	</div>
+
+	<div class="controls">
+		<div class="inputs">
+			<label class="field">
+				<span>blockIdx.x</span>
+				<input type="number" data-in="bx" min="0" max={M / BM - 1} value={blockM} />
+				<small>0 – {M / BM - 1} · along M</small>
+			</label>
+			<label class="field">
+				<span>blockIdx.y</span>
+				<input type="number" data-in="by" min="0" max={N / BN - 1} value={blockN} />
+				<small>0 – {N / BN - 1} · along N</small>
+			</label>
+			<label class="field">
+				<span>threadIdx.x</span>
+				<input type="number" data-in="tx" min="0" max={threads - 1} value={thread} />
+				<small class="thread-info">0 – {threads - 1}</small>
+			</label>
+			<div class="keys">
+				<span><i class="sw a"></i>A</span>
+				<span><i class="sw b"></i>B</span>
+				<span><i class="sw c"></i>C</span>
+				<span><i class="sw hl"></i>in use</span>
+				<span><i class="sw mine"></i>this thread</span>
+			</div>
+		</div>
+		<div class="player">
+			<div class="buttons">
+				<button type="button" data-act="first" aria-label="First step">
+					<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 3v10M13 3 6 8l7 5z" /></svg>
+				</button>
+				<button type="button" data-act="prev" aria-label="Previous step">
+					<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M11 3 4 8l7 5z" /></svg>
+				</button>
+				<button type="button" data-act="play" class="play" aria-label="Play">
+					<svg class="i-play" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5v11L13.5 8z" /></svg>
+					<svg class="i-pause" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 3h3v10H4zM9 3h3v10H9z" /></svg>
+				</button>
+				<button type="button" data-act="next" aria-label="Next step">
+					<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 3l7 5-7 5z" /></svg>
+				</button>
+			</div>
+			<div class="timeline" role="group" aria-label="Steps">
+				{
+					steps.map((st, i) => (
+						<button
+							type="button"
+							class="seg"
+							data-i={i}
+							data-kind={st.kind}
+							title={`${i + 1}. ${st.op}${st.kind === "init" ? "" : ` · ${st.loop}`}`}
+							aria-label={`Step ${i + 1}: ${st.op}`}
+						/>
+					))
+				}
+			</div>
+			<span class="counter"></span>
+		</div>
+		<div class="kinds">
+			{
+				KIND_LEGEND.map(([k, label]) => (
+					<span data-kind={k}>
+						<i />
+						<b>{opOf(k)}</b> {label}
+					</span>
+				))
+			}
+		</div>
+	</div>
+	<p class="summary">
+		{M}×{N}×{K} GEMM · CTA tile {BM}×{BN}×{BK} · grid {M / BM}×{N / BN} blocks of {threads} threads ({warpsM}×{warpsN}
+		warps of {WARP}) · MMA m{mmaM}n{mmaN}k{mmaK}{
+			isPtxAtom(shape) ? " with the PTX fragment layout" : ", elements dealt to lanes round-robin"
+		} · {tma ? "TMA copies (Hopper; real Hopper kernels pair TMA with wgmma)" : "cp.async copies (Ampere and later)"} · hardware figures are NVIDIA H100 SXM
+	</p>
+</figure>
+
+<script>
+	import { CuteLayout, type IntTuple } from "../matrix/CuteLayout";
+	import { buildSchedule, type GemmLayouts, type GemmShape, type Highlight, type Swizzle } from "./gemmSchedule";
+
+	type LayoutJSON = { shape: IntTuple; stride: IntTuple };
+	interface Config {
+		shape: GemmShape;
+		layouts: Record<"gA" | "gB" | "gC" | "sA" | "sB", LayoutJSON> & { swizzle?: Swizzle };
+		A: number[][];
+		B: number[][];
+	}
+
+	const inRect = (h: Highlight, g: string, w: number | undefined, r: number, c: number) =>
+		h.g === g && (h.w === undefined || h.w === w) && r >= h.r[0] && r < h.r[1] && c >= h.c[0] && c < h.c[1];
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".gpu-gemm")) {
+		const cfg: Config = JSON.parse(fig.querySelector("script[type='application/json']")?.textContent ?? "{}");
+		const L = (l: LayoutJSON) => new CuteLayout(l.shape, l.stride);
+		const layouts: GemmLayouts = {
+			gA: L(cfg.layouts.gA),
+			gB: L(cfg.layouts.gB),
+			gC: L(cfg.layouts.gC),
+			sA: L(cfg.layouts.sA),
+			sB: L(cfg.layouts.sB),
+			swizzle: cfg.layouts.swizzle,
+		};
+		const { BM, BN } = cfg.shape;
+
+		const $ = <T extends Element>(sel: string) => fig.querySelector<T>(sel);
+		const input = (name: string) => $<HTMLInputElement>(`[data-in=${name}]`);
+		const inputs = { bx: input("bx"), by: input("by"), tx: input("tx") };
+		const play = $<HTMLButtonElement>("[data-act=play]");
+		const counter = $<HTMLElement>(".counter");
+		const badge = $<HTMLElement>(".badge");
+		const loop = $<HTMLElement>(".loop");
+		const title = $<HTMLElement>(".step-title");
+		const text = $<HTMLElement>(".step-text");
+		const mineText = $<HTMLElement>(".mine-text");
+		const threadInfo = $<HTMLElement>(".thread-info");
+		const ctaNote = $<SVGTextElement>(".cta-note");
+		const smNote = $<SVGTextElement>(".sm-note");
+		const ctaTile = $<SVGRectElement>(".cta-tile");
+		const segs = [...fig.querySelectorAll<HTMLButtonElement>(".seg")];
+		const smemLabels = [...fig.querySelectorAll<SVGTextElement>(".smem-label")];
+		const partSubs = [...fig.querySelectorAll<SVGTextElement>(".part-sub")];
+		const partGroups = [...fig.querySelectorAll<SVGGElement>(".part")];
+		const units = [...fig.querySelectorAll<SVGElement>("[data-unit]")];
+		const flows = [...fig.querySelectorAll<SVGElement>("[data-flow]")];
+		const lines = [...fig.querySelectorAll<HTMLElement>(".code .ln")];
+		const cells = [...fig.querySelectorAll<SVGGElement>(".cell")].map((el) => ({
+			el,
+			g: el.dataset.g ?? "",
+			w: el.dataset.w === undefined ? undefined : Number(el.dataset.w),
+			r: Number(el.dataset.r),
+			c: Number(el.dataset.c),
+			idx: el.dataset.idx === undefined ? undefined : Number(el.dataset.idx),
+			text: el.querySelector("text"),
+		}));
+		const gC = cells.filter((c) => c.g === "gC");
+		const smem = cells.filter((c) => c.g === "sA" || c.g === "sB");
+		const sC = cells.filter((c) => c.g === "sC");
+		const regs = cells.filter((c) => c.idx !== undefined);
+
+		const wrap = $<HTMLElement>(".canvas-wrap");
+		const canvas = $<HTMLElement>(".canvas");
+		const edges = () => {
+			if (!wrap || !canvas) return;
+			wrap.classList.toggle("more-left", canvas.scrollLeft > 2);
+			wrap.classList.toggle("more-right", canvas.scrollLeft + canvas.clientWidth < canvas.scrollWidth - 2);
+		};
+		canvas?.addEventListener("scroll", edges, { passive: true });
+		if (canvas) new ResizeObserver(edges).observe(canvas);
+		// When the diagram is wider than its box, scroll the units the current step uses into view.
+		const follow = () => {
+			if (!canvas) return;
+			const on = [...fig.querySelectorAll("[data-unit].on")].map((el) => el.getBoundingClientRect());
+			if (!on.length) return;
+			const view = canvas.getBoundingClientRect();
+			const left = Math.min(...on.map((r) => r.left));
+			const right = Math.max(...on.map((r) => r.right));
+			let d = 0;
+			if (right - left > view.width || left < view.left) d = left - view.left - 16;
+			else if (right > view.right) d = right - view.right + 16;
+			if (Math.abs(d) > 1) canvas.scrollBy({ left: d, behavior: "smooth" });
+		};
+
+		let sched: ReturnType<typeof buildSchedule>;
+		let at = Number(fig.dataset.start ?? 0);
+		let timer: number | undefined;
+
+		const show = (i: number) => {
+			const { steps, C, row0, col0 } = sched;
+			at = Math.max(0, Math.min(steps.length - 1, i));
+			const s = steps[at];
+			fig.dataset.kind = s.kind;
+			for (const u of units) u.classList.toggle("on", s.units.includes(u.dataset.unit ?? ""));
+			for (const f of flows) f.classList.toggle("on", s.flows.includes(f.dataset.flow ?? ""));
+			lines.forEach((l, n) => l.classList.toggle("on", s.lines.includes(n)));
+			segs.forEach((b, n) => {
+				b.classList.toggle("on", n === at);
+				b.classList.toggle("done", n < at);
+				b.setAttribute("aria-current", n === at ? "step" : "false");
+			});
+			for (const c of cells) {
+				c.el.classList.toggle("hl", s.hl.some((h) => inRect(h, c.g, c.w, c.r, c.c)));
+				const mine = s.mine.some((h) => inRect(h, c.g, c.w, c.r, c.c));
+				c.el.classList.toggle("mine", mine);
+				// Last in document order paints on top, so the outline isn't hidden by neighbours.
+				if (mine) c.el.parentNode?.appendChild(c.el);
+			}
+			for (const c of smem) c.el.classList.toggle("empty", s.smemTile < 0);
+			for (const c of sC) c.el.classList.toggle("empty", !s.cStaged);
+			for (const c of gC) {
+				const inTile = c.r >= row0 && c.r < row0 + BM && c.c >= col0 && c.c < col0 + BN;
+				c.el.classList.toggle("other", !inTile);
+				c.el.classList.toggle("empty", inTile && !s.stored);
+				if (c.text) c.text.textContent = inTile && s.stored ? `${C[c.r - row0][c.c - col0]}` : "";
+			}
+			for (const c of regs) {
+				const v = s.regs[c.w ?? 0]?.[c.idx ?? 0];
+				const empty = v === null || v === undefined;
+				c.el.classList.toggle("empty", empty);
+				if (c.text) c.text.textContent = empty ? "" : `${v}`;
+			}
+			const label = s.smemLabel.split(" · ");
+			smemLabels.forEach((el, n) => {
+				el.textContent = label[n] ?? "";
+			});
+			if (badge) badge.textContent = s.op;
+			if (loop) loop.textContent = s.loop;
+			if (title) title.textContent = s.title;
+			if (text) text.textContent = s.text;
+			if (mineText) mineText.textContent = s.mineText;
+			if (counter) counter.textContent = `${at + 1} / ${steps.length}`;
+		};
+		const go = (i: number) => {
+			show(i);
+			follow();
+		};
+
+		const clampInput = (el: HTMLInputElement | null) => {
+			if (!el) return 0;
+			const v = Math.max(Number(el.min), Math.min(Number(el.max), Math.round(Number(el.value) || 0)));
+			el.value = `${v}`;
+			return v;
+		};
+		const rebuild = () => {
+			const blockM = clampInput(inputs.bx);
+			const blockN = clampInput(inputs.by);
+			const thread = clampInput(inputs.tx);
+			sched = buildSchedule({ ...cfg.shape, blockM, blockN }, layouts, cfg.A, cfg.B, thread);
+			const { row0, col0, WM, WN, warps, threads, thread: t } = sched;
+			const block = `(${blockM}, ${blockN})`;
+			if (ctaNote) ctaNote.textContent = `blockIdx ${block} → C[${row0}:${row0 + BM}, ${col0}:${col0 + BN}]`;
+			if (smNote) smNote.textContent = `CTA blockIdx ${block} · ${warps} warps · ${threads} threads · e.g. H100: 132 SMs`;
+			if (threadInfo) threadInfo.textContent = `warp ${t.warp} · lane ${t.lane}`;
+			if (ctaTile) {
+				const cg = Number(ctaTile.dataset.cg);
+				ctaTile.setAttribute("x", `${Number(ctaTile.dataset.x0) + col0 * cg - 1}`);
+				ctaTile.setAttribute("y", `${Number(ctaTile.dataset.y0) + row0 * cg - 1}`);
+			}
+			partSubs.forEach((el) => {
+				const w = Number(el.dataset.w);
+				const r = row0 + Math.floor(w / cfg.shape.warpsN) * WM;
+				const c = col0 + (w % cfg.shape.warpsN) * WN;
+				el.textContent = `threads ${w * 32}–${w * 32 + 31} · C[${r}:${r + WM}, ${c}:${c + WN}]`;
+			});
+			partGroups.forEach((el) => {
+				el.classList.toggle("mine-warp", Number(el.dataset.w) === t.warp);
+			});
+			show(at);
+		};
+
+		const stop = () => {
+			if (timer !== undefined) clearInterval(timer);
+			timer = undefined;
+			play?.classList.remove("playing");
+			play?.setAttribute("aria-label", "Play");
+		};
+		const start = () => {
+			if (at >= sched.steps.length - 1) go(0);
+			play?.classList.add("playing");
+			play?.setAttribute("aria-label", "Pause");
+			timer = window.setInterval(() => {
+				if (at >= sched.steps.length - 1) stop();
+				else go(at + 1);
+			}, 1800);
+		};
+
+		fig.querySelectorAll<HTMLButtonElement>("[data-act]").forEach((b) =>
+			b.addEventListener("click", () => {
+				const act = b.dataset.act;
+				if (act === "play") return timer === undefined ? start() : stop();
+				stop();
+				if (act === "first") go(0);
+				if (act === "prev") go(at - 1);
+				if (act === "next") go(at + 1);
+			}),
+		);
+		for (const b of segs)
+			b.addEventListener("click", () => {
+				stop();
+				go(Number(b.dataset.i));
+			});
+		fig.addEventListener("keydown", (e) => {
+			if (e.target instanceof HTMLInputElement) return;
+			if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+			e.preventDefault();
+			stop();
+			go(at + (e.key === "ArrowRight" ? 1 : -1));
+		});
+		for (const el of Object.values(inputs)) el?.addEventListener("change", rebuild);
+		rebuild();
+		edges();
+		if (at > 0) requestAnimationFrame(follow);
+	}
+</script>
+
+<style>
+	.gpu-gemm {
+		--ink: color-mix(in oklch, var(--text) 60%, var(--bg));
+		--hair: color-mix(in oklch, var(--text) 14%, var(--bg));
+		--card: color-mix(in oklch, var(--surface) 60%, var(--bg));
+		--empty: color-mix(in oklch, var(--text) 6%, var(--bg));
+		--thread: oklch(0.62 0.21 12);
+		--a: oklch(0.66 0.13 250);
+		--b: oklch(0.74 0.14 65);
+		--c: oklch(0.7 0.14 155);
+		margin: 2rem 0;
+		font-family: var(--sans);
+	}
+	/* Use the margin-note column too when the page has one. */
+	@media (min-width: 1081px) {
+		.gpu-gemm {
+			margin-right: calc(-1 * (var(--gap) + var(--note)));
+		}
+	}
+	.title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.6rem;
+	}
+	.canvas-wrap {
+		position: relative;
+	}
+	.canvas-wrap::before,
+	.canvas-wrap::after {
+		content: "";
+		position: absolute;
+		z-index: 1;
+		top: 1px;
+		bottom: 1px;
+		width: 3.5rem;
+		pointer-events: none;
+		opacity: 0;
+		transition: opacity 200ms ease;
+	}
+	.canvas-wrap::before {
+		left: 1px;
+		border-radius: 14px 0 0 14px;
+		background: linear-gradient(to right, var(--bg), transparent);
+	}
+	.canvas-wrap::after {
+		right: 1px;
+		border-radius: 0 14px 14px 0;
+		background: linear-gradient(to left, var(--bg), transparent);
+	}
+	.canvas-wrap.more-left::before,
+	.canvas-wrap.more-right::after,
+	.canvas-wrap.more-right .scroll-hint {
+		opacity: 1;
+	}
+	.scroll-hint {
+		position: absolute;
+		z-index: 2;
+		top: 0.6rem;
+		right: 0.7rem;
+		padding: 0.1rem 0.5rem;
+		border-radius: 999px;
+		border: 1px solid var(--hair);
+		background: var(--bg);
+		font-size: 0.66rem;
+		color: var(--muted);
+		opacity: 0;
+		pointer-events: none;
+		transition: opacity 200ms ease;
+	}
+	.canvas {
+		overflow-x: auto;
+		overscroll-behavior-x: contain;
+		border-radius: 14px;
+		background:
+			radial-gradient(circle at 1px 1px, var(--hair) 1px, transparent 0) 0 0 / 16px 16px,
+			color-mix(in oklch, var(--surface) 35%, var(--bg));
+		border: 1px solid var(--hair);
+		scrollbar-width: thin;
+	}
+	svg {
+		display: block;
+		max-width: none;
+		margin: 0 auto;
+	}
+
+	/* ---------- Cards ---------- */
+	.card-bg {
+		fill: var(--card);
+		stroke: var(--hair);
+		stroke-width: 1;
+		transition:
+			stroke 200ms ease,
+			fill 200ms ease;
+	}
+	.card-band {
+		fill: color-mix(in oklch, oklch(0.72 0.1 var(--tint)) 16%, var(--card));
+	}
+	.card-title {
+		font-size: 9.5px;
+		font-weight: 700;
+		letter-spacing: 0.09em;
+		fill: color-mix(in oklch, oklch(0.6 0.15 var(--tint)) 60%, var(--text));
+	}
+	.card-spec {
+		font-size: 8.5px;
+		fill: var(--muted);
+	}
+	.card.panel .card-bg {
+		fill: color-mix(in oklch, oklch(0.72 0.1 var(--tint)) 7%, var(--bg));
+	}
+	.card,
+	.unit {
+		transition: filter 200ms ease;
+	}
+	.card.on .card-bg,
+	.unit.on rect {
+		stroke: var(--accent);
+		stroke-width: 1.6;
+	}
+	.card.on,
+	.unit.on {
+		filter: drop-shadow(0 0 6px color-mix(in oklch, var(--accent) 45%, transparent));
+	}
+	.card.on .card-bg {
+		fill: color-mix(in oklch, var(--accent) 7%, var(--card));
+	}
+
+	/* ---------- Global-memory notes and labels ---------- */
+	.eq {
+		font-family: var(--serif);
+		font-style: italic;
+		font-size: 15px;
+		fill: var(--text);
+	}
+	.note,
+	.dim {
+		font-family: var(--mono);
+		font-size: 8.5px;
+		fill: var(--muted);
+	}
+	.note.strong {
+		font-family: var(--sans);
+		font-weight: 700;
+		letter-spacing: 0.08em;
+		text-transform: uppercase;
+		font-size: 8px;
+	}
+	.cta-note {
+		fill: var(--text);
+	}
+	.mat-label text {
+		font-size: 9px;
+		fill: var(--muted);
+	}
+	.ml {
+		font-weight: 700;
+		font-size: 11px;
+	}
+	.ml.a {
+		fill: var(--a);
+	}
+	.ml.b {
+		fill: var(--b);
+	}
+	.ml.c {
+		fill: var(--c);
+	}
+	.cta-tile {
+		fill: none;
+		stroke: var(--text);
+		stroke-width: 1.5;
+		stroke-dasharray: 4 2;
+		pointer-events: none;
+		transition:
+			x 300ms ease,
+			y 300ms ease;
+	}
+
+	/* ---------- Shared memory ---------- */
+	.bank-index text {
+		font-family: var(--mono);
+		font-size: 6.5px;
+		text-anchor: middle;
+		fill: var(--muted);
+		opacity: 0.8;
+	}
+	.smem-legend text {
+		font-size: 9px;
+		fill: var(--text);
+	}
+	.smem-legend .dim {
+		fill: var(--muted);
+	}
+	.legend-cap {
+		font-size: 7.5px !important;
+		font-weight: 700;
+		letter-spacing: 0.08em;
+		text-transform: uppercase;
+		fill: var(--muted) !important;
+	}
+	.swatch.a {
+		fill: color-mix(in oklch, var(--a) 45%, var(--bg));
+	}
+	.swatch.b {
+		fill: color-mix(in oklch, var(--b) 45%, var(--bg));
+	}
+	.swatch.c {
+		fill: color-mix(in oklch, var(--c) 45%, var(--bg));
+	}
+	.unused {
+		fill: none;
+		stroke: var(--hair);
+		stroke-width: 0.6;
+		stroke-dasharray: 2 2;
+	}
+
+	/* ---------- Sub-partitions ---------- */
+	.part-bg {
+		fill: var(--bg);
+		stroke: var(--hair);
+		transition: stroke 200ms ease;
+	}
+	.mine-warp .part-bg {
+		stroke: var(--thread);
+		stroke-width: 1.4;
+	}
+	.part-title {
+		font-size: 9px;
+		font-weight: 700;
+		letter-spacing: 0.08em;
+		fill: var(--text);
+	}
+	.regs rect {
+		fill: color-mix(in oklch, var(--surface) 70%, var(--bg));
+		stroke: var(--hair);
+	}
+	.tiny {
+		font-size: 7px;
+		font-weight: 700;
+		letter-spacing: 0.08em;
+		fill: var(--muted);
+	}
+	.frag {
+		font-family: var(--mono);
+		font-size: 8px;
+		letter-spacing: 0;
+		font-weight: 600;
+	}
+	.mbar rect {
+		fill: var(--bg);
+		stroke: var(--hair);
+		transition:
+			fill 200ms ease,
+			stroke 200ms ease;
+	}
+	.mbar.on rect {
+		fill: var(--accent-soft);
+	}
+	.mbar text {
+		font-family: var(--mono);
+		font-size: 7.5px;
+		text-anchor: middle;
+		fill: var(--muted);
+	}
+	.chip rect {
+		fill: none;
+		stroke: var(--hair);
+	}
+	.chip text {
+		font-size: 7.5px;
+		text-anchor: middle;
+		fill: var(--muted);
+	}
+	.tc rect {
+		fill: color-mix(in oklch, var(--c) 10%, var(--bg));
+		stroke: color-mix(in oklch, var(--c) 45%, var(--bg));
+		transition:
+			fill 200ms ease,
+			stroke 200ms ease;
+	}
+	.tc.on rect {
+		fill: color-mix(in oklch, var(--c) 35%, var(--bg));
+		stroke: var(--c);
+	}
+	.tc.on {
+		filter: drop-shadow(0 0 7px color-mix(in oklch, var(--c) 60%, transparent));
+	}
+	.tc text {
+		text-anchor: middle;
+	}
+	.tc-title {
+		font-size: 10.5px;
+		font-weight: 700;
+		fill: var(--text);
+	}
+	.tc-sub {
+		font-family: var(--mono);
+		font-size: 7.5px;
+		fill: var(--muted);
+	}
+	.cores rect {
+		fill: var(--empty);
+		stroke: var(--hair);
+		stroke-width: 0.6;
+		transition: fill 200ms ease;
+	}
+	.cores.on rect {
+		fill: oklch(0.75 0.15 60);
+		stroke: oklch(0.65 0.15 60);
+	}
+	.cores.on {
+		filter: drop-shadow(0 0 5px oklch(0.75 0.15 60 / 0.6));
+	}
+
+	/* ---------- Cells ---------- */
+	.cell rect {
+		transition:
+			fill 180ms ease,
+			stroke 180ms ease;
+	}
+	.cell.a rect {
+		fill: color-mix(in oklch, var(--a) 22%, var(--bg));
+	}
+	.cell.b rect {
+		fill: color-mix(in oklch, var(--b) 24%, var(--bg));
+	}
+	.cell.c rect {
+		fill: color-mix(in oklch, var(--c) 24%, var(--bg));
+	}
+	.cell.other rect,
+	.cell.empty rect {
+		fill: var(--empty);
+	}
+	.cell.hl.a rect {
+		fill: color-mix(in oklch, var(--a) 72%, var(--bg));
+	}
+	.cell.hl.b rect {
+		fill: color-mix(in oklch, var(--b) 75%, var(--bg));
+	}
+	.cell.hl.c rect {
+		fill: color-mix(in oklch, var(--c) 72%, var(--bg));
+	}
+	.cell.hl.empty rect {
+		fill: color-mix(in oklch, var(--accent) 22%, var(--bg));
+	}
+	.cell.mine rect {
+		stroke: var(--thread);
+		stroke-width: 1.8;
+	}
+	.cell.empty text {
+		visibility: hidden;
+	}
+	.cell text {
+		font-family: var(--mono);
+		text-anchor: middle;
+		fill: var(--text);
+		pointer-events: none;
+	}
+	.cell.hl text {
+		font-weight: 700;
+	}
+
+	/* ---------- Data paths ---------- */
+	.flow path {
+		fill: none;
+		stroke: var(--ink);
+		stroke-width: 1;
+		stroke-opacity: 0.35;
+		stroke-dasharray: 2 3;
+		marker-end: var(--m);
+		transition: stroke-opacity 200ms ease;
+	}
+	.flow.both path {
+		marker-start: var(--m);
+	}
+	.flow.on path {
+		stroke: var(--accent);
+		stroke-width: 1.8;
+		stroke-opacity: 0.9;
+		stroke-dasharray: none;
+		marker-end: var(--m-on);
+	}
+	.flow.both.on path {
+		marker-start: var(--m-on);
+	}
+	.flow circle {
+		fill: var(--accent);
+		opacity: 0;
+		transition: opacity 200ms ease;
+	}
+	.flow.cmd path {
+		stroke-dasharray: 4 3;
+	}
+	.flow.cmd.on path {
+		stroke: var(--thread);
+		stroke-dasharray: 4 3;
+		marker-end: none;
+	}
+	.flow.cmd circle {
+		fill: var(--thread);
+	}
+	.flow.on circle {
+		opacity: 1;
+		filter: drop-shadow(0 0 3px var(--accent));
+	}
+	.arrowhead {
+		fill: var(--ink);
+		opacity: 0.5;
+	}
+	.arrowhead.on {
+		fill: var(--accent);
+		opacity: 1;
+	}
+	.flow-labels text {
+		font-family: var(--mono);
+		font-size: 8px;
+		text-anchor: middle;
+		fill: var(--muted);
+	}
+	@media (prefers-reduced-motion: reduce) {
+		.flow circle {
+			display: none;
+		}
+	}
+
+	/* ---------- Step card and code ---------- */
+	.gpu-gemm[data-kind="init"],
+	.gpu-gemm [data-kind="init"] {
+		--k: oklch(0.65 0.03 260);
+	}
+	.gpu-gemm[data-kind="g2s"],
+	.gpu-gemm [data-kind="g2s"] {
+		--k: oklch(0.62 0.15 250);
+	}
+	.gpu-gemm[data-kind="sync"],
+	.gpu-gemm [data-kind="sync"] {
+		--k: oklch(0.6 0.05 290);
+	}
+	.gpu-gemm[data-kind="s2r"],
+	.gpu-gemm [data-kind="s2r"] {
+		--k: oklch(0.66 0.12 205);
+	}
+	.gpu-gemm[data-kind="mma"],
+	.gpu-gemm [data-kind="mma"] {
+		--k: oklch(0.66 0.15 155);
+	}
+	.gpu-gemm[data-kind="epilogue"],
+	.gpu-gemm [data-kind="epilogue"] {
+		--k: oklch(0.72 0.15 60);
+	}
+	.gpu-gemm[data-kind="r2s"],
+	.gpu-gemm [data-kind="r2s"] {
+		--k: oklch(0.66 0.12 180);
+	}
+	.gpu-gemm[data-kind="r2g"],
+	.gpu-gemm [data-kind="r2g"],
+	.gpu-gemm[data-kind="s2g"],
+	.gpu-gemm [data-kind="s2g"] {
+		--k: oklch(0.6 0.16 310);
+	}
+	.details {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.75rem;
+		margin-top: 0.9rem;
+	}
+	.step {
+		flex: 1 1 22rem;
+		padding: 0.75rem 0.95rem;
+		border-radius: 10px;
+		border: 1px solid var(--hair);
+		background: var(--card);
+		font-size: 0.8rem;
+		line-height: 1.55;
+		min-height: 13em;
+	}
+	.step p {
+		margin: 0;
+	}
+	.step-head {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+	}
+	.badge {
+		font-family: var(--mono);
+		font-size: 0.68rem;
+		font-weight: 700;
+		padding: 0.1rem 0.5rem;
+		border-radius: 999px;
+		color: var(--bg);
+		background: var(--k, var(--accent));
+		transition: background 200ms ease;
+	}
+	.loop {
+		font-family: var(--mono);
+		font-size: 0.72rem;
+		color: var(--muted);
+	}
+	.step-title {
+		margin-top: 0.35rem !important;
+		font-weight: 650;
+		font-size: 0.95rem;
+	}
+	.step-text {
+		margin-top: 0.2rem !important;
+		color: color-mix(in oklch, var(--text) 85%, var(--bg));
+	}
+	.mine-text {
+		margin-top: 0.55rem !important;
+		padding: 0.4rem 0.6rem;
+		border-radius: 6px;
+		background: color-mix(in oklch, var(--thread) 9%, var(--bg));
+		border-left: 3px solid var(--thread);
+	}
+	.code {
+		flex: 0 1 auto;
+		margin: 0;
+		padding: 0.6rem 0;
+		font-size: 0.68rem;
+		line-height: 1.55;
+		background: var(--card);
+		border: 1px solid var(--hair);
+		border-radius: 10px;
+		overflow-x: auto;
+	}
+	.ln {
+		display: block;
+		padding: 0 0.8rem 0 0;
+		border-left: 3px solid transparent;
+		transition: background 150ms ease;
+	}
+	.ln .no {
+		display: inline-block;
+		width: 2.2rem;
+		padding-right: 0.7rem;
+		text-align: right;
+		color: var(--muted);
+		opacity: 0.6;
+		user-select: none;
+	}
+	.cm {
+		color: var(--muted);
+		font-style: italic;
+	}
+	.gpu-gemm[data-kind] .ln.on {
+		background: color-mix(in oklch, var(--k) 16%, var(--bg));
+		border-left-color: var(--k);
+		font-weight: 600;
+	}
+
+	/* ---------- Controls, at the bottom ---------- */
+	.controls {
+		display: flex;
+		flex-direction: column;
+		gap: 0.8rem;
+		margin-top: 0.75rem;
+		padding: 0.85rem 0.95rem;
+		border: 1px solid var(--hair);
+		border-radius: 10px;
+		background: var(--card);
+		font-size: 0.8rem;
+	}
+	.inputs {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: flex-end;
+		gap: 0.6rem 1rem;
+	}
+	.field {
+		display: flex;
+		flex-direction: column;
+		gap: 0.2rem;
+	}
+	.field span {
+		font-family: var(--mono);
+		font-size: 0.7rem;
+		font-weight: 600;
+	}
+	.field small {
+		font-size: 0.66rem;
+		color: var(--muted);
+	}
+	.field .thread-info {
+		color: var(--thread);
+		font-family: var(--mono);
+	}
+	.field input {
+		width: 6.5rem;
+		font: 0.85rem var(--mono);
+		padding: 0.3rem 0.5rem;
+		border: 1px solid var(--hair);
+		border-radius: 6px;
+		background: var(--bg);
+		color: var(--text);
+	}
+	.field input:focus {
+		outline: 2px solid color-mix(in oklch, var(--accent) 50%, transparent);
+		border-color: var(--accent);
+	}
+	.keys {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.3rem 0.75rem;
+		margin-left: auto;
+		font-size: 0.7rem;
+		color: var(--muted);
+	}
+	.keys span {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.3rem;
+	}
+	.sw {
+		width: 0.75rem;
+		height: 0.75rem;
+		border-radius: 3px;
+	}
+	.sw.a {
+		background: color-mix(in oklch, var(--a) 45%, var(--bg));
+	}
+	.sw.b {
+		background: color-mix(in oklch, var(--b) 45%, var(--bg));
+	}
+	.sw.c {
+		background: color-mix(in oklch, var(--c) 45%, var(--bg));
+	}
+	.sw.hl {
+		background: color-mix(in oklch, var(--a) 75%, var(--bg));
+	}
+	.sw.mine {
+		border: 2px solid var(--thread);
+	}
+	.player {
+		display: flex;
+		align-items: center;
+		gap: 0.75rem;
+	}
+	.buttons {
+		display: flex;
+		gap: 0.3rem;
+	}
+	.buttons button {
+		display: grid;
+		place-items: center;
+		width: 2rem;
+		height: 2rem;
+		padding: 0;
+		border: 1px solid var(--hair);
+		border-radius: 8px;
+		background: var(--bg);
+		color: var(--text);
+		cursor: pointer;
+		transition:
+			border-color 150ms ease,
+			background 150ms ease;
+	}
+	.buttons button:hover {
+		border-color: var(--accent);
+	}
+	.buttons svg {
+		width: 0.8rem;
+		height: 0.8rem;
+		fill: currentColor;
+		stroke: currentColor;
+		stroke-width: 1.2;
+		stroke-linejoin: round;
+	}
+	.buttons .play {
+		width: 2.6rem;
+		background: var(--accent);
+		border-color: var(--accent);
+		color: var(--bg);
+	}
+	.play .i-pause,
+	.play.playing .i-play {
+		display: none;
+	}
+	.play.playing .i-pause {
+		display: block;
+	}
+	.timeline {
+		flex: 1;
+		display: flex;
+		gap: 3px;
+		align-items: center;
+		min-width: 8rem;
+	}
+	.seg {
+		flex: 1;
+		height: 0.55rem;
+		padding: 0;
+		border: none;
+		border-radius: 999px;
+		background: color-mix(in oklch, var(--k) 28%, var(--bg));
+		cursor: pointer;
+		transition:
+			height 150ms ease,
+			background 150ms ease;
+	}
+	.seg.done {
+		background: color-mix(in oklch, var(--k) 65%, var(--bg));
+	}
+	.seg.on {
+		height: 1.1rem;
+		background: var(--k);
+		box-shadow: 0 0 0 2px var(--bg), 0 0 0 3.5px var(--k);
+	}
+	.seg:hover {
+		background: color-mix(in oklch, var(--k) 80%, var(--bg));
+	}
+	.counter {
+		font-family: var(--mono);
+		font-size: 0.75rem;
+		color: var(--muted);
+		min-width: 3.8rem;
+		text-align: right;
+	}
+	.kinds {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.3rem 0.9rem;
+		font-size: 0.68rem;
+		color: var(--muted);
+	}
+	.kinds span {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.3rem;
+	}
+	.kinds i {
+		width: 0.55rem;
+		height: 0.55rem;
+		border-radius: 999px;
+		background: var(--k);
+	}
+	.kinds b {
+		font-family: var(--mono);
+		color: var(--text);
+		font-weight: 600;
+	}
+	.summary {
+		margin: 0.6rem 0 0;
+		font-size: 0.7rem;
+		text-align: center;
+		color: var(--muted);
+	}
+</style>
