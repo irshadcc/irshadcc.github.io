@@ -1,0 +1,106 @@
+---
+// The card NeuralNetworkGraph shows beside a node on hover or focus: its name, details and output
+// shape, its formula (LaTeX, rendered with KaTeX), and a panel per weight tensor. Everything is
+// rendered at build time; nnInteraction.ts only positions and shows it.
+import katex from "katex";
+import type { GraphNode } from "./NNGraph";
+import WeightPanel from "./WeightPanel.astro";
+import { kindClass } from "./kinds";
+import { summarizeWeights } from "./weightStats";
+
+interface Props {
+	node: GraphNode;
+	/** Element id, referenced by the node's aria-describedby. */
+	id: string;
+}
+
+const { node, id } = Astro.props;
+const formula =
+	node.formula &&
+	katex.renderToString(node.formula, {
+		displayMode: true,
+		throwOnError: false,
+		output: "html",
+	});
+const weights = node.weights ? summarizeWeights(node.weights) : [];
+---
+
+<div class={`card ${kindClass(node.kind)}`} id={id} data-for={node.id} role="tooltip" hidden>
+	<div class="head">
+		<span class="dot"></span>
+		<strong>{node.label}</strong>
+		{node.shape && <code>{node.shape}</code>}
+	</div>
+	{node.detail && <div class="detail">{node.detail}</div>}
+	{formula && <div class="formula" set:html={formula} />}
+	{weights.map((ws) => <WeightPanel summary={ws} />)}
+</div>
+
+<style>
+	.card {
+		position: absolute;
+		z-index: 10;
+		width: max-content;
+		min-width: 12rem;
+		max-width: min(20rem, calc(100vw - 16px));
+		padding: 0.6rem 0.75rem 0.7rem;
+		border: 1px solid var(--faint);
+		border-top: 3px solid var(--c);
+		border-radius: 8px;
+		background: var(--bg);
+		box-shadow:
+			0 4px 12px rgb(0 0 0 / 0.08),
+			0 1px 3px rgb(0 0 0 / 0.06);
+		font-family: var(--sans);
+		font-size: 0.75rem;
+		color: var(--text);
+		pointer-events: none;
+	}
+	.card[hidden] {
+		display: none;
+	}
+	/* Input, output and "other" nodes are grey; their charts take the accent instead. */
+	.k-input,
+	.k-other {
+		--chart: var(--accent);
+	}
+	.head {
+		display: flex;
+		align-items: baseline;
+		gap: 0.4rem;
+		font-size: 0.8rem;
+	}
+	.dot {
+		align-self: center;
+		flex: none;
+		width: 0.5rem;
+		height: 0.5rem;
+		border-radius: 50%;
+		background: var(--c);
+	}
+	.head code {
+		margin-left: auto;
+		padding: 0 0 0 0.5rem;
+		font-family: var(--mono);
+		font-size: 0.68rem;
+		color: var(--muted);
+		background: none;
+	}
+	.detail {
+		color: var(--muted);
+		margin-top: 0.1rem;
+	}
+	.formula {
+		margin: 0.5rem 0 0;
+		padding: 0 0.5rem;
+		border-radius: 6px;
+		background: var(--surface);
+		overflow-x: auto;
+	}
+	.formula :global(.katex-display) {
+		margin: 0.5rem 0;
+	}
+	.formula :global(.katex) {
+		font-size: 1.05em;
+	}
+</style>

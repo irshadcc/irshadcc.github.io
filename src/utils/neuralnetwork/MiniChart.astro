@@ -1,0 +1,55 @@
+---
+// Frame for the small charts in a node's hover card: a caption, a plot area of the given size
+// with a baseline along its bottom, and text ticks under it. The marks come in the default slot
+// (drawn over the baseline) and the caption in the "caption" slot.
+interface Props {
+	width: number;
+	height: number;
+	ticks: { x: number; text: string; anchor?: "middle" | "end" }[];
+}
+
+const { width, height, ticks } = Astro.props;
+---
+
+<div class="chart">
+	<div class="caption"><slot name="caption" /></div>
+	<svg viewBox={`0 0 ${width} ${height + 14}`} width={width} height={height + 14} aria-hidden="true">
+		<line class="axis" x1="0" x2={width} y1={height + 0.5} y2={height + 0.5} />
+		<slot />
+		{
+			ticks.map((t) => (
+				<text x={t.x} y={height + 12} text-anchor={t.anchor}>
+					{t.text}
+				</text>
+			))
+		}
+	</svg>
+</div>
+
+<style>
+	.chart {
+		margin-top: 0.5rem;
+	}
+	.caption {
+		color: var(--muted);
+		margin-bottom: 0.25rem;
+	}
+	.caption :global(strong) {
+		color: var(--text);
+	}
+	svg {
+		display: block;
+		max-width: 100%;
+		height: auto;
+		margin: 0 auto;
+		overflow: visible;
+	}
+	text {
+		font-family: var(--mono);
+		font-size: 9px;
+		fill: var(--muted);
+	}
+	.axis {
+		stroke: var(--faint);
+	}
+</style>

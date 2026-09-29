@@ -5,6 +5,11 @@
 //   const x = g.node("input", "Image", { detail: "224×224×3" });
 //   const c = g.node("conv", "Conv 11×11", { from: x, detail: "96 filters, stride 4", shape: "55×55×96" });
 //   g.node("output", "Logits", { from: c });
+//
+// A node can also carry the formula it computes (LaTeX) and its weights; both are shown in a
+// card when the node is hovered or focused:
+//
+//   g.node("linear", "FC", { from: c, formula: "y = Wx + b", weights: { W: w, b: bias } });
 
 /** What a node does; picks its colour and its legend entry. */
 export type NodeKind =
@@ -20,6 +25,16 @@ export type NodeKind =
 	| "op"
 	| "other";
 
+/**
+ * A weight tensor: nested arrays (number[] for a vector, number[][] for a matrix, and so on),
+ * or flat row-major data with its shape, e.g. { shape: [96, 3, 11, 11], data: Float32Array }.
+ */
+export type Tensor = NestedArray | { shape: number[]; data: ArrayLike<number> };
+export type NestedArray = number[] | NestedArray[];
+
+/** One tensor (shown as "W"), or several by name, e.g. { W_1: ..., b_1: ... }; names are LaTeX. */
+export type NodeWeights = Tensor | Record<string, Tensor>;
+
 export interface GraphNode {
 	id: string;
 	kind: NodeKind;
@@ -31,6 +46,10 @@ export interface GraphNode {
 	shape?: string;
 	/** Group (see NNGraph.group) this node is drawn inside. */
 	group?: string;
+	/** What the node computes, in LaTeX (rendered with KaTeX), e.g. "y = \\sigma(Wx + b)". */
+	formula?: string;
+	/** The node's parameters; the hover card shows their distribution and rank. */
+	weights?: NodeWeights;
 }
 
 export interface GraphEdge {
@@ -52,6 +71,8 @@ export interface NodeOptions {
 	detail?: string;
 	shape?: string;
 	group?: string;
+	formula?: string;
+	weights?: NodeWeights;
 	/** Explicit id; defaults to an auto-generated one. Ids must be unique. */
 	id?: string;
 }
@@ -66,9 +87,21 @@ export class NNGraph {
 		const id = opts.id ?? `n${this.nodes.length}`;
 		if (this.has(id)) throw new Error(`NNGraph: duplicate node id "${id}"`);
 		if (opts.group && !this.groups.some((g) => g.id === opts.group)) {
-			throw new Error(`NNGraph: node "${label}" is in unknown group "${opts.group}"`);
+			throw new Error(
+				`NNGraph: node "${label}" is in unknown group "${opts.group}"`,
+			);
 		}
-		this.nodes.push({ id, kind, label, detail: opts.detail, shape: opts.shape, group: opts.group });
+		const { detail, shape, group, formula, weights } = opts;
+		this.nodes.push({
+			id,
+			kind,
+			label,
+			detail,
+			shape,
+			group,
+			formula,
+			weights,
+		});
 		for (const from of [opts.from ?? []].flat()) this.edge(from, id);
 		return id;
 	}
@@ -76,7 +109,10 @@ export class NNGraph {
 	/** Adds an edge between two existing nodes, with an optional label. */
 	edge(from: string, to: string, label?: string): void {
 		for (const id of [from, to]) {
-			if (!this.has(id)) throw new Error(`NNGraph: edge ${from} -> ${to} uses unknown node "${id}"`);
+			if (!this.has(id))
+				throw new Error(
+					`NNGraph: edge ${from} -> ${to} uses unknown node "${id}"`,
+				);
 		}
 		this.edges.push({ from, to, label });
 	}

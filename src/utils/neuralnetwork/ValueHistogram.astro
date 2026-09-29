@@ -1,0 +1,54 @@
+---
+// Histogram of a weight tensor's values (bins from weightStats.ts), with 0 marked when it falls
+// inside the range.
+import MiniChart from "./MiniChart.astro";
+import { HIST_BINS, type WeightSummary, formatValue } from "./weightStats";
+
+interface Props {
+	summary: WeightSummary;
+	width?: number;
+	height?: number;
+}
+
+const { summary: ws, width = 240, height = 44 } = Astro.props;
+const r1 = (v: number) => Math.round(v * 10) / 10;
+
+const peak = Math.max(...ws.hist);
+const bin = width / HIST_BINS;
+const bars = ws.hist.flatMap((count, i) => {
+	if (!count) return [];
+	const h = Math.max(1, (count / peak) * height);
+	return [
+		{ x: r1(i * bin + 0.75), y: r1(height - h), w: r1(bin - 1.5), h: r1(h) },
+	];
+});
+
+const zero =
+	ws.min < 0 && ws.max > 0
+		? r1(((0 - ws.min) / (ws.max - ws.min)) * width)
+		: undefined;
+// Label 0 only where it doesn't crowd the min and max labels at the ends.
+const ticks = [
+	{ x: 0, text: formatValue(ws.min) },
+	...(zero !== undefined && zero > 30 && zero < width - 30
+		? [{ x: zero, text: "0", anchor: "middle" as const }]
+		: []),
+	{ x: width, text: formatValue(ws.max), anchor: "end" as const },
+];
+---
+
+<MiniChart width={width} height={height} ticks={ticks}>
+	<Fragment slot="caption">Value distribution</Fragment>
+	{bars.map((b) => <rect class="bar" x={b.x} y={b.y} width={b.w} height={b.h} rx="1" />)}
+	{zero !== undefined && <line class="zero" x1={zero} x2={zero} y1="0" y2={height} />}
+</MiniChart>
+
+<style>
+	.bar {
+		fill: var(--chart, var(--c));
+	}
+	.zero {
+		stroke: var(--muted);
+		stroke-dasharray: 2 2;
+	}
+</style>

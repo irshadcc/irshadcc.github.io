@@ -1,0 +1,57 @@
+/* Colours for NeuralNetworkGraph, shared by the diagram, its legend and its hover cards (which
+   are separate components, so this can't live in one component's scoped styles). Each kind class
+   (see kinds.ts) sets --c; everything coloured by kind reads it. */
+
+/* Categorical slots in fixed order (same palette as LineChart); dark steps for the dark surface. */
+.nn-graph {
+	--s1: #2a78d6;
+	--s2: #eb6834;
+	--s3: #1baf7a;
+	--s4: #eda100;
+	--s5: #e87ba4;
+	--s6: #008300;
+	--s7: #4a3aa7;
+	--s8: #e34948;
+}
+@media (prefers-color-scheme: dark) {
+	.nn-graph {
+		--s1: #3987e5;
+		--s2: #d95926;
+		--s3: #199e70;
+		--s4: #c98500;
+		--s5: #d55181;
+		--s6: #008300;
+		--s7: #9085e9;
+		--s8: #e66767;
+	}
+}
+
+/* Kind -> colour. Input, output and other stay neutral so the layers themselves carry the colour. */
+.nn-graph .k-input,
+.nn-graph .k-other {
+	--c: var(--muted);
+}
+.nn-graph .k-embedding {
+	--c: var(--s1);
+}
+.nn-graph .k-linear {
+	--c: var(--s2);
+}
+.nn-graph .k-conv {
+	--c: var(--s3);
+}
+.nn-graph .k-pool {
+	--c: var(--s4);
+}
+.nn-graph .k-attention {
+	--c: var(--s5);
+}
+.nn-graph .k-norm {
+	--c: var(--s6);
+}
+.nn-graph .k-activation {
+	--c: var(--s7);
+}
+.nn-graph .k-op {
+	--c: var(--s8);
+}

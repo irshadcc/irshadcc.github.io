@@ -1,87 +1,290 @@
 ---
 import Layout from "../../layouts/Layout.astro";
-import { NNGraph } from "../../utils/neuralnetwork/NNGraph";
+import { NNGraph, type NodeWeights } from "../../utils/neuralnetwork/NNGraph";
 import NeuralNetworkGraph from "../../utils/neuralnetwork/NeuralNetworkGraph.astro";
+
+// ---- Synthetic weights for the hover cards (no trained weights ship with this site): seeded
+// Gaussian draws at each layer's usual initialisation scale, so every build is identical.
+const rng = (seed: number) => {
+	let a = seed >>> 0;
+	return () => {
+		a = (a + 0x6d2b79f5) >>> 0; // mulberry32
+		let t = Math.imul(a ^ (a >>> 15), a | 1);
+		t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+		return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+	};
+};
+const gaussian = (shape: number[], std: number, seed: number) => {
+	const next = rng(seed);
+	const data = new Float32Array(shape.reduce((a, b) => a * b, 1));
+	for (let i = 0; i < data.length; i++) {
+		data[i] =
+			std *
+			Math.sqrt(-2 * Math.log(1 - next())) *
+			Math.cos(2 * Math.PI * next());
+	}
+	return { shape, data };
+};
+/** A rows × cols matrix of rank k with entries of roughly the given std: a product of two Gaussian factors. */
+const lowRank = (
+	rows: number,
+	cols: number,
+	k: number,
+	std: number,
+	seed: number,
+) => {
+	const a = gaussian([rows, k], 1, seed).data;
+	const b = gaussian([k, cols], std / Math.sqrt(k), seed + 1).data;
+	const data = new Float32Array(rows * cols);
+	for (let i = 0; i < rows; i++) {
+		for (let l = 0; l < k; l++) {
+			const ail = a[i * k + l];
+			for (let j = 0; j < cols; j++)
+				data[i * cols + j] += ail * b[l * cols + j];
+		}
+	}
+	return { shape: [rows, cols], data };
+};
+const zeros = (n: number) => ({ shape: [n], data: new Float32Array(n) });
+
+const MLP = String.raw`h_{k+1} = \mathrm{ReLU}(W_k h_k + b_k),\quad h_0 = x`;
 
 // ---- DLRM (Naumov et al., 2019), MLPerf Criteo Terabyte configuration: 13 dense features,
 // 26 categorical features with 128-d embeddings, dot-product feature interaction.
 const dlrm = new NNGraph();
 {
 	const g = dlrm;
-	const dense = g.node("input", "Dense features", { detail: "13 continuous values", shape: "B×13" });
-	const bottom = g.node("linear", "Bottom MLP", { from: dense, detail: "13 → 512 → 256 → 128", shape: "B×128" });
+	const dense = g.node("input", "Dense features", {
+		detail: "13 continuous values",
+		shape: "B×13",
+		formula: String.raw`x \in \mathbb{R}^{13}`,
+	});
+	const bottom = g.node("linear", "Bottom MLP", {
+		from: dense,
+		detail: "13 → 512 → 256 → 128",
+		shape: "B×128",
+		formula: MLP,
+		weights: {
+			W_1: gaussian([512, 13], Math.sqrt(2 / 13), 1),
+			b_1: gaussian([512], 0.01, 2),
+		},
+	});
 	const tables = g.group("26 embedding tables (3 shown)");
-	const embs = [1, 2, 26].map((i) => {
+	// 1000 rows each (the real tables have up to 40M). Table 1 is built with rank 16 and table 26
+	// with rank 4, to show the rank chart finding low-rank structure; table 2 is full rank.
+	const tableWeights = [
+		lowRank(1000, 128, 16, 0.05, 10),
+		gaussian([1000, 128], 0.05, 20),
+		lowRank(1000, 128, 4, 0.05, 30),
+	];
+	const embs = [1, 2, 26].map((i, t) => {
 		const cat = g.node("input", `Categorical ${i}`, { detail: "sparse ids" });
 		return g.node("embedding", `Embedding table ${i}`, {
 			from: cat,
 			detail: "EmbeddingBag, dim 128",
 			shape: "B×128",
 			group: tables,
+			formula: String.raw`v_{${i}} = \sum_{j \in S_{${i}}} E_{${i}}[j]`,
+			weights: { E: tableWeights[t] },
 		});
 	});
 	const inter = g.node("op", "Feature interaction", {
 		from: [bottom, ...embs],
 		detail: "pairwise dot products of 27 vectors",
 		shape: "B×351",
+		formula: String.raw`z = \big[\, v_i^{\top} v_j \,\big]_{0 \le i < j \le 26},\quad v_0 = h`,
 	});
-	const cat = g.node("op", "Concat", { from: [inter, bottom], detail: "interactions + dense", shape: "B×479" });
-	const top = g.node("linear", "Top MLP", { from: cat, detail: "479 → 1024 → 1024 → 512 → 256 → 1", shape: "B×1" });
-	const sig = g.node("activation", "Sigmoid", { from: top });
+	const cat = g.node("op", "Concat", {
+		from: [inter, bottom],
+		detail: "interactions + dense",
+		shape: "B×479",
+		formula: String.raw`u = [\, z \,;\, h \,]`,
+	});
+	const top = g.node("linear", "Top MLP", {
+		from: cat,
+		detail: "479 → 1024 → 1024 → 512 → 256 → 1",
+		shape: "B×1",
+		formula: MLP,
+	});
+	const sig = g.node("activation", "Sigmoid", {
+		from: top,
+		formula: String.raw`\hat{y} = \sigma(s) = \frac{1}{1 + e^{-s}}`,
+	});
 	g.node("output", "Click probability", { from: sig });
 }
 
 // ---- Transformer, base model (Vaswani et al., 2017): d_model 512, 8 heads, d_ff 2048,
 // 6 encoder and 6 decoder layers. Each sub-layer is wrapped in a residual + LayerNorm.
+const EMBED = String.raw`x_t = \sqrt{d_{\text{model}}}\; E[\text{token}_t]`;
+const PE = String.raw`\begin{aligned} PE_{p,\,2i} &= \sin\big(p / 10000^{2i/d}\big) \\ PE_{p,\,2i+1} &= \cos\big(p / 10000^{2i/d}\big) \end{aligned}`;
+const SELF_ATTN = String.raw`\begin{aligned} \mathrm{MHA}(x) &= [\,\mathrm{head}_1; \dots; \mathrm{head}_8\,]\, W^O \\ \mathrm{head}_i &= \mathrm{softmax}\Big(\frac{x W_i^Q (x W_i^K)^{\top}}{\sqrt{d_k}}\Big)\, x W_i^V \end{aligned}`;
+const MASKED_ATTN = String.raw`\begin{aligned} \mathrm{head}_i &= \mathrm{softmax}\Big(\frac{x W_i^Q (x W_i^K)^{\top}}{\sqrt{d_k}} + M\Big)\, x W_i^V \\ M_{st} &= -\infty \ \text{ for } t > s, \text{ else } 0 \end{aligned}`;
+const CROSS_ATTN = String.raw`\mathrm{head}_i = \mathrm{softmax}\Big(\frac{x W_i^Q (e W_i^K)^{\top}}{\sqrt{d_k}}\Big)\, e W_i^V,\quad e = \text{encoder output}`;
+const ADD_NORM = String.raw`\begin{aligned} y &= \mathrm{LN}\big(x + \mathrm{Sublayer}(x)\big) \\ \mathrm{LN}(x) &= \gamma \odot \frac{x - \mu}{\sqrt{\sigma^2 + \epsilon}} + \beta \end{aligned}`;
+const FFN = String.raw`\mathrm{FFN}(x) = \max(0,\, x W_1 + b_1)\, W_2 + b_2`;
+const SOFTMAX = String.raw`p_i = \frac{e^{\ell_i}}{\sum_j e^{\ell_j}}`;
+// Xavier-uniform-like scale for the 512 × 512 attention projections.
+const attnWeights = (seed: number) => ({
+	"W^Q": gaussian([512, 512], 1 / Math.sqrt(512), seed),
+	"W^O": gaussian([512, 512], 1 / Math.sqrt(512), seed + 1),
+});
 const transformer = new NNGraph();
 {
 	const g = transformer;
 	const src = g.node("input", "Input tokens", { shape: "n" });
-	const srcEmb = g.node("embedding", "Input embedding", { from: src, detail: "d_model = 512", shape: "n×512" });
-	const srcPe = g.node("other", "Positional encoding", { detail: "sinusoidal" });
-	const srcIn = g.node("op", "+", { from: [srcEmb, srcPe] });
+	const srcEmb = g.node("embedding", "Input embedding", {
+		from: src,
+		detail: "d_model = 512",
+		shape: "n×512",
+		formula: EMBED,
+	});
+	const srcPe = g.node("other", "Positional encoding", {
+		detail: "sinusoidal",
+		formula: PE,
+	});
+	const srcIn = g.node("op", "+", {
+		from: [srcEmb, srcPe],
+		formula: String.raw`x_t + PE_t`,
+	});
 
 	const enc = g.group("Encoder layer × 6");
-	const selfAttn = g.node("attention", "Multi-head attention", { from: srcIn, detail: "8 heads, self", group: enc });
-	const enc1 = g.node("norm", "Add & Norm", { from: [selfAttn, srcIn], group: enc });
-	const encFf = g.node("linear", "Feed forward", { from: enc1, detail: "512 → 2048 → 512, ReLU", group: enc });
-	const encOut = g.node("norm", "Add & Norm", { from: [encFf, enc1], shape: "n×512", group: enc });
+	const selfAttn = g.node("attention", "Multi-head attention", {
+		from: srcIn,
+		detail: "8 heads, self",
+		group: enc,
+		formula: SELF_ATTN,
+		weights: attnWeights(40),
+	});
+	const enc1 = g.node("norm", "Add & Norm", {
+		from: [selfAttn, srcIn],
+		group: enc,
+		formula: ADD_NORM,
+	});
+	const encFf = g.node("linear", "Feed forward", {
+		from: enc1,
+		detail: "512 → 2048 → 512, ReLU",
+		group: enc,
+		formula: FFN,
+	});
+	const encOut = g.node("norm", "Add & Norm", {
+		from: [encFf, enc1],
+		shape: "n×512",
+		group: enc,
+		formula: ADD_NORM,
+	});
 
-	const tgt = g.node("input", "Output tokens", { detail: "shifted right", shape: "m" });
-	const tgtEmb = g.node("embedding", "Output embedding", { from: tgt, detail: "d_model = 512", shape: "m×512" });
-	const tgtPe = g.node("other", "Positional encoding", { detail: "sinusoidal" });
-	const tgtIn = g.node("op", "+", { from: [tgtEmb, tgtPe] });
+	const tgt = g.node("input", "Output tokens", {
+		detail: "shifted right",
+		shape: "m",
+	});
+	const tgtEmb = g.node("embedding", "Output embedding", {
+		from: tgt,
+		detail: "d_model = 512",
+		shape: "m×512",
+		formula: EMBED,
+	});
+	const tgtPe = g.node("other", "Positional encoding", {
+		detail: "sinusoidal",
+		formula: PE,
+	});
+	const tgtIn = g.node("op", "+", {
+		from: [tgtEmb, tgtPe],
+		formula: String.raw`x_t + PE_t`,
+	});
 
 	const dec = g.group("Decoder layer × 6");
 	const masked = g.node("attention", "Masked multi-head attention", {
 		from: tgtIn,
 		detail: "8 heads, causal self",
 		group: dec,
+		formula: MASKED_ATTN,
 	});
-	const dec1 = g.node("norm", "Add & Norm", { from: [masked, tgtIn], group: dec });
-	const cross = g.node("attention", "Multi-head attention", { from: dec1, detail: "8 heads, cross", group: dec });
+	const dec1 = g.node("norm", "Add & Norm", {
+		from: [masked, tgtIn],
+		group: dec,
+		formula: ADD_NORM,
+	});
+	const cross = g.node("attention", "Multi-head attention", {
+		from: dec1,
+		detail: "8 heads, cross",
+		group: dec,
+		formula: CROSS_ATTN,
+	});
 	g.edge(encOut, cross, "K, V");
-	const dec2 = g.node("norm", "Add & Norm", { from: [cross, dec1], group: dec });
-	const decFf = g.node("linear", "Feed forward", { from: dec2, detail: "512 → 2048 → 512, ReLU", group: dec });
-	const dec3 = g.node("norm", "Add & Norm", { from: [decFf, dec2], shape: "m×512", group: dec });
+	const dec2 = g.node("norm", "Add & Norm", {
+		from: [cross, dec1],
+		group: dec,
+		formula: ADD_NORM,
+	});
+	const decFf = g.node("linear", "Feed forward", {
+		from: dec2,
+		detail: "512 → 2048 → 512, ReLU",
+		group: dec,
+		formula: FFN,
+	});
+	const dec3 = g.node("norm", "Add & Norm", {
+		from: [decFf, dec2],
+		shape: "m×512",
+		group: dec,
+		formula: ADD_NORM,
+	});
 
-	const lin = g.node("linear", "Linear", { from: dec3, detail: "512 → vocabulary" });
-	const soft = g.node("activation", "Softmax", { from: lin });
+	const lin = g.node("linear", "Linear", {
+		from: dec3,
+		detail: "512 → vocabulary",
+		formula: String.raw`\ell = x W + b`,
+	});
+	const soft = g.node("activation", "Softmax", { from: lin, formula: SOFTMAX });
 	g.node("output", "Output probabilities", { from: soft, shape: "m×vocab" });
 }
 
 // ---- AlexNet (Krizhevsky et al., 2012), as one tower (the paper splits it across two GPUs).
 // Every conv and hidden FC layer is followed by ReLU; LRN follows conv1 and conv2.
+const CONV = String.raw`y_{c,i,j} = \mathrm{ReLU}\Big(b_c + \sum_{c',u,v} W_{c,c',u,v}\; x_{c',\,si+u,\,sj+v}\Big)`;
+const POOL = String.raw`y_{c,i,j} = \max_{0 \le u,v < 3} x_{c,\,2i+u,\,2j+v}`;
+const FC = String.raw`y = \mathrm{ReLU}(W x + b)`;
 const alexnet = new NNGraph();
 {
 	const g = alexnet;
-	const img = g.node("input", "Image", { detail: "RGB (paper says 224; 227 fits the maths)", shape: "227×227×3" });
+	const img = g.node("input", "Image", {
+		detail: "RGB (paper says 224; 227 fits the maths)",
+		shape: "227×227×3",
+	});
 	const features = g.group("Features");
-	const conv = (label: string, from: string, detail: string, shape: string) =>
-		g.node("conv", label, { from, detail, shape, group: features });
+	const conv = (
+		label: string,
+		from: string,
+		detail: string,
+		shape: string,
+		weights?: NodeWeights,
+	) =>
+		g.node("conv", label, {
+			from,
+			detail,
+			shape,
+			group: features,
+			formula: CONV,
+			weights,
+		});
 	const pool = (from: string, shape: string) =>
-		g.node("pool", "Max pool", { from, detail: "3×3, stride 2", shape, group: features });
-	const c1 = conv("Conv1", img, "96 × 11×11, stride 4 · ReLU, LRN", "55×55×96");
+		g.node("pool", "Max pool", {
+			from,
+			detail: "3×3, stride 2",
+			shape,
+			group: features,
+			formula: POOL,
+		});
+	// The paper initialises every layer's weights from N(0, 0.01²); conv1's biases start at 0.
+	const c1 = conv(
+		"Conv1",
+		img,
+		"96 × 11×11, stride 4 · ReLU, LRN",
+		"55×55×96",
+		{
+			W: gaussian([96, 3, 11, 11], 0.01, 50),
+			b: zeros(96),
+		},
+	);
 	const p1 = pool(c1, "27×27×96");
 	const c2 = conv("Conv2", p1, "256 × 5×5, pad 2 · ReLU, LRN", "27×27×256");
 	const p2 = pool(c2, "13×13×256");
@@ -91,24 +294,44 @@ const alexnet = new NNGraph();
 	const p3 = pool(c5, "6×6×256");
 
 	const classifier = g.group("Classifier");
-	const fc6 = g.node("linear", "FC6", { from: p3, detail: "9216 → 4096 · ReLU, dropout 0.5", group: classifier });
-	const fc7 = g.node("linear", "FC7", { from: fc6, detail: "4096 → 4096 · ReLU, dropout 0.5", group: classifier });
-	const fc8 = g.node("linear", "FC8", { from: fc7, detail: "4096 → 1000", group: classifier });
-	const soft = g.node("activation", "Softmax", { from: fc8 });
+	const fc6 = g.node("linear", "FC6", {
+		from: p3,
+		detail: "9216 → 4096 · ReLU, dropout 0.5",
+		group: classifier,
+		formula: FC,
+	});
+	const fc7 = g.node("linear", "FC7", {
+		from: fc6,
+		detail: "4096 → 4096 · ReLU, dropout 0.5",
+		group: classifier,
+		formula: FC,
+	});
+	const fc8 = g.node("linear", "FC8", {
+		from: fc7,
+		detail: "4096 → 1000",
+		group: classifier,
+		formula: String.raw`\ell = W x + b`,
+	});
+	const soft = g.node("activation", "Softmax", { from: fc8, formula: SOFTMAX });
 	g.node("output", "Class probabilities", { from: soft, shape: "1000" });
 }
 ---
 
 <Layout title="NeuralNetworkGraph demo">
 	<h1>NeuralNetworkGraph demo</h1>
-	<p>Hover or tab to a layer to highlight what feeds it and what it feeds.</p>
+	<p>
+		Hover or tab to a layer to highlight what feeds it and what it feeds. Layers marked with a dot
+		in the corner also show their formula and, for some, their weights: distribution and rank. The
+		weights here are synthetic (seeded random draws at each layer's initialisation scale); the DLRM
+		embedding tables 1 and 26 are built low-rank on purpose.
+	</p>
 
 	<h2>DLRM</h2>
-	<NeuralNetworkGraph graph={dlrm} title="Deep Learning Recommendation Model (MLPerf configuration)" />
+	<NeuralNetworkGraph graph={dlrm} direction="BT" title="Deep Learning Recommendation Model (MLPerf configuration)" />
 
 	<h2>Transformer</h2>
-	<NeuralNetworkGraph graph={transformer} title="Transformer, base model" />
+	<NeuralNetworkGraph graph={transformer} direction="BT" title="Transformer, base model" />
 
 	<h2>AlexNet</h2>
-	<NeuralNetworkGraph graph={alexnet} title="AlexNet" />
+	<NeuralNetworkGraph graph={alexnet} direction="BT" title="AlexNet" />
 </Layout>

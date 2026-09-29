@@ -1,0 +1,53 @@
+---
+// The legend above a NeuralNetworkGraph: one swatch per node kind the graph uses, in KINDS order.
+import type { GraphNode } from "./NNGraph";
+import { KINDS, kindClass, legendKind } from "./kinds";
+
+interface Props {
+	nodes: GraphNode[];
+}
+
+const present = new Set(Astro.props.nodes.map((n) => legendKind(n.kind)));
+const items = KINDS.filter((k) => present.has(k.kind));
+---
+
+{
+	items.length > 1 && (
+		<ul class="legend">
+			{items.map((k) => (
+				<li>
+					<span class={`swatch ${kindClass(k.kind)}`} />
+					{k.name}
+				</li>
+			))}
+		</ul>
+	)
+}
+
+<style>
+	.legend {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.3rem 1rem;
+		list-style: none;
+		padding: 0;
+		margin: 0 0 0.75rem;
+		font-family: var(--sans);
+		font-size: 0.75rem;
+		color: var(--muted);
+	}
+	li {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.35rem;
+		margin: 0;
+	}
+	.swatch {
+		width: 0.8rem;
+		height: 0.8rem;
+		border-radius: 3px;
+		background: color-mix(in oklch, var(--c) 22%, var(--bg));
+		border: 1.5px solid color-mix(in oklch, var(--c) 75%, var(--bg));
+	}
+</style>
