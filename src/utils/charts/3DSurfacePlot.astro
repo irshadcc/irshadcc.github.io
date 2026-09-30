@@ -9,14 +9,23 @@
 // restrictRange={false} they reach one range-width past each end, and `fn` is also sent as
 // source and re-sampled in the browser; the function must then be self-contained (use only
 // x, y and globals like Math), which is checked here.
+// `fn` may take a third argument, `params`. With paramsFrom="some-id" the plot listens for
+// "matrixinput" events from the element with that id (a <MatrixInput>) and re-samples `fn` in
+// the browser with the new matrix as `params`; `fn` must be self-contained here too.
+// Children are drawn as a controls panel under the plot, inside the figure, which is where
+// that <MatrixInput> belongs.
 // Usage in .mdx:
 //   <SurfacePlot
 //     fn={(x, y) => Math.sin(x) * Math.cos(y)}
 //     x={[-Math.PI, Math.PI]}
 //     y={[-Math.PI, Math.PI]}
 //   />
+//   <SurfacePlot fn={(x, y, m) => m[0][0] * x * x + m[1][1] * y * y} params={[[1, 0], [0, 1]]} paramsFrom="scale" ...>
+//     <MatrixInput id="scale" value={[[1, 0], [0, 1]]} />
+//   </SurfacePlot>
 interface Props {
-	fn: (x: number, y: number) => number;
+	// biome-ignore lint/suspicious/noExplicitAny: params is whatever shape the caller's fn expects
+	fn: (x: number, y: number, params?: any) => number;
 	/** x range as [min, max]. */
 	x: [number, number];
 	/** y range as [min, max]. */
@@ -44,6 +53,10 @@ interface Props {
 	 * reach one range-width past each end, re-sampling `fn` in the browser.
 	 */
 	restrictRange?: boolean;
+	/** Passed to `fn` as its third argument; the initial value when paramsFrom is set. */
+	params?: unknown;
+	/** Id of a <MatrixInput> whose matrix replaces `params` whenever it changes. */
+	paramsFrom?: string;
 }
 
 const {
@@ -62,6 +75,8 @@ const {
 	mesh = true,
 	rangeSliders = false,
 	restrictRange = true,
+	params,
+	paramsFrom,
 } = Astro.props;
 
 const [nx, ny] = typeof samples === "number" ? [samples, samples] : samples;
@@ -71,7 +86,7 @@ const ys = grid(y[0], y[1], Math.max(ny, 2));
 // z[j][i] = f(xs[i], ys[j]); NaN/±Infinity become null and leave a hole in the surface.
 const z = ys.map((yv) =>
 	xs.map((xv) => {
-		const v = fn(xv, yv);
+		const v = fn(xv, yv, params);
 		return Number.isFinite(v) ? v : null;
 	}),
 );
@@ -94,13 +109,13 @@ function serialize(): string {
 	const py = probes(y[0], y[1]);
 	try {
 		const rebuilt = new Function(`return (${src});`)();
-		if (px.every((a) => py.every((b) => Object.is(rebuilt(a, b), fn(a, b))))) return src;
+		if (px.every((a) => py.every((b) => Object.is(rebuilt(a, b, params), fn(a, b, params))))) return src;
 	} catch {
 		// Falls through to the error below (e.g. ReferenceError for a helper defined elsewhere).
 	}
 	throw new Error(
-		"SurfacePlot: fn can't be re-sampled in the browser (restrictRange={false}). " +
-			"Write it as a self-contained function of x and y that uses only globals such as Math, " +
+		"SurfacePlot: fn can't be re-sampled in the browser (restrictRange={false} or paramsFrom). " +
+			"Write it as a self-contained function of x, y and params that uses only globals such as Math, " +
 			"e.g. (x, y) => Math.sin(x) * Math.cos(y).",
 	);
 }
@@ -118,7 +133,9 @@ const data = {
 	diverging,
 	mesh,
 	restrict: restrictRange,
-	src: restrictRange ? undefined : serialize(),
+	params,
+	paramsFrom,
+	src: restrictRange && !paramsFrom ? undefined : serialize(),
 };
 ---
 
@@ -167,6 +184,13 @@ const data = {
 			</div>
 		)
 	}
+	{
+		Astro.slots.has("default") && (
+			<div class="controls">
+				<slot />
+			</div>
+		)
+	}
 </figure>
 
 <script>
@@ -194,7 +218,11 @@ const data = {
 		mesh: boolean;
 		/** restrictRange: keep the x/y ranges inside the sampled grid. */
 		restrict: boolean;
-		/** Function source, present only when restrictRange is off. */
+		/** Third argument of the function, as sampled at build time. */
+		params?: unknown;
+		/** Id of the <MatrixInput> that supplies new params. */
+		paramsFrom?: string;
+		/** Function source, present only when restrictRange is off or paramsFrom is set. */
 		src?: string;
 	}
 
@@ -256,9 +284,14 @@ const data = {
 			y: [d.ys[0], d.ys[d.ys.length - 1]],
 		};
 		const range: Record<Axis, [number, number]> = { x: [...base.x], y: [...base.y] };
-		// Rebuild the function from its source (only sent when restrictRange is off).
+		// Rebuild the function from its source (only sent when the browser may re-sample it).
 		// The build already checked that the rebuilt copy matches the original.
-		const f = d.src ? (new Function(`return (${d.src});`)() as (x: number, y: number) => number) : undefined;
+		const f = d.src
+			? (new Function(`return (${d.src});`)() as (x: number, y: number, params?: unknown) => number)
+			: undefined;
+		let params = d.params;
+		/** Set once params differ from the build's: the build-time grid no longer applies. */
+		let stale = false;
 		/** Tolerance for float round-off when comparing x or y values. */
 		const eps = (a: Axis) => (base[a][1] - base[a][0]) * 1e-9;
 		/**
@@ -296,7 +329,7 @@ const data = {
 			Math.abs(range[a][0] - base[a][0]) <= eps(a) && Math.abs(range[a][1] - base[a][1]) <= eps(a);
 
 		function load() {
-			if (f && !(isBase("x") && isBase("y"))) {
+			if (f && (stale || (!d.restrict && !(isBase("x") && isBase("y"))))) {
 				// Re-sample over the range, as densely as the build did.
 				const grid = (a: Axis) => {
 					const [lo, hi] = range[a];
@@ -307,7 +340,7 @@ const data = {
 				ys = grid("y");
 				z = ys.map((yv) =>
 					xs.map((xv) => {
-						const v = f(xv, yv);
+						const v = f(xv, yv, params);
 						return Number.isFinite(v) ? v : null;
 					}),
 				);
@@ -736,6 +769,18 @@ const data = {
 			render();
 		});
 
+		// ---- Live params: re-sample whenever the linked <MatrixInput> reports a usable matrix.
+		if (f && d.paramsFrom) {
+			document.getElementById(d.paramsFrom)?.addEventListener("matrixinput", (e) => {
+				const { value, valid } = (e as CustomEvent<{ value: number[][]; valid: boolean }>).detail;
+				if (!valid) return; // keep showing the last usable matrix
+				params = value;
+				stale = true;
+				load();
+				render();
+			});
+		}
+
 		new ResizeObserver(render).observe(plot);
 		matchMedia("(prefers-color-scheme: dark)").addEventListener("change", render);
 		load();
@@ -845,6 +890,21 @@ const data = {
 	.legend-ticks {
 		position: relative;
 		height: 1.1rem;
+	}
+	/* Inputs passed as children: a panel of the figure, in the figure's own type. */
+	.controls {
+		margin-top: 0.8rem;
+		padding: 0.8rem 0 0.2rem;
+		border-top: 1px solid var(--faint);
+	}
+	.controls :global(.matrix-input) {
+		margin: 0;
+		font-size: 0.75rem;
+	}
+	.controls :global(.matrix-input .label) {
+		font-family: var(--sans);
+		font-size: 0.85rem;
+		font-weight: 600;
 	}
 	.range-sliders {
 		display: flex;

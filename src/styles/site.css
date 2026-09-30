@@ -214,6 +214,28 @@ hr {
 	background: var(--faint);
 }
 
+/* Collapsible asides (e.g. derivations): summary reads like an h4. */
+details {
+	margin: 1.5rem 0 1.25rem;
+}
+summary {
+	font-family: var(--sans);
+	font-size: 1rem;
+	font-weight: 600;
+	letter-spacing: -0.015em;
+	cursor: pointer;
+}
+summary:hover {
+	color: var(--accent);
+}
+details[open] > summary {
+	margin-bottom: 1rem;
+}
+details[open] {
+	padding-bottom: 0.25rem;
+	border-bottom: 1px solid var(--faint);
+}
+
 img,
 video,
 svg {

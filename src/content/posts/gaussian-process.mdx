@@ -1,0 +1,312 @@
+---
+title: "Gaussian Process Regression"
+description: "Visualising Gaussing Process"
+date: 2026-10-07
+---
+
+import SurfacePlot from "../../utils/charts/3DSurfacePlot.astro";
+import MatrixInput from "../../utils/matrix/MatrixInput.astro";
+
+export const sigma = [
+	[1, 0.7],
+	[0.7, 1],
+];
+// Zero-mean density for covariance s. Self-contained, so the plot can re-sample it in the browser.
+export const gaussian2d = (x, y, s) => {
+	const det = s[0][0] * s[1][1] - s[0][1] * s[1][0];
+	const q = (s[1][1] * x * x - (s[0][1] + s[1][0]) * x * y + s[0][0] * y * y) / det;
+	return Math.exp(-q / 2) / (2 * Math.PI * Math.sqrt(det));
+};
+
+
+
+# Multivariate Gaussian 
+
+A Gaussian process is built entirely out of multivariate Gaussians, so that is where we start. The multivariate Gaussian extends the familiar bell curve from a single number to a vector $\mathbf x \in \mathbb R^d$ of random variables that vary together. It is fully described by two things: a mean vector $\boldsymbol\mu$, which says where the distribution is centred, and a covariance matrix $\Sigma$, which says how much each component spreads and how strongly each pair of components moves together. Its density is
+
+$$
+\large p(\mathbf{x}) = \frac{1}{(2\pi)^{d/2}\,|\Sigma|^{1/2}}\,\exp\!\left(-\tfrac{1}{2}(\mathbf{x}-\boldsymbol\mu)^\top \Sigma^{-1}(\mathbf{x}-\boldsymbol\mu)\right).
+$$
+
+<SurfacePlot
+	title="Density of a two-dimensional Gaussian"
+	fn={gaussian2d}
+	params={sigma}
+	paramsFrom="gaussian-cov"
+	x={[-3, 3]}
+	y={[-3, 3]}
+	samples={51}
+	xLabel="x₁"
+	yLabel="x₂"
+	zLabel="p(x)"
+	yaw={-35}
+	pitch={30}
+>
+	<MatrixInput id="gaussian-cov" label="Σ" value={sigma} symmetric positiveDefinite />
+</SurfacePlot>
+
+We can take a sample from multi-variate gaussian and partition the vector, mean and covariance into two. 
+$$
+\begin{pmatrix}\mathbf x_a\\\mathbf x_b\end{pmatrix} \sim \mathcal N\!\left(
+\begin{pmatrix}\boldsymbol\mu_a\\\boldsymbol\mu_b\end{pmatrix},\;
+\begin{pmatrix}\Sigma_{aa}&\Sigma_{ab}\\\Sigma_{ba}&\Sigma_{bb}\end{pmatrix}\right).
+$$
+
+### Marginalisation
+
+To get $p(\mathbf x_a)$ you simply read off the relevant blocks — integrating out $\mathbf x_b$ does nothing more than drop its rows and columns:
+
+$$\mathbf x_a \sim \mathcal N(\boldsymbol\mu_a,\; \Sigma_{aa}).$$
+
+
+### Conditioning
+
+Given an **observed** value of $\mathbf x_b$, the conditional $p(\mathbf x_a\mid \mathbf x_b)$ is Gaussian with
+
+$$\boxed{\;\boldsymbol\mu_{a\mid b} = \boldsymbol\mu_a + \Sigma_{ab}\,\Sigma_{bb}^{-1}\,(\mathbf x_b - \boldsymbol\mu_b)\;}$$
+
+$$\boxed{\;\Sigma_{a\mid b} = \Sigma_{aa} - \Sigma_{ab}\,\Sigma_{bb}^{-1}\,\Sigma_{ba}\;}$$
+
+The derivation is in [Appendix A.1](#a1-derivation-of-the-conditional-gaussian).
+
+## Appendix
+
+### A.1 Derivation of the conditional Gaussian
+
+<details>
+<summary>Derivation</summary>
+
+$$
+\bold{x} = \begin{bmatrix}\mathbf x_a\\\mathbf x_b\end{bmatrix} 
+\hspace{3em}
+\bold{\mu} = \begin{bmatrix}\mathbf \mu_a\\\mathbf \mu_b\end{bmatrix} 
+\hspace{3em}
+\bold{y} = \bold{x}-\bold{\mu} = \begin{bmatrix}\mathbf y_a\\\mathbf y_b\end{bmatrix}  = \begin{bmatrix}\mathbf x_a-\mu_a\\\mathbf x_b-\mu_b\end{bmatrix}  
+$$
+
+**Step 1: Only the exponent matters.** By the definition of conditional probability,
+
+$$
+p(\mathbf x_a \mid \mathbf x_b) = \frac{p(\mathbf x_a, \mathbf x_b)}{p(\mathbf x_b)}.
+$$
+
+$\mathbf x_b$ is observed, so it is a fixed number. The denominator $p(\mathbf x_b)$ and the normalising constant of the joint do not depend on $\mathbf x_a$, so as a function of $\mathbf x_a$
+
+$$
+p(\mathbf x_a \mid \mathbf x_b) \;\propto\; \exp\!\left(-\tfrac{1}{2}\,\mathbf y^\top \Sigma^{-1}\, \mathbf y\right).
+$$
+
+All we have to do is work out what this exponent looks like as a function of $\mathbf x_a$.
+
+**Step 2: Partition the inverse covariance.** Write $\Lambda = \Sigma^{-1}$ (the *precision matrix*) and split it the same way as $\Sigma$:
+
+$$
+\Lambda = \Sigma^{-1} = \begin{bmatrix}\Lambda_{aa}&\Lambda_{ab}\\\Lambda_{ba}&\Lambda_{bb}\end{bmatrix}.
+$$
+
+$\Sigma$ is symmetric, so $\Lambda$ is symmetric too, which means $\Lambda_{aa}^\top = \Lambda_{aa}$, $\Lambda_{bb}^\top = \Lambda_{bb}$ and $\Lambda_{ba} = \Lambda_{ab}^\top$. Note that $\Lambda_{aa}$ is **not** $\Sigma_{aa}^{-1}$; we will find what it is in Step 5.
+
+**Step 3: Expand the quadratic form.**
+
+$$
+\begin{aligned}
+\mathbf y^\top \Lambda\, \mathbf y
+&= \begin{bmatrix}\mathbf y_a^\top & \mathbf y_b^\top\end{bmatrix}
+\begin{bmatrix}\Lambda_{aa}&\Lambda_{ab}\\\Lambda_{ba}&\Lambda_{bb}\end{bmatrix}
+\begin{bmatrix}\mathbf y_a\\\mathbf y_b\end{bmatrix} \\[4pt]
+&= \mathbf y_a^\top \Lambda_{aa}\, \mathbf y_a
+ + \mathbf y_a^\top \Lambda_{ab}\, \mathbf y_b
+ + \mathbf y_b^\top \Lambda_{ba}\, \mathbf y_a
+ + \mathbf y_b^\top \Lambda_{bb}\, \mathbf y_b .
+\end{aligned}
+$$
+
+The two middle terms are scalars, and a scalar equals its own transpose: $\mathbf y_b^\top \Lambda_{ba}\, \mathbf y_a = (\mathbf y_b^\top \Lambda_{ba}\, \mathbf y_a)^\top = \mathbf y_a^\top \Lambda_{ab}\, \mathbf y_b$. So they are equal and
+
+$$
+\mathbf y^\top \Lambda\, \mathbf y
+= \underbrace{\mathbf y_a^\top \Lambda_{aa}\, \mathbf y_a}_{\text{quadratic in } \mathbf y_a}
++ \underbrace{2\,\mathbf y_a^\top \Lambda_{ab}\, \mathbf y_b}_{\text{linear in } \mathbf y_a}
++ \underbrace{\mathbf y_b^\top \Lambda_{bb}\, \mathbf y_b}_{\text{constant}} .
+$$
+
+**Step 4: Complete the square in $\mathbf y_a$.** For any vector $\mathbf m$,
+
+$$
+(\mathbf y_a - \mathbf m)^\top \Lambda_{aa} (\mathbf y_a - \mathbf m)
+= \mathbf y_a^\top \Lambda_{aa}\, \mathbf y_a - 2\,\mathbf y_a^\top \Lambda_{aa}\, \mathbf m + \mathbf m^\top \Lambda_{aa}\, \mathbf m .
+$$
+
+The quadratic term already matches Step 3. To make the linear terms match we need $-\Lambda_{aa}\,\mathbf m = \Lambda_{ab}\,\mathbf y_b$, i.e.
+
+$$
+\mathbf m = -\Lambda_{aa}^{-1} \Lambda_{ab}\, \mathbf y_b .
+$$
+
+With this choice of $\mathbf m$,
+
+$$
+\mathbf y^\top \Lambda\, \mathbf y
+= (\mathbf y_a - \mathbf m)^\top \Lambda_{aa} (\mathbf y_a - \mathbf m)
++ \underbrace{\mathbf y_b^\top \Lambda_{bb}\, \mathbf y_b - \mathbf m^\top \Lambda_{aa}\, \mathbf m}_{\text{does not depend on } \mathbf x_a} .
+$$
+
+The last two terms only involve $\mathbf x_b$, so they become a constant factor that is absorbed into the proportionality. Substituting $\mathbf y_a = \mathbf x_a - \boldsymbol\mu_a$:
+
+$$
+p(\mathbf x_a \mid \mathbf x_b) \;\propto\;
+\exp\!\left(-\tfrac{1}{2}\,\big(\mathbf x_a - (\boldsymbol\mu_a + \mathbf m)\big)^\top \Lambda_{aa}\, \big(\mathbf x_a - (\boldsymbol\mu_a + \mathbf m)\big)\right).
+$$
+
+Comparing with the Gaussian density at the top of the page, this is exactly the exponent of a Gaussian in $\mathbf x_a$ with mean $\boldsymbol\mu_a + \mathbf m$ and inverse covariance $\Lambda_{aa}$. Since a density must integrate to one, the normalising constant is forced, and
+
+$$
+\boldsymbol\mu_{a\mid b} = \boldsymbol\mu_a - \Lambda_{aa}^{-1} \Lambda_{ab}\,(\mathbf x_b - \boldsymbol\mu_b),
+\hspace{3em}
+\Sigma_{a\mid b} = \Lambda_{aa}^{-1} .
+$$
+
+**Step 5: Express $\Lambda$ in terms of $\Sigma$.** The result is correct but written with blocks of $\Lambda$. To get rid of them we need the blocks of $\Sigma^{-1}$, and the Schur complement identity (derived in [Appendix A.2](#a2-schur-complement-and-the-inverse-of-a-block-matrix)) gives them directly. Define the *Schur complement* of $\Sigma_{bb}$ in $\Sigma$:
+
+$$
+S = \Sigma_{aa} - \Sigma_{ab}\,\Sigma_{bb}^{-1}\,\Sigma_{ba}.
+$$
+
+Then
+
+$$
+\begin{bmatrix}\Lambda_{aa}&\Lambda_{ab}\\\Lambda_{ba}&\Lambda_{bb}\end{bmatrix}
+= \begin{bmatrix}\Sigma_{aa}&\Sigma_{ab}\\\Sigma_{ba}&\Sigma_{bb}\end{bmatrix}^{-1}
+= \begin{bmatrix}
+S^{-1} & -S^{-1}\,\Sigma_{ab}\,\Sigma_{bb}^{-1} \\[4pt]
+-\Sigma_{bb}^{-1}\,\Sigma_{ba}\,S^{-1} & \Sigma_{bb}^{-1} + \Sigma_{bb}^{-1}\,\Sigma_{ba}\,S^{-1}\,\Sigma_{ab}\,\Sigma_{bb}^{-1}
+\end{bmatrix}.
+$$
+
+We only need the top row. Reading off the two blocks:
+
+$$
+\Lambda_{aa} = S^{-1},
+\hspace{3em}
+\Lambda_{ab} = -S^{-1}\,\Sigma_{ab}\,\Sigma_{bb}^{-1}.
+$$
+
+**Step 6: Substitute back.** The covariance from Step 4 is
+
+$$
+\Sigma_{a\mid b} = \Lambda_{aa}^{-1} = S = \Sigma_{aa} - \Sigma_{ab}\,\Sigma_{bb}^{-1}\,\Sigma_{ba}.
+$$
+
+For the mean we need $-\Lambda_{aa}^{-1}\Lambda_{ab}$, where the $S$ and $S^{-1}$ cancel:
+
+$$
+-\Lambda_{aa}^{-1}\Lambda_{ab} = -S\,\big(-S^{-1}\,\Sigma_{ab}\,\Sigma_{bb}^{-1}\big) = \Sigma_{ab}\,\Sigma_{bb}^{-1},
+$$
+
+so
+
+$$
+\boldsymbol\mu_{a\mid b} = \boldsymbol\mu_a + \Sigma_{ab}\,\Sigma_{bb}^{-1}\,(\mathbf x_b - \boldsymbol\mu_b).
+$$
+
+These are the two boxed results from the [Conditioning](#conditioning) section. Notice that the conditional mean is linear in the observed $\mathbf x_b$, while the conditional covariance does not depend on the value of $\mathbf x_b$ at all.
+
+</details>
+
+### A.2 Schur complement and the inverse of a block matrix
+
+<details>
+<summary>Proof</summary>
+
+Take a square matrix split into four blocks, with $A$ and $D$ square and $D$ invertible:
+
+$$
+M = \begin{bmatrix}A&B\\C&D\end{bmatrix}.
+$$
+
+The *Schur complement* of $D$ in $M$ is
+
+$$
+S = A - B\,D^{-1}C .
+$$
+
+The claim is that, whenever $S$ is invertible,
+
+$$
+\boxed{\;
+M^{-1} = \begin{bmatrix}
+S^{-1} & -S^{-1}B\,D^{-1} \\[4pt]
+-D^{-1}C\,S^{-1} & D^{-1} + D^{-1}C\,S^{-1}B\,D^{-1}
+\end{bmatrix}
+\;}
+$$
+
+The idea is block Gaussian elimination: knock out the off-diagonal blocks $B$ and $C$ so that $M$ becomes block diagonal, which is trivial to invert.
+
+**Step 1: Eliminate $B$.** Subtract $B\,D^{-1}$ times the bottom block row from the top block row. As a matrix product this is a multiplication on the left:
+
+$$
+\begin{bmatrix}I & -B\,D^{-1}\\0&I\end{bmatrix}
+\begin{bmatrix}A&B\\C&D\end{bmatrix}
+= \begin{bmatrix}A - B\,D^{-1}C & B - B\,D^{-1}D\\C&D\end{bmatrix}
+= \begin{bmatrix}S&0\\C&D\end{bmatrix}.
+$$
+
+This is where the Schur complement comes from: it is what is left of $A$ after $B$ has been eliminated.
+
+**Step 2: Eliminate $C$.** Subtract the right block column times $D^{-1}C$ from the left block column, which is a multiplication on the right:
+
+$$
+\begin{bmatrix}S&0\\C&D\end{bmatrix}
+\begin{bmatrix}I&0\\-D^{-1}C&I\end{bmatrix}
+= \begin{bmatrix}S & 0\\C - D\,D^{-1}C&D\end{bmatrix}
+= \begin{bmatrix}S&0\\0&D\end{bmatrix}.
+$$
+
+**Step 3: Combine.** Name the two elimination matrices
+
+$$
+L = \begin{bmatrix}I & -B\,D^{-1}\\0&I\end{bmatrix},
+\hspace{3em}
+R = \begin{bmatrix}I&0\\-D^{-1}C&I\end{bmatrix}.
+$$
+
+Steps 1 and 2 together say
+
+$$
+L\,M\,R = \begin{bmatrix}S&0\\0&D\end{bmatrix}.
+$$
+
+**Step 4: Invert both sides.** $L$ and $R$ are triangular with identity blocks on the diagonal, so they are always invertible. Using $(L\,M\,R)^{-1} = R^{-1}M^{-1}L^{-1}$ and the fact that a block-diagonal matrix is inverted block by block:
+
+$$
+R^{-1}M^{-1}L^{-1} = \begin{bmatrix}S^{-1}&0\\0&D^{-1}\end{bmatrix}
+\;\;\Longrightarrow\;\;
+M^{-1} = R \begin{bmatrix}S^{-1}&0\\0&D^{-1}\end{bmatrix} L .
+$$
+
+**Step 5: Multiply out.** First the left two factors:
+
+$$
+\begin{bmatrix}I&0\\-D^{-1}C&I\end{bmatrix}
+\begin{bmatrix}S^{-1}&0\\0&D^{-1}\end{bmatrix}
+= \begin{bmatrix}S^{-1}&0\\-D^{-1}C\,S^{-1}&D^{-1}\end{bmatrix},
+$$
+
+then multiply by $L$:
+
+$$
+M^{-1} =
+\begin{bmatrix}S^{-1}&0\\-D^{-1}C\,S^{-1}&D^{-1}\end{bmatrix}
+\begin{bmatrix}I & -B\,D^{-1}\\0&I\end{bmatrix}
+= \begin{bmatrix}
+S^{-1} & -S^{-1}B\,D^{-1} \\[4pt]
+-D^{-1}C\,S^{-1} & D^{-1} + D^{-1}C\,S^{-1}B\,D^{-1}
+\end{bmatrix},
+$$
+
+which is the claimed identity.
+
+**Applying it to $\Sigma$.** Set $A = \Sigma_{aa}$, $B = \Sigma_{ab}$, $C = \Sigma_{ba}$ and $D = \Sigma_{bb}$ to get the form used in [A.1](#a1-derivation-of-the-conditional-gaussian). Both invertibility assumptions hold for a covariance matrix: $\Sigma$ is positive definite, so its diagonal block $\Sigma_{bb}$ is positive definite and therefore invertible. Taking determinants of $L\,M\,R$ (with $|L| = |R| = 1$) gives $|\Sigma| = |S|\,|\Sigma_{bb}|$, and since $|\Sigma| \neq 0$ we get $|S| \neq 0$, so $S$ is invertible too.
+
+</details>
