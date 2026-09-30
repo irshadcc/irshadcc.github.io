@@ -1,15 +1,18 @@
 ---
-// A 3D-parallel training job laid out by its parallel coordinates rather than by host.
+// A parallel training job laid out by its parallel coordinates rather than by host.
 // Inspired by MegaScale's performance heat-map (Figure 7, arXiv:2402.15627), which draws ranks
 // inside their hosts, so TP, DP and PP groups scatter and need dashed connectors. Here:
 //
 //   columns = pipeline stages (PP), left to right in the direction activations flow
 //   rows    = data-parallel replicas (DP)
-//   cells   = tensor-parallel groups (TP), one square per shard
+//   cells   = one replica's share of one stage: a block per context-parallel chunk (CP),
+//             stacked top to bottom, each a tensor-parallel group (TP) with one square per shard
 //
-// so every group is a straight line: a TP group is one cell, a DP group is a vertical line
-// through the same square of every row, and a pipeline is a horizontal line through the same
-// square of every column. Distribution strips along the top (per stage) and right (per
+// so every group is a straight line: a TP group is one block, a CP group is a vertical line
+// through the same square of every block in a cell, a DP group is a vertical line through the
+// same square of every row, and a pipeline is a horizontal line through the same square of every
+// column. An expert-parallel group (EP, carved out of CP × DP; see parallelism.ts) is a run of
+// consecutive squares down one column, drawn as a capsule. Distribution strips along the top (per stage) and right (per
 // replica) show every rank's value and mark the slowest, since synchronous training runs at
 // the pace of its slowest rank. A toggle recolours squares by idle time: how long each rank
 // waits for the slowest one per step.
@@ -19,14 +22,19 @@
 // Usage in .mdx:
 //   <LogicalDistributedTopology parallel={{ tp: 4, dp: 3, pp: 4 }} values={times} unit="s"
 //     network={{ gpusPerServer: 4, serversPerPod: 3, spinesPerPod: 4 }} />
+//   <LogicalDistributedTopology parallel={{ tp: 2, cp: 2, dp: 4, pp: 2, ep: 4 }} />
 import { type ColorScaleSpec, colorScale } from "../colors/colorScales";
 import { ClusterNetwork, type HopClass, type NetworkShape } from "./network";
-import { DIM_NAMES, DIMS, type Dim, ParallelLayout } from "./parallelism";
+import { type Axis, DIM_NAMES, DIMS, type Degrees, type Dim, ParallelLayout } from "./parallelism";
 
 interface Props {
-	parallel: Record<Dim, number>;
-	/** Rank numbering, fastest-varying dimension first (Megatron-LM default: tp, dp, pp). */
-	order?: [Dim, Dim, Dim];
+	/** Parallel degrees; cp and ep default to 1, and ep must divide cp × dp. */
+	parallel: Degrees;
+	/**
+	 * Rank numbering, fastest-varying dimension first (Megatron-LM default: tp, cp, dp, pp).
+	 * cp may be left out, and then goes right after tp.
+	 */
+	order?: Axis[];
 	/** One value per rank, e.g. compute time per step. */
 	values?: number[] | Record<number, number>;
 	/** Colour scale for the values (see colorScales.ts). */
@@ -40,14 +48,14 @@ interface Props {
 	network?: NetworkShape;
 	/** Rank selected initially. */
 	selected?: number;
-	/** Override the TP / DP / PP colours. */
+	/** Override the TP / CP / EP / DP / PP colours. */
 	commColors?: Partial<Record<Dim, string>>;
 	title?: string;
 }
 
 const {
 	parallel,
-	order = ["tp", "dp", "pp"],
+	order = ["tp", "cp", "dp", "pp"],
 	values,
 	colors = "paper",
 	idleColors = "blues",
@@ -62,7 +70,8 @@ const {
 
 const layout = new ParallelLayout(parallel, order);
 const N = layout.size;
-const { tp: T, dp: D, pp: P } = parallel;
+const { tp: T, cp: C, dp: D, pp: P } = layout.degrees;
+const active = DIMS.filter((d) => layout.degrees[d] > 1);
 const net = network ? new ClusterNetwork(network) : undefined;
 
 // ---- Values: compute time, and idle time relative to the slowest rank.
@@ -85,12 +94,16 @@ const withUnit = (v: number) => (unit ? `${fmt(v)} ${unit}` : fmt(v));
 
 // ---- Geometry (px).
 const S = 24; // square per TP shard
-const CP = 6; // cell padding
+const PAD = 6; // cell padding
 const tpCols = Math.min(T, 4);
 const tpRows = Math.ceil(T / tpCols);
+const BLOCK_H = tpRows * S; // one CP chunk's TP group
+const BLOCK_GAP = 12; // between CP chunks
 const BADGE = net ? 13 : 0; // host line under the squares
-const cellW = tpCols * S + 2 * CP;
-const cellH = tpRows * S + 2 * CP + BADGE;
+const cellW = tpCols * S + 2 * PAD;
+const cellH = C * BLOCK_H + (C - 1) * BLOCK_GAP + 2 * PAD + BADGE;
+// With CP, the CP and DP lines both run down a column; offset them so both stay visible.
+const LINE_OFF = C > 1 ? 4 : 0;
 const COL_GAP = 34;
 const ROW_GAP = 18;
 const MARGIN = 12;
@@ -101,6 +114,7 @@ const gridX0 = MARGIN + LEFT;
 const gridY0 = MARGIN + STRIP_H + HEADER;
 const cellX = (p: number) => gridX0 + p * (cellW + COL_GAP);
 const cellY = (d: number) => gridY0 + d * (cellH + ROW_GAP);
+const blockY = (d: number, c: number) => cellY(d) + PAD + c * (BLOCK_H + BLOCK_GAP);
 const gridRight = cellX(P - 1) + cellW;
 const gridBottom = cellY(D - 1) + cellH;
 const RS_X = gridRight + 26; // per-replica strips right of the grid
@@ -110,8 +124,8 @@ const H = gridBottom + MARGIN;
 
 const squares = Array.from({ length: N }, (_, rank) => {
 	const c = layout.coordOf(rank);
-	const x = cellX(c.pp) + CP + (c.tp % tpCols) * S;
-	const y = cellY(c.dp) + CP + Math.floor(c.tp / tpCols) * S;
+	const x = cellX(c.pp) + PAD + (c.tp % tpCols) * S;
+	const y = blockY(c.dp, c.cp) + Math.floor(c.tp / tpCols) * S;
 	const v = vals[rank];
 	const idle = idleOf(rank);
 	return {
@@ -138,22 +152,36 @@ const hostLabel = (ranks: number[]) => {
 	return hs.length === 1 ? `host ${hs[0]}` : `hosts ${hs[0]}–${hs[hs.length - 1]}`;
 };
 
-// ---- Cells (one per TP group) and the DP / PP group lines.
+// ---- Cells (one per replica and stage), TP blocks (one per CP chunk) and the group lines.
 const cells = Array.from({ length: D * P }, (_, i) => {
 	const d = Math.floor(i / P);
 	const p = i % P;
-	const ranks = layout.groupOf("tp", layout.rankOf({ tp: 0, dp: d, pp: p }));
-	return { d, p, ranks, x: cellX(p), y: cellY(d), host: hostLabel(ranks) };
+	const ranks = squares.filter((s) => s.c.dp === d && s.c.pp === p).map((s) => s.rank);
+	return { d, p, x: cellX(p), y: cellY(d), host: hostLabel(ranks) };
 });
+const tpBlocks = layout.groups("tp").map((g) => {
+	const s = squares[g[0]];
+	return { ranks: g, x: cellX(s.c.pp) + PAD - 3, y: blockY(s.c.dp, s.c.cp) - 3 };
+});
+const cpLines = layout.groups("cp").map((g) => ({
+	ranks: g,
+	segs: g.slice(1).map((b, i) => ({ x: squares[b].cx - LINE_OFF, y1: squares[g[i]].y + S, y2: squares[b].y })),
+}));
 const dpLines = layout.groups("dp").map((g) => ({
 	ranks: g,
 	segs: g.slice(1).map((b, i) => {
 		const sa = squares[g[i]];
 		const sb = squares[b];
 		// Hop label sits in the gap above b's cell, clear of any squares.
-		return { x: sa.cx, y1: sa.y + S, y2: sb.y, ly: cellY(sb.c.dp) - ROW_GAP / 2 + 3, hop: hopOf(g[i], b) };
+		return { x: sa.cx + LINE_OFF, y1: sa.y + S, y2: sb.y, ly: cellY(sb.c.dp) - ROW_GAP / 2 + 3, hop: hopOf(g[i], b) };
 	}),
 }));
+// An EP group is a contiguous run down one column (CP chunks, then replicas), so a capsule.
+const epCapsules = layout.groups("ep").map((g) => {
+	const first = squares[g[0]];
+	const last = squares[g[g.length - 1]];
+	return { ranks: g, x: first.x - 3, y: first.y - 3, h: last.y + S - first.y + 6 };
+});
 const ppLines = layout.groups("pp").map((g) => ({
 	ranks: g,
 	segs: g.slice(1).map((b, i) => {
@@ -184,15 +212,14 @@ const replicaStrips = hasValues
 // ---- Text: per-rank description (info line) and the bottleneck summary.
 const info = squares.map((s) => {
 	const r = s.rank;
-	const parts = [`Rank ${r}: stage ${s.c.pp}, replica ${s.c.dp}, TP shard ${s.c.tp}`];
+	const parts = [`Rank ${r}: stage ${s.c.pp}, replica ${s.c.dp}${C > 1 ? `, CP chunk ${s.c.cp}` : ""}, TP shard ${s.c.tp}`];
 	const host = serverOf(r);
 	if (host !== undefined) parts[0] += `, host ${host}`;
 	const v = vals[r];
 	if (v !== undefined) {
 		parts.push(r === slowest ? `${withUnit(v)}, the slowest rank` : `${withUnit(v)}, idles ${withUnit(maxV - v)} waiting for rank ${slowest}`);
 	}
-	for (const dim of DIMS) {
-		if (parallel[dim] < 2) continue;
+	for (const dim of active) {
 		const g = layout.groupOf(dim, r);
 		const i = g.indexOf(r);
 		const peers = dim === "pp" ? [g[i - 1], g[i + 1]].filter((p) => p !== undefined) : g.filter((p) => p !== r);
@@ -221,6 +248,10 @@ const summary = hasValues
 
 const hash = [...JSON.stringify(Astro.props)].reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7).toString(36);
 const arrowId = `lg-arrow-${hash}`;
+// "tensor-, context- and pipeline-parallel"
+const names = active.map((d) => DIM_NAMES[d].split(" ")[0].toLowerCase());
+const dimList = names.length < 2 ? names.join("") : `${names.slice(0, -1).join("-, ")}- and ${names[names.length - 1]}`;
+const hint = active.length ? `Hover or click a rank to see its ${dimList}-parallel groups.` : "";
 const commStyle = DIMS.filter((d) => commColors[d])
 	.map((d) => `--${d}: ${commColors[d]}`)
 	.join("; ");
@@ -230,10 +261,10 @@ const commStyle = DIMS.filter((d) => commColors[d])
 	{title && <figcaption class="title">{title}</figcaption>}
 	<div class="legend">
 		{
-			DIMS.filter((d) => parallel[d] > 1).map((d) => (
+			active.map((d) => (
 				<span class="key">
 					<span class={`swatch-line ${d}`} />
-					{DIM_NAMES[d]} ({d.toUpperCase()} = {parallel[d]})
+					{DIM_NAMES[d]} ({d.toUpperCase()} = {layout.degrees[d]})
 				</span>
 			))
 		}
@@ -270,7 +301,8 @@ const commStyle = DIMS.filter((d) => commColors[d])
 			height={H}
 			style={`min-width: ${Math.round(W * 0.75)}px`}
 			role="group"
-			aria-label={title ?? `${N} ranks: ${P} pipeline stages × ${D} data-parallel replicas × ${T} tensor-parallel shards`}
+			aria-label={title ??
+				`${N} ranks: ${P} pipeline stages × ${D} data-parallel replicas${C > 1 ? ` × ${C} context-parallel chunks` : ""} × ${T} tensor-parallel shards`}
 		>
 			<defs>
 				<marker
@@ -374,9 +406,25 @@ const commStyle = DIMS.filter((d) => commColors[d])
 
 			<!-- Group overlays, hidden until a member is selected. -->
 			{
-				cells.map((c) => (
-					<g class="grp tp" data-dim="tp" data-ranks={c.ranks.join(",")}>
-						<rect x={c.x - 3} y={c.y - 3} width={cellW + 6} height={cellH + 6} rx="8" />
+				epCapsules.map((e) => (
+					<g class="grp ep" data-dim="ep" data-ranks={e.ranks.join(",")}>
+						<rect x={e.x} y={e.y} width={S + 6} height={e.h} rx="6" />
+					</g>
+				))
+			}
+			{
+				tpBlocks.map((b) => (
+					<g class="grp tp" data-dim="tp" data-ranks={b.ranks.join(",")}>
+						<rect x={b.x} y={b.y} width={tpCols * S + 6} height={BLOCK_H + 6} rx="5" />
+					</g>
+				))
+			}
+			{
+				cpLines.map((g) => (
+					<g class="grp cp" data-dim="cp" data-ranks={g.ranks.join(",")}>
+						{g.segs.map((s) => (
+							<line x1={s.x} y1={s.y1} x2={s.x} y2={s.y2} />
+						))}
 					</g>
 				))
 			}
@@ -438,20 +486,24 @@ const commStyle = DIMS.filter((d) => commColors[d])
 		</svg>
 	</div>
 
-	<p class="info" aria-live="polite">Hover or click a rank to see its tensor-, data- and pipeline-parallel groups.</p>
+	<p class="info" aria-live="polite">{hint}</p>
 	<div class="info-store" hidden>{info.map((t) => <span>{t}</span>)}</div>
 	{summary && <p class="summary">{summary}</p>}
 </figure>
 
 <script>
-	// Selection highlights the rank's three groups (its cell, its vertical DP line and its
-	// horizontal pipeline) and fades every rank outside them. The mode buttons swap each
+	// Selection highlights the rank's groups (its TP block, its CP and DP lines, its EP capsule
+	// and its horizontal pipeline), outlines each peer in the colour of the group it shares with
+	// the selection (the closest one when it shares several) and fades every rank outside them.
+	// The mode buttons swap each
 	// square's colour between the value scale and the idle-time scale.
 	for (const fig of document.querySelectorAll<HTMLElement>(".logical")) {
 		const info = fig.querySelector<HTMLElement>(".info");
 		const hint = info?.textContent ?? "";
 		const texts = [...fig.querySelectorAll<HTMLElement>(".info-store span")].map((s) => s.textContent ?? "");
 		const ranks = [...fig.querySelectorAll<SVGGElement>(".rank")];
+		// Closest groups first: a rank in both the TP block and the DP line counts as a TP peer.
+		const closeness = ["tp", "cp", "ep", "dp", "pp"];
 		const groups = [...fig.querySelectorAll<SVGGElement>(".grp")].map((el) => ({
 			el,
 			dim: el.dataset.dim ?? "",
@@ -466,11 +518,17 @@ const commStyle = DIMS.filter((d) => commColors[d])
 			for (const g of groups) {
 				const on = sel !== null && g.ranks.has(sel);
 				g.el.classList.toggle("on", on);
-				if (on) for (const r of g.ranks) if (!peer.has(r)) peer.set(r, g.dim);
+				if (!on) continue;
+				for (const r of g.ranks) {
+					const cur = peer.get(r);
+					if (cur === undefined || closeness.indexOf(g.dim) < closeness.indexOf(cur)) peer.set(r, g.dim);
+				}
 			}
 			ranks.forEach((el, r) => {
 				el.classList.toggle("selected", r === sel);
 				el.classList.toggle("peer", peer.has(r));
+				if (peer.has(r) && r !== sel) el.dataset.peer = peer.get(r);
+				else delete el.dataset.peer;
 				el.setAttribute("aria-pressed", String(r === pinned));
 			});
 			if (info) info.textContent = sel === null ? hint : texts[sel];
@@ -511,6 +569,8 @@ const commStyle = DIMS.filter((d) => commColors[d])
 <style>
 	.logical {
 		--tp: #4caf50;
+		--cp: #1f9bb0;
+		--ep: #d6456b;
 		--dp: #a86ad8;
 		--pp: #c99a1e;
 		margin: 1.75rem 0;
@@ -519,6 +579,8 @@ const commStyle = DIMS.filter((d) => commColors[d])
 	@media (prefers-color-scheme: dark) {
 		.logical {
 			--tp: #66c26a;
+			--cp: #3dbcd0;
+			--ep: #ec6f8f;
 			--dp: #b98ae3;
 			--pp: #d8ad3a;
 		}
@@ -554,6 +616,12 @@ const commStyle = DIMS.filter((d) => commColors[d])
 	}
 	.swatch-line.tp {
 		background: var(--tp);
+	}
+	.swatch-line.cp {
+		background: var(--cp);
+	}
+	.swatch-line.ep {
+		background: var(--ep);
 	}
 	.swatch-line.dp {
 		background: var(--dp);
@@ -684,6 +752,43 @@ const commStyle = DIMS.filter((d) => commColors[d])
 		stroke: var(--text);
 		stroke-width: 2.4;
 	}
+	/* Without a value colour the selected square is white, never black, in both themes. */
+	.rank.selected:not([data-fill-compute]) rect {
+		fill: #fff;
+	}
+	.rank.selected:not([data-fill-compute]) text {
+		fill: #1a1a1a;
+		font-weight: 700;
+	}
+	/* Peers: outlined in the colour of the group they share with the selection, and, where no
+	   value colours the square, tinted with it too. */
+	.rank[data-peer] rect {
+		stroke: var(--group);
+		stroke-width: 2;
+	}
+	.rank[data-peer]:not([data-fill-compute]) rect {
+		fill: color-mix(in oklch, var(--group) 45%, white);
+	}
+	/* The tint is a light pastel in both themes (mixed into a dark background it reads as
+	   near-black), so its label stays dark. */
+	.rank[data-peer]:not([data-fill-compute]) text {
+		fill: #1a1a1a;
+	}
+	.rank[data-peer="tp"] {
+		--group: var(--tp);
+	}
+	.rank[data-peer="cp"] {
+		--group: var(--cp);
+	}
+	.rank[data-peer="ep"] {
+		--group: var(--ep);
+	}
+	.rank[data-peer="dp"] {
+		--group: var(--dp);
+	}
+	.rank[data-peer="pp"] {
+		--group: var(--pp);
+	}
 	.tracing .rank:not(.peer) {
 		opacity: 0.3;
 	}
@@ -700,6 +805,17 @@ const commStyle = DIMS.filter((d) => commColors[d])
 		fill: none;
 		stroke: var(--tp);
 		stroke-width: 2.2;
+	}
+	.grp.cp line {
+		stroke: var(--cp);
+		stroke-width: 2.4;
+		stroke-linecap: round;
+	}
+	/* A bright pink band, not a tint: mixed into a dark surface a tint turns near-black. */
+	.grp.ep rect {
+		fill: color-mix(in oklch, var(--ep) 55%, white);
+		stroke: var(--ep);
+		stroke-width: 2;
 	}
 	.grp.dp line {
 		stroke: var(--dp);
