@@ -21,6 +21,10 @@ const megascaleNet = { gpusPerServer: 4, serversPerPod: 3, spinesPerPod: 4 };
 const big = Array.from({ length: 128 }, () => 1.8 + rand() * 0.06);
 big[77] = 2.2;
 
+// ---- 64 ranks = TP 2 × CP 2 × DP 4 × PP 4, with EP 4 for the MoE layers. One slow GPU.
+const moe = Array.from({ length: 64 }, () => 1.5 + rand() * 0.05);
+moe[21] = 1.78;
+
 const scaleNames = Object.keys(COLOR_SCALES) as ColorScaleName[];
 ---
 
@@ -72,6 +76,38 @@ const scaleNames = Object.keys(COLOR_SCALES) as ColorScaleName[];
 		commColors={{ tp: "#e8590c", dp: "#1971c2", pp: "#2f9e44" }}
 		selected={77}
 	/>
+
+	<h2>Context parallelism</h2>
+	<p>
+		Each cell now holds one block per context-parallel chunk: the sequence is split across the blocks, and each
+		block is a tensor-parallel group. A CP group is a vertical line inside a cell, next to the DP line that
+		continues to the other replicas.
+	</p>
+	<LogicalDistributedTopology
+		parallel={{ tp: 2, cp: 2, dp: 2, pp: 3 }}
+		network={{ gpusPerServer: 4, serversPerPod: 2, spinesPerPod: 2 }}
+		selected={5}
+		title="24 ranks: 3 stages × 2 replicas × 2 CP chunks × 2 TP shards"
+	/>
+
+	<h2>Expert parallelism</h2>
+	<p>
+		Expert parallelism adds no ranks: MoE layers regroup each position's context-parallel and data-parallel ranks
+		into expert-parallel groups (Megatron-Core's layout), so an EP group runs down one column, through the CP
+		chunks first and then across replicas.
+	</p>
+	<LogicalDistributedTopology
+		parallel={{ tp: 2, cp: 2, dp: 4, pp: 4, ep: 4 }}
+		values={moe}
+		unit="s"
+		valueLabel="compute time"
+		network={{ gpusPerServer: 8, serversPerPod: 4, spinesPerPod: 4 }}
+		selected={21}
+		title="64 ranks: TP 2 × CP 2 × DP 4 × PP 4, EP 4"
+	/>
+
+	<h2>Expert parallelism without CP</h2>
+	<LogicalDistributedTopology parallel={{ tp: 4, dp: 4, pp: 2, ep: 2 }} selected={6} />
 
 	<h2>Without values or a network</h2>
 	<LogicalDistributedTopology parallel={{ tp: 2, dp: 4, pp: 3 }} selected={9} />
