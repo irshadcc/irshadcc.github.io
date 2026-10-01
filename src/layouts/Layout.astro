@@ -14,6 +14,8 @@ interface Props {
 }
 
 const { title, description = SITE.description, article } = Astro.props;
+// A post passes its table of contents in slot="toc"; it is drawn in the left margin.
+const hasToc = Astro.slots.has("toc");
 const pageTitle = title ? `${title} | ${SITE.title}` : SITE.title;
 const base = import.meta.env.BASE_URL.replace(/\/$/, "");
 const path = Astro.url.pathname.replace(base, "").replace(/\/$/, "") || "/";
@@ -57,7 +59,7 @@ const isActive = (href: string) => {
 			href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;650;700&family=JetBrains+Mono:wght@400;500&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap"
 		/>
 	</head>
-	<body>
+	<body class={hasToc ? "has-toc" : undefined}>
 		<header class="site-header">
 			<div class="frame">
 				<a class="wordmark" href={`${base}/`}>
@@ -73,6 +75,13 @@ const isActive = (href: string) => {
 
 		<main>
 			<div class="frame">
+				{
+					hasToc && (
+						<aside class="toc-rail">
+							<slot name="toc" />
+						</aside>
+					)
+				}
 				<div class="column">
 					<slot />
 				</div>

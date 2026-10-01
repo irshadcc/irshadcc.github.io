@@ -1,0 +1,214 @@
+---
+// An editable matrix: a grid of number inputs between brackets. Whenever an entry changes it
+// fires a bubbling "matrixinput" CustomEvent on its root element, with
+// detail = { value: number[][], valid: boolean }. Other components subscribe by `id`
+// (e.g. <SurfacePlot paramsFrom="cov" />).
+// With `symmetric`, editing (i, j) also sets (j, i). With `positiveDefinite`, a matrix that is
+// not symmetric positive definite (so not a valid covariance) is flagged and reported as
+// valid: false. An empty or non-numeric entry is invalid too.
+// Usage in .mdx:
+//   <MatrixInput id="cov" label="Σ" value={[[1, 0.7], [0.7, 1]]} symmetric positiveDefinite />
+interface Props {
+	/** Element id; subscribers listen for "matrixinput" on it. */
+	id: string;
+	/** Initial entries, as rows. */
+	value: number[][];
+	/** Shown before the matrix, followed by "=". */
+	label?: string;
+	/** Step of the number inputs' arrows. */
+	step?: number;
+	min?: number;
+	max?: number;
+	/** Keep the matrix symmetric: editing (i, j) also sets (j, i). */
+	symmetric?: boolean;
+	/** Require a symmetric positive definite matrix. */
+	positiveDefinite?: boolean;
+}
+
+const { id, value, label, step = 0.1, min, max, symmetric = false, positiveDefinite = false } = Astro.props;
+const cols = value[0]?.length ?? 0;
+if (!value.length || value.some((row) => row.length !== cols)) {
+	throw new Error("MatrixInput: value must be a non-empty rectangular array of rows");
+}
+if ((symmetric || positiveDefinite) && value.length !== cols) {
+	throw new Error("MatrixInput: symmetric / positiveDefinite need a square matrix");
+}
+const name = label ?? "matrix";
+---
+
+<figure class="matrix-input" id={id} data-symmetric={symmetric ? "" : undefined} data-pd={positiveDefinite ? "" : undefined}>
+	<div class="row">
+		{label && <span class="label">{label} =</span>}
+		<div class="bracket">
+			<div class="grid" style={`grid-template-columns: repeat(${cols}, auto)`}>
+				{
+					value.map((row, i) =>
+						row.map((v, j) => (
+							<input
+								type="number"
+								value={v}
+								step={step}
+								min={min}
+								max={max}
+								data-i={i}
+								data-j={j}
+								aria-label={`${name} row ${i + 1}, column ${j + 1}`}
+							/>
+						)),
+					)
+				}
+			</div>
+		</div>
+	</div>
+	<p class="message" role="status" hidden></p>
+</figure>
+
+<script>
+	// Client side of MatrixInput: reads the inputs into a matrix, validates it and announces it.
+
+	/** Whether a symmetric matrix is positive definite, by attempting a Cholesky factorisation. */
+	function isPositiveDefinite(m: number[][]) {
+		const n = m.length;
+		const l = m.map(() => new Array<number>(n).fill(0));
+		for (let i = 0; i < n; i++) {
+			for (let j = 0; j <= i; j++) {
+				let sum = m[i][j];
+				for (let k = 0; k < j; k++) sum -= l[i][k] * l[j][k];
+				if (i === j) {
+					if (!(sum > 1e-12)) return false;
+					l[i][i] = Math.sqrt(sum);
+				} else {
+					l[i][j] = sum / l[j][j];
+				}
+			}
+		}
+		return true;
+	}
+
+	function setup(el: HTMLElement) {
+		const inputs = [...el.querySelectorAll<HTMLInputElement>("input")];
+		const message = el.querySelector<HTMLElement>(".message");
+		const symmetric = "symmetric" in el.dataset;
+		const pd = "pd" in el.dataset;
+		const at = (i: string | undefined, j: string | undefined) =>
+			inputs.find((o) => o.dataset.i === i && o.dataset.j === j);
+
+		/** The current entries; NaN where an input is empty or not a number. */
+		function read() {
+			const m: number[][] = [];
+			for (const input of inputs) {
+				const i = Number(input.dataset.i);
+				m[i] ??= [];
+				m[i][Number(input.dataset.j)] = input.value.trim() === "" ? Number.NaN : Number(input.value);
+			}
+			return m;
+		}
+
+		/** Why the matrix can't be used, or "" if it can. */
+		function problem(m: number[][]) {
+			if (m.some((row) => row.some((v) => !Number.isFinite(v)))) return "Every entry needs a number.";
+			if (!pd) return "";
+			if (m.some((row, i) => row.some((v, j) => Math.abs(v - m[j][i]) > 1e-9))) return "The matrix must be symmetric.";
+			return isPositiveDefinite(m) ? "" : "Not positive definite, so not a valid covariance matrix.";
+		}
+
+		function announce() {
+			const value = read();
+			const why = problem(value);
+			el.classList.toggle("invalid", why !== "");
+			if (message) {
+				message.textContent = why;
+				message.hidden = why === "";
+			}
+			el.dispatchEvent(new CustomEvent("matrixinput", { bubbles: true, detail: { value, valid: why === "" } }));
+		}
+
+		for (const input of inputs) {
+			input.addEventListener("input", () => {
+				if (symmetric) {
+					const twin = at(input.dataset.j, input.dataset.i);
+					if (twin && twin !== input) twin.value = input.value;
+				}
+				announce();
+			});
+		}
+	}
+
+	for (const el of document.querySelectorAll<HTMLElement>(".matrix-input")) setup(el);
+</script>
+
+<style>
+	.matrix-input {
+		margin: 1.75rem 0;
+		font-family: var(--mono);
+		font-size: 0.85rem;
+		text-align: center;
+	}
+	.row {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.7rem;
+	}
+	.label {
+		font-family: var(--serif);
+		font-size: 1.15rem;
+		color: var(--text);
+		white-space: nowrap;
+	}
+	/* Square brackets: side borders plus short top and bottom caps. */
+	.bracket {
+		position: relative;
+		padding: 0.45rem 0.6rem;
+		border-inline: 1.5px solid var(--text);
+	}
+	.bracket::before,
+	.bracket::after {
+		content: "";
+		position: absolute;
+		top: 0;
+		bottom: 0;
+		width: 0.4rem;
+		border-block: 1.5px solid var(--text);
+	}
+	.bracket::before {
+		left: 0;
+	}
+	.bracket::after {
+		right: 0;
+	}
+	.grid {
+		display: grid;
+		gap: 0.4rem;
+	}
+	input {
+		width: 4.6rem;
+		padding: 0.3rem 0.4rem;
+		font: inherit;
+		text-align: center;
+		color: var(--text);
+		background: var(--surface);
+		border: 1px solid var(--faint);
+		border-radius: 6px;
+	}
+	input:focus-visible {
+		outline: 2px solid var(--accent);
+		outline-offset: 1px;
+	}
+	.invalid input {
+		border-color: #c8443f;
+	}
+	.message {
+		margin-top: 0.5rem;
+		font-family: var(--sans);
+		font-size: 0.75rem;
+		color: #c8443f;
+	}
+	@media (prefers-color-scheme: dark) {
+		.invalid input {
+			border-color: #e66767;
+		}
+		.message {
+			color: #e66767;
+		}
+	}
+</style>
