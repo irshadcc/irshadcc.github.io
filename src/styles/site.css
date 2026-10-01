@@ -83,6 +83,39 @@ body {
 	padding: 0 1.5rem;
 }
 
+/*
+ * Posts with a table of contents get a rail pinned to the left edge of wide screens. The page
+ * frames stay centred as usual; only when the viewport is too narrow to fit the rail beside
+ * them do they shift right, just far enough to keep a clear gap. Narrower screens hide the rail.
+ */
+.toc-rail {
+	display: none;
+}
+@media (min-width: 1340px) {
+	body.has-toc {
+		--toc: 10rem;
+		--toc-gap: 5rem;
+	}
+	body.has-toc .frame {
+		width: auto;
+		margin-left: max(
+			calc((100vw - (var(--measure) + var(--gap) + var(--note))) / 2),
+			calc(var(--toc) + var(--toc-gap))
+		);
+	}
+	body.has-toc main {
+		position: relative;
+	}
+	.toc-rail {
+		display: block;
+		position: absolute;
+		top: 3.5rem;
+		bottom: 0;
+		left: 1.5rem;
+		width: var(--toc);
+	}
+}
+
 /* ---------- Header ---------- */
 
 .site-header .frame {

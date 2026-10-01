@@ -6,6 +6,7 @@ date: 2026-10-07
 
 import SurfacePlot from "../../utils/charts/3DSurfacePlot.astro";
 import MatrixInput from "../../utils/matrix/MatrixInput.astro";
+import ConfidenceChart from "../../utils/charts/ConfidenceChart.astro";
 
 export const sigma = [
 	[1, 0.7],
@@ -17,8 +18,81 @@ export const gaussian2d = (x, y, s) => {
 	const q = (s[1][1] * x * x - (s[0][1] + s[1][0]) * x * y + s[0][0] * y * y) / det;
 	return Math.exp(-q / 2) / (2 * Math.PI * Math.sqrt(det));
 };
+// Squared-exponential kernel over two scalar inputs; p = [[lengthscale, signal std]].
+export const rbfKernel = (x, y, p) => {
+	const l = p[0][0];
+	const sf = p[0][1];
+	if (!(l > 0)) return NaN;
+	return sf * sf * Math.exp(-((x - y) ** 2) / (2 * l * l));
+};
+export const kernelParams = [[2, 2]];
+// Posterior covariance k(x, x' | data) for a unit RBF kernel (lengthscale 1) with noise
+// variance 0.01; p[0] holds the observed input locations. Self-contained for in-browser re-sampling.
+export const posteriorCov = (x, y, p) => {
+	const X = p[0];
+	const n = X.length;
+	const k = (a, b) => Math.exp(-((a - b) ** 2) / 2);
+	// Solve (K + 0.01 I) v = k(X, y) by Gaussian elimination.
+	const A = X.map((xi, i) => X.map((xj, j) => k(xi, xj) + (i === j ? 0.01 : 0)));
+	const v = X.map((xi) => k(xi, y));
+	for (let c = 0; c < n; c++) {
+		for (let r = c + 1; r < n; r++) {
+			const m = A[r][c] / A[c][c];
+			for (let j = c; j < n; j++) A[r][j] -= m * A[c][j];
+			v[r] -= m * v[c];
+		}
+	}
+	for (let r = n - 1; r >= 0; r--) {
+		for (let j = r + 1; j < n; j++) v[r] -= A[r][j] * v[j];
+		v[r] /= A[r][r];
+	}
+	let reduction = 0;
+	for (let i = 0; i < n; i++) reduction += k(x, X[i]) * v[i];
+	return k(x, y) - reduction;
+};
+// 1D regression example: noise-free samples of sin at four inputs, same kernel and noise as above.
+export const trainX = [-2.5, -1, 0.5, 2];
+export const trainY = trainX.map(Math.sin);
+export const gp1d = (() => {
+	const k = (a, b) => Math.exp(-((a - b) ** 2) / 2);
+	const n = trainX.length;
+	const solve = (b) => {
+		const A = trainX.map((xi, i) => trainX.map((xj, j) => k(xi, xj) + (i === j ? 0.01 : 0)));
+		const v = [...b];
+		for (let c = 0; c < n; c++) {
+			for (let r = c + 1; r < n; r++) {
+				const m = A[r][c] / A[c][c];
+				for (let j = c; j < n; j++) A[r][j] -= m * A[c][j];
+				v[r] -= m * v[c];
+			}
+		}
+		for (let r = n - 1; r >= 0; r--) {
+			for (let j = r + 1; j < n; j++) v[r] -= A[r][j] * v[j];
+			v[r] /= A[r][r];
+		}
+		return v;
+	};
+	const alpha = solve(trainY);
+	const kStar = (x) => trainX.map((xi) => k(x, xi));
+	const mean = (x) => kStar(x).reduce((acc, ki, i) => acc + ki * alpha[i], 0);
+	const std = (x) => {
+		const ks = kStar(x);
+		const v = solve(ks);
+		return Math.sqrt(Math.max(k(x, x) - ks.reduce((acc, ki, i) => acc + ki * v[i], 0), 0));
+	};
+	return { mean, upper: (x) => mean(x) + 2 * std(x), lower: (x) => mean(x) - 2 * std(x) };
+})();
+export const gpX = () => Array.from({ length: 241 }, (_, i) => -4 + i / 30);
+// Temperature example: one noise-free reading of +3 °C at 9:00, kernel with σ_f = 2 °C, ℓ = 2 h.
+export const tempK = (t) => 4 * Math.exp(-((t - 9) ** 2) / 8);
+export const tempMean = (t) => (tempK(t) / 4) * 3;
+export const tempStd = (t) => Math.sqrt(Math.max(4 - tempK(t) ** 2 / 4, 0));
+export const tempLower = (t) => tempMean(t) - 2 * tempStd(t);
+export const tempUpper = (t) => tempMean(t) + 2 * tempStd(t);
+export const tempT = () => Array.from({ length: 241 }, (_, i) => 6 + i / 20);
 
 
+> **Disclaimer:** This post was written with the help of Claude
 
 # Multivariate Gaussian 
 
@@ -69,7 +143,395 @@ $$\boxed{\;\Sigma_{a\mid b} = \Sigma_{aa} - \Sigma_{ab}\,\Sigma_{bb}^{-1}\,\Sigm
 
 The derivation is in [Appendix A.1](#a1-derivation-of-the-conditional-gaussian).
 
-## Appendix
+---
+
+# Gaussian Process 
+
+Throughout this section we will use one running example: **the temperature over a day**. Let $f(t)$ be how many degrees warmer (or colder) than the daily average it is at hour $t$, so $f(9)$ is the deviation at 9:00 and $f(14)$ the deviation at 14:00.
+
+### From vectors to functions
+
+Suppose we only care about three moments: 9:00, 10:00 and 14:00. Then the temperature is just a vector of three numbers, and a multivariate Gaussian is a natural model for it:
+
+$$
+\begin{bmatrix} f(9) \\ f(10) \\ f(14) \end{bmatrix} \sim \mathcal N(\mathbf 0, \Sigma).
+$$
+
+What should $\Sigma$ look like? Common sense says:
+
+- 9:00 and 10:00 are close in time, so their temperatures should be **strongly related**. If 9:00 is unusually warm, 10:00 probably is too.
+- 9:00 and 14:00 are far apart, so they should be **nearly unrelated**. A warm morning tells us little about the afternoon.
+
+Now imagine we want the temperature at *every* moment of the day, not just three. The vector becomes a function, with one random value for every time $t$. That is a **Gaussian process**:
+
+> A Gaussian process is a collection of random variables, any finite number of which have a joint Gaussian distribution.
+
+In plain words: a GP is a random function, and if you look at it at any handful of points, what you see is an ordinary multivariate Gaussian. We write
+
+$$
+f \sim \mathcal{GP}\big(m(t),\, k(t, t')\big),
+\hspace{3em}
+m(t) = \mathbb E[f(t)],
+\hspace{3em}
+k(t, t') = \operatorname{cov}\big(f(t), f(t')\big).
+$$
+
+The mean function $m$ is the "typical" value at each time; we will take it to be $0$, i.e. "on average, the daily average". The **covariance function** (or **kernel**) $k$ replaces the matrix $\Sigma$: instead of storing one number per pair of components, it is a rule that gives the covariance for *any* pair of times. To get $\Sigma$ for a particular set of times, just evaluate the rule on every pair:
+
+$$
+\Sigma =
+\begin{bmatrix}
+k(9, 9) & k(9, 10) & k(9, 14) \\
+k(10, 9) & k(10, 10) & k(10, 14) \\
+k(14, 9) & k(14, 10) & k(14, 14)
+\end{bmatrix}.
+$$
+
+### The covariance function
+
+The usual choice of rule is the *squared exponential* (or RBF) kernel. It depends only on how far apart the two times are:
+
+$$
+k(t, t') = \sigma_f^2 \exp\!\left(-\frac{(t - t')^2}{2\ell^2}\right).
+$$
+
+It has two knobs:
+
+- $\sigma_f$, the **signal standard deviation**: how far the temperature typically strays from the average. Setting $t = t'$ gives $\operatorname{var}(f(t)) = k(t, t) = \sigma_f^2$.
+- $\ell$, the **lengthscale**: how long the "memory" is. Two times about $\ell$ apart are still clearly related; times $3\ell$ apart are almost independent.
+
+**Example.** Take $\sigma_f = 2$°C and $\ell = 2$ hours. Then
+
+$$
+\begin{aligned}
+k(9, 9) &= 4 \cdot e^{0} = 4.00, \\
+k(9, 10) &= 4 \cdot e^{-1^2/8} = 4 \cdot 0.88 = 3.53, \\
+k(10, 14) &= 4 \cdot e^{-4^2/8} = 4 \cdot 0.14 = 0.54, \\
+k(9, 14) &= 4 \cdot e^{-5^2/8} = 4 \cdot 0.04 = 0.18,
+\end{aligned}
+\hspace{3em}
+\Sigma =
+\begin{bmatrix}
+4.00 & 3.53 & 0.18 \\
+3.53 & 4.00 & 0.54 \\
+0.18 & 0.54 & 4.00
+\end{bmatrix}.
+$$
+
+Dividing by the variance $4$ gives the correlations: $0.88$ between 9:00 and 10:00, but only $0.04$ between 9:00 and 14:00. That is exactly the common-sense picture from before, produced by one simple formula.
+
+The plot below draws $k(t, t')$ for every pair of times between 6:00 and 18:00, with the same $\ell = 2$ and $\sigma_f = 2$. Each point on the surface is one entry of a (very large) $\Sigma$. The ridge along the diagonal $t = t'$ is the variance $\sigma_f^2 = 4$; stepping off the diagonal, the covariance falls away. Change $\ell$ to make the ridge wider (longer memory) or narrower, and $\sigma_f$ to make it taller.
+
+<SurfacePlot
+	title="Squared exponential kernel k(t, t′)"
+	fn={rbfKernel}
+	params={kernelParams}
+	paramsFrom="kernel-params"
+	x={[6, 18]}
+	y={[6, 18]}
+	samples={51}
+	xLabel="t (hour)"
+	yLabel="t′ (hour)"
+	zLabel="k(t, t′)"
+	yaw={-35}
+	pitch={30}
+>
+	<MatrixInput id="kernel-params" label="(ℓ, σ_f)" value={kernelParams} min={0.1} />
+</SurfacePlot>
+
+### Regression: conditioning on data
+
+So far the GP describes what we believe about the temperature *before* measuring anything. This is called the **prior**. Regression is the step of updating that belief once we have readings; the updated GP is called the **posterior**.
+
+The key point: we don't need any new maths for this. The readings and the values we want to predict are all just values of $f$ at a few times, so together they form one multivariate Gaussian. "Updating on the readings" is then exactly the **conditioning** formula from the Multivariate Gaussian section. We will build up to the general formula in three small steps.
+
+#### Step 1: one reading, one prediction
+
+We take a reading: **at 9:00 it is 3°C above average**, so $f(9) = 3$. What should we expect at 10:00?
+
+Put the value we want and the value we measured into one vector. Its covariance matrix comes straight from the kernel (the numbers are from the example above, with $\sigma_f = 2$°C and $\ell = 2$ hours):
+
+$$
+\begin{bmatrix} f(10) \\ f(9) \end{bmatrix}
+\sim \mathcal N\!\left(
+\begin{bmatrix} 0 \\ 0 \end{bmatrix},\;
+\begin{bmatrix} k(10, 10) & k(10, 9) \\ k(9, 10) & k(9, 9) \end{bmatrix}
+\right)
+=
+\mathcal N\!\left(
+\begin{bmatrix} 0 \\ 0 \end{bmatrix},\;
+\begin{bmatrix} 4.00 & 3.53 \\ 3.53 & 4.00 \end{bmatrix}
+\right).
+$$
+
+This is the partitioned Gaussian with $\mathbf x_a = f(10)$ (what we want) and $\mathbf x_b = f(9)$ (what we measured). Every block is a single number:
+
+$$
+\boldsymbol\mu_a = \boldsymbol\mu_b = 0,
+\quad
+\Sigma_{aa} = k(10, 10) = 4,
+\quad
+\Sigma_{ab} = \Sigma_{ba} = k(10, 9) = 3.53,
+\quad
+\Sigma_{bb} = k(9, 9) = 4.
+$$
+
+Substituting into the two boxed conditioning formulas:
+
+$$
+\begin{aligned}
+\text{mean} &= \boldsymbol\mu_a + \Sigma_{ab}\,\Sigma_{bb}^{-1}\,(\mathbf x_b - \boldsymbol\mu_b)
+= 0 + \frac{3.53}{4}\,(3 - 0) = 2.65\text{°C}, \\[8pt]
+\text{variance} &= \Sigma_{aa} - \Sigma_{ab}\,\Sigma_{bb}^{-1}\,\Sigma_{ba}
+= 4 - \frac{3.53 \times 3.53}{4} = 0.88, \quad\text{so std. dev.} = 0.94\text{°C}.
+\end{aligned}
+$$
+
+Doing the same for 14:00 only changes the covariance between the two times, from $3.53$ to $k(14, 9) = 0.18$:
+
+| Predict at | Covariance with 9:00 | Mean | Std. dev. |
+|---|---|---|---|
+| (before any reading) | | $0$°C | $2.00$°C |
+| 10:00 | 3.53 | $\tfrac{3.53}{4}\cdot 3 = 2.65$°C | $\sqrt{4 - 3.53^2/4} = 0.94$°C |
+| 14:00 | 0.18 | $\tfrac{0.18}{4}\cdot 3 = 0.13$°C | $\sqrt{4 - 0.18^2/4} = 2.00$°C |
+
+Read the mean formula as: *prediction = (how related the two times are) × (what we measured)*. The fraction $3.53/4 = 0.88$ is just the correlation between 9:00 and 10:00.
+
+- **At 10:00**, an hour after the reading, the times are strongly related. The GP expects it to still be warm, about $+2.65$°C, and it is much more certain: the uncertainty dropped from $2$°C to under $1$°C.
+- **At 14:00**, five hours later, the times are almost unrelated. The reading barely matters: the prediction stays near the average ($+0.13$°C), and the uncertainty is still the prior's $2$°C.
+
+The chart below does this calculation for every time from 6:00 to 18:00. The line is the predicted mean and the shaded band is the 95% interval (mean $\pm 2$ std. dev.); hover to read the interval at any hour. The band pinches to a point at the reading, is still narrow at 10:00, and by 14:00 has widened back to the prior's $\pm 4$°C, while the mean has slid back to the average.
+
+<ConfidenceChart
+	title="Temperature after one reading of +3 °C at 9:00"
+	x={tempT}
+	mean={tempMean}
+	lower={tempLower}
+	upper={tempUpper}
+	points={[[9, 3]]}
+	meanLabel="Predicted mean"
+	bandLabel="95% interval"
+	pointsLabel="Reading at 9:00"
+	xLabel="t (hour)"
+	yLabel="°C above average"
+/>
+
+#### Step 2: several readings
+
+Now add a second reading: **at 11:00 it is 1°C above average**. Predict 10:00 again. The vector now has one value we want and two we measured, and its covariance matrix is again just the kernel evaluated on every pair:
+
+$$
+\begin{bmatrix} f(10) \\ \hline f(9) \\ f(11) \end{bmatrix}
+\sim \mathcal N\!\left(\mathbf 0,\;
+\left[\begin{array}{c|cc}
+k(10, 10) & k(10, 9) & k(10, 11) \\ \hline
+k(9, 10) & k(9, 9) & k(9, 11) \\
+k(11, 10) & k(11, 9) & k(11, 11)
+\end{array}\right]
+\right)
+=
+\mathcal N\!\left(\mathbf 0,\;
+\left[\begin{array}{c|cc}
+4.00 & 3.53 & 3.53 \\ \hline
+3.53 & 4.00 & 2.43 \\
+3.53 & 2.43 & 4.00
+\end{array}\right]
+\right).
+$$
+
+The lines split it into the same four blocks as before, and each block has a name:
+
+- $K = \begin{bmatrix} 4.00 & 2.43 \\ 2.43 & 4.00 \end{bmatrix}$, the bottom-right block: covariance **among the readings**. With $n$ readings it is $n \times n$.
+- $K_* = \begin{bmatrix} 3.53 \\ 3.53 \end{bmatrix}$, the bottom-left block: covariance **between each reading and each prediction time**. With $n$ readings and $m$ prediction times it is $n \times m$; the top-right block is its transpose $K_*^\top$.
+- $K_{**} = 4.00$, the top-left block: covariance **among the prediction times**, $m \times m$.
+
+So $\Sigma_{aa} = K_{**}$, $\Sigma_{ab} = K_*^\top$, $\Sigma_{ba} = K_*$, $\Sigma_{bb} = K$, and the readings $\mathbf y = (3, 1)$ play the role of $\mathbf x_b$. The conditioning formulas give
+
+$$
+\begin{aligned}
+\text{mean} &= K_*^\top K^{-1} \mathbf y
+= \begin{bmatrix} 3.53 & 3.53 \end{bmatrix}
+\begin{bmatrix} 4.00 & 2.43 \\ 2.43 & 4.00 \end{bmatrix}^{-1}
+\begin{bmatrix} 3 \\ 1 \end{bmatrix}
+= 2.20\text{°C}, \\[8pt]
+\text{variance} &= K_{**} - K_*^\top K^{-1} K_*
+= 4 - 3.88 = 0.12, \quad\text{so std. dev.} = 0.35\text{°C}.
+\end{aligned}
+$$
+
+Two things happened compared to Step 1. The mean moved from $2.65$ toward the new, cooler reading, landing between the two. And the uncertainty shrank from $0.94$°C to $0.35$°C, because 10:00 is now pinned down from both sides. The $K^{-1}$ is what makes the readings share the work sensibly: 9:00 and 11:00 are themselves correlated, so they partly tell the same story, and $K^{-1}$ stops that shared part from being counted twice.
+
+#### Step 3: noisy readings
+
+Real thermometers are not perfect. Model each reading as the true temperature plus some random measurement error:
+
+$$
+y_i = f(t_i) + \varepsilon_i,
+\hspace{3em}
+\varepsilon_i \sim \mathcal N(0, \sigma_n^2).
+$$
+
+We assume the errors are independent: of each other, and of the temperature itself. Now what we observe is $\mathbf y$, not $f(X)$, so to use the conditioning formula we need the joint distribution of $\mathbf f_* = f(X_*)$ (what we want) and $\mathbf y$ (what we measured). We work it out the same way as before, one covariance at a time.
+
+**Is it still Gaussian?** Yes. $\mathbf f_*$ and $f(X)$ are jointly Gaussian, $\boldsymbol\varepsilon$ is Gaussian and independent of them, and adding independent Gaussians gives a Gaussian. So $(\mathbf f_*, \mathbf y)$ is jointly Gaussian, and we only need its mean and covariance.
+
+**Mean.** $\mathbb E[y_i] = \mathbb E[f(t_i)] + \mathbb E[\varepsilon_i] = 0 + 0 = 0$.
+
+**Covariance between two readings.** Covariance is linear in each argument, so it splits into four terms:
+
+$$
+\begin{aligned}
+\operatorname{cov}(y_i, y_j)
+&= \operatorname{cov}\big(f(t_i) + \varepsilon_i,\; f(t_j) + \varepsilon_j\big) \\[6pt]
+&= \underbrace{\operatorname{cov}\big(f(t_i), f(t_j)\big)}_{k(t_i, t_j)}
++ \underbrace{\operatorname{cov}\big(f(t_i), \varepsilon_j\big)}_{0 \text{ (independent)}}
++ \underbrace{\operatorname{cov}\big(\varepsilon_i, f(t_j)\big)}_{0 \text{ (independent)}}
++ \underbrace{\operatorname{cov}(\varepsilon_i, \varepsilon_j)}_{\sigma_n^2 \text{ if } i = j, \text{ else } 0} \\[6pt]
+&= k(t_i, t_j) + \sigma_n^2\,[i = j].
+\end{aligned}
+$$
+
+So the noise only adds $\sigma_n^2$ to each reading's variance with *itself*: the diagonal. As a matrix, $\operatorname{cov}(\mathbf y, \mathbf y) = K + \sigma_n^2 I$.
+
+**Covariance between a reading and a prediction.** The prediction $f(t_*)$ has no noise term, so only one term survives:
+
+$$
+\operatorname{cov}\big(f(t_*), y_i\big)
+= \underbrace{\operatorname{cov}\big(f(t_*), f(t_i)\big)}_{k(t_*, t_i)}
++ \underbrace{\operatorname{cov}\big(f(t_*), \varepsilon_i\big)}_{0}
+= k(t_*, t_i).
+$$
+
+This is unchanged by the noise, so the off-diagonal blocks are still $K_*$ and $K_*^\top$.
+
+**Covariance among predictions.** $\operatorname{cov}\big(f(t_*), f(t_*')\big) = k(t_*, t_*')$, unchanged, so the top-left block is still $K_{**}$.
+
+**Assemble and condition.** Putting the blocks together, the joint distribution is the one from Step 2 with $K$ replaced by $K + \sigma_n^2 I$:
+
+$$
+\begin{bmatrix} \mathbf f_* \\ \mathbf y \end{bmatrix}
+\sim \mathcal N\!\left(
+\mathbf 0,\;
+\begin{bmatrix}
+K_{**} & K_*^\top \\
+K_* & K + \sigma_n^2 I
+\end{bmatrix}
+\right).
+$$
+
+Now match it to the partitioned Gaussian: $\mathbf x_a = \mathbf f_*$, $\mathbf x_b = \mathbf y$, $\boldsymbol\mu_a = \boldsymbol\mu_b = \mathbf 0$, $\Sigma_{aa} = K_{**}$, $\Sigma_{ab} = K_*^\top$, $\Sigma_{ba} = K_*$ and $\Sigma_{bb} = K + \sigma_n^2 I$. Substituting into the two conditioning formulas:
+
+$$
+\begin{aligned}
+\boldsymbol\mu_{a\mid b} &= \boldsymbol\mu_a + \Sigma_{ab}\,\Sigma_{bb}^{-1}\,(\mathbf x_b - \boldsymbol\mu_b)
+&&= \mathbf 0 + K_*^\top \big(K + \sigma_n^2 I\big)^{-1} (\mathbf y - \mathbf 0), \\[6pt]
+\Sigma_{a\mid b} &= \Sigma_{aa} - \Sigma_{ab}\,\Sigma_{bb}^{-1}\,\Sigma_{ba}
+&&= K_{**} - K_*^\top \big(K + \sigma_n^2 I\big)^{-1} K_* .
+\end{aligned}
+$$
+
+These are the general GP regression formulas:
+
+$$\boxed{\;\boldsymbol\mu_* = K_*^\top \big(K + \sigma_n^2 I\big)^{-1} \mathbf y\;}$$
+
+$$\boxed{\;\Sigma_* = K_{**} - K_*^\top \big(K + \sigma_n^2 I\big)^{-1} K_*\;}$$
+
+Steps 1 and 2 are these formulas with $\sigma_n = 0$. Note there is no training loop: "fitting" a GP is a single linear solve with the $n \times n$ matrix $K + \sigma_n^2 I$.
+
+**Example.** Redo Step 2 with a thermometer error of $\sigma_n = 0.5$°C, so $\sigma_n^2 = 0.25$. Only the diagonal of $K$ changes:
+
+$$
+K + \sigma_n^2 I = \begin{bmatrix} 4.00 + 0.25 & 2.43 \\ 2.43 & 4.00 + 0.25 \end{bmatrix} = \begin{bmatrix} 4.25 & 2.43 \\ 2.43 & 4.25 \end{bmatrix}.
+$$
+
+| Predict at | Noise-free ($\sigma_n = 0$) | Noisy ($\sigma_n = 0.5$°C) |
+|---|---|---|
+| 10:00 | $2.20 \pm 0.35$°C | $2.11 \pm 0.52$°C |
+| 9:00 (a reading) | $3.00 \pm 0.00$°C | $2.79 \pm 0.48$°C |
+
+The prediction at 10:00 is a little less certain, because the readings it relies on are themselves uncertain. More striking is 9:00: without noise the GP must reproduce the reading exactly, with zero uncertainty. With noise it treats $3$°C as a measurement that might be slightly off, pulls it a little toward its neighbour at 11:00, and keeps some uncertainty. So with noise the mean no longer has to pass exactly through each reading, and the band no longer pinches to zero there.
+
+#### Putting it together
+
+To see how well this recovers an unknown function, the chart below takes readings from a curve we know, $\sin x$, at four points $x = -2.5, -1, 0.5$ and $2$, with $\ell = 1$ and $\sigma_f = 1$. The readings themselves are exact, but the model allows a little noise, $\sigma_n = 0.1$. The dashed line is the true curve, which the GP never sees. Both effects from the table appear at once:
+
+- **Near the readings** the mean follows the true curve closely and the band is tight, like 10:00 in the example.
+- **Far from every reading**, past about $|x| > 3$, the mean drifts back toward zero and the band widens back toward the prior's $\pm 2\sigma_f$, like 14:00.
+
+<ConfidenceChart
+	title="GP posterior for four readings of sin x"
+	x={gpX}
+	mean={gp1d.mean}
+	lower={gp1d.lower}
+	upper={gp1d.upper}
+	reference={Math.sin}
+	points={trainX.map((xi, i) => [xi, trainY[i]])}
+	meanLabel="Posterior mean"
+	bandLabel="95% interval"
+	referenceLabel="sin x (true function)"
+	pointsLabel="Readings"
+	xLabel="x"
+	yLabel="f(x)"
+/>
+
+### The posterior covariance
+
+After the readings, the GP is still a GP, just with a new covariance function. Writing the boxed $\Sigma_*$ for a single pair of inputs:
+
+$$
+k(x, x' \mid \text{data}) = \underbrace{k(x, x')}_{\text{before the readings}} - \underbrace{k(x, X)\,\big(K + \sigma_n^2 I\big)^{-1} k(X, x')}_{\text{what the readings explained}} .
+$$
+
+In the temperature example, this is the $4 - 3.53^2/4$ we computed for 10:00: the prior variance minus the part the 9:00 reading accounted for.
+
+The surface below is this posterior covariance, with the same four readings, kernel and noise as the chart. Compare it with the kernel plot above. Along any row or column that passes through a reading, the surface is pressed down to almost zero: we know the value there, so there is nothing left to vary. Between readings small bumps remain, and beyond them the full prior ridge returns. The entries below are the reading locations; move them and the dips follow.
+
+<SurfacePlot
+	title="Posterior covariance k(x, x′ | data)"
+	fn={posteriorCov}
+	params={[trainX]}
+	paramsFrom="posterior-inputs"
+	x={[-4, 4]}
+	y={[-4, 4]}
+	samples={61}
+	xLabel="x"
+	yLabel="x′"
+	zLabel="k(x, x′ | data)"
+	yaw={-35}
+	pitch={30}
+	diverging
+>
+	<MatrixInput id="posterior-inputs" label="X" value={[trainX]} step={0.25} />
+</SurfacePlot>
+
+Notice that this surface depends only on *where* we took readings, not on *what* they said. In the table, the 10:00 uncertainty of $0.94$°C would be the same whether 9:00 read $+3$°C or $-5$°C. The readings' values move the mean; their locations set the uncertainty.
+
+# Summary
+
+Putting the pieces together, regression with a Gaussian process goes like this:
+
+1. **Choose a kernel.** Pick $k(\mathbf x, \mathbf x')$ to express what you believe about the unknown function before seeing data: how smooth it is ($\ell$) and how far it strays from the mean ($\sigma_f$). Together with a mean function, usually $m(\mathbf x) = 0$, this is the **prior**.
+2. **Collect readings.** Gather $n$ inputs $X$ and their measured outputs $\mathbf y$, and choose the noise level $\sigma_n$ of the measurements.
+3. **Build the covariance blocks.** Evaluate the kernel on every pair of points:
+   - $K = k(X, X)$, $n \times n$, among the readings;
+   - $K_* = k(X, X_*)$, $n \times m$, between the readings and the $m$ inputs $X_*$ you want to predict at;
+   - $K_{**} = k(X_*, X_*)$, $m \times m$, among the prediction inputs.
+4. **Condition on the readings.** Apply the conditioning formula of the multivariate Gaussian to get the **posterior**:
+   $$
+   \boldsymbol\mu_* = K_*^\top \big(K + \sigma_n^2 I\big)^{-1} \mathbf y,
+   \hspace{3em}
+   \Sigma_* = K_{**} - K_*^\top \big(K + \sigma_n^2 I\big)^{-1} K_*.
+   $$
+5. **Read off the prediction.** $\boldsymbol\mu_*$ is the best guess at each prediction input. The square roots of the diagonal of $\Sigma_*$ are the standard deviations, so $\boldsymbol\mu_* \pm 2\sqrt{\operatorname{diag}(\Sigma_*)}$ is the 95% band drawn in the charts.
+6. **Tune the hyperparameters (optional).** In practice $\ell$, $\sigma_f$ and $\sigma_n$ are not guessed but fitted, usually by choosing the values that make the observed readings most probable under the model, i.e. maximising the marginal likelihood $p(\mathbf y \mid \ell, \sigma_f, \sigma_n)$. Then repeat steps 3–5 with the fitted values.
+
+The only expensive step is solving with the $n \times n$ matrix $K + \sigma_n^2 I$, which costs $O(n^3)$ time. That is cheap for hundreds or a few thousand readings, but is the reason plain GPs are rarely used on very large datasets.
+
+**A Bayesian method.** These steps are Bayesian inference: the GP is a **prior** over functions, the noise model $y_i = f(\mathbf x_i) + \varepsilon_i$ is the **likelihood**, and the conditioned GP is the **posterior** given by Bayes' rule. Because both prior and likelihood are Gaussian, Bayes' rule reduces to the conditioning formula, so the posterior comes out in closed form, with no sampling or iterative optimisation. The uncertainty band is the practical payoff: the prediction is a whole distribution, not just one number. Step 6 is only partly Bayesian, since it picks a single best value for each hyperparameter rather than averaging over them.
+
+---
+
+# Appendix
 
 ### A.1 Derivation of the conditional Gaussian
 
@@ -130,35 +592,60 @@ $$
 + \underbrace{\mathbf y_b^\top \Lambda_{bb}\, \mathbf y_b}_{\text{constant}} .
 $$
 
-**Step 4: Complete the square in $\mathbf y_a$.** For any vector $\mathbf m$,
+**Step 4: Complete the square in $\mathbf y_a$.** Take a generic vector $\mathbf z$ (playing the role of $\mathbf y_a$), a symmetric matrix $Q$ (playing the role of $\Lambda_{aa}$) and a constant vector $\mathbf c$ to be chosen. Expanding,
 
 $$
-(\mathbf y_a - \mathbf m)^\top \Lambda_{aa} (\mathbf y_a - \mathbf m)
-= \mathbf y_a^\top \Lambda_{aa}\, \mathbf y_a - 2\,\mathbf y_a^\top \Lambda_{aa}\, \mathbf m + \mathbf m^\top \Lambda_{aa}\, \mathbf m .
+(\mathbf z - \mathbf c)^\top Q\, (\mathbf z - \mathbf c)
+= \mathbf z^\top Q\, \mathbf z - 2\,\mathbf z^\top Q\, \mathbf c + \mathbf c^\top Q\, \mathbf c .
 $$
 
-The quadratic term already matches Step 3. To make the linear terms match we need $-\Lambda_{aa}\,\mathbf m = \Lambda_{ab}\,\mathbf y_b$, i.e.
+Now set
 
 $$
-\mathbf m = -\Lambda_{aa}^{-1} \Lambda_{ab}\, \mathbf y_b .
+\mathbf z = \mathbf y_a,
+\hspace{3em}
+Q = \Lambda_{aa},
+\hspace{3em}
+\mathbf c = -\Lambda_{aa}^{-1} \Lambda_{ab}\, \mathbf y_b ,
 $$
 
-With this choice of $\mathbf m$,
+and substitute them into the expansion. The braces mark the pieces being replaced; $\mathbf c^\top$ uses $(\Lambda_{aa}^{-1})^\top = \Lambda_{aa}^{-1}$ and $\Lambda_{ab}^\top = \Lambda_{ba}$:
+
+$$
+\begin{aligned}
+(\mathbf y_a - \mathbf c)^\top \Lambda_{aa} (\mathbf y_a - \mathbf c)
+&= \mathbf y_a^\top \Lambda_{aa}\, \mathbf y_a
+- 2\,\mathbf y_a^\top \underbrace{\Lambda_{aa}\,\mathbf c}_{-\Lambda_{ab}\,\mathbf y_b}
++ \underbrace{\mathbf c^\top}_{-\mathbf y_b^\top \Lambda_{ba}\Lambda_{aa}^{-1}}\, \underbrace{\Lambda_{aa}\,\mathbf c}_{-\Lambda_{ab}\,\mathbf y_b} \\[14pt]
+&= \mathbf y_a^\top \Lambda_{aa}\, \mathbf y_a
++ 2\,\mathbf y_a^\top \Lambda_{ab}\, \mathbf y_b
++ \mathbf y_b^\top \Lambda_{ba}\Lambda_{aa}^{-1}\Lambda_{ab}\, \mathbf y_b \\[14pt]
+&= \underbrace{\mathbf y_a^\top \Lambda_{aa}\, \mathbf y_a
++ 2\,\mathbf y_a^\top \Lambda_{ab}\, \mathbf y_b
++ \mathbf y_b^\top \Lambda_{bb}\, \mathbf y_b}_{\mathbf y^\top \Lambda\, \mathbf y \text{ from Step 3}}
+- \mathbf y_b^\top \Lambda_{bb}\, \mathbf y_b
++ \mathbf y_b^\top \Lambda_{ba}\Lambda_{aa}^{-1}\Lambda_{ab}\, \mathbf y_b && \text{(add and subtract } \mathbf y_b^\top \Lambda_{bb}\, \mathbf y_b\text{)} \\[14pt]
+&= \mathbf y^\top \Lambda\, \mathbf y
+- \mathbf y_b^\top \big(\Lambda_{bb} - \Lambda_{ba}\Lambda_{aa}^{-1}\Lambda_{ab}\big)\, \mathbf y_b .
+\end{aligned}
+$$
+
+Moving the last term to the other side,
 
 $$
 \mathbf y^\top \Lambda\, \mathbf y
-= (\mathbf y_a - \mathbf m)^\top \Lambda_{aa} (\mathbf y_a - \mathbf m)
-+ \underbrace{\mathbf y_b^\top \Lambda_{bb}\, \mathbf y_b - \mathbf m^\top \Lambda_{aa}\, \mathbf m}_{\text{does not depend on } \mathbf x_a} .
+= (\mathbf y_a - \mathbf c)^\top \Lambda_{aa} (\mathbf y_a - \mathbf c)
++ \underbrace{\mathbf y_b^\top \big(\Lambda_{bb} - \Lambda_{ba}\Lambda_{aa}^{-1}\Lambda_{ab}\big)\, \mathbf y_b}_{\text{does not depend on } \mathbf x_a} .
 $$
 
-The last two terms only involve $\mathbf x_b$, so they become a constant factor that is absorbed into the proportionality. Substituting $\mathbf y_a = \mathbf x_a - \boldsymbol\mu_a$:
+The last term only involves $\mathbf y_b = \mathbf x_b - \boldsymbol\mu_b$, so it becomes a constant factor that is absorbed into the proportionality. Substituting $\mathbf y_a = \mathbf x_a - \boldsymbol\mu_a$:
 
 $$
 p(\mathbf x_a \mid \mathbf x_b) \;\propto\;
-\exp\!\left(-\tfrac{1}{2}\,\big(\mathbf x_a - (\boldsymbol\mu_a + \mathbf m)\big)^\top \Lambda_{aa}\, \big(\mathbf x_a - (\boldsymbol\mu_a + \mathbf m)\big)\right).
+\exp\!\left(-\tfrac{1}{2}\,\big(\mathbf x_a - (\boldsymbol\mu_a + \mathbf c)\big)^\top \Lambda_{aa}\, \big(\mathbf x_a - (\boldsymbol\mu_a + \mathbf c)\big)\right).
 $$
 
-Comparing with the Gaussian density at the top of the page, this is exactly the exponent of a Gaussian in $\mathbf x_a$ with mean $\boldsymbol\mu_a + \mathbf m$ and inverse covariance $\Lambda_{aa}$. Since a density must integrate to one, the normalising constant is forced, and
+Comparing with the Gaussian density at the top of the page, this is exactly the exponent of a Gaussian in $\mathbf x_a$ with mean $\boldsymbol\mu_a + \mathbf c$ and inverse covariance $\Lambda_{aa}$. Since a density must integrate to one, the normalising constant is forced, and
 
 $$
 \boldsymbol\mu_{a\mid b} = \boldsymbol\mu_a - \Lambda_{aa}^{-1} \Lambda_{ab}\,(\mathbf x_b - \boldsymbol\mu_b),

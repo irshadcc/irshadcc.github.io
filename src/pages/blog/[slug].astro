@@ -1,5 +1,6 @@
 ---
 import { render } from "astro:content";
+import TableOfContents from "../../components/TableOfContents.astro";
 import Layout from "../../layouts/Layout.astro";
 import { getPosts } from "../../posts";
 import { formatDate, readingTime } from "../../site";
@@ -10,10 +11,13 @@ export async function getStaticPaths() {
 }
 
 const { post } = Astro.props;
-const { Content } = await render(post);
+const { Content, headings } = await render(post);
+// Timeline navigation for posts with enough sections to need it; h4 and deeper are left out.
+const toc = headings.filter((h) => h.depth <= 3);
 ---
 
 <Layout title={post.data.title} description={post.data.description} article={post.data}>
+	{toc.length >= 3 && <TableOfContents slot="toc" headings={toc} />}
 	<h1>{post.data.title}</h1>
 	<p class="post-meta">
 		<time datetime={post.data.date.toISOString()}>{formatDate(post.data.date)}</time>

@@ -1,0 +1,353 @@
+---
+// Plots a function y = f(x) with a shaded confidence band around it, drawn with Chart.js.
+// `mean`, `lower` and `upper` are sampled at the points `x` returns, at build time; only the
+// sampled points are sent to the browser. Hovering highlights the band at the nearest x: a
+// vertical bar spans the interval there and the tooltip reads the mean and the interval.
+// Optional extras: a dashed `reference` curve (e.g. the true function) and `points`, drawn
+// as dots (e.g. the observations a model was fitted to).
+// Usage in .mdx:
+//   <ConfidenceChart
+//     x={() => Array.from({ length: 101 }, (_, i) => -5 + i / 10)}
+//     mean={(x) => Math.sin(x)}
+//     lower={(x) => Math.sin(x) - 0.5}
+//     upper={(x) => Math.sin(x) + 0.5}
+//     bandLabel="±2σ"
+//     points={[[0, 0.1], [1, 0.8]]}
+//   />
+type Fn = (x: number) => number;
+
+interface Props {
+	x: () => number[];
+	mean: Fn;
+	lower: Fn;
+	upper: Fn;
+	/** Dashed comparison curve, e.g. the true function. */
+	reference?: Fn;
+	/** Dots drawn on top, as [x, y] pairs. */
+	points?: [number, number][];
+	meanLabel?: string;
+	bandLabel?: string;
+	referenceLabel?: string;
+	pointsLabel?: string;
+	title?: string;
+	xLabel?: string;
+	yLabel?: string;
+	/** Plot height in px. */
+	height?: number;
+}
+
+const {
+	x,
+	mean,
+	lower,
+	upper,
+	reference,
+	points = [],
+	meanLabel = "Mean",
+	bandLabel = "Confidence interval",
+	referenceLabel = "Reference",
+	pointsLabel = "Observations",
+	title,
+	xLabel,
+	yLabel,
+	height = 340,
+} = Astro.props;
+
+const xs = x();
+// NaN/±Infinity become null so Chart.js leaves a gap instead of drawing a spike.
+const sample = (fn: Fn) =>
+	xs.map((xv) => {
+		const y = fn(xv);
+		return { x: xv, y: Number.isFinite(y) ? y : null };
+	});
+
+const data = {
+	title,
+	xLabel,
+	yLabel,
+	meanLabel,
+	bandLabel,
+	referenceLabel,
+	pointsLabel,
+	mean: sample(mean),
+	lower: sample(lower),
+	upper: sample(upper),
+	reference: reference ? sample(reference) : undefined,
+	points: points.map(([px, py]) => ({ x: px, y: py })),
+};
+---
+
+<figure class="ci-chart" data-chart={JSON.stringify(data)}>
+	<div class="plot" style={`height: ${height}px`}>
+		<canvas role="img" aria-label={title ?? `${meanLabel} with ${bandLabel}`}></canvas>
+	</div>
+</figure>
+
+<script>
+	// Client side of ConfidenceChart. Astro bundles this once per page, however many charts it has.
+	import {
+		Chart,
+		type ChartDataset,
+		type ChartOptions,
+		Filler,
+		Legend,
+		LinearScale,
+		LineController,
+		LineElement,
+		type Plugin,
+		PointElement,
+		Title,
+		Tooltip,
+		type TooltipItem,
+	} from "chart.js";
+
+	// Filler shades the band between the upper and lower datasets.
+	Chart.register(LineController, LineElement, PointElement, LinearScale, Filler, Legend, Title, Tooltip);
+
+	type Pt = { x: number; y: number | null };
+
+	/** Shape of the data-chart JSON written by the frontmatter. */
+	interface ChartData {
+		title?: string;
+		xLabel?: string;
+		yLabel?: string;
+		meanLabel: string;
+		bandLabel: string;
+		referenceLabel: string;
+		pointsLabel: string;
+		mean: Pt[];
+		lower: Pt[];
+		upper: Pt[];
+		reference?: Pt[];
+		points: Pt[];
+	}
+
+	// Dataset order is fixed, so plugins and callbacks can find each one by index.
+	const UPPER = 0;
+	const LOWER = 1;
+	const MEAN = 2;
+
+	/** Number for display: integers as-is, anything else to 3 significant digits. */
+	const fmt = (v: number) => (Number.isInteger(v) ? `${v}` : Number(v.toPrecision(3)).toString());
+
+	/** "#rrggbb" plus an alpha, as rgba(); canvas can't resolve color-mix() everywhere. */
+	function withAlpha(hex: string, a: number) {
+		const m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex);
+		if (!m) return hex;
+		const [r, g, b] = m.slice(1).map((h) => Number.parseInt(h, 16));
+		return `rgba(${r}, ${g}, ${b}, ${a})`;
+	}
+
+	/** Reads the colours and font from CSS; the variables switch for dark mode in <style>. */
+	function theme(el: HTMLElement) {
+		const css = getComputedStyle(el);
+		const v = (name: string) => css.getPropertyValue(name).trim();
+		return {
+			main: v("--ci-main"),
+			points: v("--ci-points"),
+			text: v("--text"),
+			muted: v("--muted"),
+			grid: v("--faint"),
+			bg: v("--bg"),
+			font: v("--sans"),
+		};
+	}
+	type Theme = ReturnType<typeof theme>;
+
+	// On hover, a solid bar from the lower to the upper bound at the hovered x, capped at both
+	// ends, so the interval there stands out from the shaded band. Drawn over the datasets.
+	const highlight = (t: () => Theme): Plugin<"line"> => ({
+		id: "intervalHighlight",
+		afterDatasetsDraw(chart) {
+			const active = chart.tooltip?.getActiveElements();
+			if (!active?.length) return;
+			const i = active[0].index;
+			const up = chart.getDatasetMeta(UPPER).data[i];
+			const lo = chart.getDatasetMeta(LOWER).data[i];
+			if (!up || !lo || !Number.isFinite(up.y) || !Number.isFinite(lo.y)) return;
+			const { ctx, chartArea } = chart;
+			const c = t();
+			ctx.save();
+			// Faint full-height hairline, like the line chart's crosshair.
+			ctx.strokeStyle = c.grid;
+			ctx.lineWidth = 1;
+			ctx.beginPath();
+			ctx.moveTo(up.x, chartArea.top);
+			ctx.lineTo(up.x, chartArea.bottom);
+			ctx.stroke();
+			// The interval itself.
+			ctx.strokeStyle = c.main;
+			ctx.lineWidth = 3;
+			ctx.lineCap = "round";
+			ctx.beginPath();
+			ctx.moveTo(up.x, up.y);
+			ctx.lineTo(lo.x, lo.y);
+			for (const yv of [up.y, lo.y]) {
+				ctx.moveTo(up.x - 6, yv);
+				ctx.lineTo(up.x + 6, yv);
+			}
+			ctx.stroke();
+			ctx.restore();
+		},
+	});
+
+	function datasets(d: ChartData, t: Theme): ChartDataset<"line", Pt[]>[] {
+		const bandEdge = {
+			borderColor: withAlpha(t.main, 0.45),
+			borderWidth: 1,
+			pointRadius: 0,
+			pointHoverRadius: 0,
+			spanGaps: false,
+		};
+		const sets: ChartDataset<"line", Pt[]>[] = [
+			// The upper edge fills down to the next dataset (the lower edge): that is the band.
+			{
+				...bandEdge,
+				label: d.bandLabel,
+				data: d.upper,
+				fill: "+1",
+				backgroundColor: withAlpha(t.main, 0.18),
+			},
+			{ ...bandEdge, label: `${d.bandLabel} (lower)`, data: d.lower, fill: false },
+			{
+				label: d.meanLabel,
+				data: d.mean,
+				borderColor: t.main,
+				backgroundColor: t.main,
+				borderWidth: 2.5,
+				pointRadius: 0,
+				pointHoverRadius: 5,
+				pointHoverBorderWidth: 2,
+				pointHoverBorderColor: t.bg,
+				fill: false,
+				spanGaps: false,
+			},
+		];
+		if (d.reference) {
+			sets.push({
+				label: d.referenceLabel,
+				data: d.reference,
+				borderColor: t.muted,
+				backgroundColor: t.muted,
+				borderWidth: 1.5,
+				borderDash: [5, 4],
+				pointRadius: 0,
+				pointHoverRadius: 0,
+				fill: false,
+			});
+		}
+		if (d.points.length) {
+			sets.push({
+				label: d.pointsLabel,
+				data: d.points,
+				showLine: false,
+				pointStyle: "circle",
+				pointRadius: 4.5,
+				pointHoverRadius: 4.5,
+				pointBorderWidth: 1.5,
+				pointBorderColor: t.bg,
+				backgroundColor: t.points,
+				borderColor: t.points,
+				fill: false,
+			});
+		}
+		return sets;
+	}
+
+	function options(d: ChartData, t: Theme): ChartOptions<"line"> {
+		const xs = d.mean.map((p) => p.x);
+		const axisTitle = (text?: string) => ({ display: !!text, text, color: t.muted });
+		const axis = (text?: string) => ({
+			title: axisTitle(text),
+			grid: { color: t.grid },
+			border: { color: t.grid },
+			ticks: { color: t.muted, callback: (v: string | number) => fmt(Number(v)) },
+		});
+		return {
+			responsive: true,
+			maintainAspectRatio: false,
+			animation: false,
+			// Hover picks the nearest sample index; the band and mean share the same x values.
+			interaction: { mode: "index", intersect: false },
+			font: { family: t.font },
+			scales: {
+				x: { type: "linear", min: Math.min(...xs), max: Math.max(...xs), ...axis(d.xLabel) },
+				y: axis(d.yLabel),
+			},
+			plugins: {
+				title: { display: !!d.title, text: d.title, color: t.text, font: { size: 14, weight: 600 } },
+				legend: {
+					align: "start",
+					labels: {
+						color: t.text,
+						boxWidth: 18,
+						// The lower edge is half of the band, not a series of its own.
+						filter: (item) => item.datasetIndex !== LOWER,
+					},
+				},
+				tooltip: {
+					backgroundColor: t.bg,
+					titleColor: t.muted,
+					bodyColor: t.text,
+					borderColor: t.grid,
+					borderWidth: 1,
+					displayColors: false,
+					// Index mode would also pick unrelated entries from the dots, which have their
+					// own x values; the tooltip reads only the mean, band and reference.
+					filter: (item: TooltipItem<"line">) =>
+						item.datasetIndex === MEAN || (!!d.reference && item.datasetIndex === MEAN + 1),
+					callbacks: {
+						title: (items: TooltipItem<"line">[]) => `x = ${fmt(items[0]?.parsed.x ?? 0)}`,
+						label: (item: TooltipItem<"line">) => {
+							const y = item.parsed.y;
+							if (y === null) return "";
+							if (item.datasetIndex !== MEAN) return `${d.referenceLabel}: ${fmt(y)}`;
+							const lo = d.lower[item.dataIndex]?.y;
+							const hi = d.upper[item.dataIndex]?.y;
+							const band = lo == null || hi == null ? "" : `  ${d.bandLabel}: [${fmt(lo)}, ${fmt(hi)}]`;
+							return [`${d.meanLabel}: ${fmt(y)}`, band].filter(Boolean);
+						},
+					},
+				},
+			},
+		};
+	}
+
+	for (const el of document.querySelectorAll<HTMLElement>(".ci-chart")) {
+		const d: ChartData = JSON.parse(el.dataset.chart ?? "{}");
+		const canvas = el.querySelector("canvas");
+		if (!canvas) continue;
+		let t = theme(el);
+		const chart = new Chart<"line", Pt[]>(canvas, {
+			type: "line",
+			data: { datasets: datasets(d, t) },
+			options: options(d, t),
+			plugins: [highlight(() => t)],
+		});
+		// Canvas colours don't follow CSS, so repaint when the OS theme flips.
+		matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+			t = theme(el);
+			chart.data.datasets = datasets(d, t);
+			chart.options = options(d, t);
+			chart.update();
+		});
+	}
+</script>
+
+<style>
+	.ci-chart {
+		--ci-main: #2a78d6;
+		--ci-points: #eb6834;
+		margin: 1.75rem 0;
+	}
+	@media (prefers-color-scheme: dark) {
+		.ci-chart {
+			--ci-main: #3987e5;
+			--ci-points: #d95926;
+		}
+	}
+	.plot {
+		position: relative;
+		width: 100%;
+	}
+</style>
