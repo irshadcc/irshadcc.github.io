@@ -1,0 +1,529 @@
+---
+title: "From Grouped-Query Attention to Multi-Head Latent Attention"
+description: "GQA shares key-value heads; MLA compresses keys and values into a learned latent. This post derives both designs, draws their architectures, and works through their KV-cache costs."
+date: 2026-10-02
+tags: [Machine learning, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import { NNGraph } from "../../utils/neuralnetwork/NNGraph";
+import NeuralNetworkGraph from "../../utils/neuralnetwork/NeuralNetworkGraph.astro";
+
+export const mhaGraph = (() => {
+  const g = new NNGraph();
+  const x = g.node("input", "Token state", { shape: "d_model" });
+  const q = g.node("linear", "Q projections", {
+    from: x,
+    detail: "8 independent heads",
+    shape: "8×d_head",
+    formula: String.raw`q_i = W_i^Q h_t`,
+  });
+  const k = g.node("linear", "K projections", {
+    from: x,
+    detail: "8 independent heads",
+    shape: "8×d_head",
+    formula: String.raw`k_i = W_i^K h_t`,
+  });
+  const v = g.node("linear", "V projections", {
+    from: x,
+    detail: "8 independent heads",
+    shape: "8×d_head",
+    formula: String.raw`v_i = W_i^V h_t`,
+  });
+  const cache = g.node("other", "KV cache", {
+    from: [k, v],
+    detail: "8 K heads + 8 V heads per token",
+    shape: "16×d_head",
+  });
+  const attn = g.node("attention", "Scaled dot-product attention", {
+    from: [q, cache],
+    detail: "head i reads K_i and V_i",
+    formula: String.raw`o_i = \operatorname{softmax}(q_i K_i^\top / \sqrt{d_h})V_i`,
+  });
+  g.node("output", "Output projection", { from: attn, shape: "d_model" });
+  return g;
+})();
+
+export const gqaGraph = (() => {
+  const g = new NNGraph();
+  const x = g.node("input", "Token state", { shape: "d_model" });
+  const q0 = g.node("linear", "Query heads 0–3", {
+    from: x,
+    detail: "group 0",
+    shape: "4×d_head",
+  });
+  const q1 = g.node("linear", "Query heads 4–7", {
+    from: x,
+    detail: "group 1",
+    shape: "4×d_head",
+  });
+  const kv0 = g.node("linear", "K/V head 0", {
+    from: x,
+    detail: "shared by queries 0–3",
+    shape: "2×d_head",
+  });
+  const kv1 = g.node("linear", "K/V head 1", {
+    from: x,
+    detail: "shared by queries 4–7",
+    shape: "2×d_head",
+  });
+  const a0 = g.node("attention", "Attention group 0", {
+    from: [q0, kv0],
+    detail: "4 query heads, 1 KV head",
+  });
+  const a1 = g.node("attention", "Attention group 1", {
+    from: [q1, kv1],
+    detail: "4 query heads, 1 KV head",
+  });
+  g.node("output", "Concatenate + project", {
+    from: [a0, a1],
+    shape: "d_model",
+  });
+  return g;
+})();
+
+export const mlaGraph = (() => {
+  const g = new NNGraph();
+  const x = g.node("input", "Token state h_t", { shape: "d_model" });
+  const qLatent = g.node("linear", "Query latent c_t^Q", {
+    from: x,
+    detail: "down-project, then expand per head",
+    shape: "d_c′",
+    formula: String.raw`c_t^Q = W^{DQ}h_t`,
+  });
+  const qContent = g.node("linear", "Content queries", {
+    from: qLatent,
+    shape: "n_h×d_head",
+    formula: String.raw`q_t^C = W^{UQ}c_t^Q`,
+  });
+  const qRoPE = g.node("other", "Rotary queries", {
+    from: qLatent,
+    detail: "one per query head",
+    shape: "n_h×d_rope",
+  });
+  const kvLatent = g.node("linear", "Joint KV latent c_t^KV", {
+    from: x,
+    detail: "cached content",
+    shape: "d_c",
+    formula: String.raw`c_t^{KV} = W^{DKV}h_t`,
+  });
+  const kRoPE = g.node("other", "Shared rotary key", {
+    from: x,
+    detail: "cached position",
+    shape: "d_rope",
+  });
+  const keys = g.node("linear", "Content keys", {
+    from: kvLatent,
+    detail: "expanded per head",
+    shape: "n_h×d_head",
+    formula: String.raw`k_t^C = W^{UK}c_t^{KV}`,
+  });
+  const values = g.node("linear", "Values", {
+    from: kvLatent,
+    detail: "expanded per head",
+    shape: "n_h×d_head",
+    formula: String.raw`v_t^C = W^{UV}c_t^{KV}`,
+  });
+  const attn = g.node("attention", "Multi-head attention", {
+    from: [qContent, qRoPE, keys, kRoPE, values],
+    detail: "content + position scores",
+  });
+  g.node("output", "Output projection", { from: attn, shape: "d_model" });
+  return g;
+})();
+
+## Background
+
+A decoder generates one token at a time. At every layer, the new token's query attends to the
+keys and values of all earlier tokens. Recomputing those old vectors would waste work, so the
+decoder stores them in a **key-value cache (KV cache)**. The cache makes generation practical,
+but its size grows with the sequence length, batch size, layer count, and number of key-value
+heads. The [KV-cache post](/blog/kv-cache-and-paged-attention/) derives that process in detail.
+
+Two attention designs attack this memory cost in different ways. **Grouped-query attention
+(GQA)** lets several query heads share each key-value head. **Multi-head latent attention
+(MLA)** stores a compressed representation from which all heads' keys and values can be derived.
+Both preserve many query heads, but they choose very different things to remember about the past.
+
+This post first establishes multi-head attention as the baseline, then derives GQA and MLA,
+works through a cache-size example, and closes with the practical trade-offs. The architecture
+figures use eight heads so the sharing is visible; production models are usually much wider.
+
+## The expensive part of multi-head attention
+
+Let $h_t \in \mathbb{R}^{d}$ be the hidden state for token $t$. **Multi-head attention (MHA)**
+projects it into $n_h$ query, key, and value heads. Each head has width $d_h$:
+
+$$
+q_{t,i}=W_i^Qh_t,\qquad k_{t,i}=W_i^Kh_t,\qquad v_{t,i}=W_i^Vh_t.
+$$
+
+Query head $i$ attends only to key and value head $i$:
+
+$$
+o_{t,i}=\sum_{j\leq t}
+\operatorname{softmax}_j\!\left(\frac{q_{t,i}^{\mathsf T}k_{j,i}}{\sqrt{d_h}}\right)v_{j,i}.
+$$
+
+The query exists only for the current decode step, so it need not be cached. The old keys and
+values do. MHA therefore stores $2n_hd_h$ numbers per token per layer: one factor of two for K
+and V, and one copy for every head.
+
+<NeuralNetworkGraph graph={mhaGraph} direction="LR" title="Multi-head attention: every query head owns a distinct K/V pair" />
+
+The arithmetic is not the whole cost. During single-token decoding, each layer repeatedly reads
+the cache for the entire prefix. That operation has little computation per byte loaded, so memory
+capacity limits the number of live tokens while memory bandwidth limits how quickly attention can
+read them. This is why changing only the cached representation can materially change serving
+throughput.
+
+## Grouped-query attention: share complete KV heads
+
+**Grouped-query attention** keeps $n_h$ query heads but uses only $n_g$ key and value heads, where
+$1 < n_g < n_h$. Query heads are divided into groups. Every query in group $g$ attends to the same
+$K_g$ and $V_g$:
+
+$$
+o_{t,i}=\operatorname{Attention}(q_{t,i}, K_{g(i)}, V_{g(i)}),
+\qquad g(i)=\left\lfloor\frac{i}{n_h/n_g}\right\rfloor.
+$$
+
+With eight query heads and two KV heads, queries 0–3 share KV head 0 and queries 4–7 share KV head
+1. The figure makes the grouping explicit: follow either query branch and it meets exactly one
+shared K/V branch.
+
+<NeuralNetworkGraph graph={gqaGraph} direction="LR" title="Grouped-query attention: eight query heads share two K/V heads" />
+
+The endpoints have familiar names:
+
+- $n_g=n_h$ is ordinary MHA: one KV head for every query head.
+- $n_g=1$ is **multi-query attention (MQA)**: all queries share one KV head.
+- Values between them are GQA, trading cache size against independent K/V capacity.
+
+The cache now holds only $2n_gd_h$ numbers per token per layer. Compared with MHA, its size and
+the bytes read for cached K/V fall by $n_h/n_g$. The query count has not changed, so the layer can
+still produce $n_h$ distinct attention distributions. What is shared is the representation those
+queries search and retrieve.
+
+### Converting an MHA checkpoint
+
+GQA does not always require training from scratch. Ainslie et al. converted existing MHA
+checkpoints by mean-pooling the key and value projection heads within each new group, then
+continued pretraining. In their T5-XXL experiment, GQA with eight KV groups used 5% of the
+original pretraining steps. It reached an average task score of 47.1 versus 47.2 for MHA, while
+measured inference time fell from 1.51 to 0.28 seconds per sample.<Sidenote>These are the paper's
+specific T5-XXL setup and hardware measurements, not a universal speedup. Kernel quality, batch
+size, context length, and tensor parallelism all affect the result.</Sidenote>
+
+Mean pooling has a simple interpretation. If MHA heads 0–3 become one group, initialize the new
+key matrix as
+
+$$
+\bar W_0^K=\frac{1}{4}\sum_{i=0}^{3}W_i^K,
+$$
+
+and do the same for $W^V$. Continued training then lets the shared projections specialize to
+their new role.
+
+## Multi-head latent attention: cache a shared code
+
+GQA reduces memory by storing fewer complete KV heads. **Multi-head latent attention** takes a
+different route: it learns a low-dimensional code shared by all heads. For each token, MLA first
+down-projects the hidden state into a joint key-value latent:
+
+$$
+c_t^{KV}=W^{DKV}h_t,\qquad c_t^{KV}\in\mathbb{R}^{d_c}.
+$$
+
+Two up-projections can reconstruct the content keys and values used by all heads:
+
+$$
+k_t^C=W^{UK}c_t^{KV},\qquad v_t^C=W^{UV}c_t^{KV}.
+$$
+
+Only $c_t^{KV}$ must be retained for content. The architecture below shows the key distinction
+from GQA: GQA caches a small set of ready-to-use K/V vectors, while MLA caches one code before the
+per-head key and value branches.
+
+<NeuralNetworkGraph graph={mlaGraph} direction="LR" title="Multi-head latent attention: cache one content latent and one shared rotary key" />
+
+MLA also applies a low-rank projection to queries. This reduces activation memory during training,
+but not the inference KV cache: old queries are never needed during decoding.
+
+### Why rotary position needs a separate path
+
+There is a complication. **Rotary position embedding (RoPE)** rotates queries and keys according
+to token position. If RoPE is applied to the reconstructed content key, the position-dependent
+rotation sits between $c_t^{KV}$ and the attention score. The key up-projection can no longer be
+combined with the query projection, so an optimized decoder would have to reconstruct old keys.
+
+DeepSeek-V2 therefore separates content from position. Every head gets a rotary query
+$q_{t,i}^R$, while all heads share one rotary key $k_t^R$. The actual query and key are
+concatenations:
+
+$$
+q_{t,i}=[q_{t,i}^C;q_{t,i}^R],\qquad
+k_{t,i}=[k_{t,i}^C;k_t^R].
+$$
+
+The cache stores both the content latent $c_t^{KV}$ and the small shared rotary key $k_t^R$.
+Its size is therefore $d_c+d_h^R$ numbers per token per layer, where $d_h^R$ is the rotary-key
+width.
+
+### The absorption trick
+
+The graph draws explicit key and value up-projections because that is the easiest way to
+understand the learned representation. A decoder need not materialize those full vectors.
+Ignoring the rotary part for a moment, an attention score contains
+
+$$
+(W_i^Qh_t)^{\mathsf T}(W_i^{UK}c_j^{KV})
+=h_t^{\mathsf T}(W_i^Q)^{\mathsf T}W_i^{UK}c_j^{KV}.
+$$
+
+Because both projections are linear, their product can be prepared as one query-side projection.
+The query then scores the cached latent directly. The value up-projection can similarly be folded
+into the output projection. This **weight absorption** is what turns MLA from "compressed storage
+followed by expensive decompression" into an efficient inference formulation. The separate RoPE
+path exists precisely so position-dependent rotations do not block this algebra.
+
+## A small PyTorch implementation
+
+The following modules implement the diagrams directly. They are deliberately small reference
+versions, not optimized kernels. Both accept a cache from the preceding decode step and return an
+updated cache. The cache keeps its compressed form: GQA repeats its KV heads only for the attention
+operation, while MLA reconstructs full content keys and values only after reading the latent.
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def causal_mask(new_tokens, total_tokens, device):
+    """New token i may see the old cache and new tokens up to i."""
+    return torch.ones(new_tokens, total_tokens, dtype=torch.bool, device=device).tril(
+        diagonal=total_tokens - new_tokens
+    )
+
+
+class GroupedQueryAttention(nn.Module):
+    def __init__(self, d_model=512, query_heads=8, kv_heads=2):
+        super().__init__()
+        assert query_heads % kv_heads == 0
+        self.query_heads = query_heads
+        self.kv_heads = kv_heads
+        self.d_head = d_model // query_heads
+        self.q_proj = nn.Linear(d_model, query_heads * self.d_head, bias=False)
+        self.k_proj = nn.Linear(d_model, kv_heads * self.d_head, bias=False)
+        self.v_proj = nn.Linear(d_model, kv_heads * self.d_head, bias=False)
+        self.out_proj = nn.Linear(query_heads * self.d_head, d_model, bias=False)
+
+    def forward(self, x, cache=None):
+        batch, tokens, _ = x.shape
+        # q: [batch, query_heads, tokens, d_head]
+        q = self.q_proj(x).view(batch, tokens, self.query_heads, self.d_head).transpose(1, 2)
+        k = self.k_proj(x).view(batch, tokens, self.kv_heads, self.d_head).transpose(1, 2)
+        v = self.v_proj(x).view(batch, tokens, self.kv_heads, self.d_head).transpose(1, 2)
+
+        if cache is not None:
+            old_k, old_v = cache
+            k = torch.cat((old_k, k), dim=2)
+            v = torch.cat((old_v, v), dim=2)
+        new_cache = (k, v)  # keep only kv_heads, not the repeated tensors below
+
+        # Map each KV head to query_heads / kv_heads consecutive query heads.
+        repeats = self.query_heads // self.kv_heads
+        k_for_attention = k.repeat_interleave(repeats, dim=1)
+        v_for_attention = v.repeat_interleave(repeats, dim=1)
+        mask = causal_mask(tokens, k.shape[2], x.device)
+        y = F.scaled_dot_product_attention(q, k_for_attention, v_for_attention, attn_mask=mask)
+        y = y.transpose(1, 2).reshape(batch, tokens, -1)
+        return self.out_proj(y), new_cache
+```
+
+The important line is `repeat_interleave`. It does not enlarge the persistent cache. It only makes
+the two stored KV heads line up with eight query heads for this simple implementation. Production
+kernels usually implement that broadcast inside the attention kernel and avoid materializing the
+repeated tensors.
+
+MLA uses the same attention operation, but its persistent state is `(c_kv, k_rope)`. The helper
+below applies RoPE to pairs formed by the first and second halves of each rotary vector.
+
+```python
+def apply_rope(x, positions):
+    # x: [batch, heads, tokens, d_rope], where d_rope is even
+    half = x.shape[-1] // 2
+    inv_freq = 1.0 / (10000 ** (torch.arange(half, device=x.device) / half))
+    angles = positions[:, None] * inv_freq[None, :]
+    cos, sin = angles.cos()[None, None], angles.sin()[None, None]
+    x1, x2 = x[..., :half], x[..., half:]
+    return torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
+
+
+class MultiHeadLatentAttention(nn.Module):
+    def __init__(self, d_model=512, heads=8, d_head=64, d_latent=256, d_rope=32, d_query=256):
+        super().__init__()
+        assert d_rope % 2 == 0
+        self.heads, self.d_head, self.d_rope = heads, d_head, d_rope
+
+        self.q_down = nn.Linear(d_model, d_query, bias=False)
+        self.q_up = nn.Linear(d_query, heads * d_head, bias=False)
+        self.q_rope = nn.Linear(d_query, heads * d_rope, bias=False)
+
+        self.kv_down = nn.Linear(d_model, d_latent, bias=False)
+        self.k_up = nn.Linear(d_latent, heads * d_head, bias=False)
+        self.v_up = nn.Linear(d_latent, heads * d_head, bias=False)
+        self.k_rope = nn.Linear(d_model, d_rope, bias=False)
+        self.out_proj = nn.Linear(heads * d_head, d_model, bias=False)
+
+    def forward(self, x, cache=None):
+        batch, tokens, _ = x.shape
+        old_tokens = 0 if cache is None else cache[0].shape[1]
+        positions = torch.arange(old_tokens, old_tokens + tokens, device=x.device)
+
+        c_q = self.q_down(x)
+        q_content = self.q_up(c_q).view(batch, tokens, self.heads, self.d_head).transpose(1, 2)
+        q_rotary = self.q_rope(c_q).view(batch, tokens, self.heads, self.d_rope).transpose(1, 2)
+        q_rotary = apply_rope(q_rotary, positions)
+
+        c_kv = self.kv_down(x)  # the content state that will actually be cached
+        k_rotary = self.k_rope(x).view(batch, 1, tokens, self.d_rope)
+        k_rotary = apply_rope(k_rotary, positions)
+        if cache is not None:
+            old_c_kv, old_k_rotary = cache
+            c_kv = torch.cat((old_c_kv, c_kv), dim=1)
+            k_rotary = torch.cat((old_k_rotary, k_rotary), dim=2)
+        new_cache = (c_kv, k_rotary)
+
+        total = c_kv.shape[1]
+        k_content = self.k_up(c_kv).view(batch, total, self.heads, self.d_head).transpose(1, 2)
+        values = self.v_up(c_kv).view(batch, total, self.heads, self.d_head).transpose(1, 2)
+        shared_k_rotary = k_rotary.expand(-1, self.heads, -1, -1)
+
+        queries = torch.cat((q_content, q_rotary), dim=-1)
+        keys = torch.cat((k_content, shared_k_rotary), dim=-1)
+        mask = causal_mask(tokens, total, x.device)
+        y = F.scaled_dot_product_attention(queries, keys, values, attn_mask=mask)
+        y = y.transpose(1, 2).reshape(batch, tokens, -1)
+        return self.out_proj(y), new_cache
+```
+
+One prefill followed by one decode step shows the cache shapes:
+
+```python
+torch.manual_seed(0)
+x = torch.randn(2, 5, 512)
+next_x = torch.randn(2, 1, 512)
+
+gqa = GroupedQueryAttention()
+_, gqa_cache = gqa(x)
+y_gqa, gqa_cache = gqa(next_x, gqa_cache)
+print(y_gqa.shape, gqa_cache[0].shape, gqa_cache[1].shape)
+# torch.Size([2, 1, 512]) torch.Size([2, 2, 6, 64]) torch.Size([2, 2, 6, 64])
+
+mla = MultiHeadLatentAttention()
+_, mla_cache = mla(x)
+y_mla, mla_cache = mla(next_x, mla_cache)
+print(y_mla.shape, mla_cache[0].shape, mla_cache[1].shape)
+# torch.Size([2, 1, 512]) torch.Size([2, 6, 256]) torch.Size([2, 1, 6, 32])
+```
+
+The six cached positions are the five-token prefill plus one decode token. GQA stores two keys and
+two values of width 64. MLA stores one 256-wide content latent and one shared 32-wide rotary key.
+This MLA code reconstructs full content keys and values to keep the derivation visible; an
+optimized inference implementation uses the absorption trick and specialized kernels instead.
+
+## Worked cache example
+
+Consider a scaled-down decoder with these assumptions:
+
+- 24 layers, 8 query heads, and $d_h=64$;
+- GQA uses 2 KV groups;
+- MLA uses $d_c=256$ and $d_h^R=32$;
+- the cache uses bfloat16, or 2 bytes per number;
+- one sequence contains 4096 cached tokens.
+
+For MHA, each token uses
+
+$$
+2\times24\times8\times64=24{,}576\text{ numbers}
+=48\text{ KiB}.
+$$
+
+GQA replaces eight KV heads with two:
+
+$$
+2\times24\times2\times64=6{,}144\text{ numbers}
+=12\text{ KiB}.
+$$
+
+MLA stores one 256-wide content latent and one 32-wide rotary key per layer:
+
+$$
+24\times(256+32)=6{,}912\text{ numbers}
+=13.5\text{ KiB}.
+$$
+
+Multiplying by 4096 tokens gives the full sequence cache:
+
+| Attention | Cached numbers per token | KiB per token | MiB per 4096-token sequence | Relative to MHA |
+| --- | ---: | ---: | ---: | ---: |
+| MHA, 8 KV heads | 24,576 | 48.0 | 192 | 1.00× |
+| GQA, 2 KV heads | 6,144 | 12.0 | 48 | 0.25× |
+| MLA, $d_c=256$, $d_h^R=32$ | 6,912 | 13.5 | 54 | 0.28× |
+
+Check one entry: GQA stores two keys and two values of width 64 in each of 24 layers. That is
+$2\times2\times64\times24=6144$ bfloat16 numbers, or 12 KiB per token. The 4× reduction follows
+directly from replacing eight KV heads with two.
+
+These dimensions are illustrative, not a DeepSeek configuration. In DeepSeek-V2, the paper sets
+$d_c=4d_h$ and $d_h^R=d_h/2$, so MLA caches $4.5d_h$ numbers per layer. The paper describes this
+as the cache size of GQA with 2.25 groups. Its reported 93.3% cache reduction compares the full
+DeepSeek-V2 design with the preceding DeepSeek 67B model, so it should not be treated as a fixed
+property of MLA for every architecture.
+
+## Choosing between them
+
+GQA is the simpler serving design. It changes the number of KV projection heads, and mature
+attention kernels already understand the resulting mapping from query heads to KV heads. Its
+cache reduction is transparent: halving the KV-head count halves the cache. It is also possible
+to uptrain an MHA checkpoint instead of starting over.
+
+MLA asks more of the model and the inference stack. Training must learn a useful joint bottleneck;
+RoPE needs the decoupled path; and fast decoding depends on weight absorption and kernels that
+operate on the latent representation. In return, cache width is no longer tied to an integer
+number of complete KV heads. The model keeps per-head content projections while the stored state
+passes through one learned bottleneck.
+
+| Property | MHA | GQA | MLA |
+| --- | --- | --- | --- |
+| Query heads | Independent | Independent | Independent content and rotary queries |
+| Cached content | K and V for every head | K and V for every group | One joint KV latent |
+| Cached position state | Included in every key | Included in every KV-group key | One shared rotary key |
+| Cache elements per token per layer | $2n_hd_h$ | $2n_gd_h$ | $d_c+d_h^R$ |
+| Main implementation idea | Direct per-head attention | Broadcast each KV head to a query group | Low-rank compression, decoupled RoPE, weight absorption |
+
+Neither formula alone predicts model quality. Reducing KV heads restricts the independent
+representations available to queries; compressing through a latent restricts them through a
+learned rank bottleneck. The useful comparison is empirical at a fixed training recipe, parameter
+budget, serving implementation, and memory target.
+
+## Summary
+
+- MHA caches one key and one value for every head, costing $2n_hd_h$ numbers per token per layer.
+- GQA preserves all query heads but shares complete K/V heads within groups, reducing cache and
+  cache bandwidth by $n_h/n_g$ relative to MHA.
+- MLA stores a joint low-rank content latent plus a shared rotary key, costing $d_c+d_h^R$ numbers
+  per token per layer.
+- Decoupled RoPE keeps position-dependent rotation away from the compressed content path, which
+  enables key and value projection weights to be absorbed into the query and output projections.
+- GQA is structurally simpler; MLA offers a more flexible learned bottleneck but needs specialized
+  training and inference support.
+
+## References
+
+1. Vaswani et al., [Attention Is All You Need](https://arxiv.org/abs/1706.03762), 2017.
+2. Shazeer, [Fast Transformer Decoding: One Write-Head is All You Need](https://arxiv.org/abs/1911.02150), 2019.
+3. Ainslie et al., [GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints](https://arxiv.org/abs/2305.13245), 2023.
+4. DeepSeek-AI, [DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model](https://arxiv.org/abs/2405.04434), 2024.

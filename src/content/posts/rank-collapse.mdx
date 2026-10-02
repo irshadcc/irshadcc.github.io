@@ -1,0 +1,349 @@
+---
+title: "Rank Collapse in Neural Networks"
+description: "Rank collapse squeezes many distinct inputs into a low-dimensional representation. A small feed-forward network shows exactly what information disappears, how to detect it with singular values, and when low rank is useful rather than harmful."
+date: 2026-10-02
+tags: [Machine learning, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import { NNGraph } from "../../utils/neuralnetwork/NNGraph";
+import NeuralNetworkGraph from "../../utils/neuralnetwork/NeuralNetworkGraph.astro";
+
+export const W2 = [
+	[1, 1, 0],
+	[0, 1, 1],
+	[1, 0, 1],
+];
+
+export const fullRankW1 = [
+	[1, 0, 0],
+	[0, 1, 0],
+	[0, 0, 1],
+];
+
+export const rankTwoW1 = [
+	[1, 0, 0],
+	[0, 1, 0],
+	[0, 0, 0],
+];
+
+export const rankOneW1 = [
+	[1 / 3, 1 / 3, 1 / 3],
+	[1 / 3, 1 / 3, 1 / 3],
+	[1 / 3, 1 / 3, 1 / 3],
+];
+
+export const rankGraph = (() => {
+	const g = new NNGraph();
+	const x = g.node("input", "Input x", {
+		shape: "3",
+		detail: "one cube corner",
+		formula: String.raw`x \in \{0,1\}^3`,
+	});
+	for (const [label, rank, W] of [
+		["Full-rank path", 3, fullRankW1],
+		["Rank-2 path", 2, rankTwoW1],
+		["Rank-1 path", 1, rankOneW1],
+	]) {
+		const group = g.group(`${label} (rank ${rank})`);
+		const linear = g.node("linear", "Linear W₁", {
+			from: x,
+			shape: "3",
+			group,
+			detail: `rank ${rank}`,
+			formula: String.raw`z = W_1 x`,
+			weights: { W_1: W },
+		});
+		const relu = g.node("activation", "ReLU", {
+			from: linear,
+			shape: "3",
+			group,
+			formula: String.raw`h = \max(0,z)`,
+		});
+		g.node("output", "Output y", {
+			from: relu,
+			shape: "3",
+			group,
+			formula: String.raw`y = W_2h`,
+			weights: { W_2: W2 },
+		});
+	}
+	return g;
+})();
+
+## Background
+
+A hidden layer may have 1,024 neurons and still carry only a handful of independent signals.
+Width counts coordinates; **rank** counts independent directions in which a collection of
+representations actually varies. When that number becomes much smaller than the available width,
+the representation has suffered **rank collapse**.
+
+This matters because the discarded directions can encode distinctions needed later. Once two
+inputs become the same hidden vector, every deterministic layer after it must treat them the same.
+The network may then learn slowly, produce correlated features, or be unable to express the target
+function at all. Rank collapse is not always a bug, though: removing nuisance directions can be a
+useful bottleneck.
+
+This post first defines rank collapse with singular values. It then follows eight inputs through a
+small feed-forward network (FFN) under full-rank, rank-2, and rank-1 weights. Finally, it separates
+rank collapse from neural collapse and gives practical ways to measure and control it.
+
+## What collapses?
+
+Put a batch of $n$ hidden vectors into a matrix $H \in \mathbb{R}^{n \times d}$, one example per
+row and one feature per column. The algebraic rank is the number of non-zero singular values:
+
+$$
+H = U\Sigma V^\top, \qquad
+\operatorname{rank}(H) = \#\{i : \sigma_i > 0\}.
+$$
+
+The right singular vectors in $V$ are feature-space directions. Their singular values $sigma_i$
+say how strongly the batch varies along those directions. If only one singular value remains, all
+centered representations lie on a line. If two remain, they lie in a plane.
+
+Exact rank is brittle in floating-point arithmetic: a singular value of $10^{-12}$ is technically
+non-zero but often carries no useful signal. Two common softer measurements are **stable rank** and
+**entropy effective rank**:
+
+$$
+\operatorname{srank}(H) = \frac{\lVert H\rVert_F^2}{\lVert H\rVert_2^2}
+= \frac{\sum_i \sigma_i^2}{\sigma_1^2},
+$$
+
+$$
+\operatorname{erank}(H) = \exp\!\left(-\sum_i p_i\log p_i\right),
+\qquad p_i = \frac{\sigma_i}{\sum_j \sigma_j}.
+$$
+
+Both equal 1 when one singular direction dominates. Neither requires an arbitrary hard cutoff.
+Center $H$ before measuring if the question is how examples vary around their mean; otherwise a
+large common offset can look like an important direction.<Sidenote>The rank of the weights and the
+rank of the activations are related but not identical. “Rank collapse” may refer to either, so a
+measurement should always name its matrix.</Sidenote>
+
+### Why a low-rank layer loses information
+
+For a linear layer applied to a batch,
+
+$$
+Z = XW^\top,
+$$
+
+the rank inequality gives
+
+$$
+\operatorname{rank}(Z)
+\le \min\big(\operatorname{rank}(X),\operatorname{rank}(W)\big).
+$$
+
+Equivalently, every direction $v$ in the null space of $W$ disappears because $Wv=0$. Inputs $x$
+and $x+v$ therefore produce the same pre-activation. No downstream deterministic computation can
+recover which one arrived.
+
+A nonlinearity needs a qualification. Element-wise ReLU can change the algebraic rank of a batch,
+so weight rank is not a universal upper bound on every later activation matrix. But ReLU cannot
+separate a pair that the preceding linear map has already made identical. The experiment below
+uses non-negative inputs and weights, making ReLU the identity so that we can see the linear
+bottleneck without that complication.
+
+## A three-neuron FFN
+
+Consider the network
+
+$$
+h = \operatorname{ReLU}(W_1x), \qquad y = W_2h,
+$$
+
+with zero biases. It has three inputs, three hidden units, and three outputs. The architecture does
+not get narrower; only the rank of $W_1$ changes. Hover or focus each linear node below to inspect
+the exact matrix and its measured rank.
+
+<NeuralNetworkGraph
+	graph={rankGraph}
+	title="The same 3 → 3 → 3 FFN under three first-layer weight matrices"
+/>
+
+The second layer is full rank and fixed in every path:
+
+$$
+W_2 =
+\begin{bmatrix}
+1&1&0\\
+0&1&1\\
+1&0&1
+\end{bmatrix},
+\qquad \det(W_2)=2.
+$$
+
+Because $W_2$ is invertible, it does not create or repair a collision. It merely remixes the hidden
+coordinates. Any difference among the three paths therefore comes from $W_1$.
+
+### The dataset and three weight choices
+
+The dataset contains all eight corners of the binary cube, $x\in\{0,1\}^3$. These are the three
+first-layer matrices:
+
+$$
+W_1^{(3)} = I,
+\qquad
+W_1^{(2)} =
+\begin{bmatrix}1&0&0\\0&1&0\\0&0&0\end{bmatrix},
+\qquad
+W_1^{(1)} = \frac{1}{3}
+\begin{bmatrix}1&1&1\\1&1&1\\1&1&1\end{bmatrix}.
+$$
+
+Their singular values are $(1,1,1)$, $(1,1,0)$, and $(1,0,0)$, respectively. The rank-2 matrix
+erases $x_3$. The rank-1 matrix keeps only the average $s=(x_1+x_2+x_3)/3$ and repeats it in all
+three hidden coordinates.
+
+The table shows every computed output. Repeated rows are the visible symptom of information loss.
+
+| Input $x$ | Full-rank output | Rank-2 output | Rank-1 output |
+| --- | --- | --- | --- |
+| $(0,0,0)$ | $(0,0,0)$ | $(0,0,0)$ | $(0,0,0)$ |
+| $(0,0,1)$ | $(0,1,1)$ | $(0,0,0)$ | $(2/3,2/3,2/3)$ |
+| $(0,1,0)$ | $(1,1,0)$ | $(1,1,0)$ | $(2/3,2/3,2/3)$ |
+| $(0,1,1)$ | $(1,2,1)$ | $(1,1,0)$ | $(4/3,4/3,4/3)$ |
+| $(1,0,0)$ | $(1,0,1)$ | $(1,0,1)$ | $(2/3,2/3,2/3)$ |
+| $(1,0,1)$ | $(1,1,2)$ | $(1,0,1)$ | $(4/3,4/3,4/3)$ |
+| $(1,1,0)$ | $(2,1,1)$ | $(2,1,1)$ | $(4/3,4/3,4/3)$ |
+| $(1,1,1)$ | $(2,2,2)$ | $(2,1,1)$ | $(2,2,2)$ |
+
+Check one pair by hand. Under $W_1^{(2)}$, the inputs $(0,0,0)$ and $(0,0,1)$ differ only in the
+erased coordinate. Both give $h=(0,0,0)$ and hence $y=(0,0,0)$. A classifier after this FFN cannot
+assign the pair different labels, regardless of how its later weights are trained.
+
+Under $W_1^{(1)}$, the three inputs with exactly one 1 all map to
+$h=(1/3,1/3,1/3)$ and $y=(2/3,2/3,2/3)$. The network remembers the Hamming weight
+$x_1+x_2+x_3$, but forgets which coordinate was active. That compression is harmless for a target
+that depends only on the sum, and fatal for a target that asks for the active coordinate.
+
+### What the numbers say
+
+NumPy gives the following results for the full batch. “Centered hidden singular values” measure
+variation around the batch mean.
+
+| First layer | Rank of $W_1$ | Centered singular values of $H$ | Rank of $Y$ | Distinct outputs |
+| --- | ---: | ---: | ---: | ---: |
+| Full rank | 3 | $(1.414, 1.414, 1.414)$ | 3 | 8 of 8 |
+| Rank 2 | 2 | $(1.414, 1.414, 0)$ | 2 | 4 of 8 |
+| Rank 1 | 1 | $(1.414, 0, 0)$ | 1 | 4 of 8 |
+
+Rank alone does not count distinct points. Both collapsed paths have four distinct outputs, but
+their geometry differs: the rank-2 outputs span a plane and the rank-1 outputs lie on a line. This
+is why a spectrum plus a task-relevant metric is more informative than one rank number.
+
+The calculation is reproducible with this complete script:
+
+```python
+import itertools
+import numpy as np
+
+X = np.array(list(itertools.product([0.0, 1.0], repeat=3)))
+W2 = np.array([[1, 1, 0], [0, 1, 1], [1, 0, 1]], dtype=float)
+weights = {
+    "full": np.eye(3),
+    "rank 2": np.diag([1.0, 1.0, 0.0]),
+    "rank 1": np.ones((3, 3)) / 3,
+}
+
+for name, W1 in weights.items():
+    H = np.maximum(0, X @ W1.T)
+    Y = H @ W2.T
+    centered = H - H.mean(axis=0, keepdims=True)
+    print(name)
+    print("singular values:", np.linalg.svd(centered, compute_uv=False))
+    print("ranks W1/H/Y:", *(np.linalg.matrix_rank(A) for A in (W1, H, Y)))
+    print("distinct outputs:", len(np.unique(Y, axis=0)))
+    print(Y)
+```
+
+## How collapse develops in deeper networks
+
+For a deep *linear* network, each layer multiplies the previous representation:
+
+$$
+H_{\ell+1}=H_\ell W_\ell^\top.
+$$
+
+Ranks cannot increase under multiplication. More importantly, even when every matrix has exact
+full rank, repeated products can make all but a few singular directions numerically tiny. One
+direction is amplified relative to the others, so the effective rank falls long before the exact
+rank does. Work on randomly initialized deep networks observes this spectral instability and links
+rank preservation to trainability.
+
+Nonlinear networks are subtler, but the same diagnostic remains useful: form an activation matrix
+from a representative batch and follow its centered singular spectrum through depth. A sudden
+spectral cliff identifies the layer where examples start occupying far fewer directions. Research
+has reported low-rank weights and activations in multilayer perceptrons, convolutional networks,
+residual networks, and Transformers; the cause and interpretation depend on the architecture and
+training regime.
+
+### Why optimization suffers
+
+If many examples have nearly parallel hidden vectors, their gradients with respect to the next
+weight matrix are nearly parallel too. Updates lose independent directions, so fitting different
+targets becomes difficult. At exact rank 1, the layer exposes only one feature direction to the
+remainder of the network.
+
+Small singular values also make the network ill-conditioned. Back-propagated signals along those
+directions are attenuated by products of Jacobians. This connects rank collapse to vanishing
+gradients, although the two terms are not synonyms: rank describes the diversity of a set of
+representations, while gradient magnitude describes sensitivity of the loss.
+
+## Related collapses, and when low rank helps
+
+**Neural collapse** is a more specific late-training phenomenon in supervised classification.
+Within each class, penultimate-layer features approach their class mean, and the class means and
+classifier acquire a highly symmetric geometry. Rank collapse is the broader loss of independent
+directions in a weight or representation matrix. Neural collapse can involve low-dimensional
+features, but an arbitrary rank-1 hidden layer is not evidence of neural collapse.
+
+Low rank is also not automatically bad. A model should discard directions that contain noise or
+irrelevant detail. The rank-1 network above is the smallest sufficient representation if the target
+depends only on $x_1+x_2+x_3$. Low-rank adapters and matrix factorization exploit exactly this idea
+to reduce parameters. The useful question is therefore not “is the rank small?” but “did the model
+retain the directions the task needs?”
+
+### Practical diagnosis and control
+
+Measure both weights and activations. For activations, use a fixed, representative validation batch;
+center its rows; and plot the singular spectrum, stable rank, or effective rank at every layer. Track
+task performance beside rank, because a low value without lost performance may be healthy
+compression.
+
+If harmful collapse appears, common interventions include normalization, residual connections,
+better-conditioned initialization, and explicit spectral or orthogonality regularization. These
+methods act differently: a residual path preserves an identity route, normalization rescales and
+recenters activations, and spectral penalties discourage singular values from becoming too
+uneven. None is a universal prescription; verify that it restores both the needed spectrum and the
+task metric.
+
+## Summary
+
+- Rank collapse means a weight or representation matrix retains far fewer independent directions
+  than its width suggests.
+- A low-rank linear map has a null space. Inputs that differ only inside it become identical, and
+  later deterministic layers cannot recover the difference.
+- In the cube example, reducing $W_1$ from rank 3 to rank 2 cuts eight distinct outputs to four;
+  rank 1 keeps only the input sum and confines every output to a line.
+- Use centered singular spectra, stable rank, and task performance together. Exact matrix rank is
+  too brittle and does not say whether the discarded directions matter.
+- Low rank can be useful compression. It becomes collapse when it removes information required by
+  the task or destabilizes optimization.
+
+## References
+
+1. H. Daneshmand et al., [“Batch Normalization Provably Avoids Rank Collapse for Randomly
+   Initialised Deep Networks”](https://arxiv.org/abs/2003.01652), 2020.
+2. R. Feng et al., [“Rank Diminishing in Deep Neural Networks”](https://arxiv.org/abs/2206.06072),
+   2022.
+3. A. Rangamani et al., [“Feature Learning in Deep Classifiers through Intermediate Neural
+   Collapse”](https://proceedings.mlr.press/v202/rangamani23a.html), ICML 2023.
+4. E. Zangrando et al., [“Neural Rank Collapse: Weight Decay and Small Within-Class Variability
+   Yield Low-Rank Bias”](https://arxiv.org/abs/2402.03991), 2024.
+5. Y. Dong, J.-B. Cordonnier, and A. Loukas, [“Attention Is Not All You Need: Pure Attention Loses
+   Rank Doubly Exponentially with Depth”](https://proceedings.mlr.press/v139/dong21a.html), ICML
+   2021.

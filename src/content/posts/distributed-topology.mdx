@@ -1,0 +1,621 @@
+---
+title: "Distributed Topology for Training and Inference"
+description: "A distributed job gives every GPU a rank and puts each rank into tensor-, data-, pipeline- and expert-parallel groups. This post reads Megatron-LM's RankGenerator to see how those groups are built, lists every process group Megatron creates, and looks at how the same layout choices play out when serving a model."
+date: 2026-10-02
+tags: [Distributed training, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import MarginNote from "../../components/MarginNote.astro";
+import LogicalDistributedTopology from "../../utils/distributed/LogicalDistributedTopology.astro";
+
+## Background
+
+A job that runs one model on many GPUs gives every GPU a number, its **rank**, and then puts each
+rank into several groups: the ranks that split each layer's matrices (tensor parallel, TP), the
+ranks that hold the same weights but see different data (data parallel, DP), the ranks that hold
+consecutive layers (pipeline parallel, PP), and so on. Every collective then runs inside one of
+these groups.
+
+[How GPUs Talk](/blog/collective-communication/) covered what each collective costs. This post is
+about the other half: which GPUs end up in which group, and therefore which links each group's
+traffic crosses. We'll read the code Megatron-LM uses to build its groups, list every group it
+creates, and then look at how the same choices play out when serving a model.
+
+## A running example
+
+The figure below lays out a 32-GPU job by its parallel coordinates: 2 pipeline stages (columns),
+4 data-parallel replicas (rows), and 4 tensor-parallel shards per cell, with each pair of replicas
+also forming an expert-parallel group. The GPUs sit in 8-GPU servers, and rank $r$ runs on GPU
+$r$. Hover or click a rank to see the groups it belongs to and how many switches each group's
+traffic crosses.
+
+<LogicalDistributedTopology
+	parallel={{ tp: 4, dp: 4, pp: 2, ep: 2 }}
+	network={{ gpusPerServer: 8, serversPerPod: 2, spinesPerPod: 2 }}
+	selected={0}
+	title="32 ranks: TP 4 × DP 4 × PP 2, EP 2"
+/>
+
+Rank 0's TP group, ranks 0–3, sits inside one server and talks over NVLink. Its DP group, ranks
+0, 4, 8 and 12, spans two servers, and its pipeline neighbour, rank 16, is in another pod, 5
+switches away. None of that is an accident. It follows from how the ranks are numbered.
+
+Every collective runs over a process group, so before training starts each rank has to know which
+ranks share its TP group, its DP group, and so on. In Megatron-LM this happens once, in
+`initialize_model_parallel`, and the groups come from a small class called `RankGenerator` in
+[`megatron/core/parallel_state.py`](https://github.com/NVIDIA/Megatron-LM/blob/8c487209a2ae6eeb276c8244a6495a28950321af/megatron/core/parallel_state.py).
+The figure above follows the same numbering, so its groups are exactly
+the ones Megatron would create.<Sidenote>I checked this by running Megatron's
+`generate_masked_orthogonal_rank_groups` on the 32-rank job: its TP, DP, PP and EP groups match
+the figure's group for group.</Sidenote>
+
+## Ranks are mixed-radix numbers
+
+`RankGenerator` takes the size of each parallel dimension and an **order string**, which defaults
+to `"tp-cp-ep-dp-pp"`. The order says how a global rank is split into one coordinate per
+dimension. The leftmost dimension varies fastest, like the last digit of a number:
+
+$$
+\text{rank} = t + T\,\big(c + C\,(d + D\,p)\big)
+\qquad
+t \in [0, T),\ c \in [0, C),\ d \in [0, D),\ p \in [0, P)
+$$
+
+where $T, C, D, P$ are the TP, CP, DP and PP sizes and $t, c, d, p$ are a rank's coordinates. EP
+is 1 in this generator, so it drops out. Each dimension's **stride**, how far apart in rank two
+neighbours along it are, is the product of the sizes to its left: $1$ for TP, $T$ for CP, $TC$
+for DP and $TCD$ for PP.
+
+For the 32-rank job above ($T = 4$, $C = 1$, $D = 4$, $P = 2$), the strides are 1, 4 and 16, so
+rank 13 is TP shard 1, DP replica 3 and pipeline stage 0: $13 = 1 + 4 \cdot 3 + 16 \cdot 0$.
+
+A **group** along some dimensions is the set of ranks that agree on all the *other* coordinates.
+The TP group of rank 13 holds the ranks with replica 3 and stage 0, that is
+$\{12, 13, 14, 15\}$. Its DP group holds the ranks with TP shard 1 and stage 0:
+$\{1, 5, 9, 13\}$.
+
+## Inside RankGenerator
+
+The class has three parts: a constructor that records the sizes, a method that turns a token
+into a mask, and a function that turns the mask into groups.
+
+### The constructor
+
+The constructor only records the sizes in the order the string gives them. Any dimension of size
+1 that the string leaves out is appended at the end, where it changes nothing:
+
+```python
+class RankGenerator(object):
+    def __init__(self, tp, ep, dp, pp, cp, order, rank_offset=0):
+        assert ep == 1 or cp == 1, "Both EP and CP > 1 are not allowed in one rank generator."
+        self.world_size = tp * dp * pp * cp * ep
+        self.name_to_size = {"tp": tp, "pp": pp, "dp": dp, "ep": ep, "cp": cp}
+        order = order.lower()
+        for name in self.name_to_size.keys():
+            if name not in order and self.name_to_size[name] != 1:
+                raise RuntimeError(...)
+            elif name not in order:
+                order = order + "-" + name
+        self.order = order
+        self.ordered_size = [self.name_to_size[token] for token in order.split("-")]
+```
+
+I've trimmed this slightly. The current version also has a `gtp_remat` dimension, which has size
+1 unless you turn on that feature. `rank_offset` just adds a constant to every rank, for when this
+model occupies a later slice of the world.
+
+### Asking for a group
+
+To get groups, you call `get_ranks` with a **token**: one or more dimension names joined by
+hyphens. The token becomes a boolean mask over the order, marking which dimensions vary *inside*
+a group:
+
+```python
+    def get_mask(self, order, token):
+        ordered_token = order.split("-")
+        mask = [False] * len(ordered_token)
+        for t in token.split("-"):
+            mask[ordered_token.index(t)] = True
+        return mask
+
+    def get_ranks(self, token):
+        mask = self.get_mask(self.order, token)
+        ranks = generate_masked_orthogonal_rank_groups(self.world_size, self.ordered_size, mask)
+        if self.rank_offset > 0:
+            for rank_group in ranks:
+                for i in range(len(rank_group)):
+                    rank_group[i] += self.rank_offset
+        return ranks
+```
+
+With order `tp-cp-ep-dp-pp`, the token `"dp"` gives the mask `[F, F, F, T, F]`, and `"tp-pp"`
+gives `[T, F, F, F, T]`. The order of names inside the token doesn't matter; only the mask does.
+
+### Generating the groups
+
+All the work happens in `generate_masked_orthogonal_rank_groups`. Without its docstring and
+assertion, it reads:
+
+```python
+def generate_masked_orthogonal_rank_groups(world_size, parallel_size, mask):
+    def prefix_product(a, init=1):
+        r = [init]
+        for v in a:
+            init = init * v
+            r.append(init)
+        return r
+
+    def inner_product(a, b):
+        return sum([x * y for x, y in zip(a, b)])
+
+    def decompose(index, shape, stride=None):
+        if stride is None:
+            stride = prefix_product(shape)
+        return [(index // d) % s for s, d in zip(shape, stride)]
+
+    masked_shape = [s for s, m in zip(parallel_size, mask) if m]
+    unmasked_shape = [s for s, m in zip(parallel_size, mask) if not m]
+
+    global_stride = prefix_product(parallel_size)
+    masked_stride = [d for d, m in zip(global_stride, mask) if m]
+    unmasked_stride = [d for d, m in zip(global_stride, mask) if not m]
+
+    group_size = prefix_product(masked_shape)[-1]
+    num_of_group = world_size // group_size
+
+    ranks = []
+    for group_index in range(num_of_group):
+        decomposed_group_idx = decompose(group_index, unmasked_shape)
+        rank = []
+        for rank_in_group in range(group_size):
+            decomposed_rank_idx = decompose(rank_in_group, masked_shape)
+            rank.append(
+                inner_product(decomposed_rank_idx, masked_stride)
+                + inner_product(decomposed_group_idx, unmasked_stride)
+            )
+        ranks.append(rank)
+    return ranks
+```
+
+The helpers are the mixed-radix arithmetic from above:
+
+- `prefix_product(shape)` turns sizes into strides: `[2, 2, 2]` → `[1, 2, 4, 8]`. The last entry
+  is the total size.
+- `decompose(index, shape)` splits a number into its digits in that mixed radix: digit $i$ is
+  $\lfloor \text{index} / \text{stride}_i \rfloor \bmod \text{shape}_i$.
+- `inner_product(idx, stride)` puts digits back together into a number: $\sum_i
+  \text{idx}_i\,\text{stride}_i$.
+
+The main loop splits the dimensions in two by the mask:
+
+- The **masked** dimensions vary *inside* a group. Their sizes multiply to the group size, and
+  `rank_in_group` counts through their coordinates.
+- The **unmasked** dimensions are fixed within a group, and different values pick out different
+  groups. `group_index` counts through their coordinates.
+
+For each pair, both counters are decomposed into coordinates, and each set is multiplied by its
+dimensions' **global** strides, those of the full order. Adding them gives the global rank:
+
+$$
+\text{rank} = \underbrace{\sum_{i \in \text{masked}} \text{idx}_i \cdot \text{stride}_i}_{\text{position inside the group}}
++ \underbrace{\sum_{j \in \text{unmasked}} \text{idx}_j \cdot \text{stride}_j}_{\text{which group}}
+$$
+
+This is just the rank formula from earlier, with its terms sorted into two piles.
+
+## A worked example
+
+Take 8 GPUs with TP 2, DP 2 and PP 2, and the default order. CP and EP have size 1, so their
+coordinate is always 0 and I'll leave them out. The sizes are then `[2, 2, 2]` for
+(tp, dp, pp), and the global strides are `[1, 2, 4]`.
+
+Ask for `get_ranks("dp")`. The mask selects dp:
+
+| | Dimensions | Shape | Global strides |
+| --- | --- | --- | --- |
+| Masked (inside a group) | dp | `[2]` | `[2]` |
+| Unmasked (which group) | tp, pp | `[2, 2]` | `[1, 4]` |
+
+The group size is 2, so there are $8 / 2 = 4$ groups. For each one:
+
+| `group_index` | (tp, pp) | Group offset $1 \cdot tp + 4 \cdot pp$ | Ranks: offset + $2 \cdot dp$ for $dp = 0, 1$ |
+| ---: | --- | ---: | --- |
+| 0 | (0, 0) | 0 | [0, 2] |
+| 1 | (1, 0) | 1 | [1, 3] |
+| 2 | (0, 1) | 4 | [4, 6] |
+| 3 | (1, 1) | 5 | [5, 7] |
+
+Note that `decompose` counts through the unmasked dimensions in order too, so tp varies fastest
+in `group_index` as well. The other tokens work the same way:
+
+| Token | Masked strides | Groups |
+| --- | --- | --- |
+| `"tp"` | `[1]` | [0, 1], [2, 3], [4, 5], [6, 7] |
+| `"dp"` | `[2]` | [0, 2], [1, 3], [4, 6], [5, 7] |
+| `"pp"` | `[4]` | [0, 4], [1, 5], [2, 6], [3, 7] |
+| `"tp-pp"` | `[1, 4]` | [0, 1, 4, 5], [2, 3, 6, 7] |
+| `"tp-dp"` | `[1, 2]` | [0, 1, 2, 3], [4, 5, 6, 7] |
+
+A multi-dimension token gives the union of several groups. `"tp-pp"` is Megatron's **model
+parallel group**: all the ranks that together hold one copy of the model.
+
+## Every process group Megatron-LM creates
+
+`initialize_model_parallel` builds two generators over the same world. The **dense** generator
+(`decoder_rank_generator`) describes the attention and dense MLP layers. It has EP = 1. The
+**expert** generator (`expert_decoder_rank_generator`) describes the MoE layers. It uses the
+**same order string** with the expert sizes: expert TP (ETP, which defaults to TP), EP, CP = 1,
+and an expert DP that takes whatever is left, $\text{world} / (\text{ETP} \cdot \text{EP} \cdot P)$.
+
+Every group is then built the same way. Loop over the groups for a token, create each one, and
+keep the one that contains this rank in a module-level global:
+
+```python
+for ranks in decoder_rank_generator.get_ranks('tp'):
+    group = create_group(
+        ranks,
+        timeout=timeout,
+        pg_options=get_nccl_options("tp", nccl_comm_cfgs),
+        group_desc="TENSOR_MODEL_PARALLEL_GROUP",
+    )
+    if rank in ranks:
+        _TENSOR_MODEL_PARALLEL_GROUP = group
+        _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = ranks
+```
+
+Every rank creates *every* group, including the ones it isn't in.<Sidenote>`torch.distributed.new_group`
+requires all processes in the world to call it for every group, in the same order, even if they
+are not members.</Sidenote> Model code never sees the loop. It calls a getter such as
+`get_tensor_model_parallel_group()` and passes the result to its collectives.
+
+The tables below list every group this creates, with the group containing rank 0 in the 32-rank
+job from the top of the post. I computed those with Megatron's own generator. The last column is a
+one-line summary; the next section walks through each use in detail.
+
+### Dense groups
+
+| Global (getter) | Token | Rank 0's group | Used for |
+| --- | --- | --- | --- |
+| `_TENSOR_MODEL_PARALLEL_GROUP` (`get_tensor_model_parallel_group`) | `tp` | [0–3] | All-reduce, or reduce-scatter/all-gather with sequence parallelism, inside every layer |
+| `_CONTEXT_PARALLEL_GROUP` (`get_context_parallel_group`) | `cp` | [0] | Exchanging keys and values in attention (a singleton here, since CP = 1) |
+| `_PIPELINE_MODEL_PARALLEL_GROUP` (`get_pipeline_model_parallel_group`) | `pp` | [0, 16] | Send/recv of activations and their gradients between stages |
+| `_EMBEDDING_GROUP` (`get_embedding_group`) | first and last rank of each `pp` group | [0, 16] | All-reducing the gradients of the word embeddings, which are tied between the input layer (first stage) and the output layer (last stage) |
+| `_POSITION_EMBEDDING_GROUP` (`get_position_embedding_group`) | first rank of each `pp` group | [0] | All-reducing position-embedding gradients. By default only the first stage holds them, so the group has one rank and the all-reduce does nothing |
+| `_DATA_PARALLEL_GROUP` (`get_data_parallel_group()`) | `dp` | [0, 4, 8, 12] | Which samples a rank reads, the number of micro-batches, and counting samples seen |
+| `_DATA_PARALLEL_GROUP_WITH_CP` (`get_data_parallel_group(with_context_parallel=True)`) | `dp-cp` | [0, 4, 8, 12] | Gradient all-reduce or reduce-scatter, and distributed-optimizer sharding. CP ranks hold the same weights but see different tokens, so their gradients are summed too |
+| `_MODEL_PARALLEL_GROUP` (`get_model_parallel_group`) | `tp-pp` | [0–3, 16–19] | Gradient norm and inf/NaN checks over one copy of the model (without the distributed optimizer) |
+| `_TENSOR_AND_DATA_PARALLEL_GROUP` (`get_tensor_and_data_parallel_group`) | `tp-dp` | [0–15] | No direct users in `megatron/core` at this commit; callers ask for the CP version below, which has the same ranks when CP = 1 |
+| `_TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP` (same getter, `with_context_parallel=True`) | `tp-dp-cp` | [0–15] | FP8/FP4 amax reduction, the global MoE load-balancing loss, and the router's expert-bias update |
+| `_TENSOR_AND_CONTEXT_PARALLEL_GROUP` (`get_tensor_and_context_parallel_group`) | `tp-cp` | [0–3] | The per-micro-batch MoE load-balancing loss, and FP8 amax reduction with `tp_only_amax_red` |
+
+### Expert (MoE) groups
+
+| Global (getter) | Token | Rank 0's group | Used for |
+| --- | --- | --- | --- |
+| `_EXPERT_MODEL_PARALLEL_GROUP` (`get_expert_model_parallel_group`) | `ep` | [0, 4] | Sending tokens to the experts and back (all-to-all) |
+| `_EXPERT_TENSOR_PARALLEL_GROUP` (`get_expert_tensor_parallel_group`) | `tp` | [0–3] | Tensor parallelism inside each expert |
+| `_EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP` (`get_expert_tensor_and_model_parallel_group`) | `tp-ep` | [0–7] | The all-gather and DeepEP/HybridEP token dispatchers, and sharing per-expert token counts |
+| `_EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP` (`get_expert_tensor_model_pipeline_parallel_group`) | `tp-ep-pp` | [0–7, 16–23] | Gradient norm and inf/NaN checks for expert parameters (without the distributed optimizer); the building block of the optimizer-instance group below |
+| `_EXPERT_DATA_PARALLEL_GROUP` (`get_expert_data_parallel_group`) | `dp` | [0, 8] | Ranks that hold the same experts: expert-gradient reduction and optimizer sharding |
+
+Rank 0's dense DP group, [0, 4, 8, 12], splits in two inside an MoE layer: the EP pair [0, 4] runs
+the all-to-all, and the expert-DP pair [0, 8] reduces the expert gradients. In the default
+order `ep` sits between `cp` and `dp`, so EP and expert DP are carved out of the digits CP and DP
+use in the dense generator. That is why EP groups run along the DP lines in the topology
+figure.<MarginNote>Megatron asserts that both generators produce the same PP groups, since a layer
+can't change pipeline stage.</MarginNote>
+
+### Distributed-optimizer groups
+
+With the distributed optimizer, the optimizer state is sharded over the data-parallel ranks.
+`num_distributed_optimizer_instances` (default 1) splits each DP group into several smaller
+instances. Each instance shards its own copy of the state, so the sharding collectives stay inside
+a smaller, closer group.
+
+| Global (getter) | How it is built | Used for |
+| --- | --- | --- |
+| `_INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP` (`get_data_parallel_group(with_context_parallel=True, partial_data_parallel=True)`) | Consecutive slices of each `dp-cp` group | Sharding inside one optimizer instance (equals the full `dp-cp` group when there is one instance) |
+| `_INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP` | Consecutive slices of each expert `dp` group | The same for expert parameters |
+| `_INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP` (`get_inter_distributed_optimizer_instance_group`) | Matching ranks of different instances | All-reducing gradients across instances (shared by dense and expert layers) |
+| `_INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP` (`get_intra_distributed_optimizer_instance_group`) | Union of expert `tp-ep-pp` groups, enough to cover one instance | Gradient-norm and zero-count reductions over every rank of one instance. Here that is the whole world, [0–31] |
+
+### Other groups
+
+- **Gloo copies.** With `create_gloo_process_groups` (on by default), the `dp`, `dp-cp`, expert
+  `dp` and intra-partial groups are also created with the CPU `gloo` backend, as
+  `..._GLOO` globals. They are used for CPU-side work such as gathering distributed-optimizer
+  state for checkpoints.
+- **Hierarchical CP** (`_HIERARCHICAL_CONTEXT_PARALLEL_GROUPS`). With
+  `hierarchical_context_parallel_sizes`, each CP group is split into levels, e.g. an inner
+  all-to-all level and an outer ring level, via `create_hierarchical_groups`.
+- **Dynamic CP** (`_DYNAMIC_DP_CP_GROUPS`). With `dynamic_context_parallel`, each `dp-cp` group is
+  also cut into sub-groups of every power-of-two size, so the CP size can change from batch to
+  batch.
+- **Separate all-gather communicators** (`create_all_gather_groups`, enabled with
+  `--create-all-gather-group`). These are copies of the `dp-cp` and expert `dp` groups that
+  Megatron FSDP uses for its parameter all-gathers, so they can overlap with the gradient
+  reduce-scatters running on the original communicator.
+- **Generalized TP weight rematerialization** (`gtp_remat`). The newest addition: an extra
+  dimension that shards only weights, inserted after `cp` in the dense order and after `ep` in the
+  expert order. It adds its own groups, such as `_GTP_WEIGHT_REMAT_GROUP`, and `_WITH_GTP_REMAT`
+  variants of the DP groups. With its default size of 1 they are all singletons or copies of the
+  groups above.
+
+## Where each process group is used
+
+A process group is used in two ways. Most obviously, it is the group a collective runs over. But
+just as often, code only asks for a rank's **position** in a group, to decide what it owns:
+its TP rank picks which slice of each weight matrix it holds, its PP rank picks which layers it
+runs, and its DP rank picks which samples it reads. Both kinds of use appear below.
+
+File paths are relative to `megatron/core/` at the commit linked above, except for those under
+`megatron/training/`. Modern Megatron code rarely calls the getters directly. Instead it receives a
+`ProcessGroupCollection` (`process_groups_config.py`), whose fields are the groups by short name:
+`pg_collection.tp`, `.cp`, `.pp`, `.dp_cp`, `.ep`, `.expt_dp` and so on.
+
+### One training step, in order
+
+The table follows one training step and lists every group that does work in it. The subsections
+after it explain each one.
+
+| Phase | What happens | Group | Collective |
+| --- | --- | --- | --- |
+| Load the batch | Each replica reads different samples; each CP rank keeps its chunks of every sequence | `dp`, `cp` | None (rank only) |
+| Forward: every layer | Combine the partial outputs of row-parallel layers | `tp` | All-reduce, or reduce-scatter + all-gather with sequence parallelism |
+| Forward: attention | Exchange keys and values between sequence chunks | `cp` (`hcp`) | Ring send/recv, all-gather or all-to-all |
+| Forward: MoE layer | Count tokens per expert, send tokens to experts, bring results back | `tp-cp`, `ep`, expert `tp`, `tp-ep` | All-reduce, all-to-all, all-gather / reduce-scatter |
+| Between stages | Pass activations forward, gradients backward | `pp` | Send/recv |
+| Loss | Softmax over a vocabulary split across TP ranks | `tp` | All-reduce (max, then sum) |
+| Gradient sync | Sum gradients across replicas | `dp-cp` and expert `dp` | Reduce-scatter (distributed optimizer) or all-reduce |
+| Finalize gradients | Layer norms under sequence parallelism, tied embeddings, router bias, token count | `tp`, `embd`, `tp-dp-cp`, `pp`, `dp-cp` | All-reduce, broadcast |
+| Optimizer step | Gradient norm, zero count, inf/NaN check | `mp`, `tp-ep-pp` or optimizer-instance group | All-reduce |
+| Parameter sync | Share updated parameter shards | `dp-cp` and expert `dp` | All-gather |
+| Bookkeeping | Samples seen, evaluation iterations, checkpoints | `dp`, `dp-cp`, Gloo groups | All-reduce, gather |
+
+### Tensor parallel (`tp`)
+
+TP is the busiest group: it communicates inside every layer, in both directions.
+
+- **Linear layers** (`tensor_parallel/layers.py`). A `ColumnParallelLinear` splits a weight by
+  output columns, so its forward needs no communication. A `RowParallelLinear` splits by input
+  rows, so each rank produces a partial sum, and `reduce_from_tensor_model_parallel_region`
+  all-reduces it. With sequence parallelism that all-reduce becomes a reduce-scatter, and the next
+  column-parallel layer starts with the matching all-gather
+  (`gather_from_sequence_parallel_region`). The collectives themselves live in
+  `tensor_parallel/mappings.py`, wrapped as autograd functions so the backward pass runs the
+  mirror image: an all-gather's gradient is a reduce-scatter, and the other way round.
+- **Embedding** (`VocabParallelEmbedding`). Each rank holds a slice of the vocabulary, looks up
+  only the tokens that fall in it, and all-reduces (or reduce-scatters) the result.
+- **Loss** (`tensor_parallel/cross_entropy.py`). The output layer's logits are split across the
+  vocabulary too, so the softmax needs three all-reduces over `tp`: the maximum logit (for
+  numerical stability), the logit of the correct token, and the sum of exponentials.
+- **Gradients that every TP rank shares** (`distributed/finalize_model_grads.py`). With sequence
+  parallelism, every TP rank holds a full copy of each layer norm but sees only its part of the
+  sequence, so `_allreduce_non_tensor_model_parallel_grads` all-reduces those gradients over
+  `tp` after the backward pass.
+
+### Context parallel (`cp` and `hcp`)
+
+- **Attention** (`extensions/transformer_engine.py`). Megatron hands the CP group to Transformer
+  Engine with `set_context_parallel_group`, and TE runs one of four schemes, set by `cp_comm_type`
+  in `transformer/transformer_config.py`: `p2p` passes key/value chunks around a ring and overlaps
+  that with computation; `all_gather` gathers the full key/value sequence first; `a2a` swaps from
+  splitting the sequence to splitting the heads, like DeepSpeed Ulysses; and `a2a+p2p` combines
+  the two, using the hierarchical `hcp` groups with all-to-all inside a fast domain and a ring
+  between them.
+- **Splitting the batch** (`get_batch_on_this_cp_rank` in `utils.py`). By default each sequence is
+  cut into $2 \times$ CP chunks dealt out in a zigzag: with CP = 2, rank 0 gets chunks 0 and 3 and
+  rank 1 gets chunks 1 and 2. Under causal masking later chunks do more attention work, so pairing
+  an early chunk with a late one balances the ranks.
+- **Positions and loss.** Rotary embeddings receive the CP group so each rank uses the right
+  positions for its chunks (`models/gpt/gpt_model.py`). The pipeline schedule multiplies the loss
+  by the CP size (`pipeline_parallel/schedules.py`), which cancels the averaging over CP ranks
+  that happens later in the gradient sync.
+
+### Pipeline parallel and the embedding groups (`pp`, `embd`, `pos_embd`)
+
+- **Activations between stages** (`pipeline_parallel/p2p_communication.py`). Each stage sends its
+  output to the next one with `isend`/`irecv` (batched with `batch_isend_irecv`), and gradients
+  flow back the same way. The schedules in `pipeline_parallel/schedules.py` decide when.
+- **Which layers a stage owns.** The PP rank decides which transformer layers a stage builds
+  (`transformer/transformer_block.py`, `transformer/transformer_layer.py`), and whether it holds
+  the input embedding (first stage) or the output layer and loss (last stage).
+- **Token count for loss normalization** (`finalize_model_grads.py`). With per-token loss
+  averaging, only the last stage knows how many tokens the batch had, so it broadcasts the count
+  over `pp` before it is summed over `dp-cp`.
+- **Tied word embeddings** (`_allreduce_word_embedding_grads`). When the input embedding and the
+  output layer share a weight, the first and last stages each hold a copy. After the backward pass
+  they all-reduce its gradient over `embd`, so both copies take the same update.
+- **Position embeddings** (`_allreduce_position_embedding_grads`). The same idea over `pos_embd`.
+  By default only the first stage holds them, so the group has one member and the all-reduce does
+  nothing. It is there for models that pass a custom `get_position_embedding_ranks` to
+  `initialize_model_parallel`.
+
+### Data parallel (`dp`, `dp-cp` and the optimizer-instance groups)
+
+- **Gradient sync** (`distributed/param_and_grad_buffer.py`). Gradients are grouped into buckets,
+  and each bucket's collective is launched as soon as its gradients are ready, overlapping the rest
+  of the backward pass. Without the distributed optimizer it is an all-reduce. With it, it is a
+  reduce-scatter that leaves each rank only the shard it updates. Dense parameters use `dp-cp`,
+  since CP ranks hold the same weights and must sum their gradients too. Expert parameters use the
+  expert `dp` group (`distributed/distributed_data_parallel.py`).
+- **Parameter sync.** After the optimizer step, the distributed optimizer all-gathers the updated
+  shards over the same group, so every rank has the full parameters for the next forward pass.
+- **Several optimizer instances.** With `num_distributed_optimizer_instances > 1`, the
+  reduce-scatter runs inside a smaller intra-instance group, and an all-reduce over the
+  inter-instance group then sums the results across instances. That keeps the sharding traffic
+  inside a smaller, closer group.
+- **Plain `dp`, without CP**, is used for bookkeeping. The data samplers shard the dataset by DP
+  rank (`megatron/training/datasets/data_samplers.py`), the number of micro-batches is the global
+  batch size divided by the micro-batch size times the DP size, and the training loop
+  all-reduces the count of samples seen over it (`megatron/training/training.py`). CP ranks are
+  left out because they read the same samples.
+- **Gloo copies** (`optimizer/distrib_optimizer.py`). `save_parameter_state` writes the
+  distributed optimizer's state from DP rank 0. To get it there, `get_parameter_state_dp_zero`
+  copies each rank's shard to CPU memory and gathers the shards over the Gloo version of the DP
+  group.
+
+### Model parallel and gradient statistics (`mp`, `tp-ep-pp`)
+
+The optimizer needs a few numbers about the gradients as a whole: the global gradient norm for
+clipping, the number of zeros, and whether any value is inf or NaN (to skip a step under mixed
+precision). Each rank computes them for the gradients it holds, then sums or maxes them over the
+**gradient-statistics group** (`optimizer/__init__.py`, `optimizer/clip_grads.py`):
+
+- Without the distributed optimizer, every DP replica holds identical gradients, so the group only
+  needs to cover one copy of the model: `mp` (`tp-pp`) for dense parameters, `tp-ep-pp` for
+  expert parameters.
+- With the distributed optimizer, each rank holds a different shard of the gradients, so the
+  group must cover a whole optimizer instance: the intra-instance group, which is the whole world
+  when there is a single instance.
+
+### MoE groups (`ep`, expert `tp`, `tp-ep`, `tp-cp`, `tp-dp-cp`, expert `dp`)
+
+An MoE layer uses more groups than any other part of the model. In order:
+
+1. **Routing statistics** (`transformer/moe/router.py`). The load-balancing loss needs to know
+   how many tokens went to each expert. The per-micro-batch loss (`aux_loss`) counts them over
+   `tp-cp`: one micro-batch's tokens are spread across the TP ranks (with sequence parallelism)
+   and the CP ranks. The global loss (`global_aux_loss`) counts over `tp-dp-cp`, the whole global
+   batch.
+2. **Dispatch** (`transformer/moe/token_dispatcher.py`). The all-to-all dispatcher sends every
+   token to the rank holding its expert with an all-to-all over `ep`. If the experts themselves
+   are tensor-parallel, it then all-gathers the tokens over the expert `tp` group, so every shard
+   of an expert sees all of that expert's tokens. The all-gather dispatcher instead gathers every
+   token over `tp-ep` and lets each rank keep its own. The flex dispatcher hands the exchange to
+   DeepEP or HybridEP, also over `tp-ep`.
+3. **Expert computation** (`transformer/moe/experts.py`). Expert linear layers are tensor-parallel
+   over the expert `tp` group, just like dense layers over `tp`.
+4. **Combine.** The reverse of dispatch: a reduce-scatter over expert `tp` (or `tp-ep`), then an
+   all-to-all back over `ep`.
+5. **After the backward pass.** Expert gradients are reduced over the expert `dp` group. If the
+   router uses an expert bias for load balancing, `_update_router_expert_bias` all-reduces the
+   token counts over `tp-dp-cp` first (`finalize_model_grads.py`).
+
+Only expert-DP rank 0 writes the expert weights when saving a checkpoint
+(`megatron/training/checkpointing.py`), since the other ranks in that group hold identical copies.
+
+### Low-precision scaling (`tp-dp-cp`, `tp-cp`)
+
+FP8 and FP4 training keep a running maximum (the **amax**) of each tensor to choose its scale. All
+ranks that compute parts of the same tensors must agree on it, so Megatron passes an amax group
+to Transformer Engine's `fp8_autocast` (`fp8_utils.py`, `fp4_utils.py`). By default that is
+`tp-dp-cp`, so the whole replica set shares one scale. With `tp_only_amax_red` it is `tp-cp`,
+which keeps the reduction inside one replica.
+
+### In inference
+
+Megatron's own inference engine uses a subset of the same groups.
+
+- **TP** runs the same layer collectives, but `tensor_parallel/inference_layers.py` swaps in
+  versions built on NVLink's in-switch reductions (`multimem_reduce_scatter`,
+  `multimem_all_gather`) over symmetric memory buffers. This is the latency-optimized all-reduce
+  path discussed in the inference section below.
+- **PP** sends activations forward as in training, and
+  `broadcast_from_last_pipeline_stage` (`inference/communication_utils.py`) broadcasts each newly
+  generated token from the last stage over `pp`, so the first stage can embed it for the next step.
+- **EP** runs the same dispatch and combine all-to-alls. There are no gradients, so the DP,
+  optimizer and embedding-gradient groups go unused.
+
+## The order string decides what is local
+
+Launchers put consecutive ranks on the same server, so the dimension listed first gets the
+smallest stride and the most local links. The default `tp-cp-ep-dp-pp` puts TP inside a server,
+then CP and EP, then DP, and PP across the widest distance, which is exactly the placement the
+[cost model](/blog/collective-communication/) argues for. Change the order and the same code builds different groups. With
+`"tp-pp-dp"` on the 8-GPU example, PP gets stride 2 and DP stride 4:
+
+| Order | DP groups | PP groups |
+| --- | --- | --- |
+| `tp-cp-ep-dp-pp` (default) | [0, 2], [1, 3], [4, 6], [5, 7] | [0, 4], [1, 5], [2, 6], [3, 7] |
+| `tp-pp-dp` | [0, 4], [1, 5], [2, 6], [3, 7] | [0, 2], [1, 3], [4, 6], [5, 7] |
+
+Here is the 32-rank job again with `tp-pp-dp` order. The logical picture is the same, but click
+rank 0 and look at the hop labels: the pipeline neighbour is now 4 ranks away on the same
+server, while DP peers are 8 ranks apart and cross the network.
+
+<LogicalDistributedTopology
+	parallel={{ tp: 4, dp: 4, pp: 2 }}
+	order={["tp", "pp", "dp"]}
+	network={{ gpusPerServer: 8, serversPerPod: 2, spinesPerPod: 2 }}
+	selected={0}
+	title="The same job with Megatron order tp-pp-dp"
+/>
+
+## Topology for inference
+
+Serving a model uses the same parallel dimensions, and the same numbering conventions: serving
+engines such as vLLM also give TP ranks consecutive numbers, so a TP group lands on one server.
+What changes is the traffic.
+
+**Data parallelism needs no communication.** There are no gradients to sum, so each replica is an
+independent copy of the model behind a load balancer. DP groups simply disappear from the
+picture.
+
+**Pipeline parallelism is cheap but adds latency.** Each stage sends its activations to the next
+once per forward pass, which costs $\alpha + M\beta$ per boundary. That is little data, so PP is
+the natural way to span servers when a model doesn't fit in one, at the cost of every request
+passing through every stage in turn.
+
+**Tensor parallelism is latency-bound during decoding.** TP all-reduces activations twice in every
+transformer layer, on every forward pass. During prefill, a 4096-token prompt with hidden size
+8192 in bf16 makes each all-reduce 64 MiB. When decoding a batch of 32 sequences, each step
+processes just one token per sequence, so the same all-reduce is only 0.5 MiB. With the cost
+model from the collectives post, for a ring over 8 GPUs ($\alpha = 3\ \mu\text{s}$,
+450 GB/s NVLink):
+
+| Phase | Message | Latency term $2(N-1)\alpha$ | Bandwidth term $2\frac{N-1}{N}M\beta$ |
+| --- | ---: | ---: | ---: |
+| Prefill, 4096 tokens | 64 MiB | 42 µs | 261 µs |
+| Decode, batch of 32 | 0.5 MiB | 42 µs | 2 µs |
+
+During decoding, almost all of the time is latency. With 80 layers, that is 160 all-reduces per
+generated token, or about **7 ms** per step spent on TP communication alone. This is why TP stays
+inside the fast NVLink domain, and why serving engines replace the ring with all-reduces that
+finish in fewer steps. vLLM, for example, uses its own all-reduce instead of NCCL's for messages
+under 8 MiB. Its **one-shot** version has every GPU read all its peers' buffers directly and sum
+them in a single step, and it uses this for messages under 256 KiB on 8 GPUs. Its **two-shot**
+version does a reduce-scatter and then an all-gather, each as a single direct exchange rather
+than $N-1$ ring steps.<Sidenote>See `csrc/custom_all_reduce.cuh` in vLLM. TensorRT-LLM offers the
+same `ONESHOT` and `TWOSHOT` strategies, plus one built on NVLink's in-switch reductions
+(`MULTIMEM`), where the switch itself adds the values up.</Sidenote> The 0.5 MiB decode message
+above would use two-shot: 2 steps instead of 14, so the latency term drops from 42 µs to 6 µs,
+and the per-token cost from about 7 ms to about 1.3 ms.
+
+**Expert parallelism means all-to-all on every MoE layer.** Each MoE layer dispatches tokens to the
+GPUs holding their experts and combines the results, two all-to-alls per layer. During decoding
+these messages are small and every rank talks to every other, so they are latency-bound too, and
+spreading experts across servers puts the network on that critical path. Dedicated libraries
+such as DeepSeek's DeepEP exist to make exactly this exchange fast.
+
+Here is a typical layout for serving a model that needs two servers per copy: TP 8 inside each
+server, 2 pipeline stages across servers, and 2 independent replicas. Click rank 0: its TP group
+never leaves the server, and the only traffic between servers is the pipeline hop. (The figure
+still draws the DP line, but replicas exchange nothing while serving.)
+
+<LogicalDistributedTopology
+	parallel={{ tp: 8, dp: 2, pp: 2 }}
+	network={{ gpusPerServer: 8, serversPerPod: 2, spinesPerPod: 2 }}
+	selected={0}
+	title="Serving: TP 8 × PP 2, 2 independent replicas"
+/>
+
+Some deployments go a step further and **disaggregate** prefill and decode: prompts are processed
+on one pool of GPUs, and the resulting KV cache is sent to a second pool that generates the
+tokens. That adds one large point-to-point transfer per request, $\alpha + M\beta$ with $M$ the
+size of the KV cache, in exchange for letting each pool use the parallel layout that suits its
+phase.<MarginNote>Prefill is bandwidth- and compute-bound, and decode is latency-bound, so the two
+phases want different layouts.</MarginNote>
+
+## Summary
+
+- A rank's coordinates are the digits of a mixed-radix number. The order string says which
+  dimension varies fastest, and `RankGenerator` builds every group by fixing some digits and
+  varying the rest.
+- Megatron-LM builds two generators, one for dense layers and one for MoE layers, and creates
+  more than twenty kinds of process group from them, all from the same few lines of arithmetic.
+- The dimension listed first gets consecutive ranks and therefore the fastest links. The default
+  order puts TP inside a server and PP furthest apart, matching how much each one communicates.
+- In inference, DP communication disappears, and decoding turns TP and EP collectives into many
+  small, latency-bound messages. That makes keeping them on NVLink even more important.

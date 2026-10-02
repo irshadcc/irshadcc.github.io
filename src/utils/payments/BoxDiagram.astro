@@ -1,0 +1,223 @@
+---
+// An architecture diagram: boxes on a grid joined by arrows. Click (or focus) a box that has a
+// note to read it under the figure and highlight the arrows that touch it. A node with
+// group -1 is drawn as a dashed container behind the others (e.g. "one shard"). Layout is in
+// boxDiagram.ts.
+// Usage in .mdx:
+//   import { gatewayNodes, gatewayEdges } from "../../utils/payments/paymentFigures";
+//   <BoxDiagram nodes={gatewayNodes} edges={gatewayEdges} selected="api" title="Inside the gateway" />
+import {
+	type BoxEdge,
+	type BoxGrid,
+	type BoxNode,
+	drawBoxes,
+	validateBoxes,
+} from "./boxDiagram";
+
+interface Props {
+	nodes: BoxNode[];
+	edges: BoxEdge[];
+	grid?: BoxGrid;
+	/** Node whose note is shown on load. */
+	selected?: string;
+	title?: string;
+	/** Text shown when nothing is selected. */
+	hint?: string;
+}
+
+const {
+	nodes,
+	edges,
+	grid,
+	selected,
+	title,
+	hint = "Click a box to read what it does.",
+} = Astro.props;
+const err = validateBoxes(nodes, edges);
+if (err) throw new Error(`BoxDiagram: ${err}`);
+const hash = [...JSON.stringify(Astro.props)]
+	.reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7)
+	.toString(36);
+const { svg } = drawBoxes(nodes, edges, grid, `bx-${hash}`);
+const noted = nodes.filter((n) => n.note);
+---
+
+<figure class="boxd" data-selected={selected ?? ""}>
+	{title && <figcaption class="boxd-title">{title}</figcaption>}
+	<div class="boxd-canvas" set:html={svg} />
+	{
+		noted.length > 0 && (
+			<div class="boxd-notes">
+				<p class="boxd-note" data-id="" hidden={!!selected}>
+					{hint}
+				</p>
+				{noted.map((n) => (
+					<p class="boxd-note" data-id={n.id} hidden={n.id !== selected}>
+						<strong>{n.label}.</strong> <span set:html={n.note} />
+					</p>
+				))}
+			</div>
+		)
+	}
+</figure>
+
+<script>
+	for (const fig of document.querySelectorAll<HTMLElement>(".boxd")) {
+		const notes = [...fig.querySelectorAll<HTMLElement>(".boxd-note")];
+		const boxes = [...fig.querySelectorAll<SVGGElement>(".box.has-note")];
+		const edges = [...fig.querySelectorAll<SVGGElement>(".edge")];
+		const select = (id: string) => {
+			for (const n of notes) n.hidden = n.dataset.id !== id;
+			for (const b of boxes) b.classList.toggle("sel", b.dataset.id === id);
+			for (const e of edges) e.classList.toggle("lit", !!id && (e.dataset.from === id || e.dataset.to === id));
+		};
+		for (const b of boxes) {
+			const pick = () => select(b.classList.contains("sel") ? "" : (b.dataset.id ?? ""));
+			b.addEventListener("click", pick);
+			b.addEventListener("keydown", (e) => {
+				if (e.key === "Enter" || e.key === " ") {
+					e.preventDefault();
+					pick();
+				}
+			});
+		}
+		select(fig.dataset.selected ?? "");
+	}
+</script>
+
+<style>
+	.boxd {
+		--g0: #5f7380;
+		--g1: #2f6fb0;
+		--g2: #b8742a;
+		--g3: #2f8a5b;
+		--g4: #b33b5e;
+		--g5: #7a62b8;
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+	}
+	@media (prefers-color-scheme: dark) {
+		.boxd {
+			--g0: #98aab5;
+			--g1: #6aa8e6;
+			--g2: #e0a25e;
+			--g3: #5fc08b;
+			--g4: #e2708f;
+			--g5: #a993e6;
+		}
+	}
+	.boxd-title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.4rem;
+	}
+	.boxd-canvas {
+		overflow-x: auto;
+	}
+	.boxd-canvas :global(svg) {
+		display: block;
+		max-width: 100%;
+		height: auto;
+		margin: 0 auto;
+	}
+	.boxd-canvas :global(.box rect) {
+		fill: color-mix(in oklch, var(--c) 12%, var(--bg));
+		stroke: var(--c);
+		stroke-width: 1.2;
+	}
+	.boxd-canvas :global(.g0) {
+		--c: var(--g0);
+	}
+	.boxd-canvas :global(.g1) {
+		--c: var(--g1);
+	}
+	.boxd-canvas :global(.g2) {
+		--c: var(--g2);
+	}
+	.boxd-canvas :global(.g3) {
+		--c: var(--g3);
+	}
+	.boxd-canvas :global(.g4) {
+		--c: var(--g4);
+	}
+	.boxd-canvas :global(.g5) {
+		--c: var(--g5);
+	}
+	.boxd-canvas :global(.has-note) {
+		cursor: pointer;
+		outline: none;
+	}
+	.boxd-canvas :global(.has-note:hover rect),
+	.boxd-canvas :global(.has-note:focus-visible rect) {
+		stroke-width: 2;
+	}
+	.boxd-canvas :global(.sel rect) {
+		fill: color-mix(in oklch, var(--c) 30%, var(--bg));
+		stroke-width: 2.2;
+	}
+	.boxd-canvas :global(.ctr rect) {
+		fill: none;
+		stroke: var(--faint);
+		stroke-width: 1.2;
+		stroke-dasharray: 5 4;
+	}
+	.boxd-canvas :global(.cl) {
+		font-size: 9px;
+		font-weight: 600;
+		fill: var(--muted);
+	}
+	.boxd-canvas :global(.bl) {
+		font-size: 11px;
+		font-weight: 600;
+		text-anchor: middle;
+		fill: var(--text);
+		pointer-events: none;
+	}
+	.boxd-canvas :global(.bs) {
+		font-size: 9px;
+		text-anchor: middle;
+		fill: var(--muted);
+		pointer-events: none;
+	}
+	.boxd-canvas :global(.edge line) {
+		stroke: var(--muted);
+		stroke-width: 1.2;
+	}
+	.boxd-canvas :global(.edge.dashed line) {
+		stroke-dasharray: 4 3;
+	}
+	.boxd-canvas :global(.edge.lit line) {
+		stroke: var(--accent);
+		stroke-width: 2;
+	}
+	.boxd-canvas :global(.ah) {
+		fill: var(--muted);
+	}
+	.boxd-canvas :global(.el) {
+		font-family: var(--mono);
+		font-size: 8.5px;
+		fill: var(--muted);
+	}
+	.boxd-canvas :global(.edge.lit .el) {
+		fill: var(--accent);
+	}
+	.boxd-notes {
+		min-height: 3.2em;
+		margin-top: 0.5rem;
+		padding: 0.5rem 0.75rem;
+		border-left: 3px solid var(--accent);
+		background: var(--surface);
+		font-size: 0.82rem;
+		line-height: 1.5;
+	}
+	.boxd-note {
+		margin: 0;
+	}
+	.boxd-note[hidden] {
+		display: none;
+	}
+	.boxd-note[data-id=""] {
+		color: var(--muted);
+	}
+</style>

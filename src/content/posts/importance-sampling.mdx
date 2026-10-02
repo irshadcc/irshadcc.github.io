@@ -1,0 +1,263 @@
+---
+title: "Importance Sampling"
+description: "Why changing the sampling distribution can make rare-event estimates practical, how importance weights undo that change, and how a poor proposal can make things worse."
+date: 2026-10-02
+tags: [Machine learning, Probability]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import ImportanceSamplingExplorer from "../../utils/probability/ImportanceSamplingExplorer.astro";
+
+## Background
+
+Suppose a model fails on one input in a thousand. To estimate that failure rate with ordinary
+**Monte Carlo sampling**---approximating an expectation with an average of random evaluations---we
+draw typical inputs and count failures. Almost every expensive evaluation tells us only that
+nothing failed. The inputs that determine the answer are precisely the ones we rarely see.
+
+**Importance sampling** changes where we look. We draw more often from a convenient
+**proposal distribution** that visits the important region, then attach a weight that corrects
+for having changed the distribution. It matters in rare-event simulation, Bayesian inference,
+off-policy evaluation, and latent-variable models. The method can reduce variance by orders of
+magnitude, but a bad proposal can also produce an estimate dominated by one enormous weight.
+
+This post follows the treatment in Chapter 14, "Sampling," of Christopher M. Bishop and Hugh
+Bishop's *Deep Learning: Foundations and Concepts*. We will derive the identity, work through a
+Gaussian tail with real numbers, then cover proposal design, self-normalized estimates, and the
+diagnostics that reveal failure.
+
+## The change of distribution
+
+Let $p(x)$ be a **target distribution** and let $f(x)$ be a quantity whose expectation we want:
+
+$$
+I = \mathbb E_p[f(X)] = \int f(x)p(x)\,dx.
+$$
+
+Direct Monte Carlo draws $x_1,\ldots,x_N \sim p$ and uses
+
+$$
+\widehat I_{\text{direct}} = \frac{1}{N}\sum_{n=1}^N f(x_n).
+$$
+
+Now introduce a proposal density $q(x)$. Multiply and divide the integrand by $q(x)$:
+
+$$
+I
+= \int f(x)\frac{p(x)}{q(x)}q(x)\,dx
+= \mathbb E_q\!\left[f(X)w(X)\right],
+\qquad
+w(x)=\frac{p(x)}{q(x)}.
+$$
+
+The ratio $w(x)$ is the **importance weight**. It is an accounting correction. If the proposal
+draws $x$ ten times as often as the target would, then $w(x)=1/10$, so that sample contributes
+one tenth as much. This gives the importance-sampling estimator
+
+$$
+\widehat I_{\text{IS}}
+= \frac{1}{N}\sum_{n=1}^N f(x_n)w(x_n),
+\qquad x_n\sim q.
+$$
+
+Its expectation is still $I$, so the estimator is unbiased when the weights are exact. The
+essential condition is **support coverage**: wherever $f(x)p(x)$ is non-zero, $q(x)$ must also
+be non-zero. A weight cannot repair a region that the proposal never samples.
+
+<ImportanceSamplingExplorer threshold={3} initialMean={3} />
+
+The shaded area is the probability we want. Move the proposal mean. At $\mu=0$, the proposal
+equals the target and only $0.135\%$ of samples enter the event. At $\mu=3$, half do. The bars
+show the price of that convenience: observations made common by $q$ receive small weights.
+
+## A worked rare-event estimate
+
+Let $Z\sim\mathcal N(0,1)$ and estimate
+
+$$
+I = \Pr(Z>3)
+= \mathbb E_p[\mathbf 1\{Z>3\}],
+$$
+
+where $\mathbf 1\{\cdot\}$ is an **indicator function**: one when its condition is true and zero
+otherwise. The exact value, used here to check the estimators, is
+
+$$
+I = 1-\Phi(3) = 0.001349898 \approx 0.135\%.
+$$
+
+Direct sampling therefore sees one useful observation every $1/I=740.8$ draws on average. For
+one direct draw, the indicator is Bernoulli, so its variance is
+
+$$
+\operatorname{var}_p[\mathbf 1\{Z>3\}]
+= I(1-I)
+= 0.00134808.
+$$
+
+Choose the proposal $q=\mathcal N(3,1)$, shifting the same bell curve into the tail. For equal
+variances, its weight simplifies to
+
+$$
+w(x)
+= \frac{\mathcal N(x;0,1)}{\mathcal N(x;3,1)}
+= \exp\!\left(\frac{3^2}{2}-3x\right).
+$$
+
+Take four illustrative proposal draws that all exceed the threshold. Their contributions are
+their weights because the indicator equals one:
+
+| proposal draw $x_n$ | indicator | weight $w(x_n)$ | contribution |
+| ------------------: | --------: | --------------: | -----------: |
+|                 3.0 |         1 |      0.01110900 |   0.01110900 |
+|                 3.5 |         1 |      0.00247875 |   0.00247875 |
+|                 4.0 |         1 |      0.00055308 |   0.00055308 |
+|                 4.5 |         1 |      0.00012341 |   0.00012341 |
+
+Check one entry: at $x=3.5$,
+$w(3.5)=\exp(4.5-10.5)=e^{-6}=0.00247875$. The sample is common under the shifted
+proposal but rare under the target, so it counts only a little. These four deliberately chosen
+values illustrate the arithmetic; they are not presented as a random estimate.
+
+### Comparing variance exactly
+
+For this Gaussian example, we can compare the estimators without running a simulation. If
+$q=\mathcal N(\mu,1)$, the second moment of one weighted contribution is
+
+$$
+\mathbb E_q\!\left[\mathbf 1\{X>3\}w(X)^2\right]
+= e^{\mu^2}\left[1-\Phi(3+\mu)\right].
+$$
+
+Subtracting $I^2$ gives the per-draw variance. The same factor $1/N$ would divide every row for
+an average of $N$ independent draws, so it cancels in the comparison.
+
+| proposal mean $\mu$ | proposal draws above 3 | per-draw variance | reduction vs. direct |
+| -------------------: | ----------------------: | ----------------: | -------------------: |
+|                  0.0 |                  0.135% |      0.001348076 |                 1.0× |
+|                  1.0 |                  2.275% |      0.000084269 |                16.0× |
+|                  2.0 |                 15.866% |      0.000013828 |                97.5× |
+|                  3.0 |                 50.000% |      0.000006172 |               218.4× |
+|                  4.0 |                 84.134% |      0.000009550 |               141.2× |
+
+Moving from $\mu=3$ to $\mu=4$ creates more event samples, yet variance gets worse. Hit rate is
+not the objective. The proposal must cover the parts of $f(x)p(x)$ that matter *and* keep the
+weights well behaved.
+
+## How to choose the proposal
+
+The variance of an importance estimate is controlled by the spread of $f(X)p(X)/q(X)$ under
+$q$. If $f$ is non-negative, the zero-variance proposal is
+
+$$
+q^*(x)=\frac{f(x)p(x)}{I}.
+$$
+
+Under $q^*$, every contribution is exactly $I$. This is a guide, not an algorithm: its
+normalizing constant is the unknown answer, and sampling from it may be as hard as the original
+problem. Still, it tells us what a useful proposal should resemble: the magnitude of the
+integrand $f(x)p(x)$, not merely the target $p(x)$.
+
+For the tail example, $q^*$ is the standard normal conditioned on $x>3$. The shifted normal is
+easy to sample and roughly covers that region, which explains its lower variance. In a
+multimodal problem, one shifted bell curve may miss an entire mode. A **mixture proposal**---a
+weighted combination of several distributions---can cover multiple important regions while a
+broad component protects the tails.
+
+Three rules are useful in practice:
+
+- Give $q$ support everywhere that $|f|p$ has support.
+- Put proposal mass where $|f(x)|p(x)$ is large, not only where $p(x)$ is large.
+- Prefer slightly heavier tails than the target; a thin-tailed proposal can create rare,
+  explosive weights.
+
+## When the target is not normalized
+
+Bayesian inference often gives an unnormalized density $\widetilde p(x)$ with unknown constant
+$Z$:
+
+$$
+p(x)=\frac{\widetilde p(x)}{Z}.
+$$
+
+We cannot compute $p(x)/q(x)$, but $Z$ cancels if we normalize the raw weights
+$\widetilde w_n=\widetilde p(x_n)/q(x_n)$ across the sample:
+
+$$
+\widehat I_{\text{SNIS}}
+= \frac{\sum_{n=1}^N \widetilde w_n f(x_n)}
+       {\sum_{n=1}^N \widetilde w_n}.
+$$
+
+This is **self-normalized importance sampling** (SNIS). Unlike the ordinary estimator, the ratio
+is generally biased at finite $N$, though it is consistent under standard conditions: it
+converges to the correct expectation as $N$ grows. Its practical advantage is that only the
+target density up to proportionality is needed.<Sidenote>The normalized weights should be
+computed in log space with a log-sum-exp operation. Direct exponentiation can underflow or
+overflow long before the mathematics fails.</Sidenote>
+
+## Diagnosing failure
+
+An estimate may look stable because nearly all weights are tiny while one decisive sample has
+not appeared yet. A standard warning light is the **effective sample size** (ESS):
+
+$$
+\operatorname{ESS}
+= \frac{\left(\sum_n \widetilde w_n\right)^2}
+       {\sum_n \widetilde w_n^2}
+= \frac{1}{\sum_n \bar w_n^2},
+$$
+
+where $\bar w_n=\widetilde w_n/\sum_j\widetilde w_j$. Equal weights give $\operatorname{ESS}=N$;
+one dominant weight gives an ESS near one. ESS is a heuristic, not a guarantee, so report it
+with repeated-run variability, the maximum normalized weight, and a plot of the weight
+distribution.
+
+The central failure modes are:
+
+- **Missing support:** $q(x)=0$ where $f(x)p(x)\ne0$. The estimator cannot recover the omitted
+  contribution.
+- **Weight degeneracy:** a few samples carry almost all the mass, producing high or even
+  infinite variance.
+- **A proposal tuned to the wrong quantity:** matching $p$ is insufficient when $f$ concentrates
+  elsewhere.
+- **Adaptive reuse without care:** learning $q$ from the same draws used for the final estimate
+  can change its statistical properties. Separate adaptation and estimation, or use a method
+  whose adaptive estimator has been justified.
+
+## Where it appears in deep learning
+
+The identity is simple, but it reappears in several forms. **Importance-weighted autoencoders**
+(IWAEs) use multiple importance-weighted latent samples to optimize a tighter evidence lower
+bound than the basic variational autoencoder objective. Large classifiers use candidate
+sampling: sampled softmax evaluates a subset of classes and corrects for the sampling law.
+Off-policy reinforcement learning similarly reweights trajectories or actions collected under
+one policy to estimate expectations under another.
+
+These applications share the same trade-off. A proposal that tracks the target or the important
+part of the integrand can save computation. A mismatch produces variable weights, low effective
+sample size, and unstable gradients.
+
+## Summary
+
+- Importance sampling draws from $q$ and multiplies by $p/q$, changing where computation is
+  spent without changing the expectation.
+- The proposal must cover the support of $f p$; no finite weight can correct a region that was
+  never sampled.
+- Good proposals resemble $|f|p$. In the Gaussian-tail example, shifting the proposal reduced
+  variance by about $218\times$.
+- Self-normalization removes an unknown target normalizer, at the cost of finite-sample bias.
+- Inspect weight concentration and effective sample size. More event hits do not by themselves
+  imply a better estimate.
+
+## References
+
+1. Christopher M. Bishop and Hugh Bishop, ["Sampling," Chapter 14 of *Deep Learning:
+   Foundations and Concepts*](https://doi.org/10.1007/978-3-031-45468-4_14), Springer, 2024,
+   pp. 429--458. The authors also provide a
+   [free-to-use online edition](https://www.bishopbook.com/).
+2. Yuri Burda, Roger Grosse, and Ruslan Salakhutdinov,
+   ["Importance Weighted Autoencoders"](https://arxiv.org/abs/1509.00519), ICLR 2016.
+3. Sébastien Jean, Kyunghyun Cho, Roland Memisevic, and Yoshua Bengio,
+   ["On Using Very Large Target Vocabulary for Neural Machine Translation"](https://arxiv.org/abs/1412.2007),
+   ACL-IJCNLP 2015.

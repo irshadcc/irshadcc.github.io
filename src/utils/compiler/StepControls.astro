@@ -1,0 +1,149 @@
+---
+// The control row for a step-through figure: first / previous / play / next buttons (the same
+// set CollectiveSteps uses), then one labelled timeline segment per step, then "k / n".
+// Behaviour comes from bindStepper() in stepper.ts, called by the figure's own script.
+// Usage in a component:
+//   <StepControls labels={["CUDA", "IR -O0", "PTX"]} step={1} />
+interface Props {
+	labels: string[];
+	step?: number;
+}
+
+const { labels, step = 0 } = Astro.props;
+---
+
+<div class="st-controls">
+	<div class="st-buttons">
+		<button type="button" data-act="first" aria-label="First step">
+			<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 3v10M13 3 6 8l7 5z"></path></svg>
+		</button>
+		<button type="button" data-act="prev" aria-label="Previous step">
+			<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M11 3 4 8l7 5z"></path></svg>
+		</button>
+		<button type="button" data-act="play" class="play" aria-label="Play">
+			<svg class="i-play" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5v11L13.5 8z"></path></svg>
+			<svg class="i-pause" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 3h3v10H4zM9 3h3v10H9z"></path></svg>
+		</button>
+		<button type="button" data-act="next" aria-label="Next step">
+			<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 3l7 5-7 5z"></path></svg>
+		</button>
+	</div>
+	<ol class="st-timeline" aria-label="Steps">
+		{
+			labels.map((label, i) => (
+				<li>
+					<button type="button" class:list={["st-seg", { done: i <= step }]} aria-current={String(i === step)}>
+						{label}
+					</button>
+				</li>
+			))
+		}
+	</ol>
+	<span class="st-counter">{step + 1} / {labels.length}</span>
+</div>
+
+<style>
+	.st-controls {
+		display: flex;
+		align-items: center;
+		gap: 0.6rem;
+		margin: 0.4rem 0 0.5rem;
+		font-family: var(--sans);
+	}
+	.st-buttons {
+		display: flex;
+		gap: 0.3rem;
+		flex: none;
+	}
+	.st-buttons button {
+		display: grid;
+		place-items: center;
+		width: 2rem;
+		height: 2rem;
+		padding: 0;
+		border: 1px solid var(--faint);
+		border-radius: 8px;
+		background: var(--bg);
+		color: var(--text);
+		cursor: pointer;
+		transition: border-color 150ms ease;
+	}
+	.st-buttons button:hover {
+		border-color: var(--accent);
+	}
+	.st-buttons svg {
+		width: 0.8rem;
+		height: 0.8rem;
+		fill: currentColor;
+		stroke: currentColor;
+		stroke-width: 1.2;
+		stroke-linejoin: round;
+	}
+	.st-buttons .play {
+		width: 2.6rem;
+		background: var(--accent);
+		border-color: var(--accent);
+		color: var(--bg);
+	}
+	.play .i-pause,
+	.play:global(.playing) .i-play {
+		display: none;
+	}
+	.play:global(.playing) .i-pause {
+		display: block;
+	}
+	.st-timeline {
+		flex: 1;
+		display: flex;
+		flex-wrap: wrap;
+		gap: 3px;
+		margin: 0;
+		padding: 0;
+		list-style: none;
+	}
+	.st-timeline li {
+		flex: 1 1 auto;
+		margin: 0;
+	}
+	.st-seg {
+		width: 100%;
+		padding: 0.22rem 0.45rem;
+		border: 0;
+		border-radius: 4px;
+		background: var(--surface);
+		color: var(--muted);
+		font: 600 0.7rem var(--sans);
+		white-space: nowrap;
+		cursor: pointer;
+		box-shadow: inset 0 -3px var(--faint);
+	}
+	.st-seg:global(.done) {
+		box-shadow: inset 0 -3px var(--accent);
+		color: var(--text);
+	}
+	.st-seg[aria-current="true"] {
+		background: var(--accent-soft);
+		color: var(--text);
+		outline: 1.5px solid var(--accent);
+	}
+	.st-counter {
+		flex: none;
+		min-width: 2.6rem;
+		font-family: var(--mono);
+		font-size: 0.75rem;
+		color: var(--muted);
+		text-align: right;
+	}
+	@media (max-width: 640px) {
+		.st-controls {
+			flex-wrap: wrap;
+		}
+		.st-timeline {
+			order: 3;
+			flex-basis: 100%;
+		}
+		.st-counter {
+			margin-left: auto;
+		}
+	}
+</style>

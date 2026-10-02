@@ -1,0 +1,400 @@
+---
+// Step through Raft runs (simulated by raft.ts, following Figure 2 of the Raft paper). One row
+// per server: role, current term, vote, and log. Each box is a log entry with its command and
+// term, coloured by term; solid boxes are committed on that server, pale dashed ones are not, and
+// the bar marks its commitIndex. Entries that changed in this step are outlined. Below: the RPCs
+// sent in the step and how each was answered.
+// Usage in .mdx:
+//   <RaftRun />                      all scenarios, with tabs
+//   <RaftRun only="fig8d" step={5} />
+import { drawRaft } from "./consensusDraw";
+import { SCENARIOS, run } from "./raft";
+
+interface Props {
+	scenario?: string;
+	only?: string;
+	step?: number;
+	title?: string;
+}
+
+const { scenario, only, step = 0, title } = Astro.props;
+const list = only ? SCENARIOS.filter((s) => s.id === only) : SCENARIOS;
+const sc = list.find((s) => s.id === (only ?? scenario)) ?? list[0];
+const frames = run(sc);
+const maxLog = Math.max(
+	...frames.flatMap((f) => f.servers.map((s) => s.log.length)),
+);
+const at = Math.max(0, Math.min(step, frames.length - 1));
+const f = frames[at];
+---
+
+<figure class="rfr" data-config={JSON.stringify({ ids: list.map((s) => s.id), id: sc.id, step: at })}>
+	{title && <figcaption class="title">{title}</figcaption>}
+	{
+		list.length > 1 && (
+			<div class="tabs" role="tablist">
+				{list.map((s) => (
+					<button type="button" role="tab" data-id={s.id} aria-selected={s.id === sc.id ? "true" : "false"}>
+						{s.label}
+					</button>
+				))}
+			</div>
+		)
+	}
+	<p class="summary">{sc.summary}</p>
+	<div class="controls">
+		<button type="button" class="play" aria-label="Play">
+			<svg class="i-play" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5v11L13.5 8z"></path></svg>
+			<svg class="i-pause" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 3h3v10H4zM9 3h3v10H9z"></path></svg>
+		</button>
+		<label>
+			step
+			<input type="range" min="0" max={frames.length - 1} value={at} />
+			<output>{at}/{frames.length - 1}</output>
+		</label>
+	</div>
+	<p class="step-title">{f.title}</p>
+	<p class="step-note">{f.note}</p>
+	<div class="diagram" set:html={drawRaft(f, at > 0 ? frames[at - 1] : undefined, maxLog)} />
+	<ul class="msgs">
+		{f.messages.map((m) => <li class={m.ok ? "ok" : "no"}>{`S${m.from + 1} → S${m.to + 1}: ${m.text}`}</li>)}
+	</ul>
+</figure>
+
+<script>
+	import { drawRaft } from "./consensusDraw";
+	import { SCENARIOS, run } from "./raft";
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".rfr")) {
+		const cfg = JSON.parse(fig.dataset.config ?? "{}");
+		const list = SCENARIOS.filter((s) => cfg.ids.includes(s.id));
+		let sc = list.find((s) => s.id === cfg.id) ?? list[0];
+		let frames = run(sc);
+		const maxOf = () => Math.max(...frames.flatMap((f) => f.servers.map((s) => s.log.length)));
+		let maxLog = maxOf();
+		const range = fig.querySelector<HTMLInputElement>("input[type=range]");
+		const out = fig.querySelector("output");
+		const play = fig.querySelector<HTMLButtonElement>(".play");
+		const q = (sel: string) => fig.querySelector<HTMLElement>(sel);
+		if (!range) continue;
+		let timer: number | undefined;
+
+		const render = () => {
+			const t = Number(range.value);
+			const f = frames[t];
+			if (out) out.textContent = `${t}/${frames.length - 1}`;
+			const set = (sel: string, text: string) => {
+				const el = q(sel);
+				if (el) el.textContent = text;
+			};
+			set(".summary", sc.summary);
+			set(".step-title", f.title);
+			set(".step-note", f.note);
+			const d = q(".diagram");
+			if (d) d.innerHTML = drawRaft(f, t > 0 ? frames[t - 1] : undefined, maxLog);
+			const ul = q(".msgs");
+			if (ul) {
+				ul.replaceChildren(
+					...f.messages.map((m) => {
+						const li = document.createElement("li");
+						li.className = m.ok ? "ok" : "no";
+						li.textContent = `S${m.from + 1} → S${m.to + 1}: ${m.text}`;
+						return li;
+					}),
+				);
+			}
+		};
+		const stop = () => {
+			if (timer !== undefined) clearInterval(timer);
+			timer = undefined;
+			play?.classList.remove("playing");
+			play?.setAttribute("aria-label", "Play");
+		};
+		for (const tab of fig.querySelectorAll<HTMLButtonElement>(".tabs button")) {
+			tab.addEventListener("click", () => {
+				stop();
+				sc = list.find((s) => s.id === tab.dataset.id) ?? sc;
+				frames = run(sc);
+				maxLog = maxOf();
+				for (const b of fig.querySelectorAll(".tabs button")) b.setAttribute("aria-selected", String(b === tab));
+				range.max = String(frames.length - 1);
+				range.value = "0";
+				render();
+			});
+		}
+		range.addEventListener("input", () => {
+			stop();
+			render();
+		});
+		play?.addEventListener("click", () => {
+			if (timer !== undefined) return stop();
+			if (Number(range.value) >= frames.length - 1) range.value = "0";
+			play.classList.add("playing");
+			play.setAttribute("aria-label", "Pause");
+			render();
+			timer = window.setInterval(() => {
+				if (Number(range.value) >= frames.length - 1) return stop();
+				range.value = String(Number(range.value) + 1);
+				render();
+			}, 2400);
+		});
+	}
+</script>
+
+<style>
+	.rfr {
+		--t1: #3b6ea5;
+		--t2: #3f9a8c;
+		--t3: #c9862f;
+		--t4: #7e62ad;
+		--t5: #c0504d;
+		--t6: #6b8e23;
+		--leader: #2f8f6a;
+		--candidate: #c9862f;
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+	}
+	@media (prefers-color-scheme: dark) {
+		.rfr {
+			--t1: #5d8fc7;
+			--t2: #4fb3a3;
+			--t3: #d9a04a;
+			--t4: #9a80c8;
+			--t5: #e07a76;
+			--t6: #8fb84a;
+			--leader: #5cc196;
+			--candidate: #d9a04a;
+		}
+	}
+	.title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.5rem;
+	}
+	.tabs {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.35rem;
+		margin-bottom: 0.4rem;
+	}
+	.tabs button {
+		padding: 0.2rem 0.65rem;
+		border: 1px solid var(--faint);
+		border-radius: 999px;
+		background: var(--bg);
+		color: var(--muted);
+		font: inherit;
+		font-size: 0.75rem;
+		cursor: pointer;
+	}
+	.tabs button[aria-selected="true"] {
+		border-color: var(--accent);
+		background: var(--accent-soft);
+		color: var(--text);
+	}
+	.summary {
+		margin: 0 0 0.4rem;
+		font-size: 0.78rem;
+		color: var(--muted);
+		text-align: center;
+	}
+	.controls {
+		display: flex;
+		justify-content: center;
+		align-items: center;
+		gap: 0.75rem;
+		margin-bottom: 0.5rem;
+		font-size: 0.78rem;
+		color: var(--muted);
+	}
+	.controls label {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.4rem;
+	}
+	.controls input {
+		width: 12rem;
+		accent-color: var(--accent);
+	}
+	.controls output {
+		min-width: 2.4rem;
+		font-family: var(--mono);
+		color: var(--text);
+	}
+	.play {
+		display: inline-grid;
+		place-items: center;
+		width: 1.9rem;
+		height: 1.9rem;
+		border: 1px solid var(--faint);
+		border-radius: 999px;
+		background: var(--bg);
+		color: var(--text);
+		cursor: pointer;
+	}
+	.play:hover {
+		border-color: var(--accent);
+	}
+	.play svg {
+		width: 0.8rem;
+		height: 0.8rem;
+		fill: currentColor;
+	}
+	.play .i-pause,
+	.play.playing .i-play {
+		display: none;
+	}
+	.play.playing .i-pause {
+		display: block;
+	}
+	.step-title {
+		margin: 0;
+		font-size: 0.85rem;
+		font-weight: 600;
+		text-align: center;
+	}
+	.step-note {
+		margin: 0.15rem auto 0.5rem;
+		max-width: 36rem;
+		min-height: 2.6em;
+		font-size: 0.78rem;
+		color: var(--muted);
+		text-align: center;
+	}
+	.diagram :global(svg) {
+		display: block;
+		max-width: 100%;
+		height: auto;
+		margin: 0 auto;
+	}
+	.diagram :global(.idx) {
+		font-family: var(--mono);
+		font-size: 9px;
+		text-anchor: middle;
+		fill: var(--muted);
+	}
+	.diagram :global(.srv-name) {
+		font-family: var(--mono);
+		font-size: 12px;
+		font-weight: 600;
+		fill: var(--text);
+	}
+	.diagram :global(.badge) {
+		fill: var(--surface);
+		stroke: var(--faint);
+	}
+	.diagram :global(.badge-text) {
+		font-size: 9.5px;
+		text-anchor: middle;
+		fill: var(--muted);
+	}
+	.diagram :global(.leader .badge) {
+		fill: var(--leader);
+		stroke: var(--leader);
+	}
+	.diagram :global(.leader .badge-text) {
+		fill: #fff;
+		font-weight: 600;
+	}
+	.diagram :global(.candidate .badge) {
+		fill: var(--candidate);
+		stroke: var(--candidate);
+	}
+	.diagram :global(.candidate .badge-text) {
+		fill: #fff;
+		font-weight: 600;
+	}
+	.diagram :global(.down) {
+		opacity: 0.4;
+	}
+	.diagram :global(.down .badge) {
+		stroke-dasharray: 3 2;
+	}
+	.diagram :global(.term),
+	.diagram :global(.vote) {
+		font-family: var(--mono);
+		font-size: 9px;
+		fill: var(--muted);
+	}
+	.diagram :global(.term) {
+		fill: var(--text);
+	}
+	.diagram :global(.entry rect) {
+		fill-opacity: 0.18;
+		stroke-width: 1.2;
+		stroke-dasharray: 3 2;
+	}
+	.diagram :global(.entry.committed rect) {
+		fill-opacity: 1;
+		stroke-dasharray: none;
+	}
+	.diagram :global(.entry.changed rect) {
+		stroke: var(--text);
+		stroke-width: 2.2;
+		stroke-dasharray: none;
+	}
+	.diagram :global(.entry text) {
+		text-anchor: middle;
+		fill: var(--text);
+	}
+	.diagram :global(.entry.committed text) {
+		fill: #fff;
+	}
+	.diagram :global(.cmd) {
+		font-family: var(--mono);
+		font-size: 10px;
+		font-weight: 600;
+	}
+	.diagram :global(.eterm) {
+		font-family: var(--mono);
+		font-size: 7.5px;
+	}
+	.diagram :global(.t1 rect) {
+		fill: var(--t1);
+		stroke: var(--t1);
+	}
+	.diagram :global(.t2 rect) {
+		fill: var(--t2);
+		stroke: var(--t2);
+	}
+	.diagram :global(.t3 rect) {
+		fill: var(--t3);
+		stroke: var(--t3);
+	}
+	.diagram :global(.t4 rect) {
+		fill: var(--t4);
+		stroke: var(--t4);
+	}
+	.diagram :global(.t5 rect) {
+		fill: var(--t5);
+		stroke: var(--t5);
+	}
+	.diagram :global(.t6 rect) {
+		fill: var(--t6);
+		stroke: var(--t6);
+	}
+	.diagram :global(.commit-mark) {
+		stroke: var(--text);
+		stroke-width: 2.5;
+	}
+	.msgs {
+		margin: 0.5rem auto 0;
+		padding: 0;
+		max-width: 40rem;
+		list-style: none;
+		font-family: var(--mono);
+		font-size: 0.68rem;
+		line-height: 1.5;
+		overflow-wrap: anywhere;
+	}
+	.msgs li::before {
+		content: "✓ ";
+		color: var(--leader);
+	}
+	.msgs li.no::before {
+		content: "✗ ";
+		color: #c0504d;
+	}
+</style>

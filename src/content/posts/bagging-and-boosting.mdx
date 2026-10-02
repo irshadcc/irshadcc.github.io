@@ -1,0 +1,435 @@
+---
+title: "Bagging and Boosting, Worked by Hand"
+description: "Bagging and boosting both combine many weak models into one strong one, but they fix different problems. Bagging averages away variance, while boosting removes bias step by step. This post derives the formulas behind each and works through small numeric examples of bagging, AdaBoost and gradient boosting."
+date: 2026-10-01
+tags: [Machine learning, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import MarginNote from "../../components/MarginNote.astro";
+import LineChart from "../../utils/charts/LineChart.astro";
+
+## Background
+
+A single decision tree is easy to train and easy to read, but it is rarely the best model you can
+build. A deep tree fits its training set too closely and changes a lot when the data changes a
+little (**high variance**). A shallow tree is stable but too simple to capture the pattern (**high
+bias**).
+
+Ensemble methods train many models and combine their predictions. The two classic families attack
+the two failure modes separately:
+
+| | Bagging | Boosting |
+| --- | --- | --- |
+| Base models | Strong, low-bias (deep trees) | Weak, high-bias (stumps, shallow trees) |
+| Training | Independent, in parallel | Sequential, each fixes the last |
+| Combining | Plain average or majority vote | Weighted sum |
+| Reduces | Variance | Bias (and some variance) |
+| Example | Random forest | AdaBoost, gradient boosting, XGBoost |
+
+Both start from the same observation: the expected squared error of a model splits into three
+parts.<Sidenote>For a target $y = f(x) + \varepsilon$ with noise variance $\sigma_\varepsilon^2$,
+the expectation is taken over training sets drawn from the same distribution.</Sidenote>
+
+$$
+\mathbb{E}\big[(y - \hat f(x))^2\big]
+= \underbrace{\big(\mathbb{E}[\hat f(x)] - f(x)\big)^2}_{\text{bias}^2}
++ \underbrace{\mathbb{E}\big[(\hat f(x) - \mathbb{E}[\hat f(x)])^2\big]}_{\text{variance}}
++ \underbrace{\sigma_\varepsilon^2}_{\text{noise}}
+$$
+
+We cannot do anything about the noise. Bagging shrinks the second term, and boosting shrinks the
+first.
+
+## Bagging
+
+**Bagging** is short for **b**ootstrap **agg**regat**ing**. The algorithm is three lines long:
+
+1. Draw $B$ **bootstrap samples** from the training set of size $n$: each is $n$ points drawn
+   uniformly *with replacement*.
+2. Train one model $\hat f_b$ on each sample.
+3. Combine them. For regression, average:
+
+$$
+\hat f_{\text{bag}}(x) = \frac{1}{B} \sum_{b=1}^{B} \hat f_b(x)
+$$
+
+For classification, take a majority vote:
+
+$$
+\hat f_{\text{bag}}(x) = \arg\max_{k} \sum_{b=1}^{B} \mathbb{1}\big[\hat f_b(x) = k\big]
+$$
+
+### What a bootstrap sample looks like
+
+Because we sample with replacement, some points appear several times and some don't appear at
+all. The probability that a given point is *never* picked in $n$ draws is
+
+$$
+\Pr(\text{point left out}) = \left(1 - \frac{1}{n}\right)^n \xrightarrow{\;n \to \infty\;} e^{-1} \approx 0.368
+$$
+
+So each bootstrap sample contains about $1 - e^{-1} \approx 63.2\%$ of the distinct training
+points. For a small set of $n = 10$ the fraction is $1 - 0.9^{10} \approx 65.1\%$, already close.
+
+For example, bootstrapping the dataset $\{A, B, C, D, E\}$ might give:
+
+| Sample | Drawn points | Left out (out-of-bag) |
+| --- | --- | --- |
+| 1 | A, A, C, D, E | B |
+| 2 | B, C, C, C, E | A, D |
+| 3 | A, B, D, D, E | C |
+
+The left-out points are called **out-of-bag** (OOB) points. Each model can be scored on the points
+it never saw, which gives a free validation estimate without holding out a separate
+set.<Sidenote>To get the OOB prediction for point $B$ above, average only the models that did not
+train on $B$ (here, model 1). Averaging this over all points gives the OOB error.</Sidenote>
+
+### Why averaging reduces variance
+
+Suppose each model's prediction at a point $x$ has variance $\sigma^2$, and any two models have
+correlation $\rho$ (they are trained on overlapping data, so $\rho > 0$). The variance of their
+average is
+
+$$
+\begin{aligned}
+\operatorname{Var}\!\left(\frac{1}{B}\sum_{b=1}^B \hat f_b\right)
+&= \frac{1}{B^2}\left(\sum_{b} \operatorname{Var}(\hat f_b) + \sum_{b \ne c} \operatorname{Cov}(\hat f_b, \hat f_c)\right) \\
+&= \frac{1}{B^2}\left(B\sigma^2 + B(B-1)\rho\sigma^2\right) \\
+&= \rho\sigma^2 + \frac{1 - \rho}{B}\,\sigma^2
+\end{aligned}
+$$
+
+Two things fall out of this formula:
+
+- The second term goes to zero as $B$ grows, so **adding more models never hurts**; it only stops
+  helping.
+- The first term, $\rho\sigma^2$, is a floor. **Correlation between models limits how much
+  bagging can help.**
+
+Plugging in numbers: with $\sigma^2 = 4$, $\rho = 0.3$ and $B = 10$ models, the variance drops from
+$4$ to $0.3 \cdot 4 + 0.7 \cdot 4 / 10 = 1.2 + 0.28 = 1.48$. With $B = 1000$ it would be $1.2028$,
+barely better. The chart below shows the variance of the ensemble, as a fraction of a single
+model's, for three levels of correlation.
+
+<LineChart
+	x={() => Array.from({ length: 50 }, (_, i) => i + 1)}
+	series={[
+		{ name: "ρ = 0", fn: (b) => 1 / b },
+		{ name: "ρ = 0.3", fn: (b) => 0.3 + 0.7 / b },
+		{ name: "ρ = 0.6", fn: (b) => 0.6 + 0.4 / b },
+	]}
+	xLabel="Number of models B"
+	yLabel="Ensemble variance / σ²"
+/>
+
+This is exactly the motivation for **random forests**. A random forest is bagging over trees, plus
+one extra trick: at each split, the tree may only choose from a random subset of $m$ features
+(typically $m \approx \sqrt{p}$ for classification). This makes the trees less alike, lowering
+$\rho$ and therefore the floor.
+
+Bagging leaves bias alone: the average of $B$ models has the same expected value as one of them.
+That is why it is used with deep, low-bias trees, whose only problem is variance.
+
+### Example: majority vote
+
+Here is the classification version of the same idea. Suppose we have $B$ classifiers, each wrong
+with probability $p = 0.3$, and (optimistically) their mistakes are independent. The majority vote
+is wrong only when more than half of them are wrong, which is a binomial tail:
+
+$$
+\Pr(\text{vote wrong}) = \sum_{k = \lfloor B/2 \rfloor + 1}^{B} \binom{B}{k} p^k (1 - p)^{B - k}
+$$
+
+For $B = 3$:
+
+$$
+\binom{3}{2}(0.3)^2(0.7) + \binom{3}{3}(0.3)^3 = 0.189 + 0.027 = 0.216
+$$
+
+| Classifiers $B$ | 1 | 3 | 5 | 11 | 25 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Vote error | 0.300 | 0.216 | 0.163 | 0.078 | 0.018 |
+
+Three 70%-accurate classifiers vote their way to 78.4%, and twenty-five reach 98.2%. Real
+classifiers trained on the same data make correlated mistakes, so the real gains are smaller,
+but the direction is the same.<Sidenote>The flip side: if each classifier is *worse* than chance
+($p > 0.5$), voting makes things worse, and the error goes to 1.</Sidenote>
+
+## Boosting
+
+Bagging trains models independently and hopes their errors cancel. **Boosting** trains them one
+after another, and each new model is told explicitly where the current ensemble is going wrong.
+The final model is a weighted sum:
+
+$$
+F_M(x) = \sum_{m=1}^{M} \alpha_m h_m(x)
+$$
+
+where each $h_m$ is a **weak learner**, a model only slightly better than random guessing, such as
+a decision stump (a tree with a single split). Adding weak learners one at a time lets the
+ensemble grow into a complex function, which is how boosting reduces bias.
+
+We will look at the two most important variants: AdaBoost, which reweights the training points,
+and gradient boosting, which fits the residuals.
+
+## AdaBoost
+
+AdaBoost (adaptive boosting) is for binary classification with labels $y_i \in \{-1, +1\}$. It
+keeps a weight $w_i$ on every training point. Points the ensemble gets wrong gain weight, so the
+next weak learner focuses on them.
+
+1. Start with uniform weights $w_i^{(1)} = 1/n$.
+2. For $m = 1, \dots, M$:
+   1. Train a weak learner $h_m$ to minimize the **weighted error**
+      $$
+      \varepsilon_m = \sum_{i=1}^{n} w_i^{(m)} \, \mathbb{1}\big[h_m(x_i) \ne y_i\big]
+      $$
+   2. Give it a vote
+      $$
+      \alpha_m = \frac{1}{2} \ln \frac{1 - \varepsilon_m}{\varepsilon_m}
+      $$
+   3. Update and renormalize the weights
+      $$
+      w_i^{(m+1)} = \frac{w_i^{(m)} \exp\big(-\alpha_m \, y_i \, h_m(x_i)\big)}{Z_m}
+      $$
+      where $Z_m$ is the sum of the numerators, so the new weights sum to 1.
+3. Predict with $\operatorname{sign}\big(F_M(x)\big) = \operatorname{sign}\big(\sum_m \alpha_m h_m(x)\big)$.
+
+### Reading the formulas
+
+**The vote $\alpha_m$.** A learner with error $\varepsilon = 0.5$ is a coin flip and gets
+$\alpha = 0$. As the error goes to 0, $\alpha$ grows without bound. A learner with error above
+0.5 gets a *negative* vote: flipping its predictions would make it a good learner, and the
+negative sign does exactly that.
+
+<LineChart
+	x={() => Array.from({ length: 97 }, (_, i) => 0.02 + i * 0.01)}
+	series={[{ name: "α", fn: (e) => 0.5 * Math.log((1 - e) / e) }]}
+	xLabel="Weighted error ε"
+	yLabel="Vote α"
+	height={260}
+/>
+
+**The weight update.** Since $y_i h_m(x_i)$ is $+1$ for a correct prediction and $-1$ for a
+wrong one, the update is just
+
+$$
+w_i \leftarrow \frac{w_i}{Z_m} \cdot
+\begin{cases}
+e^{-\alpha_m} & \text{if } h_m(x_i) = y_i \\
+e^{+\alpha_m} & \text{if } h_m(x_i) \ne y_i
+\end{cases}
+$$
+
+Correct points shrink, wrong points grow. Working out $Z_m$ shows how
+much:<Sidenote>$Z_m = (1 - \varepsilon_m)e^{-\alpha_m} + \varepsilon_m e^{\alpha_m}$. Substituting
+$e^{\alpha_m} = \sqrt{(1-\varepsilon_m)/\varepsilon_m}$ gives $Z_m = 2\sqrt{\varepsilon_m(1 -
+\varepsilon_m)}$.</Sidenote>
+
+$$
+Z_m = 2\sqrt{\varepsilon_m(1 - \varepsilon_m)}
+$$
+
+and after normalizing, the misclassified points hold total weight $\varepsilon_m e^{\alpha_m} / Z_m
+= 1/2$. In other words, **AdaBoost reweights the data so that the learner it just trained is
+exactly a coin flip**. The next learner can't copy it and has to find something new.
+
+**Where it comes from.** AdaBoost is not an ad hoc recipe. It is greedy minimization of the
+**exponential loss**
+
+$$
+L(F) = \sum_{i=1}^{n} \exp\big(-y_i F(x_i)\big)
+$$
+
+At step $m$, we add $\alpha h$ to the current $F_{m-1}$. The loss becomes
+$\sum_i w_i \exp(-\alpha y_i h(x_i))$ with $w_i \propto \exp(-y_i F_{m-1}(x_i))$, which are
+exactly AdaBoost's weights. Splitting the sum into correct and wrong points gives
+$(1 - \varepsilon)e^{-\alpha} + \varepsilon e^{\alpha}$, and setting its derivative in $\alpha$ to
+zero gives the $\alpha_m$ formula above.<MarginNote>The product $\prod_m Z_m$ is an upper bound on
+the training error, and since every $Z_m < 1$ when $\varepsilon_m < 0.5$, the training error
+falls exponentially fast.</MarginNote>
+
+### Example: three stumps
+
+Take ten points on a line, $x = 0, 1, \dots, 9$, with labels
+
+| $x$ | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 |
+| --- | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: |
+| $y$ | + | + | + | − | − | − | + | + | + | − |
+
+No single threshold separates these classes. Our weak learners are stumps of the form "predict
+$+1$ if $x < t$, else $-1$" (or the reverse). All weights start at $0.1$.
+
+**Round 1.** The best stump is $t = 2.5$: predict $+1$ for $x < 2.5$, $-1$ otherwise. It
+misclassifies $x = 6, 7, 8$.
+
+$$
+\varepsilon_1 = 3 \times 0.1 = 0.3,
+\qquad
+\alpha_1 = \tfrac{1}{2}\ln\tfrac{0.7}{0.3} = 0.4236
+$$
+
+The three wrong points are multiplied by $e^{0.4236} = 1.528$, the seven right points by
+$e^{-0.4236} = 0.655$, and $Z_1 = 2\sqrt{0.3 \cdot 0.7} = 0.9165$. The new weights are:
+
+| $x$ | 0–2 | 3–5 | 6–8 | 9 |
+| --- | :-: | :-: | :-: | :-: |
+| $w^{(2)}$ | 0.0714 | 0.0714 | **0.1667** | 0.0714 |
+
+As promised, the three wrong points now hold $3 \times 0.1667 = 0.5$ of the weight.
+
+**Round 2.** Under the new weights, the best stump is $t = 8.5$: $+1$ for $x < 8.5$. It gets the
+heavy points 6–8 right and misclassifies $x = 3, 4, 5$, which are light.
+
+$$
+\varepsilon_2 = 3 \times 0.0714 = 0.2143,
+\qquad
+\alpha_2 = \tfrac{1}{2}\ln\tfrac{0.7857}{0.2143} = 0.6496
+$$
+
+| $x$ | 0–2 | 3–5 | 6–8 | 9 |
+| --- | :-: | :-: | :-: | :-: |
+| $w^{(3)}$ | 0.0455 | **0.1667** | 0.1061 | 0.0455 |
+
+**Round 3.** Now $x = 3, 4, 5$ are heavy. The best stump is $t = 5.5$ the other way round: $-1$
+for $x < 5.5$, $+1$ otherwise. It misclassifies $x = 0, 1, 2$ and $9$.
+
+$$
+\varepsilon_3 = 4 \times 0.0455 = 0.1818,
+\qquad
+\alpha_3 = \tfrac{1}{2}\ln\tfrac{0.8182}{0.1818} = 0.7520
+$$
+
+**The combined model.** Add up the three weighted votes in each region:
+
+| $x$ | $0.4236\,h_1$ | $0.6496\,h_2$ | $0.7520\,h_3$ | $F_3(x)$ | Prediction | $y$ |
+| --- | ---: | ---: | ---: | ---: | :-: | :-: |
+| 0–2 | +0.4236 | +0.6496 | −0.7520 | +0.3213 | + | + |
+| 3–5 | −0.4236 | +0.6496 | −0.7520 | −0.5260 | − | − |
+| 6–8 | −0.4236 | +0.6496 | +0.7520 | +0.9780 | + | + |
+| 9 | −0.4236 | −0.6496 | +0.7520 | −0.3213 | − | − |
+
+Each stump alone gets at least 3 of 10 points wrong. Their weighted sum gets all 10 right. After
+round 1 the ensemble had 3 errors, after round 2 still 3, and after round 3 none.
+
+## Gradient boosting
+
+AdaBoost is tied to the exponential loss. **Gradient boosting** generalizes the idea to any
+differentiable loss $L(y, F)$, which makes it work for regression, classification and ranking
+alike.
+
+The idea is to do gradient descent, but in *function space*. At each step, compute how the loss
+would like each prediction to move. That is the negative gradient, called the **pseudo-residual**:
+
+$$
+r_{im} = -\left[\frac{\partial L(y_i, F(x_i))}{\partial F(x_i)}\right]_{F = F_{m-1}}
+$$
+
+We can't move the predictions directly, because the model must also work on unseen $x$. So we fit
+a small tree $h_m$ to the pseudo-residuals and take a step along it:
+
+1. Initialize with a constant: $F_0(x) = \arg\min_c \sum_i L(y_i, c)$.
+2. For $m = 1, \dots, M$:
+   1. Compute pseudo-residuals $r_{im}$.
+   2. Fit a regression tree $h_m$ to the pairs $(x_i, r_{im})$.
+   3. Update $F_m(x) = F_{m-1}(x) + \eta \, h_m(x)$.
+
+The **learning rate** $\eta \in (0, 1]$ shrinks each step. Smaller steps need more trees but
+generalize better, the same trade-off as in ordinary gradient descent.
+
+For squared error $L = \frac{1}{2}(y - F)^2$, the gradient is $-(y - F)$, so
+
+$$
+r_{im} = y_i - F_{m-1}(x_i)
+$$
+
+The pseudo-residual is just the ordinary residual. **Each tree learns what the ensemble so far is
+still getting wrong.** The constant $F_0$ is the mean of $y$.
+
+Other losses give other residuals: for absolute error the pseudo-residual is
+$\operatorname{sign}(y_i - F)$, which is robust to outliers, and for log loss in binary
+classification it is $y_i - p_i$, the label minus the predicted probability.
+
+### Example: fitting residuals with stumps
+
+Here are five points, fit with stumps and learning rate $\eta = 0.5$:
+
+| $x$ | 1 | 2 | 3 | 4 | 5 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| $y$ | 1.0 | 1.2 | 2.8 | 3.2 | 5.0 |
+
+**Step 0.** $F_0 = \bar y = 13.2 / 5 = 2.64$ for every point. The mean squared error is $2.134$.
+
+**Step 1.** The residuals $y - F_0$ are
+
+$$
+r_1 = (-1.64,\; -1.44,\; 0.16,\; 0.56,\; 2.36)
+$$
+
+The stump that best fits them splits at $x < 2.5$. Each leaf predicts the mean residual on its
+side:
+
+$$
+h_1(x) =
+\begin{cases}
+(-1.64 - 1.44)/2 = -1.54 & x < 2.5 \\
+(0.16 + 0.56 + 2.36)/3 = 1.0267 & x \ge 2.5
+\end{cases}
+$$
+
+Take half a step:
+
+$$
+F_1 = F_0 + 0.5\,h_1 = (1.87,\; 1.87,\; 3.153,\; 3.153,\; 3.153)
+$$
+
+The error drops to $0.949$.
+
+**Step 2.** New residuals:
+
+$$
+r_2 = y - F_1 = (-0.87,\; -0.67,\; -0.353,\; 0.047,\; 1.847)
+$$
+
+The largest leftover error is now at $x = 5$, so the best stump splits at $x < 4.5$, with leaves
+$-0.4617$ and $1.8467$:
+
+$$
+F_2 = F_1 + 0.5\,h_2 = (1.639,\; 1.639,\; 2.923,\; 2.923,\; 4.077)
+$$
+
+**Step 3.** Residuals $r_3 = (-0.639, -0.439, -0.123, 0.278, 0.923)$, best split at
+$x < 3.5$ with leaves $-0.4003$ and $0.6004$:
+
+$$
+F_3 = (1.439,\; 1.439,\; 2.722,\; 3.223,\; 4.377)
+$$
+
+| Step | 0 | 1 | 2 | 3 |
+| --- | ---: | ---: | ---: | ---: |
+| Split | — | $x < 2.5$ | $x < 4.5$ | $x < 3.5$ |
+| MSE | 2.134 | 0.949 | 0.309 | 0.129 |
+
+Each stump only knows how to cut the line in two, but three of them already trace out a staircase
+that follows the data. Keep going and the training error goes to zero, which is exactly when you
+need a validation set, a small $\eta$ and early stopping to keep the model from overfitting.
+
+Production libraries such as XGBoost, LightGBM and CatBoost all run this loop. They add
+second-order (Newton) steps, regularization on leaf values, and fast histogram-based split finding,
+but the core is still "fit a tree to the gradient, take a small step".
+
+## Summary
+
+| | Bagging | AdaBoost | Gradient boosting |
+| --- | --- | --- | --- |
+| Each model trains on | A bootstrap sample | Reweighted data | Pseudo-residuals |
+| Combination | $\frac{1}{B}\sum_b \hat f_b$ | $\operatorname{sign}\sum_m \alpha_m h_m$ | $F_0 + \eta\sum_m h_m$ |
+| Loss | Any (per model) | Exponential | Any differentiable |
+| Main effect | Lowers variance | Lowers bias | Lowers bias |
+| Overfits with more models? | No | Slowly | Yes, needs early stopping |
+| Parallel training | Yes | No | No (within a tree, yes) |
+
+As a rule of thumb, reach for a random forest when you want a strong model with almost no tuning,
+and for gradient boosting when you are willing to tune the learning rate, tree depth and number of
+trees in exchange for the last few points of accuracy.

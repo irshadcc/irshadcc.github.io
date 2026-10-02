@@ -1,0 +1,424 @@
+---
+title: "Paxos and Raft"
+description: "How a group of machines agrees on one value, and then on a whole log of commands, while some of them crash and messages get lost. This post derives Paxos from Lamport's Paxos Made Simple, then follows Raft's leader election, log replication and safety rules, with step-through simulations of both, including the Raft paper's Figure 8."
+date: 2026-10-02
+tags: [Distributed systems, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import MarginNote from "../../components/MarginNote.astro";
+import PaxosRun from "../../utils/consensus/PaxosRun.astro";
+import RaftRun from "../../utils/consensus/RaftRun.astro";
+
+## Background
+
+A database on one machine is easy to reason about, and it fails as soon as that machine does.
+The standard fix is to run the same service on several machines, so that losing a minority of them
+loses nothing. That raises a hard question: how do the copies stay identical when machines crash
+at any moment and messages are delayed, reordered or lost? If two copies disagree about whether a
+payment happened, replication has made things worse, not better.
+
+The answer is a **consensus algorithm**: a protocol that lets a group of machines agree on a value,
+and by repeating it, on a sequence of values, such that no two machines ever decide differently.
+**Paxos**, published by Leslie Lamport in 1998<Sidenote>As "The Part-Time Parliament" (ACM TOCS
+16(2), 1998), told as the story of a Greek island's parliament. Lamport's 2001 rewrite, *Paxos Made
+Simple*, opens: "The Paxos algorithm, when presented in plain English, is very simple." This post
+follows that version.</Sidenote>, was the first widely used one and underlies systems such as
+Google's Chubby lock service and Spanner. **Raft**, published by Diego Ongaro and John Ousterhout in
+2014, solves the same problem with a design aimed at being easier to understand and implement; etcd,
+the store behind Kubernetes, uses it.
+
+This post covers, in order:
+
+1. **The problem**: replicated state machines, and why majorities (quorums) are the key idea.
+2. **Paxos**: agreeing on a single value in two phases, why it is safe, and why it needs a leader to
+   make progress.
+3. **Multi-Paxos**: going from one value to a log of commands.
+4. **Raft**: terms, leader election, log replication, and the two rules that make it safe,
+   including the subtle case in the Raft paper's Figure 8.
+5. **A comparison** and practical notes.
+
+Every figure is a step-through simulation. The simulators apply the papers' rules message by
+message, and a script checks the safety properties on every run.
+
+## The problem
+
+### Replicated state machines
+
+A **state machine** is a deterministic program that takes commands one at a time: "set x to 1",
+"withdraw 30 from account 7". Run the same commands in the same order from the same starting
+state, and you get the same state and the same outputs. So to keep several copies (**replicas**) of
+a service identical, it is enough to make them agree on one thing: the order of the commands. That
+ordered list is the **log**.
+
+Agreeing on the log reduces to agreeing on one value many times: "which command is entry 1?", then
+"which command is entry 2?", and so on. Lamport puts it this way: "we implement a sequence of
+separate instances of the Paxos consensus algorithm, the value chosen by the $i$th instance being
+the $i$th state machine command in the sequence."
+
+### What consensus must guarantee
+
+*Paxos Made Simple* states the safety requirements for agreeing on one value:
+
+- Only a value that has been proposed may be chosen.
+- Only a single value is chosen.
+- A process never learns that a value has been chosen unless it actually has been.
+
+The setting is the **asynchronous, non-Byzantine model**. Machines run at arbitrary speeds, may
+crash and restart, and remember what they wrote to stable storage. Messages can take arbitrarily
+long, be duplicated or be lost, but are never corrupted, and no machine lies. Notably, there is no
+reliable clock: a slow machine and a crashed one look the same.
+
+That last point has a famous consequence. Fischer, Lynch and Paterson proved in 1985 that no
+deterministic algorithm can guarantee to reach consensus in this model if even one process may
+crash (the **FLP impossibility** result). Both Paxos and Raft therefore separate the two concerns:
+they are **always safe** (never two different decisions), and they make **progress** only when the
+network behaves well enough for a single leader to emerge, which they arrange with timeouts and
+randomness.
+
+### Quorums
+
+Why can a group survive failures at all? Because it never needs everyone. A value is decided once a
+**majority** of the machines (a **quorum**) has accepted it. Any two majorities of the same group
+share at least one member, so two conflicting decisions would need some machine to accept both,
+and the protocols are built so that this cannot happen.
+
+With $n$ machines a quorum is $\lfloor n/2 \rfloor + 1$, and the group keeps working as long as a
+quorum is up:
+
+| Machines $n$ | Quorum | Failures tolerated |
+| --: | --: | --: |
+| 1 | 1 | 0 |
+| 2 | 2 | 0 |
+| 3 | 2 | 1 |
+| 4 | 3 | 1 |
+| 5 | 3 | 2 |
+| 6 | 4 | 2 |
+| 7 | 4 | 3 |
+
+So $2f + 1$ machines tolerate $f$ failures. An even-sized group buys nothing: 4 machines tolerate
+one failure, the same as 3, while needing a larger quorum. That is why clusters are almost always 3
+or 5 machines.
+
+## Paxos
+
+### Roles and proposal numbers
+
+Paxos describes three roles. **Proposers** suggest values, **acceptors** vote on them, and
+**learners** find out what was chosen. In a real system each machine plays all three; keeping them
+apart makes the algorithm easier to state.
+
+A naive scheme, in which each acceptor accepts the first value it hears, fails as soon as two
+proposers speak at once: the acceptors can split, say two for X and two for Y with one crashed, and
+no value ever gets a majority. So an acceptor must be able to accept more than one proposal over
+time. To keep those proposals apart, each carries a **proposal number** $n$, and different
+proposals must have different numbers. In practice each proposer draws from its own disjoint set
+of numbers. In the figures, proposer $p$ uses $10 \cdot \text{round} + p$, so P1 uses 11, 21,
+31, … and P2 uses 12, 22, ….
+
+A value is **chosen** when a majority of acceptors have accepted the *same* proposal (the same
+number and value). Several proposals may end up chosen, but they must all carry the same value.
+
+### Phase 1: prepare and promise
+
+The heart of Paxos is the rule that once a value might have been chosen, every later proposal must
+carry that same value. Lamport calls the precise version of this rule P2b. A proposer about to
+issue proposal $n$ cannot know what acceptors will do in the future, so, in Lamport's words,
+"instead of trying to predict the future, the proposer controls it by extracting a promise".
+
+**Phase 1a.** The proposer picks a new number $n$ and sends a **prepare($n$)** request to a
+majority of acceptors.
+
+**Phase 1b.** If an acceptor receives prepare($n$) with $n$ greater than any prepare it has already
+answered, it replies with a **promise**: it will not accept any proposal numbered less than $n$,
+and it reports the highest-numbered proposal it has already accepted, if any. Otherwise it ignores
+the request (or, as an optimisation, tells the proposer to give up).
+
+### Phase 2: accept
+
+**Phase 2a.** If the proposer gets promises from a majority, it sends **accept($n$, $v$)** to those
+acceptors. The value $v$ is not free: it must be the value of the highest-numbered proposal reported
+in the promises. Only if none of them reported an accepted proposal may the proposer use its own
+value.
+
+**Phase 2b.** An acceptor that receives accept($n$, $v$) accepts it unless it has already answered
+a prepare numbered greater than $n$.
+
+Each acceptor has to remember only two things, on stable storage, before it replies: the highest
+prepare number it has answered, and the highest-numbered proposal it has accepted.
+
+Step through the simplest run: one proposer, five acceptors, no failures. Two round trips, ten
+requests and ten replies, and X is chosen.
+
+<PaxosRun only="basic" title="Paxos with one proposer" />
+
+### Why it is safe
+
+Suppose X was chosen by proposal $m$: some majority $C$ accepted $(m, X)$. Now some proposer runs
+phase 1 for a higher number $n$ and collects promises from a majority $S$. Because $S$ and $C$
+overlap, at least one promise reports an accepted proposal numbered $m$ or higher. By induction
+on $n$, every proposal numbered between $m$ and $n - 1$ carries X, so the highest one reported is
+X, and the phase 2a rule forces the proposer to send X. No proposal numbered above $m$ can carry
+any other value.<Sidenote>This is Lamport's invariant P2c: if a proposal $(n, v)$ is issued, then
+some majority $S$ either accepted nothing below $n$, or $v$ is the value of the highest-numbered
+proposal below $n$ accepted in $S$. The promises in phase 1 are what let the proposer learn about
+$S$ and stop it from changing afterwards.</Sidenote>
+
+The next figure shows the overlap at work. P1 gets X chosen by acceptors A1–A3. P2, which wants Y,
+then runs phase 1 with A3–A5. A3 is in both majorities and reports (11, X), so P2 must propose X.
+
+<PaxosRun only="adopt" title="A second proposer has to adopt the chosen value" />
+
+Check the last step by hand. P2's promises reported (11, X) from A3 and nothing from A4 and A5. The
+highest reported proposal is 11, with value X, so P2's accept request is accept(12, X). Afterwards
+five acceptors hold X, under two different proposal numbers.
+
+The promise is the other half of the argument. Without it, a slow accept could sneak a value in
+after a newer proposer had already looked. In the next run, P1's accept reaches only A1 before P2
+runs phase 1 on A3–A5. P2 sees no accepted value, so it is free to propose Y, and Y is chosen. When
+P1's delayed accept(11, X) finally reaches A2 and A3, A3 refuses because it has promised 12.
+
+<PaxosRun only="preempt" title="A promise blocks a stale accept" />
+
+Note the final state: A1 and A2 hold (11, X), while A3–A5 hold (12, Y). Acceptors may disagree
+about what they accepted. What matters is that only Y ever reached a majority.<MarginNote>As in
+Lamport's TLA+ specification of Paxos, the simulator also raises an acceptor's promised number to
+$n$ when it accepts proposal $n$.</MarginNote>
+
+### Progress needs a leader
+
+Safety never depends on timing, but progress does. Section 2.4 of *Paxos Made Simple* describes two
+proposers that keep preempting each other. P1 completes phase 1 for 11, then P2 completes phase 1
+for 12, so P1's accepts are refused. P1 retries with 21, which makes P2's accepts fail, and so on
+forever. Nothing unsafe happens, and nothing is ever chosen.
+
+<PaxosRun only="duel" title="Duelling proposers: safe but stuck" />
+
+The fix is to elect a **distinguished proposer**, a **leader**, and let only it propose. Because of
+FLP, the election itself must use timeouts or randomness, but a botched election only costs time:
+two would-be leaders behave like the duel above, and safety still holds.
+
+## Multi-Paxos
+
+Running both phases for every log entry would cost two round trips per command. *Paxos Made Simple*
+(section 3) avoids that with a stable leader, an arrangement usually called **Multi-Paxos**.
+
+- **Phase 1 once, for all entries.** A new leader runs phase 1 with one proposal number for every
+  log index at once, with a single short message. Acceptors answer with more than "OK" only for
+  the indexes where they have already accepted something.
+- **Phase 2 per command.** After that, each new command costs only phase 2: one round trip to a
+  majority. Lamport notes that phase 2 "has the minimum possible cost of any algorithm for reaching
+  agreement in the presence of faults".
+- **Gaps and no-ops.** A leader may propose several commands at once, so a crash can leave holes.
+  In Lamport's example, the new leader knows commands 1–134, 138 and 139. Phase 1 might force
+  values for 135 and 140, and the leader fills 136 and 137 with a **no-op** command, so that
+  138–140 can be executed in order.
+
+Section 3 of the paper sketches this in about two pages and leaves much to the implementer:
+leader election, how to find out which entries are chosen, log compaction, and membership changes.
+Building a production system from it is known to be hard; Google's *Paxos Made Live* describes the
+gap between the paper and Chubby's implementation. Raft was designed to close that gap.
+
+## Raft
+
+Raft solves the same problem as Multi-Paxos, but it is designed around a strong leader and fully
+specified. The Raft paper's Figure 2 fits the whole core algorithm on one page. Its main
+simplification is that **log entries flow only from the leader to the followers**, and a leader
+never changes its own log.
+
+### Terms and roles
+
+Every server is a **follower**, a **candidate** or the **leader**. Time is divided into **terms**,
+numbered 1, 2, 3, …. Each term begins with an election and has at most one leader. Terms act like
+Paxos's proposal numbers. Every message carries the sender's term, and the paper's Figure 2 has
+one rule for all servers: "If RPC request or response contains term $T >$ currentTerm: set
+currentTerm $= T$, convert to follower." A stale leader therefore steps down as soon as it hears
+from a newer term.
+
+Each server keeps three things on stable storage: `currentTerm`, `votedFor` (whom it voted for in
+the current term) and `log[]`. Each log entry holds a command and the term in which a leader created
+it. Two RPCs do everything: **RequestVote** for elections and **AppendEntries** for replication and
+heartbeats.
+
+### Leader election
+
+A leader sends periodic heartbeats, which are AppendEntries with no entries. A follower that hears
+nothing for an **election timeout** becomes a candidate. It increments its term, votes for
+itself, and sends RequestVote to everyone. A candidate:
+
+- **wins** if a majority of the full cluster votes for it in that term. Each server votes at most
+  once per term, first come first served, so at most one candidate can win a term. The paper calls
+  this the **Election Safety** property.
+- **steps down** if it hears from a leader whose term is at least its own.
+- **times out and tries again** in a new term if the vote splits.
+
+To make split votes rare, election timeouts are random, "chosen randomly from a fixed interval
+(e.g., 150–300ms)", so one server usually times out well before the others.<Sidenote>In the
+paper's measurements (section 9.3, five servers), elections without randomness "consistently took
+longer than 10 seconds" because of repeated split votes. With 5 ms of randomness the median downtime
+after a leader crash was 287 ms, and with a 12–24 ms timeout a new leader was elected in 35 ms on
+average.</Sidenote> Election timeouts must satisfy the paper's timing requirement
+$\text{broadcastTime} \ll \text{electionTimeout} \ll \text{MTBF}$, where MTBF is the mean time
+between failures of one server.
+
+### Log replication
+
+A client sends a command to the leader. The leader appends it to its log, then sends AppendEntries
+to the followers. Each AppendEntries carries `prevLogIndex` and `prevLogTerm`, the position and
+term of the entry just before the new ones. A follower refuses the request unless its own log has
+an entry at `prevLogIndex` with term `prevLogTerm`. This **consistency check** works like an
+induction step, and it guarantees the **Log Matching** property: if two logs contain an entry with
+the same index and term, the logs are identical up to that index.
+
+An entry is **committed** once the leader that created it has stored it on a majority of servers.
+At that point the leader applies it to its state machine and answers the client. The leader sends
+its `commitIndex` in later AppendEntries, so followers learn about it and apply the entries too.
+
+<RaftRun only="elect" step={5} title="Raft: election, then replication of two commands" />
+
+Look at steps 5 and 6. After the first round of AppendEntries all five logs hold x←1 and y←2, but
+only the leader S3 marks them committed (solid, with the commit bar after index 2). The followers
+learn the commit index from the next heartbeat. In the steady state, each command costs one round
+trip from the leader to a majority, the same as Multi-Paxos phase 2. With five servers that is
+four AppendEntries requests and four replies per round, which can carry many entries.
+
+When a follower's log disagrees with the leader's, the leader repairs it. The leader keeps a
+`nextIndex` per follower, starting just past its own last entry. If AppendEntries is refused, it
+decrements `nextIndex` and retries, until the two logs match at `prevLogIndex`. The follower then
+deletes any conflicting entries after that point and appends the leader's.
+
+### Safety: the election restriction
+
+Replication alone is not safe. A follower that missed some committed entries could become leader
+and overwrite them. Raft prevents this when it elects leaders: a voter refuses a candidate whose log
+is less **up-to-date** than its own. The definition, from section 5.4.1, is: "If the logs have last
+entries with different terms, then the log with the later term is more up-to-date. If the logs end
+with the same term, then whichever log is longer is more up-to-date."
+
+A committed entry is on a majority, and a winner needs votes from a majority, so at least one voter
+holds the entry. That voter grants its vote only to a candidate at least as up-to-date as itself,
+and that candidate therefore has the entry too. This is the **Leader Completeness** property: a
+committed entry is present in the logs of all later leaders. Unlike in Paxos, a new Raft leader
+never has to learn missing entries from others; it already has them.
+
+The next run shows both the restriction and log repair. S1 crashes with an uncommitted entry z that
+only S2 has. In the term-2 election, S2 refuses S3, because S2's log [x, y, z] is longer with the
+same last term. S3 still wins with S4 and S5. It then deletes S2's conflicting z, and backs up
+`nextIndex` for S5, which missed y.
+
+<RaftRun only="repair" step={13} title="Raft: leader crash, election restriction and log repair" />
+
+Losing z is correct. It was never on a majority, so it was never committed and no client was told
+it succeeded.
+
+### Committing entries from older terms
+
+One more rule is needed, and it is the subtlest part of Raft. A leader may count replicas to commit
+**only entries from its own current term**. Entries from earlier terms become committed indirectly,
+once an entry from the current term after them is committed. The Figure 2 rule reads: "If there
+exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N, and log[N].term ==
+currentTerm: set commitIndex = N."
+
+The paper's Figure 8 shows why. Step through the simulation of it:
+
+<RaftRun only="fig8d" step={10} title="Raft paper Figure 8 (a)–(d): an old entry on a majority is overwritten" />
+
+At step 10, entry b (term 2) is on S1, S2 and S3, a majority. If S1 had declared it committed, the
+end of the run would be a disaster. S1 crashes, and S5, whose log ends with c from term 3, wins
+term 5. Its last term, 3, is newer than the voters' last term, 2, so its log counts as more
+up-to-date. S5 then overwrites b with c everywhere. A majority of copies did not make b safe,
+because the copies were made in term 4 for an entry from term 2. A server whose log ends in a later
+term can still win.
+
+I checked this with the simulator. With the `log[N].term == currentTerm` condition removed, the
+same script commits b at step 10, and the safety checker reports index 2 committed first as b and
+later as c, and a leader (S5) missing a committed entry. With the condition in place, every
+scenario passes.
+
+The fix is case (e) of the figure. If S1 first replicates an entry *from its own term*, d, to a
+majority, then d is committed, and b with it. S5 can no longer win: S2 and S3 now end in term 4,
+newer than S5's term 3.
+
+<RaftRun only="fig8e" step={12} title="Raft paper Figure 8 (e): committing in the current term protects b" />
+
+This is also why a new Raft leader commits a blank **no-op** entry at the start of its term (paper
+section 8). It is the same idea as Lamport's no-ops: an entry from the current term commits
+everything before it, and only then does the leader know which entries are committed.
+
+## Paxos and Raft compared
+
+Raft is a refinement of Multi-Paxos with a strong leader rather than a different algorithm. A term
+plays the role of a proposal number, an election plays the role of phase 1, and AppendEntries plays
+the role of phase 2. The differences are in what is specified and in where the constraints sit.
+
+| | Paxos / Multi-Paxos | Raft |
+| --- | --- | --- |
+| Unit of agreement | One value per instance; a log is many instances | A log, replicated as a whole |
+| Ordering of attempts | Proposal numbers, disjoint per proposer | Terms; at most one leader per term |
+| Who may propose | Any proposer (a leader only for progress) | Only the leader |
+| New leader catches up | Learns accepted values in phase 1, fills gaps with no-ops | Must already have every committed entry (election restriction) |
+| Log holes | Allowed, filled later | Impossible: entries are appended in order |
+| Entry identity | Value can be re-proposed under a new number | Entries keep their original term |
+| Steady-state cost | Phase 2: one round trip to a majority | AppendEntries: one round trip to a majority |
+| Specification | Single-decree core; the rest left to implementers | Figure 2 plus membership changes and snapshots |
+
+Raft's restrictions (one leader, logs without holes, entries flowing only from leader to followers)
+remove states that Multi-Paxos must handle, which makes it easier to implement correctly. The
+paper's user study found Raft easier to learn than Paxos. The price is flexibility. Paxos lets any
+proposer make progress for any slot, which variants such as EPaxos exploit to avoid a single
+leader.<Sidenote>Raft also keeps entries' original terms, which is why it needs the Figure 8 rule.
+The paper notes that in other algorithms, "if a new leader re-replicates entries from prior 'terms,'
+it must do so with its new 'term number'", which costs extra messages but makes counting replicas
+safe.</Sidenote>
+
+## Practical notes
+
+- **Persist before replying.** Paxos acceptors must record their promise or acceptance in stable
+  storage "before actually sending the response". Raft servers must write `currentTerm`, `votedFor`
+  and the log before answering an RPC. A server that forgets a vote after a restart could vote twice
+  in one term.
+- **Reads need care.** A leader that answers reads from its own state may have been replaced
+  without knowing it. Raft's section 8 has the leader commit a no-op at the start of its term, and
+  exchange heartbeats with a majority before answering a read-only request. Leases avoid that round
+  trip but rely on bounded clock skew for safety.
+- **Duplicate commands.** If a leader crashes after committing a command but before replying, the
+  client retries. Raft's section 8 recommends that clients tag commands with serial numbers so that
+  the state machine can detect and skip duplicates.
+- **Membership changes.** Switching directly from an old set of servers to a new one can produce
+  two leaders in one term, one elected by a majority of each configuration. Raft goes through an
+  intermediate **joint consensus** configuration that needs majorities of both. Lamport suggests
+  making the configuration part of the replicated state itself.
+- **Log compaction.** Logs cannot grow forever. Raft servers take **snapshots** of the state machine
+  and discard the log before them, and the leader sends a snapshot (InstallSnapshot) to followers
+  that have fallen too far behind.
+
+## Summary
+
+- Consensus lets replicas agree on an ordered log of commands, and with deterministic state machines
+  that keeps them identical. It is always safe, but by FLP it can make progress only when timing
+  cooperates.
+- Majority quorums are the core idea. Any two majorities overlap, so $2f + 1$ machines tolerate $f$
+  failures.
+- **Paxos** chooses a value in two phases. Prepare/promise both learns what may already be chosen
+  and blocks older proposals; accept then must reuse the highest-numbered accepted value. A single
+  leader is needed only for progress, and Multi-Paxos runs phase 1 once and phase 2 per command.
+- **Raft** builds the log around a strong leader elected for a term. The election restriction (vote
+  only for candidates at least as up-to-date as you) guarantees that leaders already hold every
+  committed entry.
+- A Raft leader commits by counting replicas only for entries from its **current term**. Figure 8
+  shows that an older entry on a majority can still be overwritten.
+
+## References
+
+1. Leslie Lamport, [Paxos Made Simple](https://lamport.azurewebsites.net/pubs/paxos-simple.pdf),
+   *ACM SIGACT News* 32(4), 2001.
+2. Leslie Lamport, The Part-Time Parliament, *ACM Transactions on Computer Systems* 16(2), 1998.
+3. Diego Ongaro and John Ousterhout,
+   [In Search of an Understandable Consensus Algorithm](https://raft.github.io/raft.pdf),
+   USENIX ATC 2014. Figure 2 is the summary of the algorithm the simulator implements.
+4. Michael J. Fischer, Nancy Lynch and Michael S. Paterson, Impossibility of Distributed Consensus
+   with One Faulty Process, *Journal of the ACM* 32(2), 1985.
+5. Tushar Chandra, Robert Griesemer and Joshua Redstone, Paxos Made Live: An Engineering
+   Perspective, PODC 2007.
+6. Diego Ongaro, *Consensus: Bridging Theory and Practice*, PhD thesis, Stanford University, 2014.
+7. [raft.github.io](https://raft.github.io/), with links to implementations and visualisations.

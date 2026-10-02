@@ -1,0 +1,411 @@
+---
+title: "From Reinforcement Learning to RLHF, PPO, DPO, GRPO and DRPO"
+description: "A ground-up guide to reinforcement learning and the algorithms used to align language models, with worked examples of policy gradients, PPO clipping, DPO and group-relative advantages."
+date: 2026-10-02
+tags: [Machine learning, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import PreferenceAlgorithms from "../../utils/rl/PreferenceAlgorithms.astro";
+import RlhfTrainingLoop from "../../utils/rl/RlhfTrainingLoop.astro";
+
+## Background
+
+A language model learns to predict the next token. That objective teaches grammar, facts and
+patterns, but it does not directly teach the model to be helpful, follow an instruction or solve a
+math problem correctly. Those goals are easier to judge at the level of a complete answer than at
+the level of each next token.
+
+**Reinforcement learning** (RL) is a framework for learning actions from consequences. In language
+model post-training, the model is the learner, generated tokens are its actions, and a reward says
+how good the finished response was. This matters because a reward can express goals that are hard
+to demonstrate token by token: correctness, safety, style or a person's preference.
+
+This post builds the common core first: states, actions, rewards, policy gradients and value
+baselines. It then follows two branches. The online branch covers reinforcement learning from human
+feedback (RLHF), proximal policy optimization (PPO), group relative policy optimization (GRPO) and
+related methods. The offline branch derives direct preference optimization (DPO), explains the
+ambiguous name DRPO, and places newer preference losses on the same map.
+
+## The reinforcement-learning problem
+
+An **agent** observes a **state** $s_t$, chooses an **action** $a_t$, receives a scalar **reward**
+$r_t$, and moves to the next state. The **environment** is everything that determines the reward
+and transition. A **policy** $\pi_\theta(a \mid s)$ is the agent's probability distribution over
+actions, parameterized by $\theta$.
+
+The agent wants a large **return**, the discounted sum of future rewards:
+
+$$
+G_t = \sum_{k=0}^{T-t} \gamma^k r_{t+k}, \qquad 0 \leq \gamma \leq 1
+$$
+
+Read the symbols from left to right:
+
+- $t$ is the current time step, and $T$ is the final step.
+- $r_{t+k}$ is the reward received $k$ steps into the future.
+- $\gamma^k$ discounts that future reward. If $\gamma=1$, a reward counts fully no matter when it
+  arrives. If $\gamma=0.9$, a reward two steps away is multiplied by $0.9^2=0.81$.
+- The summation adds the discounted rewards from now until the episode ends.
+
+For example, if the next three rewards are $[2,0,5]$ and $\gamma=0.9$, then
+$G_t=2+0.9(0)+0.9^2(5)=6.05$. The agent does not merely chase the immediate reward of 2; it also
+gets credit for the later reward of 5.
+
+The discount $\gamma$ says how much later rewards count. In language-model alignment, an episode is
+usually one response. State $s_t$ is the prompt plus tokens generated so far, action $a_t$ is the
+next token, and the main reward often arrives only after the final token. With $\gamma=1$, every
+token in that response shares the same terminal return.
+
+### Values answer “what happens from here?”
+
+The **state value** $V^\pi(s)$ is the expected return after reaching $s$ and following policy
+$\pi$. The **action value** $Q^\pi(s,a)$ also fixes the next action. Their difference is the
+**advantage**:
+
+$$
+A^\pi(s,a) = Q^\pi(s,a) - V^\pi(s)
+$$
+
+$Q^\pi(s,a)$ asks, “what return should I expect if I take action $a$ here?” $V^\pi(s)$ asks,
+“what return do I normally expect from this state?” Therefore $A^\pi(s,a)>0$ means the action was
+better than the policy's usual choice, while $A^\pi(s,a)<0$ means it was worse. If $Q=8$ and
+$V=6$, the advantage is $+2$.
+
+Advantage measures whether an action was better or worse than the policy normally does from that
+state. Subtracting the baseline does not change the expected policy gradient, but it reduces its
+variance: “reward 8” is hard to interpret, while “2 better than the expected 6” gives a useful
+direction.
+
+### Three classical families
+
+| Family | What it learns | How it chooses | Examples |
+| --- | --- | --- | --- |
+| Value-based | $Q(s,a)$ | choose the action with highest value | Q-learning, DQN |
+| Policy-based | $\pi_\theta(a\mid s)$ | sample directly from the policy | REINFORCE, PPO |
+| Actor–critic | policy and value baseline | actor acts; critic estimates advantage | A2C, A3C, PPO |
+
+Q-learning works well when the action set is manageable. A language model may choose among tens of
+thousands of tokens at every step, so alignment methods usually optimize its policy directly.
+
+## Policy gradients: learning from sampled answers
+
+The **policy-gradient theorem** gives a practical estimator of how parameters affect expected
+return. REINFORCE, the simplest policy-gradient algorithm, minimizes
+
+$$
+L_{\text{PG}}(\theta) =
+-\mathbb{E}_{\tau\sim\pi_\theta}
+\left[\sum_t \log \pi_\theta(a_t\mid s_t)\,A_t\right].
+$$
+
+Here $\theta$ denotes all trainable model parameters. A **trajectory** $\tau$ is one sampled
+sequence of states, actions and rewards. The expectation says to average over many trajectories
+sampled from the current policy. Inside it, $\log\pi_\theta(a_t\mid s_t)$ is the log-probability of
+the action the model actually took, and $A_t$ grades that action relative to a baseline.
+
+The leading minus sign appears because training software normally *minimizes* a loss. For a positive
+$A_t$, minimizing the loss raises the action's log-probability. For a negative $A_t$, it lowers the
+log-probability. The logarithm is useful because a response probability is a product of token
+probabilities, while its log-probability is their numerically manageable sum.
+
+Gradient descent raises the log-probability of actions with positive advantage and lowers it for
+negative advantage. The multiplication is the key: a likely action receives no push when
+$A_t=0$, while an unexpectedly good action receives a large positive push.
+
+Consider a two-action bandit with logits $z=[0,0]$, hence probabilities $[0.5,0.5]$. Action A is
+sampled and earns reward 1; the baseline is 0.4, so $A=0.6$. For a softmax policy,
+$\nabla_z\log\pi(A)=[1-0.5,-0.5]=[0.5,-0.5]$. The ascent direction is therefore
+$0.6[0.5,-0.5]=[0.3,-0.3]$: increase A's logit and decrease B's.
+
+One sample is noisy. REINFORCE can mistake luck for skill, which motivates value baselines,
+multiple samples and conservative updates.
+
+## RLHF turns preferences into a reward
+
+**Reinforcement learning from human feedback** (RLHF) replaces a hand-written reward with a model
+learned from human comparisons. The influential InstructGPT pipeline has three stages:
+
+1. **Supervised fine-tuning** (SFT) trains a pretrained model on good demonstrations.
+2. A **reward model** learns from pairs or rankings of candidate answers. For a chosen answer
+   $y_w$ and rejected answer $y_l$, a common Bradley–Terry loss is
+
+   $$
+   L_{\text{RM}}=-\log\sigma\big(r_\phi(x,y_w)-r_\phi(x,y_l)\big).
+   $$
+
+   The reward model with parameters $\phi$ assigns the scores $r_\phi(x,y_w)$ and
+   $r_\phi(x,y_l)$. The subscripts $w$ and $l$ mean *winner* and *loser*. Their difference is passed
+   through the sigmoid $\sigma(z)=1/(1+e^{-z})$, turning any real-valued score gap into a probability
+   between 0 and 1. If the chosen response scores much higher, $\sigma$ is near 1 and the negative
+   log loss is near 0. If the ordering is wrong, the loss is large.
+
+3. The policy samples new responses and PPO maximizes the learned reward while penalizing movement
+   away from a frozen reference model.
+
+The regularized objective is commonly written
+
+$$
+\max_\pi\;\mathbb{E}_{x, y\sim\pi}[r_\phi(x,y)]
+-\beta\,D_{\mathrm{KL}}\!\left(\pi(\cdot\mid x)\,\|\,\pi_{\text{ref}}(\cdot\mid x)\right).
+$$
+
+The first term is the average learned reward for prompt $x$ and response $y$ sampled from policy
+$\pi$. The second term measures the Kullback–Leibler (KL) divergence between the trainable policy
+and frozen reference policy. KL divergence is zero when the distributions match and grows as they
+separate. The coefficient $\beta$ sets the trade-off: a large $\beta$ keeps the model close to the
+reference; a small $\beta$ gives reward maximization more freedom. The $\max_\pi$ means that the
+whole expression, reward minus drift penalty, is what training tries to increase.
+
+The KL term is a guardrail. Without it, the policy can exploit errors in the learned reward rather
+than improve in the way humans intended. This is **reward hacking**: maximizing the score while
+missing the underlying goal.
+
+The animation below follows one complete online iteration. Watch the top row build a response, then
+follow the reward down through the critic and PPO. The last arrow changes the policy that will
+produce the next rollout.
+
+<RlhfTrainingLoop />
+
+PPO and GRPO are **online**: they repeatedly sample the current policy, score those fresh responses
+and update. DPO is normally **offline**: it trains on a fixed set of preference pairs. Online data
+tracks the changing policy, but generation and scoring make it expensive. Use the comparison below
+to see which parts of the animated loop each method retains.
+
+<PreferenceAlgorithms initial="dpo" />
+
+## PPO: make a useful update, but not a reckless one
+
+**Proximal policy optimization** (PPO) reuses sampled trajectories for several optimization steps
+without letting the new policy move too far from the policy that collected them. Define the
+probability ratio
+
+$$
+r_t(\theta)=\frac{\pi_\theta(a_t\mid s_t)}{\pi_{\theta_{\text{old}}}(a_t\mid s_t)}.
+$$
+
+The denominator is the probability assigned when the trajectory was collected. The numerator is
+the probability under the policy being updated. Thus $r_t=1$ means no change, $r_t=1.2$ means the
+action is now 20% more likely, and $r_t=0.8$ means it is 20% less likely. A ratio lets PPO reuse old
+samples while correcting for the fact that the policy has already changed.
+
+The clipped surrogate objective is
+
+$$
+L^{\text{clip}}(\theta)=
+\mathbb{E}_t\left[
+\min\left(r_t A_t,
+\operatorname{clip}(r_t,1-\epsilon,1+\epsilon)A_t\right)
+\right].
+$$
+
+There are two candidate contributions for every sampled action. The first, $r_tA_t$, is the ordinary
+importance-weighted policy-gradient term. The second replaces $r_t$ with a value clipped to
+$[1-\epsilon,1+\epsilon]$. PPO takes the smaller contribution. For a good action this caps the
+reward for making it much more likely; for a bad action it caps the reward for making it much less
+likely. The expectation averages these per-token terms across the batch, and training maximizes the
+result.<Sidenote>Implementations usually minimize the negative of this objective and add value-loss
+and entropy terms. The displayed expression isolates PPO's defining clipped policy term.</Sidenote>
+
+With $\epsilon=0.2$, suppose a good token has $A_t=2$ and its ratio rises to $1.3$. The unclipped
+term is $1.3\times2=2.6$, but the clipped term is $1.2\times2=2.4$, so the objective uses $2.4$.
+There is no extra benefit for pushing its probability beyond the 20% range on this batch.
+
+The sign matters. If a bad token has $A_t=-2$ and its ratio falls to $0.7$, the two terms are
+$-1.4$ and $0.8\times(-2)=-1.6$. The minimum is $-1.6$, so PPO also removes the incentive to drive
+the ratio farther below $0.8$. Clipping is not a hard constraint on every probability; it flattens
+the training incentive beyond the interval.
+
+PPO-based RLHF commonly keeps four logical models: the trainable policy, frozen reference policy,
+trainable value model (the **critic**) and frozen reward model. Some can share parameters, but the
+memory, inference and synchronization cost remains substantial.
+
+## DPO: solve the regularized problem through comparisons
+
+**Direct preference optimization** (DPO) starts from the same KL-regularized objective but avoids
+training an explicit reward model and avoids an online RL loop. At the optimum, reward and policy
+are related by
+
+$$
+r(x,y)=\beta\log\frac{\pi^*(y\mid x)}{\pi_{\text{ref}}(y\mid x)}+C(x),
+$$
+
+This equation says that an optimal policy makes high-reward responses more likely than the
+reference. The ratio compares the optimal response probability $\pi^*(y\mid x)$ with the reference
+probability. Its logarithm is positive when the optimal policy upweights the response and negative
+when it downweights it. $\beta$ converts that log-ratio into reward units. $C(x)$ is a
+prompt-dependent normalizing constant; crucially, it does not depend on which response $y$ is being
+compared.
+
+where $C(x)$ is the same for all answers to prompt $x$. Substitute this expression into the
+Bradley–Terry preference model. The unknown $C(x)$ cancels between the chosen and rejected answers,
+leaving the DPO loss:
+
+$$
+L_{\text{DPO}}=-\mathbb{E}\left[\log\sigma\left(\beta\left[
+\log\frac{\pi_\theta(y_w\mid x)}{\pi_{\text{ref}}(y_w\mid x)}
+-\log\frac{\pi_\theta(y_l\mid x)}{\pi_{\text{ref}}(y_l\mid x)}
+\right]\right)\right].
+$$
+
+The inner bracket is a **relative margin**. Its first log-ratio measures how much the trainable
+policy has upweighted the chosen answer relative to the reference. Its second measures the same for
+the rejected answer, and is subtracted. A positive bracket therefore means the policy favors the
+winner more strongly than the reference did. The sigmoid turns the scaled margin into a predicted
+preference probability, and the negative log penalizes disagreement with the recorded label.
+
+Both $\pi_\theta(y\mid x)$ and $\pi_{\text{ref}}(y\mid x)$ refer to a whole response. For an
+autoregressive model, the whole-response log-probability is the sum of token log-probabilities:
+
+$$
+\log\pi_\theta(y\mid x)=\sum_{t=1}^{|y|}\log\pi_\theta(y_t\mid x,y_{<t}).
+$$
+
+Here $y_t$ is token $t$, $y_{<t}$ is the response prefix before it, and $|y|$ is the response
+length. This sum also explains a practical complication: longer answers accumulate more log terms,
+so sequence length can affect preference losses.
+
+### A numerical DPO update
+
+Suppose the reference assigns probabilities $0.20$ and $0.10$ to the complete chosen and rejected
+answers. The current policy assigns $0.24$ and $0.06$. With $\beta=0.1$, the margin inside the
+sigmoid is
+
+$$
+0.1\left[\log(0.24/0.20)-\log(0.06/0.10)\right]
+=0.0693.
+$$
+
+The implied probability of the recorded preference is $\sigma(0.0693)=0.5173$, and the loss is
+$-\log(0.5173)=0.6591$. Training pushes the chosen answer's policy-to-reference ratio up relative
+to the rejected answer's ratio.
+
+DPO's simplicity has a price. Its data came from an older **behavior policy**, but training changes
+the current policy. The fixed dataset may stop representing mistakes the new model actually makes.
+DPO also inherits assumptions from the Bradley–Terry preference model and the reference-policy
+derivation. “No explicit RL loop” does not mean “no RL ideas”: DPO is a closed-form route to a
+particular regularized RL objective.
+
+## GRPO: compare several answers to the same prompt
+
+**Group relative policy optimization** (GRPO), introduced in DeepSeekMath, removes PPO's learned
+critic. For each prompt it samples a group of $G$ responses, scores them, and builds an advantage
+from the group's mean and standard deviation:
+
+$$
+A_i=\frac{r_i-\operatorname{mean}(r_1,\ldots,r_G)}
+{\operatorname{std}(r_1,\ldots,r_G)}.
+$$
+
+The numerator centers response $i$'s reward around the average for the same prompt. The denominator
+rescales by the group's reward spread. This makes the advantages dimensionless and comparable
+across prompts whose reward scales differ. It also makes their group mean zero: above-average
+responses are positive and below-average responses are negative.
+
+Take four rewards $[1,0,1,0.5]$. Their mean is $0.625$ and population standard deviation is
+$0.4146$, giving advantages $[0.9045,-1.5076,0.9045,-0.3015]$. Check the fourth response:
+$(0.5-0.625)/0.4146=-0.3015$. It receives a negative update even though its raw reward is positive,
+because it was worse than the alternatives for that prompt.
+
+GRPO then uses a PPO-like clipped ratio and a KL penalty. It saves the critic's memory and training
+cost, but it is not free: the group requires several completions per prompt. A group with identical
+rewards also has zero standard deviation, so implementations need an epsilon or must skip that
+uninformative group.<Sidenote>The precise GRPO loss and KL estimator vary across papers and
+implementations. “Critic-free group baseline” is the stable defining idea; implementation details
+must be compared explicitly.</Sidenote>
+
+GRPO is especially natural for **reinforcement learning with verifiable rewards** (RLVR). A math
+checker, unit test or compiler can provide an objective terminal score. For open-ended helpfulness,
+the reward still usually comes from a learned judge, and its biases remain part of the training
+signal.
+
+## What does DRPO mean?
+
+Unlike PPO, DPO and GRPO, **DRPO is overloaded**. A paper or codebase must define it before the
+acronym is useful. Recent papers use it for at least Direct Ranking Preference Optimization,
+Dataset Reset Policy Optimization, Decoupled Reward Policy Optimization, and Doubly Robust
+Preference Optimization.
+
+This post uses **doubly robust preference optimization**, from *Doubly Robust Alignment for Large
+Language Models*. “Doubly robust” has a specific statistical meaning: the estimator remains
+consistent if either the preference model or the reference policy is correctly specified, without
+requiring both to be correct. It targets a weakness shared by many neat derivations: real human
+preferences may not follow the assumed comparison model, and a chosen reference may not represent
+the required distribution.
+
+DRPO is therefore not “DPO but newer” in a generic sense. It is a particular robustness proposal,
+and its extra estimation machinery only pays off when model misspecification is a serious concern.
+When another source says DRPO, check its expanded name first.
+
+## Other algorithms on the same map
+
+Most modern variants change one of four things: where data comes from, how a baseline is estimated,
+how far the policy may move, or what preference model turns judgments into a loss.
+
+| Method | Online? | Critic? | Reference? | Main idea |
+| --- | :---: | :---: | :---: | --- |
+| REINFORCE | yes | no | optional | multiply sampled log-probabilities by return |
+| RLOO | yes | no | usually | use other responses' mean reward as a leave-one-out baseline |
+| PPO | yes | yes | usually | clip probability-ratio incentives |
+| GRPO | yes | no | usually | normalize rewards within a response group |
+| DPO | usually no | no | yes | logistic loss on policy/reference preference margins |
+| IPO | usually no | no | yes | avoid committing to Bradley–Terry reward fitting |
+| KTO | no | no | yes | learn from individually desirable or undesirable examples |
+| SimPO | no | no | no | use length-normalized policy log-probability and a target margin |
+| ORPO | no | no | no | combine SFT with an odds-ratio penalty in one stage |
+
+**REINFORCE leave-one-out** (RLOO) samples several answers and, for each answer, uses the average
+reward of the *other* answers as its baseline. It is close in spirit to GRPO, but the exact
+advantage, normalization and clipped objective differ.
+
+**Kahneman–Tversky optimization** (KTO) accepts unpaired good/bad labels, useful when collecting a
+clean chosen/rejected pair is difficult. **Simple preference optimization** (SimPO) removes the
+frozen reference and uses average sequence log-probability to reduce length bias. **Odds ratio
+preference optimization** (ORPO) folds preference learning into supervised fine-tuning.
+
+These names do not form a ladder where each later method dominates the previous one. They encode
+different assumptions about available labels, online sampling budget, memory and failure modes.
+
+## Choosing a method
+
+Start from the feedback you can trust, not from the fashionable optimizer.
+
+- Use **PPO** when you need online exploration, have a meaningful learned reward, and can afford a
+  critic and a careful distributed training loop.
+- Use **GRPO or RLOO** when online sampling is useful but a critic is too expensive, especially when
+  a verifier can score several answers to the same prompt.
+- Use **DPO** when you already have high-quality preference pairs and want a stable, simple offline
+  baseline.
+- Consider **KTO** for unpaired binary feedback and **SimPO or ORPO** when reference-model memory is
+  the binding constraint.
+- Consider a specific **DRPO** only after identifying its full name and the misspecification or
+  ranking problem it was designed to solve.
+
+Whatever the optimizer, evaluate the reward and the policy separately. Hold out prompts, use human
+judgments where possible, slice results by response length and task, and watch both KL divergence
+and reward. A rising training reward can mean genuine improvement, reward hacking, a verbosity
+bias, or distribution shift; the scalar alone cannot tell you which.
+
+## Summary
+
+- RL raises the probability of actions with positive advantage and lowers it for negative
+  advantage; baselines make that estimate less noisy.
+- RLHF is a feedback pipeline, not one optimizer. Its classic form learns a reward model and uses
+  PPO with KL regularization.
+- PPO clips the incentive for large policy-ratio changes; DPO turns the same regularized objective
+  into an offline classification loss under specific assumptions.
+- GRPO replaces PPO's learned critic with relative rewards from several responses to one prompt.
+- DRPO is an ambiguous acronym. Always expand it; doubly robust preference optimization is one
+  recent method designed for preference-model or reference-policy misspecification.
+
+## References
+
+- Sutton and Barto, [*Reinforcement Learning: An Introduction*, second edition](http://incompleteideas.net/book/the-book-2nd.html), 2018.
+- Schulman et al., [“Proximal Policy Optimization Algorithms”](https://arxiv.org/abs/1707.06347), 2017.
+- Ouyang et al., [“Training Language Models to Follow Instructions with Human Feedback”](https://arxiv.org/abs/2203.02155), 2022.
+- Rafailov et al., [“Direct Preference Optimization: Your Language Model Is Secretly a Reward Model”](https://arxiv.org/abs/2305.18290), 2023.
+- Shao et al., [“DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models”](https://arxiv.org/abs/2402.03300), 2024.
+- Ethayarajh et al., [“KTO: Model Alignment as Prospect Theoretic Optimization”](https://arxiv.org/abs/2402.01306), 2024.
+- Hong et al., [“ORPO: Monolithic Preference Optimization without Reference Model”](https://aclanthology.org/2024.emnlp-main.626/), 2024.
+- Meng, Xia and Chen, [“SimPO: Simple Preference Optimization with a Reference-Free Reward”](https://arxiv.org/abs/2405.14734), 2024.
+- Xu et al., [“Doubly Robust Alignment for Large Language Models”](https://arxiv.org/abs/2506.01183), 2025.

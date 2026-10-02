@@ -1,0 +1,169 @@
+---
+// The iteration domain of A[i][j] = A[i-1][j+1] + A[i][j-1] under different schedules (drawn in
+// polyhedral.ts). Each dot is one iteration S(i, j), numbered by when the schedule runs it;
+// arrows are dependences, red when the schedule runs the destination first. Tiled schedules
+// colour each tile, the wavefront colours each time step. The note below says how many
+// dependences break and whether running that order on real data changes the result.
+// Usage in .mdx:
+//   <PolyhedralSchedule />
+//   <PolyhedralSchedule n={7} schedules={["original", "interchange"]} />
+import { SCHEDULES, drawSchedule, summary } from "./polyhedral";
+
+interface Props {
+	n?: number;
+	/** Keys from SCHEDULES to offer as tabs, in order. */
+	schedules?: string[];
+	title?: string;
+}
+
+const { n = 7, schedules = SCHEDULES.map((s) => s.key), title } = Astro.props;
+const shown = schedules
+	.map((k) => SCHEDULES.find((s) => s.key === k))
+	.filter((s) => s !== undefined);
+---
+
+<figure class="poly-schedule">
+	{title && <figcaption class="title">{title}</figcaption>}
+	{
+		shown.length > 1 && (
+			<div class="tabs" role="tablist">
+				{shown.map((s, i) => (
+					<button type="button" role="tab" data-i={i} aria-selected={i === 0 ? "true" : "false"}>
+						{s.label}
+					</button>
+				))}
+			</div>
+		)
+	}
+	{
+		shown.map((s, i) => (
+			<div class="panel" data-i={i} hidden={i !== 0}>
+				<div class="canvas" set:html={drawSchedule(n, s)} />
+				<p class="note">
+					{summary(n, s).map((l) => (
+						<span>{l}</span>
+					))}
+				</p>
+			</div>
+		))
+	}
+</figure>
+
+<script>
+	for (const fig of document.querySelectorAll<HTMLElement>(".poly-schedule")) {
+		const tabs = [...fig.querySelectorAll<HTMLButtonElement>("[role=tab]")];
+		const panels = [...fig.querySelectorAll<HTMLElement>(".panel")];
+		for (const tab of tabs)
+			tab.addEventListener("click", () => {
+				const i = Number(tab.dataset.i);
+				for (const t of tabs) t.setAttribute("aria-selected", String(t === tab));
+				panels.forEach((p, k) => {
+					p.hidden = k !== i;
+				});
+			});
+	}
+</script>
+
+<style>
+	.poly-schedule {
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+		--bad: #d6336c;
+		--pt-l: 86%;
+	}
+	@media (prefers-color-scheme: dark) {
+		.poly-schedule {
+			--bad: #ff6b9a;
+			--pt-l: 30%;
+		}
+	}
+	.title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.5rem;
+	}
+	.tabs {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.25rem;
+		margin-bottom: 0.5rem;
+		font-size: 0.76rem;
+	}
+	.tabs button {
+		padding: 0.25rem 0.6rem;
+		border: 1px solid var(--faint);
+		border-radius: 999px;
+		background: var(--bg);
+		color: var(--text);
+		font: inherit;
+		cursor: pointer;
+	}
+	.tabs button:hover {
+		border-color: var(--accent);
+	}
+	.tabs button[aria-selected="true"] {
+		background: var(--accent);
+		border-color: var(--accent);
+		color: var(--bg);
+	}
+	.canvas :global(svg) {
+		display: block;
+		max-width: 100%;
+		height: auto;
+		margin: 0 auto;
+	}
+	.canvas :global(.axis),
+	.canvas :global(.tick) {
+		font-family: var(--mono);
+		font-size: 10px;
+		fill: var(--muted);
+	}
+	.canvas :global(.tick) {
+		text-anchor: middle;
+	}
+	.canvas :global(.dep) {
+		stroke: var(--muted);
+		stroke-width: 1.1;
+	}
+	.canvas :global(.dep.bad) {
+		stroke: var(--bad);
+		stroke-width: 1.8;
+	}
+	.canvas :global(.ah) {
+		fill: var(--muted);
+	}
+	.canvas :global(.ah.bad) {
+		fill: var(--bad);
+	}
+	.canvas :global(.pt circle) {
+		fill: var(--surface);
+		stroke: var(--accent);
+		stroke-width: 1.2;
+	}
+	.canvas :global(.pt.grouped circle) {
+		fill: hsl(var(--hue) 60% var(--pt-l));
+		stroke: hsl(var(--hue) 45% 45%);
+	}
+	.canvas :global(.pt text) {
+		font-family: var(--mono);
+		font-size: 10.5px;
+		text-anchor: middle;
+		fill: var(--text);
+	}
+	.note {
+		display: flex;
+		flex-direction: column;
+		gap: 0.1rem;
+		margin: 0.4rem auto 0;
+		max-width: 32rem;
+		font-size: 0.76rem;
+		color: var(--muted);
+		text-align: center;
+	}
+	.note :global(span:first-child) {
+		font-family: var(--mono);
+		color: var(--text);
+	}
+</style>

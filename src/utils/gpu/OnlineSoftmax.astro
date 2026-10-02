@@ -1,0 +1,228 @@
+---
+// One query row through online softmax, one block of keys per step (drawn in flash.ts). The top
+// bars are the scores and the running maximum m; the bottom bars are the weights exp(s - m),
+// with dashed outlines where a rise in m has just scaled earlier weights down. The table tracks
+// m, the rescale factor, the running sum and the output so far.
+// Usage in .mdx:
+//   <OnlineSoftmax />
+import { ONLINE_EXAMPLE, drawOnline, exactOutput, onlineStates } from "./flash";
+
+interface Props {
+	step?: number;
+	title?: string;
+}
+
+const { step = 1, title } = Astro.props;
+const states = onlineStates(ONLINE_EXAMPLE);
+const exact = exactOutput(ONLINE_EXAMPLE);
+const at = Math.min(step, states.length - 1);
+const fmt = (x: number) => (Number.isFinite(x) ? x.toFixed(3) : "−∞");
+---
+
+<figure class="online" data-step={at}>
+	{title && <figcaption class="title">{title}</figcaption>}
+	<div class="controls">
+		<button type="button" data-act="prev" aria-label="Previous block">‹</button>
+		<div class="segs">
+			{states.map((_, i) => <button type="button" class="seg" data-i={i} aria-label={i === 0 ? "Start" : `After block ${i}`}>{i === 0 ? "start" : `block ${i}`}</button>)}
+		</div>
+		<button type="button" data-act="next" aria-label="Next block">›</button>
+	</div>
+	<div class="canvas" set:html={drawOnline(ONLINE_EXAMPLE, states[at])} />
+	<table class="state">
+		<thead>
+			<tr>
+				<th>after</th><th>m</th><th>rescale e<sup>m′−m</sup></th><th>ℓ (sum of weights)</th><th>acc (Σ weight · v)</th><th>o = acc / ℓ</th>
+			</tr>
+		</thead>
+		<tbody>
+			{
+				states.slice(1).map((s, i) => (
+					<tr data-row={i + 1} class={i + 1 > at ? "hidden-row" : ""}>
+						<td>block {i + 1}</td>
+						<td>{s.m.toFixed(1)}</td>
+						<td>{i === 0 ? "—" : fmt(s.alpha)}</td>
+						<td>{fmt(s.l)}</td>
+						<td>{fmt(s.acc)}</td>
+						<td><b>{fmt(s.acc / s.l)}</b></td>
+					</tr>
+				))
+			}
+		</tbody>
+	</table>
+	<p class="exact">Exact softmax over all 12 keys: o = <b>{exact.toFixed(3)}</b></p>
+</figure>
+
+<script>
+	import { ONLINE_EXAMPLE, drawOnline, onlineStates } from "./flash";
+
+	const states = onlineStates(ONLINE_EXAMPLE);
+	for (const fig of document.querySelectorAll<HTMLElement>(".online")) {
+		const canvas = fig.querySelector<HTMLElement>(".canvas");
+		if (!canvas) continue;
+		let at = Number(fig.dataset.step ?? 1);
+		const go = (i: number) => {
+			at = Math.max(0, Math.min(states.length - 1, i));
+			canvas.innerHTML = drawOnline(ONLINE_EXAMPLE, states[at]);
+			for (const b of fig.querySelectorAll<HTMLElement>(".seg"))
+				b.setAttribute("aria-current", String(Number(b.dataset.i) === at));
+			for (const r of fig.querySelectorAll<HTMLElement>("tr[data-row]"))
+				r.classList.toggle("hidden-row", Number(r.dataset.row) > at);
+		};
+		fig.querySelector("[data-act=prev]")?.addEventListener("click", () => go(at - 1));
+		fig.querySelector("[data-act=next]")?.addEventListener("click", () => go(at + 1));
+		for (const b of fig.querySelectorAll<HTMLElement>(".seg")) b.addEventListener("click", () => go(Number(b.dataset.i)));
+		go(at);
+	}
+</script>
+
+<style>
+	.online {
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+	}
+	.title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.5rem;
+	}
+	.controls {
+		display: flex;
+		justify-content: center;
+		align-items: center;
+		gap: 0.4rem;
+		margin-bottom: 0.5rem;
+		font-size: 0.75rem;
+	}
+	.controls button {
+		border: 1px solid var(--faint);
+		background: var(--bg);
+		color: var(--text);
+		border-radius: 999px;
+		font: inherit;
+		cursor: pointer;
+		padding: 0.2rem 0.6rem;
+	}
+	.controls button:hover {
+		border-color: var(--accent);
+	}
+	.segs {
+		display: flex;
+		gap: 0.25rem;
+	}
+	.seg[aria-current="true"] {
+		background: var(--accent) !important;
+		border-color: var(--accent) !important;
+		color: var(--bg) !important;
+	}
+	.canvas {
+		overflow-x: auto;
+	}
+	.canvas :global(svg) {
+		display: block;
+		max-width: 100%;
+		height: auto;
+		margin: 0 auto;
+	}
+	.canvas :global(.lab) {
+		font-size: 9.5px;
+		text-anchor: end;
+		fill: var(--muted);
+	}
+	.canvas :global(.tick) {
+		font-size: 8.5px;
+		text-anchor: end;
+		fill: var(--muted);
+	}
+	.canvas :global(.axis) {
+		stroke: var(--muted);
+		stroke-width: 0.8;
+	}
+	.canvas :global(.blk) {
+		fill: none;
+		stroke: var(--faint);
+	}
+	.canvas :global(.blk.cur) {
+		fill: color-mix(in oklch, var(--accent) 8%, transparent);
+		stroke: var(--accent);
+	}
+	.canvas :global(.blab) {
+		font-size: 9px;
+		text-anchor: middle;
+		fill: var(--muted);
+	}
+	.canvas :global(.sbar.todo) {
+		fill: var(--faint);
+	}
+	.canvas :global(.sbar.done),
+	.canvas :global(.wbar.done) {
+		fill: color-mix(in oklch, var(--accent) 55%, var(--bg));
+	}
+	.canvas :global(.sbar.cur),
+	.canvas :global(.wbar.cur) {
+		fill: var(--accent);
+	}
+	.canvas :global(.ghost) {
+		fill: none;
+		stroke: var(--muted);
+		stroke-dasharray: 3 2;
+	}
+	.canvas :global(.val) {
+		font-family: var(--mono);
+		font-size: 8.5px;
+		text-anchor: middle;
+		fill: var(--muted);
+	}
+	.canvas :global(.mline) {
+		stroke: #d0574f;
+		stroke-width: 1.3;
+		stroke-dasharray: 5 3;
+	}
+	.canvas :global(.mline.old) {
+		stroke: var(--muted);
+		stroke-width: 0.8;
+	}
+	.canvas :global(.mlab) {
+		font-family: var(--mono);
+		font-size: 9.5px;
+		fill: #d0574f;
+	}
+	.canvas :global(.mlab.old) {
+		fill: var(--muted);
+	}
+	.state {
+		margin: 0.6rem auto 0;
+		font-size: 0.74rem;
+		border-collapse: collapse;
+	}
+	.state th,
+	.state td {
+		padding: 0.2rem 0.6rem;
+		text-align: right;
+		font-family: var(--mono);
+	}
+	.state th {
+		font-family: var(--sans);
+		font-weight: 500;
+		color: var(--muted);
+	}
+	.state td:first-child,
+	.state th:first-child {
+		text-align: left;
+		font-family: var(--sans);
+	}
+	.state :global(.hidden-row) {
+		visibility: hidden;
+	}
+	.exact {
+		margin: 0.4rem 0 0;
+		font-size: 0.76rem;
+		text-align: center;
+		color: var(--muted);
+	}
+	.exact b {
+		color: var(--text);
+		font-family: var(--mono);
+	}
+</style>

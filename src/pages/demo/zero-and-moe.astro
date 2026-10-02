@@ -1,0 +1,26 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import EplbPlacement from "../../utils/distributed/EplbPlacement.astro";
+import MoeDispatch from "../../utils/distributed/MoeDispatch.astro";
+import ZeroMemory from "../../utils/distributed/ZeroMemory.astro";
+---
+
+<Layout title="ZeRO and MoE demo">
+	<h1>ZeRO and MoE demo</h1>
+	<p>Figures from <code>zero.ts</code>, <code>moe.ts</code> and <code>eplb.ts</code>.</p>
+
+	<h2>EplbPlacement</h2>
+	<EplbPlacement />
+
+	<h2>ZeroMemory</h2>
+	<ZeroMemory billions={7.5} n={64} />
+
+	<h2>ZeroMemory, 70B on 8 GPUs</h2>
+	<ZeroMemory billions={70} n={8} />
+
+	<h2>MoeDispatch</h2>
+	<MoeDispatch skew={1} />
+
+	<h2>MoeDispatch with a capacity factor</h2>
+	<MoeDispatch skew={1} capacity={1.25} capacityControl />
+</Layout>

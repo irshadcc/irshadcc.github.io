@@ -1,0 +1,26 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import DispatchTable from "../../utils/dispatcher/DispatchTable.astro";
+import KeySetSteps from "../../utils/dispatcher/KeySetSteps.astro";
+import KeySetWord from "../../utils/dispatcher/KeySetWord.astro";
+---
+
+<Layout title="PyTorch dispatcher demo">
+	<h1>PyTorch dispatcher demo</h1>
+	<p>Figures from <code>dispatchKeys.ts</code> and <code>dispatcherFigures.ts</code>.</p>
+
+	<h2>KeySetWord, the 64-bit layout</h2>
+	<KeySetWord />
+
+	<h2>KeySetSteps, all scenarios</h2>
+	<KeySetSteps step={5} />
+
+	<h2>KeySetSteps, one scenario at its lookup step</h2>
+	<KeySetSteps only="autocast" step={5} />
+
+	<h2>DispatchTable, first step</h2>
+	<DispatchTable />
+
+	<h2>DispatchTable, final table with the add lookup path highlighted</h2>
+	<DispatchTable step={7} highlight={["AutogradCPU", "CPU"]} />
+</Layout>

@@ -1,0 +1,210 @@
+---
+// DeepSeek's EPLB on the example from its README (algorithm ported in eplb.ts): 12 logical
+// experts in 4 groups, 16 physical copies on 2 nodes of 4 GPUs. Left, each expert's load and copy
+// count; right, the copies each GPU holds, stacked by load. Tabs switch the policy and the layer.
+// Usage in .mdx:
+//   <EplbPlacement />
+import { EPLB_EXAMPLE, drawEplb, rebalance } from "./eplb";
+
+interface Props {
+	title?: string;
+}
+
+const { title } = Astro.props;
+const CFG = { numPhy: 16, numGroups: 4, numNodes: 2, numGpus: 8 };
+const place = (layer: number, global: boolean) =>
+	rebalance(EPLB_EXAMPLE[layer], CFG.numPhy, global ? 1 : CFG.numGroups, global ? 1 : CFG.numNodes, CFG.numGpus);
+const stats = (layer: number, global: boolean) => {
+	const p = place(layer, global);
+	const mean = p.gpuLoad.reduce((a, b) => a + b, 0) / p.gpuLoad.length;
+	const max = Math.max(...p.gpuLoad);
+	const hottest = Math.max(...EPLB_EXAMPLE[layer]);
+	return { max, mean, hottest };
+};
+const s = stats(0, false);
+const draw = (layer: number, global: boolean) =>
+	drawEplb(EPLB_EXAMPLE[layer], place(layer, global), global ? { numGroups: 4, numNodes: 1 } : { numGroups: 4, numNodes: 2 });
+---
+
+<figure class="eplb">
+	{title && <figcaption class="title">{title}</figcaption>}
+	<div class="bar">
+		<div class="tabs" role="tablist" data-knob="policy">
+			<button type="button" role="tab" data-v="h" aria-selected="true">Hierarchical (prefill)</button>
+			<button type="button" role="tab" data-v="g" aria-selected="false">Global (decode)</button>
+		</div>
+		<div class="tabs" role="tablist" data-knob="layer">
+			<button type="button" role="tab" data-v="0" aria-selected="true">layer 0</button>
+			<button type="button" role="tab" data-v="1" aria-selected="false">layer 1</button>
+		</div>
+	</div>
+	<p class="legend">Colours are the 4 expert groups (experts 0–2, 3–5, 6–8, 9–11).</p>
+	<div class="canvas" set:html={draw(0, false)} />
+	<dl class="stats">
+		<div><dt>busiest GPU</dt><dd data-s="max">{s.max.toFixed(1)}</dd></div>
+		<div><dt>mean</dt><dd data-s="mean">{s.mean.toFixed(1)}</dd></div>
+		<div><dt>imbalance</dt><dd data-s="imb">{(s.max / s.mean).toFixed(2)}×</dd></div>
+		<div><dt>without copies, at least</dt><dd data-s="floor">{(s.hottest / s.mean).toFixed(2)}×</dd></div>
+	</dl>
+</figure>
+
+<script>
+	import { EPLB_EXAMPLE, drawEplb, rebalance } from "./eplb";
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".eplb")) {
+		const state = { global: false, layer: 0 };
+		const canvas = fig.querySelector<HTMLElement>(".canvas");
+		if (!canvas) continue;
+		const set = (k: string, v: string) => {
+			const el = fig.querySelector(`[data-s=${k}]`);
+			if (el) el.textContent = v;
+		};
+		const render = () => {
+			const w = EPLB_EXAMPLE[state.layer];
+			const p = state.global ? rebalance(w, 16, 1, 1, 8) : rebalance(w, 16, 4, 2, 8);
+			canvas.innerHTML = drawEplb(w, p, { numGroups: 4, numNodes: state.global ? 1 : 2 });
+			const mean = p.gpuLoad.reduce((a, b) => a + b, 0) / p.gpuLoad.length;
+			const max = Math.max(...p.gpuLoad);
+			set("max", max.toFixed(1));
+			set("mean", mean.toFixed(1));
+			set("imb", `${(max / mean).toFixed(2)}×`);
+			set("floor", `${(Math.max(...w) / mean).toFixed(2)}×`);
+		};
+		for (const list of fig.querySelectorAll<HTMLElement>("[role=tablist]"))
+			for (const tab of list.querySelectorAll<HTMLButtonElement>("[role=tab]"))
+				tab.addEventListener("click", () => {
+					for (const t of list.querySelectorAll("[role=tab]")) t.setAttribute("aria-selected", String(t === tab));
+					if (list.dataset.knob === "policy") state.global = tab.dataset.v === "g";
+					else state.layer = Number(tab.dataset.v);
+					render();
+				});
+	}
+</script>
+
+<style>
+	.eplb {
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+	}
+	.title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.5rem;
+	}
+	.bar {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.4rem 1.5rem;
+		margin-bottom: 0.4rem;
+		font-size: 0.78rem;
+	}
+	.tabs {
+		display: flex;
+		gap: 0.25rem;
+	}
+	.tabs button {
+		padding: 0.25rem 0.6rem;
+		border: 1px solid var(--faint);
+		border-radius: 999px;
+		background: var(--bg);
+		color: var(--text);
+		font: inherit;
+		cursor: pointer;
+	}
+	.tabs button:hover {
+		border-color: var(--accent);
+	}
+	.tabs button[aria-selected="true"] {
+		background: var(--accent);
+		border-color: var(--accent);
+		color: var(--bg);
+	}
+	.legend {
+		margin: 0 0 0.4rem;
+		font-size: 0.72rem;
+		color: var(--muted);
+		text-align: center;
+	}
+	.canvas {
+		overflow-x: auto;
+	}
+	.canvas :global(svg) {
+		display: block;
+		max-width: 100%;
+		height: auto;
+		margin: 0 auto;
+	}
+	.canvas :global(.h) {
+		font-size: 10px;
+		font-weight: 600;
+		fill: var(--muted);
+	}
+	.canvas :global(.lbar),
+	.canvas :global(.slot) {
+		stroke: color-mix(in oklch, #1a1a1a 30%, transparent);
+		stroke-width: 0.7;
+	}
+	.canvas :global(.el),
+	.canvas :global(.nl) {
+		font-family: var(--mono);
+		font-size: 9px;
+		text-anchor: middle;
+		fill: var(--muted);
+	}
+	.canvas :global(.nl) {
+		font-family: var(--sans);
+	}
+	.canvas :global(.cnt) {
+		font-family: var(--mono);
+		font-size: 9px;
+		font-weight: 600;
+		text-anchor: middle;
+		fill: var(--text);
+	}
+	.canvas :global(.sl) {
+		font-family: var(--mono);
+		font-size: 8.5px;
+		text-anchor: middle;
+		fill: #1a1a1a;
+		pointer-events: none;
+	}
+	.canvas :global(.node) {
+		fill: none;
+		stroke: var(--faint);
+		stroke-dasharray: 4 3;
+	}
+	.canvas :global(.mean) {
+		stroke: var(--text);
+		stroke-dasharray: 4 3;
+	}
+	.canvas :global(.ml) {
+		font-size: 9px;
+		fill: var(--muted);
+	}
+	.canvas :global(.axis) {
+		stroke: var(--muted);
+		stroke-width: 0.8;
+	}
+	.stats {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.3rem 1.5rem;
+		margin: 0.5rem 0 0;
+		font-size: 0.78rem;
+	}
+	.stats div {
+		display: flex;
+		gap: 0.4rem;
+	}
+	.stats dt {
+		color: var(--muted);
+	}
+	.stats dd {
+		margin: 0;
+		font-family: var(--mono);
+		font-weight: 600;
+	}
+</style>

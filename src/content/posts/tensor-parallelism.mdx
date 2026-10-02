@@ -1,0 +1,622 @@
+---
+title: "Tensor Parallelism, One Matrix at a Time"
+description: "Tensor parallelism splits every weight matrix of a transformer across GPUs. This post derives Megatron-LM's column- and row-parallel layers from a single matrix multiply, builds a tensor-parallel transformer block in about a hundred lines of PyTorch, works out what its all-reduces cost, and adds sequence parallelism to cut the activation memory."
+date: 2026-10-02
+tags: [Distributed training, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import MarginNote from "../../components/MarginNote.astro";
+import TpMatmul from "../../utils/distributed/TpMatmul.astro";
+import TpBlock from "../../utils/distributed/TpBlock.astro";
+import CollectiveSteps from "../../utils/distributed/CollectiveSteps.astro";
+
+## Background
+
+There are two ways to split a model that doesn't fit on one GPU. You can cut it by depth, giving
+each GPU a few whole layers, which is [pipeline parallelism](/blog/pipeline-parallelism/). Or you
+can cut every layer, giving each GPU a slice of every weight matrix. That is **tensor
+parallelism** (TP), and it is the subject of this post.
+
+Splitting by layer is cheap to communicate but leaves GPUs idle while they wait for each other.
+Splitting every layer keeps all the GPUs busy on the same layer at the same time, but they have to
+combine their partial results inside every layer. This post works out where those combinations go,
+using the scheme from Megatron-LM (Shoeybi et al., 2019), which nearly every training and serving
+framework now copies. It then counts what the communication costs, and adds **sequence
+parallelism**, which removes most of the memory TP leaves behind.
+
+The collectives used here (all-reduce, reduce-scatter and all-gather) and their costs are covered
+in [How GPUs Talk](/blog/collective-communication/), and
+[Distributed Topology](/blog/distributed-topology/) shows which ranks end up in a TP group and
+why that group is kept inside one server.
+
+## Splitting one matrix multiply
+
+Every large matrix in a transformer is used in a linear layer, $Y = XW$. Here $X$ is
+$s \times h$: one row per token, one column per feature. $W$ is $h \times h'$. There are two
+natural ways to split $W$ across $N$ GPUs.<Sidenote>PyTorch stores a linear layer's weight
+transposed, as $h' \times h$, and computes $XW^\top$. So "split $W$ by columns" means "split
+`weight` along dim 0" in code. The math below uses $Y = XW$.</Sidenote>
+
+**By columns.** Write $W = [W_0, W_1, \ldots, W_{N-1}]$, so rank $i$ holds $h'/N$ of the output
+features. Then
+
+$$
+Y = X[W_0, \ldots, W_{N-1}] = [XW_0, \ldots, XW_{N-1}]
+$$
+
+Every rank needs all of $X$, and produces its own columns of $Y$. Nothing has to be exchanged: the
+output is simply left split across the ranks.
+
+**By rows.** Split $W$ into $N$ blocks of rows instead, $W_i$ of shape $h/N \times h'$. A row
+block of $W$ only multiplies the matching columns of $X$, so split $X$ the same way:
+
+$$
+Y = [X_0, \ldots, X_{N-1}] \begin{bmatrix} W_0 \\ \vdots \\ W_{N-1} \end{bmatrix} = \sum_{i} X_i W_i
+$$
+
+Each rank computes a full-size $s \times h'$ product, but it is only a partial sum over its share
+of the inner dimension. Adding them up across ranks is an **all-reduce**.
+
+<TpMatmul modes={["column", "row"]} n={4} title="Two ways to split Y = XW over 4 ranks" />
+
+Hover a rank in the legend to see everything it holds. A column-parallel layer takes a replicated
+input and leaves a split output. A row-parallel layer takes a split input and, after the
+all-reduce, leaves a replicated output. Those two shapes fit together, which is the whole idea.
+
+## The MLP: column, then row
+
+A transformer's MLP is $Y = \text{GeLU}(XA)\,B$, with $A$ of shape $h \times 4h$ and $B$ of shape
+$4h \times h$. Split $A$ by columns, and each rank computes its own columns of $XA$. GeLU is
+applied element by element, so it doesn't care how the columns are divided: rank $i$ can compute
+$Z_i = \text{GeLU}(XA_i)$ by itself. And $Z$, split by columns, is exactly the input a
+row-parallel $B$ wants:
+
+$$
+Y = [Z_0, \ldots, Z_{N-1}] \begin{bmatrix} B_0 \\ \vdots \\ B_{N-1} \end{bmatrix} = \sum_i Z_i B_i
+$$
+
+<TpMatmul modes={["mlp"]} n={4} title="The MLP over 4 ranks" />
+
+So the whole MLP costs a single all-reduce, at the end. The other order would be worse. If $A$
+were split by rows, each rank would hold a partial sum of $XA$, and GeLU of a partial sum is not
+the partial sum of GeLUs:
+
+$$
+\text{GeLU}(X_0 A_0 + X_1 A_1) \neq \text{GeLU}(X_0 A_0) + \text{GeLU}(X_1 A_1)
+$$
+
+The ranks would need an all-reduce before the GeLU as well as after $B$. Column-then-row is the
+split that lets the nonlinearity run on local data.
+
+The memory saving is the point of all this: each rank stores $1/N$ of $A$ and $1/N$ of $B$, and
+the $s \times 4h$ activation $Z$, the largest one in the MLP, is split $N$ ways too.
+
+## The backward pass: f and g
+
+The backward pass mirrors the forward one. Write the MLP's input as $X$ and suppose every rank
+holds $\partial L / \partial Y$, the gradient of the loss with respect to the MLP's output.
+
+- The all-reduce at the end of the forward pass gave every rank the same $Y$. Its gradient just
+  passes through: every rank already has the full $\partial L/\partial Y$, and each uses it to
+  compute the gradients of its own $B_i$ and $Z_i$.
+- At the start, every rank used the same $X$, but each only sent it through its own slice
+  $A_i$. So rank $i$ can only compute its own term of the input gradient:
+
+$$
+\frac{\partial L}{\partial X} = \sum_i \frac{\partial L}{\partial (XA_i)} A_i^\top
+$$
+
+That sum is another all-reduce, this time in the backward pass.
+
+Megatron packages these as two **conjugate** operators. **$f$** sits where a replicated tensor
+enters a tensor-parallel region: it does nothing in the forward pass and all-reduces the gradient
+in the backward pass. **$g$** sits where the region ends: it all-reduces in the forward pass and
+does nothing in the backward pass. The MLP is then
+
+$$
+X \xrightarrow{\ f\ } \text{column-parallel } A \to \text{GeLU} \to \text{row-parallel } B \xrightarrow{\ g\ } Y
+$$
+
+In PyTorch, each is a small autograd function:
+
+```python
+class Copy(torch.autograd.Function):
+    """f: identity in the forward pass, all-reduce in the backward pass."""
+
+    @staticmethod
+    def forward(ctx, x):
+        return x
+
+    @staticmethod
+    def backward(ctx, grad):
+        grad = grad.clone()
+        dist.all_reduce(grad)
+        return grad
+
+
+class Reduce(torch.autograd.Function):
+    """g: all-reduce in the forward pass, identity in the backward pass."""
+
+    @staticmethod
+    def forward(ctx, x):
+        x = x.clone()
+        dist.all_reduce(x)
+        return x
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad
+```
+
+These are Megatron's `copy_to_tensor_model_parallel_region` and
+`reduce_from_tensor_model_parallel_region`, in `megatron/core/tensor_parallel/mappings.py`.
+
+## Attention: split by heads
+
+Attention splits even more naturally, because its heads are already independent. With $a$ heads of
+size $d = h/a$, the queries, keys and values are $Q = XW_Q$, $K = XW_K$ and $V = XW_V$, and head $j$
+uses only columns $jd$ to $(j+1)d$ of each. Split $W_Q$, $W_K$ and $W_V$ by columns along head
+boundaries, and rank $i$ gets complete heads: $a/N$ of them. It runs attention for those heads
+without talking to anyone.
+
+The heads' outputs are concatenated and multiplied by the output projection $W_O$. Each rank holds
+the columns of that concatenation that belong to its heads, which is a column-split input, so
+$W_O$ is row-parallel. The attention block has the same shape as the MLP:
+
+$$
+X \xrightarrow{\ f\ } \text{column-parallel } W_Q, W_K, W_V \to \text{attention over } a/N \text{ heads} \to \text{row-parallel } W_O \xrightarrow{\ g\ } Y
+$$
+
+This puts a limit on $N$: it must divide the number of heads. Models with grouped-query attention
+have fewer key and value heads than query heads. Llama 3 70B has 64 query heads but only 8 KV
+heads, so TP 8 gives each rank one KV head. Beyond 8 ranks, the KV heads have to be copied onto
+several ranks instead of split.<MarginNote>vLLM, for example, replicates KV heads when the TP size
+exceeds their number.</MarginNote>
+
+## Building it
+
+Here is a complete tensor-parallel transformer block, checked against the ordinary one. As in the
+[pipeline post](/blog/pipeline-parallelism/), it runs on CPUs with `torchrun`:
+
+```bash
+torchrun --nproc-per-node 4 tp.py
+```
+
+The script is the code blocks of this section in order, with `Copy` and `Reduce` from the previous
+section placed right after the imports.
+
+### The model
+
+First, the block as you would write it for one GPU: pre-norm attention and an MLP, with residual
+connections. The attention is written so it works for any number of heads, because a
+tensor-parallel rank will call it with only $a/N$ of them:
+
+```python
+import copy
+
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+import torch.nn.functional as F
+
+H, HEADS, FFN, SEQ, BATCH = 64, 8, 256, 16, 4
+D_HEAD = H // HEADS
+
+
+def attend(q, k, v):
+    """Causal attention over (batch, seq, heads * D_HEAD) inputs, for any number of heads."""
+    b, s, _ = q.shape
+    split = lambda t: t.view(b, s, -1, D_HEAD).transpose(1, 2)  # (b, heads, s, d)
+    out = F.scaled_dot_product_attention(split(q), split(k), split(v), is_causal=True)
+    return out.transpose(1, 2).reshape(b, s, -1)
+
+
+class Attention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.q, self.k, self.v, self.o = (nn.Linear(H, H) for _ in range(4))
+
+    def forward(self, x):
+        return self.o(attend(self.q(x), self.k(x), self.v(x)))
+
+
+class MLP(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.up, self.down = nn.Linear(H, FFN), nn.Linear(FFN, H)
+
+    def forward(self, x):
+        return self.down(F.gelu(self.up(x)))
+
+
+class Block(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.ln1, self.ln2 = nn.LayerNorm(H), nn.LayerNorm(H)
+        self.attn, self.mlp = Attention(), MLP()
+
+    def forward(self, x):
+        x = x + self.attn(self.ln1(x))
+        return x + self.mlp(self.ln2(x))
+```
+
+### The parallel layers
+
+Each parallel layer is built from a full `nn.Linear` by keeping its own slice of the weights. The
+column-parallel layer keeps a slice of the output features and its bias. The row-parallel layer
+keeps a slice of the input features, and it ends with $g$. Its bias is added once, after the
+all-reduce, otherwise it would be counted $N$ times:
+
+```python
+def shard(t, dim, rank, world):
+    return nn.Parameter(t.detach().chunk(world, dim=dim)[rank].clone())
+
+
+class ColumnParallelLinear(nn.Module):
+    """Keeps a slice of the output features. Needs no communication."""
+
+    def __init__(self, full, rank, world):
+        super().__init__()
+        self.weight = shard(full.weight, 0, rank, world)  # PyTorch stores W as (out, in)
+        self.bias = shard(full.bias, 0, rank, world)
+
+    def forward(self, x):
+        return F.linear(x, self.weight, self.bias)
+
+
+class RowParallelLinear(nn.Module):
+    """Keeps a slice of the input features, so its product is a partial sum."""
+
+    def __init__(self, full, rank, world, reduce=Reduce):
+        super().__init__()
+        self.weight = shard(full.weight, 1, rank, world)
+        self.bias = nn.Parameter(full.bias.detach().clone())  # added once, after the sum
+        self.reduce = reduce
+
+    def forward(self, x):
+        return self.reduce.apply(F.linear(x, self.weight)) + self.bias
+```
+
+The `reduce` argument is there for sequence parallelism later; for now it is always $g$.
+
+The parallel MLP and attention then follow the two diagrams above: $f$, column-parallel layers,
+the local computation, and a row-parallel layer that ends in $g$. `attend` gets $a/N$ heads'
+worth of queries, keys and values, and works it out from the shapes:
+
+```python
+class ParallelMLP(nn.Module):
+    def __init__(self, full, rank, world, enter=Copy, reduce=Reduce):
+        super().__init__()
+        self.up = ColumnParallelLinear(full.up, rank, world)
+        self.down = RowParallelLinear(full.down, rank, world, reduce)
+        self.enter = enter
+
+    def forward(self, x):
+        x = self.enter.apply(x)
+        return self.down(F.gelu(self.up(x)))
+
+
+class ParallelAttention(nn.Module):
+    def __init__(self, full, rank, world, enter=Copy, reduce=Reduce):
+        super().__init__()
+        self.q, self.k, self.v = (ColumnParallelLinear(getattr(full, n), rank, world) for n in "qkv")
+        self.o = RowParallelLinear(full.o, rank, world, reduce)
+        self.enter = enter
+
+    def forward(self, x):
+        x = self.enter.apply(x)
+        return self.o(attend(self.q(x), self.k(x), self.v(x)))  # HEADS / world heads here
+
+
+def parallelize(block, rank, world, **ops):
+    block.attn = ParallelAttention(block.attn, rank, world, **ops)
+    block.mlp = ParallelMLP(block.mlp, rank, world, **ops)
+    return block
+```
+
+The layer norms and residual connections are untouched. They run on the full, replicated
+activation on every rank, doing identical work.<Sidenote>Splitting $W_Q$, $W_K$ and $W_V$ into
+three layers means $f$ runs once for all three, as here. Megatron goes further and fuses them into
+one `ColumnParallelLinear` with $3h/N$ outputs per rank, which is one larger, faster GEMM.</Sidenote>
+
+### Checking it
+
+Every rank builds the same block from the same seed, makes a tensor-parallel copy, and runs both
+on the same input. The output should match, and each rank's slice of each gradient should match
+the same slice of the full gradient:
+
+```python
+def main():
+    dist.init_process_group("gloo")
+    rank, world = dist.get_rank(), dist.get_world_size()
+
+    torch.manual_seed(0)
+    ref = Block()
+    tp = parallelize(copy.deepcopy(ref), rank, world)
+
+    x = torch.randn(BATCH, SEQ, H)
+    out_ref, out_tp = ref(x), tp(x)
+    out_ref.square().mean().backward()
+    out_tp.square().mean().backward()
+
+    grad_err = 0.0
+    for p_ref, p_tp in zip(ref.parameters(), tp.parameters()):
+        g = p_ref.grad
+        if p_tp.shape != p_ref.shape:  # a sharded weight: compare this rank's slice
+            g = g.chunk(world, dim=0 if p_tp.shape[0] != p_ref.shape[0] else 1)[rank]
+        grad_err = max(grad_err, (g - p_tp.grad).abs().max().item())
+    out_err = (out_ref - out_tp).abs().max().item()
+    print(f"rank {rank}: output error {out_err:.1e}, gradient error {grad_err:.1e}")
+    dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+With 2 or 4 ranks, every rank prints an output error around $5 \times 10^{-7}$ and a gradient
+error around $2 \times 10^{-9}$: the same block, up to the order of floating-point additions.
+
+It is worth breaking it on purpose. Make `Copy.backward` return the gradient without the
+all-reduce, and the output is still right, but the gradient error jumps to about
+$5 \times 10^{-3}$. The weights inside the parallel layers still get correct gradients. The ones
+that go wrong are the layer norms', because each rank only passed its own heads' share of the
+input gradient back into them. A missing $f$ doesn't crash anything. It trains a slightly wrong
+model.
+
+## Embeddings and the loss
+
+The two largest matrices in a language model are at its ends: the input embedding and the output
+layer, each $|V| \times h$ for a vocabulary of $|V|$ tokens. Both are split along the vocabulary.
+
+**The embedding** is a lookup, which is a matrix multiply by a one-hot vector. Each rank holds
+$|V|/N$ rows. For a token in its range it returns the row, and for any other token it returns
+zeros. An all-reduce then gives every rank the embedding of every token: a row-parallel layer in
+disguise.
+
+**The output layer** is column-parallel: rank $i$ computes the logits $z$ for its own slice of the
+vocabulary. Gathering all $s \times |V|$ logits onto every rank would be expensive. With a
+128K-token vocabulary, they are many times larger than the hidden states. So Megatron computes the
+cross-entropy loss on the split logits, with three all-reduces of one number per token:
+
+1. The maximum logit, $m = \max_v z_v$, with a max all-reduce, for numerical stability.
+2. The sum $\sum_v e^{z_v - m}$, with a sum all-reduce.
+3. The logit of the correct token, $z_y$. Only the rank whose slice contains $y$ knows it; the
+   others contribute zero to a sum all-reduce.
+
+The loss is then $\log \sum_v e^{z_v - m} - (z_y - m)$ on every rank. The gradient with respect to
+the logits is $\text{softmax}(z) - \text{onehot}(y)$, which each rank can compute for its own
+slice of the vocabulary from these numbers, with no further communication.
+
+## What it costs
+
+In the forward pass, every block runs two all-reduces ($g$ in attention and in the MLP), and in the
+backward pass two more ($f$ in each). Each all-reduces an $s \times h$ activation, $2sh$ bytes in
+bf16 per sequence. With the ring cost from the collectives post, the bandwidth term for one block's
+forward pass is
+
+$$
+T_\text{comm} = 2 \cdot 2\frac{N-1}{N} \cdot 2sh \cdot \beta
+$$
+
+The compute is split $N$ ways. A block has $12h^2$ weights, so its forward pass costs $24h^2$ FLOPs
+per token for the matrix multiplies, plus $4sh$ for the attention scores and their weighted sum.
+At $F$ FLOP/s per GPU:
+
+$$
+T_\text{compute} = \frac{(24h^2 + 4sh)\, s}{N F}
+$$
+
+Their ratio is
+
+$$
+\frac{T_\text{comm}}{T_\text{compute}} = \frac{8(N-1)\,F\beta}{24h + 4s}
+$$
+
+Three things fall out of this. The batch size and sequence length mostly cancel, so you can't
+amortize TP communication by processing more tokens: it is a fixed tax per token. The tax grows
+with $N - 1$, so doubling the TP size nearly doubles the relative cost. And it shrinks with $h$, so
+larger models can afford more TP. $F\beta$ is the number of FLOPs a GPU can do in the time it takes
+to send one byte, and it decides how big the tax is. On an H100, at its peak of 989 bf16 TFLOP/s:
+
+| Link | $h$ | TP 2 | TP 4 | TP 8 |
+| --- | ---: | ---: | ---: | ---: |
+| NVLink, 450 GB/s | 4096 | 0.15 | 0.46 | 1.07 |
+| NVLink, 450 GB/s | 8192 | 0.08 | 0.25 | 0.58 |
+| InfiniBand, 50 GB/s | 4096 | 1.38 | 4.14 | 9.66 |
+| InfiniBand, 50 GB/s | 8192 | 0.74 | 2.23 | 5.20 |
+
+These are ratios of communication time to compute time in the forward pass, with $s = 4096$. The
+backward pass does twice the compute with the same number of all-reduces, so over a whole step the
+ratio is about $2/3$ of these. Real GPUs don't reach their peak FLOP rate, which makes the compute
+slower and the ratios smaller, and real all-reduces don't reach the link's full bandwidth, which
+pushes the other way.
+
+The table explains the placement rule from the topology post. Inside a server, TP 8 on a large
+model spends roughly a third as long communicating as computing, which is costly but workable,
+and the next section shows how to hide much of it. Across InfiniBand, the same group would spend
+several times longer communicating than computing. That is why TP almost never leaves the NVLink
+domain, and why models too large for one server add pipeline parallelism instead.
+
+## Sequence parallelism
+
+TP splits the weights, and the activations inside the attention and the MLP. But look at what is
+left over: the layer norms, the dropouts and the residual additions all run on the full $s \times
+h$ activation, and every rank does the same work on the same data, and stores the same copy for
+the backward pass.
+
+Korthikanti et al. (2022) counted the activation memory a transformer layer stores for its backward
+pass, in bytes, with 16-bit activations. With $a$ heads, a batch of $b$ sequences and TP size $t$,
+it is
+
+$$
+sbh\left(10 + \frac{24}{t} + \frac{5as}{ht}\right)
+$$
+
+The $24/t$ comes from the tensors inside the parallel regions. The $5as/ht$ is the attention
+scores and softmax, which FlashAttention never stores, so in practice it drops out. The $10$ is the
+replicated part: the inputs to the two layer norms and to the two linear layers that follow them,
+and the dropout masks. It doesn't shrink with $t$, so at TP 8, $10$ of every $13$ bytes are
+copies.
+
+### Splitting along the sequence
+
+Layer norm and dropout work on each token independently, so these regions can be split a different
+way: along the sequence. Rank $i$ keeps tokens $is/N$ to $(i+1)s/N$ and runs the layer norm,
+dropout and residual add for only those. This is **sequence parallelism** (SP).
+
+The tensor-parallel regions still need every token. So entering one, the ranks **all-gather** their
+sequence slices into the full activation. Leaving one, the row-parallel layer's partial sums have
+to be added up, but each rank only needs the sum for its own tokens. That is a **reduce-scatter**,
+not an all-reduce.
+
+<TpBlock n={4} title="What each rank holds through one transformer block" />
+
+Switch between the tabs. With plain TP, the grey cells are full copies on every rank. With SP,
+every activation in the block is split one way or the other. Change $t$ to see the replicated
+part's share grow with the TP size, and the memory readout under the figure.
+
+### The communication is free
+
+All-reduce is a reduce-scatter followed by an all-gather, and that is exactly what SP does, just
+moved apart. Under plain TP, the end of a row-parallel layer is an all-reduce:
+
+<CollectiveSteps op="all-reduce" n={4} title="TP: one all-reduce at g" />
+
+Under SP, the same layer ends with only the first half, the reduce-scatter, and the second half,
+the all-gather, runs at the start of the next tensor-parallel region, after the layer norm. Each
+moves $\frac{N-1}{N}M$ bytes, so SP sends exactly what TP did. The backward pass swaps the two: the
+gradient of an all-gather is a reduce-scatter, and the gradient of a reduce-scatter is an
+all-gather.
+
+### In code
+
+SP needs two new operators, conjugate like $f$ and $g$, that split and join along the sequence
+dimension:
+
+```python
+def gather_seq(x):
+    parts = [torch.empty_like(x) for _ in range(dist.get_world_size())]
+    dist.all_gather(parts, x.contiguous())
+    return torch.cat(parts, dim=1)
+
+
+def reduce_scatter_seq(x):
+    chunks = [c.contiguous() for c in x.chunk(dist.get_world_size(), dim=1)]
+    out = torch.empty_like(chunks[0])
+    dist.reduce_scatter(out, chunks)
+    return out
+
+
+class GatherSeq(torch.autograd.Function):
+    """All-gather along the sequence; its gradient is a reduce-scatter."""
+
+    @staticmethod
+    def forward(ctx, x):
+        return gather_seq(x)
+
+    @staticmethod
+    def backward(ctx, grad):
+        return reduce_scatter_seq(grad)
+
+
+class ScatterSeq(torch.autograd.Function):
+    """Reduce-scatter along the sequence; its gradient is an all-gather."""
+
+    @staticmethod
+    def forward(ctx, x):
+        return reduce_scatter_seq(x)
+
+    @staticmethod
+    def backward(ctx, grad):
+        return gather_seq(grad)
+```
+
+They slot into the same parallel layers in place of $f$ and $g$:
+
+```python
+tp = parallelize(copy.deepcopy(ref), rank, world, enter=GatherSeq, reduce=ScatterSeq)
+x_local = x.chunk(world, dim=1)[rank]  # each rank feeds in only its tokens
+out_local = tp(x_local)
+```
+
+The `Block` itself doesn't change. Its layer norms and residual adds now simply see a shorter
+sequence.<Sidenote>Megatron lays activations out as (sequence, batch, hidden) rather than (batch,
+sequence, hidden), so that the sequence dimension is the outermost one. Then a slice of the
+sequence is contiguous in memory, and the all-gather and reduce-scatter can work on flat buffers
+with no copies.</Sidenote>
+
+There is one catch, and the check finds it. With SP, each rank's layer norms see only its own
+tokens, so their weight gradients are partial sums. The same goes for the row-parallel biases,
+which are now added to each rank's slice. Their gradients have to be summed over the TP group
+after the backward pass:
+
+```python
+def sync_replicated_grads(block):
+    """Layer norms and row-parallel biases saw only this rank's tokens: sum their gradients."""
+    for name, p in block.named_parameters():
+        if name.startswith(("ln", "attn.o.bias", "mlp.down.bias")):
+            dist.all_reduce(p.grad)
+```
+
+Without it, the gradient error is about $9 \times 10^{-3}$. With it, the SP block matches the
+reference as closely as plain TP did, on 2 and 4 ranks. Megatron does the same in
+`_allreduce_non_tensor_model_parallel_grads`, on the parameters it marks with
+`sequence_parallel=True`.
+
+### The memory
+
+With SP, the replicated $10\,sbh$ is split too, and the activation memory per layer becomes
+
+$$
+\frac{sbh}{t}\left(34 + \frac{5as}{h}\right)
+$$
+
+Every term now shrinks with $t$. For a layer with $h = 8192$ and $s = 4096$ at TP 8, without the
+attention-score term, that is $4.25\,sbh$ against $13\,sbh$ for plain TP: 136 MiB instead of
+416 MiB per sequence, per layer. Over 80 layers, it is the difference between 11 GiB and 33 GiB of
+activations for one sequence, at no cost in communication. That is why SP is on by default
+whenever TP is.
+
+## Hiding the communication
+
+Even inside a server, the all-reduces cost a large share of the compute, and in the forward pass
+nothing can run while they do. The output projection needs the all-gathered input before it can
+start, and the next layer needs its reduce-scattered output.
+
+The way around this is to break the dependency into pieces. An all-gather followed by a matrix
+multiply can be split into $N$ steps: multiply the slice you already have while the next slice
+arrives, as in a ring. Likewise, a matrix multiply followed by a reduce-scatter can send each
+chunk of the output as soon as it is computed. Wang et al. (2023) showed how to do this for
+TP, and both Megatron (through Transformer Engine's `--tp-comm-overlap`) and PyTorch (as
+"async TP", with symmetric memory and `torch.compile`) now implement it. It needs no change to
+the math in this post, only to the order in which the pieces run.
+
+## Summary
+
+| Piece | Weight split | Forward | Backward |
+| --- | --- | --- | --- |
+| Column-parallel linear | By output features | Nothing | Nothing |
+| Row-parallel linear | By input features | All-reduce ($g$) | Nothing |
+| Entering a TP region | None | Nothing ($f$) | All-reduce |
+| Attention | By heads ($a/N$ per rank) | Nothing | Nothing |
+| Embedding | By vocabulary | All-reduce | Nothing |
+| Cross-entropy | By vocabulary | 3 small all-reduces | Nothing |
+| With SP: entering | None | All-gather | Reduce-scatter |
+| With SP: leaving | None | Reduce-scatter | All-gather |
+
+- **Column then row.** Every pair of linear layers in a transformer is split by columns, then by
+  rows, so the nonlinearity in between runs on local data, and each attention and MLP block needs
+  just one all-reduce in each direction.
+- **The cost is per token.** TP communication grows with the number of tokens exactly as the
+  compute does, so it can't be amortized. Relative to the compute it scales like $(N-1)/h$, which
+  keeps TP small (8 or less) and inside a server.
+- **Sequence parallelism is free.** Splitting an all-reduce into its reduce-scatter and all-gather
+  halves, and running the layer norms in between on a slice of the sequence, removes every
+  replicated activation without sending any more data. The one cost is a gradient all-reduce for
+  the parameters of the sequence-parallel regions.
+
+Tensor parallelism splits the weights inside each layer. The other way to split the weights is to
+split them across the data-parallel replicas instead, and gather them only when they are needed,
+which is what [ZeRO and FSDP](/blog/zero-and-fsdp/) do.

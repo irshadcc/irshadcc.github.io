@@ -1,0 +1,201 @@
+---
+// An LLVM IR function drawn as its control-flow graph: one box per basic block with its
+// instructions, arrows for branches (true/false for conditional ones). Hover any %value to light
+// up its single definition and every use, which is what SSA form guarantees; hover a block name
+// in a branch or phi to light up that block. Parsing and layout are in irCfg.ts.
+// Usage in .mdx:
+//   import { dotIr } from "../../utils/compiler/llvmData";
+//   <IrCfg ir={dotIr} title="dot(), optimized" focus="%16" />
+import { CFG_HEAD, CFG_LINE, layoutCfg, parseCfg } from "./irCfg";
+
+interface Props {
+	ir: string;
+	title?: string;
+	/** A value to highlight before the reader hovers anything, e.g. "%16". */
+	focus?: string;
+}
+
+const { ir, title, focus } = Astro.props;
+const cfg = parseCfg(ir);
+const L = layoutCfg(cfg);
+const PAD = 10;
+const describe = (v: string) => {
+	const info = cfg.values[v];
+	if (!info) return "";
+	const where =
+		info.defBlock === "argument"
+			? `an argument (${info.def})`
+			: `defined once, in block %${info.defBlock}: ${v} = ${info.def}`;
+	const uses = info.uses.length
+		? `used ${info.uses.length}× (in ${[...new Set(info.uses)].map((b) => `%${b}`).join(", ")})`
+		: "not used";
+	return `${v} is ${where}; ${uses}.`;
+};
+const hint = "Hover a %value to see its definition and uses.";
+---
+
+<figure class="cfg" data-focus={focus}>
+	{title && <figcaption class="cfg-title">{title}</figcaption>}
+	<p class="cfg-sig"><code>{cfg.signature}</code></p>
+	<svg viewBox={`0 0 ${L.width} ${L.height}`} role="img" aria-label={`Control-flow graph with ${L.blocks.length} basic blocks`}>
+		<defs>
+			<marker id="cfg-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+				<path d="M0,0 L8,4 L0,8 z" class="cfg-head"></path>
+			</marker>
+		</defs>
+		{
+			L.edges.map((e) => (
+				<g class="cfg-edge" data-from={e.from} data-to={e.to}>
+					<path d={e.d} marker-end="url(#cfg-arrow)" />
+					{e.labelAt && (
+						<text x={e.labelAt.x} y={e.labelAt.y} class="cfg-elabel">
+							{e.label}
+						</text>
+					)}
+				</g>
+			))
+		}
+		{
+			L.blocks.map((b) => (
+				<g class="cfg-block" data-block={b.name} transform={`translate(${b.x},${b.y})`}>
+					<rect width={b.w} height={b.h} rx="6" />
+					<text class="cfg-name" x={PAD} y={CFG_HEAD - 6}>{`%${b.name}:${b === L.blocks[0] ? " (entry)" : ""}`}</text>
+					{b.lines.map((line, k) => (
+						<text class="cfg-line" x={PAD} y={CFG_HEAD + (k + 1) * CFG_LINE - 3}>
+							{line.map((s) => (s.value ? <tspan class:list={["v", { def: s.def }]} data-v={s.value}>{s.text}</tspan> : s.block ? <tspan class="b" data-b={s.block}>{s.text}</tspan> : <tspan>{s.text}</tspan>))}
+						</text>
+					))}
+				</g>
+			))
+		}
+	</svg>
+	<p class="cfg-info" aria-live="polite" data-hint={hint}>{focus ? describe(focus) : hint}</p>
+	<script type="application/json" set:html={JSON.stringify(Object.fromEntries(Object.keys(cfg.values).map((v) => [v, describe(v)])))} />
+</figure>
+
+<script>
+	for (const fig of document.querySelectorAll<HTMLElement>(".cfg")) {
+		const info = fig.querySelector<HTMLElement>(".cfg-info");
+		const text: Record<string, string> = JSON.parse(fig.querySelector("script[type='application/json']")?.textContent ?? "{}");
+		const clear = () => {
+			for (const el of fig.querySelectorAll(".hl")) el.classList.remove("hl");
+		};
+		const showValue = (v: string) => {
+			clear();
+			for (const el of fig.querySelectorAll(`[data-v="${v}"]`)) el.classList.add("hl");
+			if (info) info.textContent = text[v] ?? "";
+		};
+		const showBlock = (b: string) => {
+			clear();
+			fig.querySelector(`.cfg-block[data-block="${b}"]`)?.classList.add("hl");
+			for (const el of fig.querySelectorAll(`[data-b="${b}"]`)) el.classList.add("hl");
+			if (info) info.textContent = `Block %${b}.`;
+		};
+		const reset = () => {
+			const f = fig.dataset.focus;
+			if (f) showValue(f);
+			else {
+				clear();
+				if (info) info.textContent = info.dataset.hint ?? "";
+			}
+		};
+		for (const el of fig.querySelectorAll<SVGTSpanElement>("tspan.v")) {
+			el.addEventListener("mouseenter", () => showValue(el.dataset.v ?? ""));
+			el.addEventListener("mouseleave", reset);
+		}
+		for (const el of fig.querySelectorAll<SVGTSpanElement>("tspan.b")) {
+			el.addEventListener("mouseenter", () => showBlock(el.dataset.b ?? ""));
+			el.addEventListener("mouseleave", reset);
+		}
+		reset();
+	}
+</script>
+
+<style>
+	.cfg {
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+	}
+	.cfg-title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.3rem;
+	}
+	.cfg-sig {
+		margin: 0 0 0.3rem;
+		text-align: center;
+		font-size: 0.75rem;
+	}
+	.cfg svg {
+		display: block;
+		width: 100%;
+		max-width: 560px;
+		height: auto;
+		margin: 0 auto;
+	}
+	.cfg-block rect {
+		fill: var(--surface);
+		stroke: var(--faint);
+		stroke-width: 1.2;
+	}
+	.cfg-block:global(.hl) rect {
+		stroke: var(--accent);
+		stroke-width: 2.2;
+	}
+	.cfg-name {
+		font: 600 11px var(--mono);
+		fill: var(--accent);
+	}
+	.cfg-line {
+		font: 11px var(--mono);
+		fill: var(--text);
+		white-space: pre;
+	}
+	.cfg-line .v,
+	.cfg-line .b {
+		cursor: default;
+	}
+	.cfg-line .v {
+		fill: var(--accent);
+	}
+	.cfg-line .v.def {
+		font-weight: 700;
+	}
+	.cfg-line .b {
+		fill: var(--muted);
+	}
+	.cfg-line :global(tspan.hl) {
+		fill: #c0392b;
+		font-weight: 700;
+		text-decoration: underline;
+	}
+	.cfg-edge path {
+		fill: none;
+		stroke: var(--muted);
+		stroke-width: 1.3;
+	}
+	.cfg-head {
+		fill: var(--muted);
+	}
+	.cfg-elabel {
+		font: 10px var(--sans);
+		fill: var(--muted);
+		paint-order: stroke;
+		stroke: var(--bg);
+		stroke-width: 3px;
+	}
+	.cfg-info {
+		margin: 0.4rem auto 0;
+		max-width: 560px;
+		min-height: 2.6em;
+		font-size: 0.78rem;
+		line-height: 1.45;
+		color: var(--muted);
+	}
+	@media (prefers-color-scheme: dark) {
+		.cfg-line :global(tspan.hl) {
+			fill: #ff8a7a;
+		}
+	}
+</style>

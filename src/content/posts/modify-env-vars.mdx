@@ -2,6 +2,7 @@
 title: "Why You Should Never Modify Environment Variables"
 description: "Libraries often read their configuration from environment variables, and some change them with setenv. In a multithreaded program, that can crash any other thread that happens to be calling getenv. This post looks at where the environment lives, and reproduces the crash in C++ and Python."
 date: 2024-11-15
+tags: [C++/Python]
 ---
 
 import libraryThreads from "../../assets/modify-env-vars/library-threads.png";

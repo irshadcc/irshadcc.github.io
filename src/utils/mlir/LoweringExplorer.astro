@@ -1,0 +1,192 @@
+---
+// One function at every step of its lowering through MLIR (the IR is real mlir-opt output, in
+// loweringStages.ts). Tabs pick the stage; operation names are coloured by dialect, and a bar
+// under the code shows how many operations of each dialect the stage has. Hover a dialect in the
+// bar to pick out its operations.
+// Usage in .mdx:
+//   <LoweringExplorer />
+//   <LoweringExplorer stage="loops" />
+import { MATMUL_STAGES } from "./loweringStages";
+import { DIALECTS, countOps, highlight } from "./mlirView";
+
+interface Props {
+	stage?: string;
+	title?: string;
+}
+
+const { stage = "linalg on tensors", title } = Astro.props;
+const views = MATMUL_STAGES.map((s) => {
+	const counts = countOps(s.ir);
+	const total = Object.values(counts).reduce((a, b) => a + b, 0);
+	return { ...s, html: highlight(s.ir), counts, total, lines: s.ir.split("\n").length };
+});
+const main = views.filter((v) => !v.branch);
+const side = views.filter((v) => v.branch);
+---
+
+<figure class="lowering">
+	{title && <figcaption class="title">{title}</figcaption>}
+	<div class="path">
+		{
+			main.map((v, i) => (
+				<>
+					{i > 0 && <span class="arrow" title={v.pass}>→</span>}
+					<button type="button" class="tab" data-stage={v.label} aria-pressed={v.label === stage ? "true" : "false"}>
+						{v.label}
+					</button>
+				</>
+			))
+		}
+	</div>
+	<div class="path side">
+		<span class="or">or, from the tensors:</span>
+		{
+			side.map((v) => (
+				<button type="button" class="tab" data-stage={v.label} aria-pressed={v.label === stage ? "true" : "false"}>
+					{v.label}
+				</button>
+			))
+		}
+	</div>
+	{
+		views.map((v) => (
+			<div class="panel" data-stage={v.label} hidden={v.label !== stage}>
+				<p class="pass">
+					{v.pass === "the input" ? "The input, as written." : <>After <code>{v.pass}</code>.</>} {v.lines} lines, {v.total} operations.
+				</p>
+				<pre class="ir"><code set:html={v.html} /></pre>
+				<div class="bar" role="img" aria-label="Operations per dialect">
+					{Object.entries(v.counts)
+						.sort((a, b) => b[1] - a[1])
+						.map(([d, n]) => (
+							<span class="seg" data-d={d} style={`flex:${n};background:${DIALECTS[d]}`} title={`${d}: ${n}`}>
+								{n / v.total > 0.07 ? `${d} ${n}` : ""}
+							</span>
+						))}
+				</div>
+			</div>
+		))
+	}
+</figure>
+
+<script>
+	for (const fig of document.querySelectorAll<HTMLElement>(".lowering")) {
+		for (const tab of fig.querySelectorAll<HTMLButtonElement>(".tab"))
+			tab.addEventListener("click", () => {
+				for (const t of fig.querySelectorAll(".tab")) t.setAttribute("aria-pressed", String(t === tab));
+				for (const p of fig.querySelectorAll<HTMLElement>(".panel")) p.hidden = p.dataset.stage !== tab.dataset.stage;
+			});
+		for (const seg of fig.querySelectorAll<HTMLElement>(".seg")) {
+			const panel = seg.closest<HTMLElement>(".panel");
+			seg.addEventListener("pointerenter", () => {
+				panel?.classList.add("focus");
+				for (const op of panel?.querySelectorAll<HTMLElement>(".op") ?? [])
+					op.classList.toggle("on", op.dataset.d === seg.dataset.d);
+			});
+			seg.addEventListener("pointerleave", () => panel?.classList.remove("focus"));
+		}
+	}
+</script>
+
+<style>
+	.lowering {
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+	}
+	.title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.5rem;
+	}
+	.path {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		align-items: center;
+		gap: 0.3rem;
+		font-size: 0.76rem;
+	}
+	.path.side {
+		margin: 0.35rem 0 0.6rem;
+	}
+	.or {
+		color: var(--muted);
+		margin-right: 0.2rem;
+	}
+	.arrow {
+		color: var(--muted);
+		cursor: help;
+	}
+	.tab {
+		padding: 0.22rem 0.6rem;
+		border: 1px solid var(--faint);
+		border-radius: 999px;
+		background: var(--bg);
+		color: var(--text);
+		font: inherit;
+		cursor: pointer;
+	}
+	.tab:hover {
+		border-color: var(--accent);
+	}
+	.tab[aria-pressed="true"] {
+		background: var(--accent);
+		border-color: var(--accent);
+		color: var(--bg);
+	}
+	.panel[hidden] {
+		display: none;
+	}
+	.pass {
+		margin: 0 0 0.4rem;
+		font-size: 0.76rem;
+		color: var(--muted);
+		text-align: center;
+	}
+	.ir {
+		max-height: 24rem;
+		overflow: auto;
+		margin: 0;
+		padding: 0.7rem 0.9rem;
+		border-radius: 8px;
+		background: var(--surface);
+		font-family: var(--mono);
+		font-size: 0.7rem;
+		line-height: 1.5;
+		color: var(--muted);
+	}
+	.ir :global(.op) {
+		color: #1a1a1a;
+		background: var(--c);
+		border-radius: 3px;
+		padding: 0 0.15em;
+		transition: opacity 120ms ease;
+	}
+	.panel.focus .ir :global(.op:not(.on)) {
+		opacity: 0.25;
+	}
+	.ir :global(.cm) {
+		font-style: italic;
+		opacity: 0.7;
+	}
+	.bar {
+		display: flex;
+		height: 1.3rem;
+		margin-top: 0.5rem;
+		border-radius: 4px;
+		overflow: hidden;
+		font-family: var(--mono);
+		font-size: 0.66rem;
+	}
+	.seg {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		color: #1a1a1a;
+		white-space: nowrap;
+		overflow: hidden;
+		cursor: default;
+		border-right: 1px solid var(--bg);
+	}
+</style>

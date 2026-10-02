@@ -1,0 +1,40 @@
+---
+// Shows deterministic bucketing into mutually exclusive experiments within independent layers.
+// Hover or focus a user to see that the same identifier receives one assignment per layer.
+// Usage in .mdx:
+//   <ExperimentLayers users={12} buckets={16} />
+interface Props {
+	users?: number;
+	buckets?: number;
+}
+const { users = 12, buckets = 16 } = Astro.props;
+const hash = (user: number, layer: number) =>
+	((user * 2654435761 + layer * 2246822519) >>> 0) % buckets;
+const rows = Array.from({ length: users }, (_, user) => ({
+	user,
+	product: hash(user, 1),
+	ranking: hash(user, 2),
+}));
+const variant = (bucket: number) =>
+	bucket < buckets / 2 ? "control" : "treatment";
+---
+<figure class="experiment-layers">
+	<div class="layer-head"><span>User</span><span>Layer 1: checkout UI</span><span>Layer 2: ranking model</span></div>
+	{rows.map((r) => <div class="user-row" tabindex="0"><span>u{r.user}</span><span class={variant(r.product)}>bucket {r.product} · {variant(r.product)}</span><span class={variant(r.ranking)}>bucket {r.ranking} · {variant(r.ranking)}</span></div>)}
+	<div class="legend"><i class="control"></i> control <i class="treatment"></i> treatment</div>
+	<figcaption>A stable hash of `(user ID, layer ID)` chooses a bucket. Experiments exclude each other inside a layer, while independent layers reuse the population.</figcaption>
+</figure>
+<style>
+	.experiment-layers { margin: 2rem 0; padding: 1rem; border: 1px solid var(--faint); border-radius: .6rem; background: var(--surface); overflow-x: auto; }
+	.layer-head, .user-row { min-width: 570px; display: grid; grid-template-columns: 70px 1fr 1fr; gap: .5rem; }
+	.layer-head { color: var(--muted); font: 600 .82rem var(--sans); margin-bottom: .45rem; }
+	.user-row { margin: .22rem 0; outline: none; }
+	.user-row > span { padding: .34rem .55rem; border-radius: .3rem; font: .78rem var(--sans); }
+	.user-row > span:first-child { color: var(--muted); }
+	.user-row:hover > span, .user-row:focus > span { box-shadow: inset 0 0 0 2px var(--accent); }
+	.control { background: color-mix(in srgb, var(--accent) 14%, var(--surface)); color: var(--text); }
+	.treatment { background: color-mix(in srgb, #e48b30 20%, var(--surface)); color: var(--text); }
+	.legend { margin-top: .7rem; color: var(--muted); font: .78rem var(--sans); }
+	.legend i { display: inline-block; width: .8rem; height: .8rem; margin: 0 .25rem 0 .8rem; border-radius: 2px; }
+	figcaption { color: var(--muted); font-size: .85rem; text-align: center; margin-top: .8rem; }
+</style>

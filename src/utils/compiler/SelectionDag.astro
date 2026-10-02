@@ -1,0 +1,289 @@
+---
+import StepControls from "./StepControls.astro";
+// One basic block's SelectionDAG at each phase of LLVM's instruction selection (built, combined,
+// legalized, selected), drawn from real `llc -debug-only=isel` dumps stored in llvmData.ts.
+// Operands sit above the nodes that use them; solid edges carry values, dashed edges are the
+// chain that orders memory operations. Nodes that are new or changed since the previous step are
+// outlined. Hover a node to see its line from the dump.
+// Usage in .mdx:
+//   <SelectionDag example="saxpy" step={0} title="The SelectionDAG of saxpy's if-body" />
+//   <SelectionDag example="add8" />
+import { dagStages } from "./llvmData";
+import {
+	type Dag,
+	type DagKind,
+	changedNodes,
+	layoutDag,
+	parseDag,
+} from "./selectionDag";
+
+interface Props {
+	example?: keyof typeof dagStages;
+	step?: number;
+	title?: string;
+}
+
+const { example = "saxpy", step = 0, title } = Astro.props;
+const stages = dagStages[example];
+const at = Math.max(0, Math.min(stages.length - 1, step));
+let prev: Dag | undefined;
+const drawn = stages.map((s) => {
+	const dag = parseDag(s.dump);
+	const placed = layoutDag(dag, changedNodes(prev, dag));
+	prev = dag;
+	return placed;
+});
+const W = Math.max(...drawn.map((d) => d.width));
+const H = Math.max(...drawn.map((d) => d.height));
+const KINDS: [DagKind, string][] = [
+	["generic", "generic node"],
+	["target", "NVPTX-specific node"],
+	["machine", "NVPTX instruction"],
+	["leaf", "input"],
+];
+---
+
+<figure class="sd" data-step={at} tabindex="-1">
+	{title && <figcaption class="sd-title">{title}</figcaption>}
+	<StepControls labels={stages.map((s) => s.label)} step={at} />
+	<div class="sd-panes">
+		{
+			drawn.map((d, i) => (
+				<div class="sd-pane" data-i={i} aria-hidden={i !== at ? "true" : undefined}>
+					<svg viewBox={`0 0 ${W} ${H}`} style={`width: min(100%, ${W}px)`} role="img" aria-label={`${stages[i].label}: ${d.nodes.length} nodes`}>
+						<defs>
+							<marker id={`sd-arrow-${example}-${i}`} viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+								<path d="M0,0 L8,4 L0,8 z" class="sd-head" />
+							</marker>
+						</defs>
+						<g transform={`translate(${(W - d.width) / 2},0)`}>
+							{d.edges.map((e) => (
+								<path class:list={["sd-edge", { chain: e.chain }]} d={e.d} marker-end={`url(#sd-arrow-${example}-${i})`} />
+							))}
+							{d.nodes.map((n) => (
+								<g class:list={["sd-node", n.kind, { changed: n.changed }]} data-raw={n.raw} transform={`translate(${n.x - n.w / 2},${n.y - n.h / 2})`}>
+									<title>{n.raw}</title>
+									<rect width={n.w} height={n.h} rx="5" />
+									{n.h > 24 ? (
+										<>
+											<text class="op" x={n.w / 2} y={14}>{n.flags.length ? `${n.label} ${n.flags.join(" ")}` : n.label}</text>
+											<text class="ty" x={n.w / 2} y={27}>{`${n.id} · ${n.types.join(",")}`}</text>
+										</>
+									) : (
+										<text class="op" x={n.w / 2} y={n.h / 2 + 4}>{n.label}</text>
+									)}
+								</g>
+							))}
+						</g>
+					</svg>
+				</div>
+			))
+		}
+	</div>
+	<p class="sd-raw" aria-live="polite">&nbsp;</p>
+	<div class="sd-notes">
+		{
+			stages.map((s, i) => (
+				<p class="sd-note" data-i={i} hidden={i !== at}>
+					{s.note}
+				</p>
+			))
+		}
+	</div>
+	<ul class="sd-legend">
+		{
+			KINDS.map(([k, label]) => (
+				<li>
+					<svg viewBox="0 0 14 10" aria-hidden="true">
+						<rect class={`sw ${k}`} x="0.5" y="0.5" width="13" height="9" rx="2" />
+					</svg>
+					{label}
+				</li>
+			))
+		}
+		<li>
+			<svg viewBox="0 0 22 10" aria-hidden="true"><path class="sd-edge chain" d="M1,5 H21"></path></svg>
+			chain (ordering)
+		</li>
+		<li>
+			<svg viewBox="0 0 14 10" aria-hidden="true"><rect class="sw changed" x="1" y="1" width="12" height="8" rx="2"></rect></svg>
+			new or changed
+		</li>
+	</ul>
+</figure>
+
+<script>
+	import { bindStepper } from "./stepper";
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".sd")) {
+		const panes = [...fig.querySelectorAll<HTMLElement>(".sd-pane")];
+		const notes = [...fig.querySelectorAll<HTMLElement>(".sd-note")];
+		const raw = fig.querySelector<HTMLElement>(".sd-raw");
+		bindStepper(fig, panes.length, (i) => {
+			panes.forEach((p, k) => (k === i ? p.removeAttribute("aria-hidden") : p.setAttribute("aria-hidden", "true")));
+			notes.forEach((n, k) => {
+				n.hidden = k !== i;
+			});
+		});
+		for (const node of fig.querySelectorAll<SVGGElement>(".sd-node")) {
+			node.addEventListener("mouseenter", () => {
+				if (raw) raw.textContent = node.dataset.raw ?? "";
+			});
+			node.addEventListener("mouseleave", () => {
+				if (raw) raw.innerHTML = "&nbsp;";
+			});
+		}
+	}
+</script>
+
+<style>
+	.sd {
+		--generic: #e8eef5;
+		--generic-line: #7d97b3;
+		--target: #f6ead9;
+		--target-line: #c08a45;
+		--machine: #ddefe3;
+		--machine-line: #4f9a6b;
+		--leaf: var(--surface);
+		--leaf-line: var(--faint);
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+		outline: none;
+	}
+	@media (prefers-color-scheme: dark) {
+		.sd {
+			--generic: #1f2a36;
+			--generic-line: #6d8cad;
+			--target: #33291b;
+			--target-line: #c99a5b;
+			--machine: #1b3024;
+			--machine-line: #5fae7d;
+		}
+	}
+	.sd-title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.3rem;
+	}
+	.sd-panes {
+		display: grid;
+	}
+	.sd-pane {
+		grid-area: 1 / 1;
+		min-width: 0;
+	}
+	.sd-pane[aria-hidden="true"] {
+		visibility: hidden;
+	}
+	.sd-pane svg {
+		display: block;
+		height: auto;
+		margin: 0 auto;
+	}
+	.sd-edge {
+		fill: none;
+		stroke: var(--muted);
+		stroke-width: 1.1;
+	}
+	.sd-edge.chain {
+		stroke: var(--faint);
+		stroke-dasharray: 3 3;
+		stroke-width: 1.3;
+	}
+	.sd-head {
+		fill: var(--muted);
+	}
+	.sd-node rect,
+	.sw {
+		stroke-width: 1.2;
+	}
+	.sd-node.generic rect,
+	.sw.generic,
+	.sd-node.entry rect {
+		fill: var(--generic);
+		stroke: var(--generic-line);
+	}
+	.sd-node.target rect,
+	.sw.target {
+		fill: var(--target);
+		stroke: var(--target-line);
+	}
+	.sd-node.machine rect,
+	.sw.machine {
+		fill: var(--machine);
+		stroke: var(--machine-line);
+	}
+	.sd-node.leaf rect,
+	.sw.leaf {
+		fill: var(--leaf);
+		stroke: var(--leaf-line);
+	}
+	.sd-node.changed rect,
+	.sw.changed {
+		stroke: var(--accent);
+		stroke-width: 2.4;
+	}
+	.sw.changed {
+		fill: none;
+	}
+	.sd-node:hover rect {
+		stroke: var(--text);
+	}
+	.sd-node text {
+		font-family: var(--mono);
+		text-anchor: middle;
+		fill: var(--text);
+		pointer-events: none;
+	}
+	.sd-node .op {
+		font-size: 11px;
+		font-weight: 600;
+	}
+	.sd-node .ty {
+		font-size: 9.5px;
+		fill: var(--muted);
+	}
+	.sd-raw {
+		min-height: 1.4em;
+		margin: 0.3rem 0 0;
+		font-family: var(--mono);
+		font-size: 0.68rem;
+		color: var(--muted);
+		overflow-wrap: anywhere;
+	}
+	.sd-notes {
+		display: grid;
+		margin-top: 0.2rem;
+	}
+	.sd-note {
+		grid-area: 1 / 1;
+		margin: 0;
+		font-size: 0.8rem;
+		line-height: 1.5;
+	}
+	.sd-note[hidden] {
+		display: block;
+		visibility: hidden;
+	}
+	.sd-legend {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.2rem 0.9rem;
+		margin: 0.5rem 0 0;
+		padding: 0;
+		list-style: none;
+		font-size: 0.72rem;
+		color: var(--muted);
+	}
+	.sd-legend li {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.3rem;
+		margin: 0;
+	}
+	.sd-legend svg {
+		height: 0.7rem;
+		width: auto;
+	}
+</style>

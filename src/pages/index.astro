@@ -1,8 +1,10 @@
 ---
+import PostTags from "../components/PostTags.astro";
+import TagFilter from "../components/TagFilter.astro";
 import Layout from "../layouts/Layout.astro";
-import { getPosts } from "../posts";
+import { getPublishedPosts } from "../posts";
 
-const posts = await getPosts();
+const posts = await getPublishedPosts();
 const base = import.meta.env.BASE_URL.replace(/\/$/, "");
 
 // Group posts by year, newest year first (posts are already sorted).
@@ -13,24 +15,35 @@ for (const post of posts) {
 }
 
 const shortDate = (date: Date) =>
-	date.toLocaleDateString("en-US", { month: "short", day: "2-digit", timeZone: "UTC" });
+	date.toLocaleDateString("en-US", {
+		month: "short",
+		day: "2-digit",
+		timeZone: "UTC",
+	});
+const tags = posts.flatMap((post) => post.data.tags);
 ---
 
 <Layout>
-	{[...years].map(([year, yearPosts]) => (
-		<section>
-			<h2 class="year">{year}</h2>
-			<ul class="post-list">
-				{yearPosts.map((post) => (
-					<li>
-						<time datetime={post.data.date.toISOString()}>{shortDate(post.data.date)}</time>
-						<div>
-							<a href={`${base}/blog/${post.id}`}>{post.data.title}</a>
-							<p>{post.data.description}</p>
-						</div>
-					</li>
-				))}
-			</ul>
-		</section>
-	))}
+	<div class="post-browser">
+		<TagFilter tags={tags} />
+		<div class="post-browser-content">
+			{[...years].map(([year, yearPosts]) => (
+				<section>
+					<h2 class="year">{year}</h2>
+					<ul class="post-list">
+						{yearPosts.map((post) => (
+							<li data-tags={JSON.stringify(post.data.tags)}>
+								<time datetime={post.data.date.toISOString()}>{shortDate(post.data.date)}</time>
+								<div>
+									<a href={`${base}/blog/${post.id}`}>{post.data.title}</a>
+									<p>{post.data.description}</p>
+									<PostTags tags={post.data.tags} />
+								</div>
+							</li>
+						))}
+					</ul>
+				</section>
+			))}
+		</div>
+	</div>
 </Layout>

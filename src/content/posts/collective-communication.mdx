@@ -1,0 +1,371 @@
+---
+title: "How GPUs Talk: Collectives and Their Costs"
+description: "Distributed training is held together by a handful of collectives: broadcast, reduce, reduce-scatter, all-gather, all-reduce and all-to-all. This post steps through how each one moves data between GPUs, derives its cost in the alpha-beta model, and places them on a real cluster to see which links they cross."
+date: 2026-10-01
+tags: [Distributed training, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import MarginNote from "../../components/MarginNote.astro";
+import LogicalDistributedTopology from "../../utils/distributed/LogicalDistributedTopology.astro";
+import CollectiveSteps from "../../utils/distributed/CollectiveSteps.astro";
+
+## Background
+
+A training job spread over many GPUs spends a large part of each step talking. Every form of
+parallelism needs the GPUs to exchange data at fixed points: gradients have to be summed across
+data-parallel replicas, partial matrix products have to be combined across tensor-parallel
+shards, and tokens have to be routed to the GPUs that hold their experts.
+
+These exchanges are **collectives**: operations that every rank in a group calls together. NCCL,
+RCCL and MPI all provide the same small set of them, and almost all of the communication in a
+training job reduces to these few patterns. If you know how each one moves data, you can predict
+how long a step will spend communicating, and why moving a group onto a different set of links
+can change that a lot.
+
+### Where collectives show up
+
+The figure below lays out a 32-GPU job by its parallel coordinates: 2 pipeline stages (columns),
+4 data-parallel replicas (rows), and 4 tensor-parallel shards per cell, with each pair of replicas
+also forming an expert-parallel group. The GPUs sit in 8-GPU servers. Hover or click a rank to see
+the groups it belongs to and how many switches each group's traffic crosses.
+
+<LogicalDistributedTopology
+	parallel={{ tp: 4, dp: 4, pp: 2, ep: 2 }}
+	network={{ gpusPerServer: 8, serversPerPod: 2, spinesPerPod: 2 }}
+	selected={0}
+	title="32 ranks: TP 4 × DP 4 × PP 2, EP 2"
+/>
+
+Each kind of group runs its own collectives:
+
+| Group | What it exchanges | Collective |
+| --- | --- | --- |
+| Tensor parallel (TP) | Partial sums of a split matrix multiply | All-reduce (or reduce-scatter + all-gather with sequence parallelism) |
+| Data parallel (DP) | Gradients | All-reduce; reduce-scatter + all-gather with ZeRO / FSDP |
+| Expert parallel (EP) | Tokens, to and from the GPUs holding their experts | All-to-all |
+| Context parallel (CP) | Keys and values of other sequence chunks | All-gather, or a ring of send/recv |
+| Pipeline parallel (PP) | Activations and their gradients | Point-to-point send/recv |
+
+Notice where the groups land. A TP group sits inside one server and talks over NVLink, which is
+why TP gets the chattiest traffic. DP groups span servers and cross the network. That placement is
+deliberate, and the cost model below shows why it matters.
+
+## The cost model
+
+The standard way to reason about collective cost is the **α–β model**. Sending a message of $n$
+bytes between two ranks takes
+
+$$
+T(n) = \alpha + n\beta
+$$
+
+- $\alpha$ is the **latency**: the fixed cost of a message (software overhead, link and switch
+  latency), typically a few microseconds.
+- $\beta$ is the **inverse bandwidth**, in seconds per byte. For a 400 Gb/s NIC, $\beta = 1 / (50
+  \text{ GB/s})$.
+
+Reductions also do arithmetic, which costs $\gamma$ seconds per byte reduced. On GPUs $\gamma$ is
+tiny compared with $\beta$, so I'll usually drop it.
+
+Throughout, a group has $N$ ranks and each rank holds a buffer of $M$ bytes. The algorithms below
+run in synchronous **steps**. In each step every rank sends at most one message, and all ranks
+send at the same time, so a step costs $\alpha$ plus the time to send its largest message. The
+total cost of an algorithm is therefore
+
+$$
+T = (\text{number of steps})\,\alpha + (\text{bytes on the critical path})\,\beta
+$$
+
+The first term dominates for small messages and the second for large ones. Most collective
+algorithms trade one against the other.
+
+## The collectives
+
+Each subsection below steps through one collective on four ranks and derives its cost. Each
+column in a figure is a rank, and each row is one chunk of that rank's buffer. The arcs are the
+messages sent in a step, and the outlined chunks are the ones sent (dashed) and received (solid).
+
+### Broadcast and reduce
+
+**Broadcast** copies one rank's buffer to every rank. **Reduce** is its mirror image: it sums
+everyone's buffers into one rank.
+
+The simplest fast algorithm is a **binomial tree**. In each step, every rank that already has the
+data sends it to a rank that doesn't, so the number of ranks holding it doubles. Step through it
+below:
+
+<CollectiveSteps op="broadcast" n={4} />
+
+After $\lceil \log_2 N \rceil$ steps everyone has the data. Each step sends the whole buffer, so
+
+$$
+T_\text{broadcast} = \lceil \log_2 N \rceil \,(\alpha + M\beta)
+$$
+
+Reduce runs the same tree backwards. Ranks pair up, the right one sends its partial sum to the
+left one, and half of the ranks drop out each step:
+
+<CollectiveSteps op="reduce" n={4} />
+
+$$
+T_\text{reduce} = \lceil \log_2 N \rceil \,(\alpha + M\beta + M\gamma)
+$$
+
+The tree is good for latency, needing only $\log_2 N$ steps, but bad for bandwidth: the full
+buffer crosses $\log_2 N$ links one after another, and in each step half or more of the ranks sit
+idle. For large buffers there are better options, and they are built from the next two
+collectives.<Sidenote>For example, a large broadcast can be done as a *scatter* (the root sends
+chunk $i$ to rank $i$) followed by an all-gather. That costs about $(\log_2 N + N - 1)\alpha +
+2\frac{N-1}{N}M\beta$, so the bandwidth term stops growing with $N$.</Sidenote>
+
+### Reduce-scatter
+
+**Reduce-scatter** sums everyone's buffers, but leaves the result split up: rank $i$ ends up
+with only chunk $i$ of the sum.
+
+The **ring** algorithm arranges the ranks in a circle. Each buffer is split into $N$ chunks, and in
+every step each rank sends one chunk to its right neighbour, which adds it to its own copy of that
+chunk. The chunks travel around the ring picking up one more contribution at every hop. Watch the
+stripes build up:
+
+<CollectiveSteps op="reduce-scatter" n={4} />
+
+Each chunk has to visit all $N$ ranks, so it takes $N-1$ hops. Every step moves one chunk of
+$M/N$ bytes, and all $N$ links are busy at once:
+
+$$
+T_\text{reduce-scatter} = (N-1)\,\alpha + \frac{N-1}{N}\,M\beta + \frac{N-1}{N}\,M\gamma
+$$
+
+This bandwidth term is the best possible. Rank $j$ is the only holder of its contribution to the
+$N - 1$ chunks that end up elsewhere, so at least $\frac{N-1}{N}M$ bytes must leave every rank,
+however clever the algorithm.
+
+### All-gather
+
+**All-gather** is the reverse: each rank starts with one chunk, and every rank ends up with all of
+them. The ring version simply forwards chunks around without adding anything:
+
+<CollectiveSteps op="all-gather" n={4} />
+
+Each rank must receive the $N - 1$ chunks it doesn't have, and the ring delivers one per step:
+
+$$
+T_\text{all-gather} = (N-1)\,\alpha + \frac{N-1}{N}\,M\beta
+$$
+
+Here $M$ is the size of the *gathered* result, so each rank starts with $M/N$ bytes.
+
+### All-reduce
+
+**All-reduce** sums everyone's buffers and gives the full result to every rank. It is the
+workhorse of data parallelism, where every replica needs the summed gradient.
+
+The key observation is that all-reduce is just a reduce-scatter followed by an all-gather. After
+the reduce-scatter, each rank owns one fully summed chunk; the all-gather then hands every chunk to
+every rank. The timeline below shows the two phases in different colours:
+
+<CollectiveSteps op="all-reduce" n={4} />
+
+The cost is the sum of the two:
+
+$$
+T_\text{all-reduce}^\text{ring} = 2(N-1)\,\alpha + 2\frac{N-1}{N}\,M\beta + \frac{N-1}{N}\,M\gamma
+$$
+
+The bandwidth term barely depends on $N$: each rank sends a little under $2M$ bytes, whether
+there are 4 ranks or 4,000. This makes the ring **bandwidth-optimal**: no all-reduce algorithm can
+send less than $2\frac{N-1}{N}M$ bytes per rank.<Sidenote>Patarasuk and Yuan, "Bandwidth optimal
+all-reduce algorithms for clusters of workstations", JPDC 2009.</Sidenote> The price is latency:
+$2(N-1)$ steps grows linearly with $N$.
+
+This also explains a result from the ZeRO paper. ZeRO and FSDP replace the gradient all-reduce
+with a reduce-scatter (each rank keeps only the gradient shard for the parameters it owns) and,
+after the optimizer step, an all-gather of the updated parameters. Since all-reduce *is*
+reduce-scatter plus all-gather, sharding the optimizer state costs no extra
+communication.<MarginNote>ZeRO stage 3 also all-gathers the parameters again in the backward pass,
+which is why its traffic is 1.5× that of plain data parallelism.</MarginNote>
+
+### All-to-all
+
+In **all-to-all**, every rank has a separate chunk for every other rank. Chunk $j$ of rank $i$'s
+send buffer must end up at rank $j$, in slot $i$ of its receive buffer. It's a distributed
+transpose. In a mixture-of-experts layer, the chunks are the tokens routed to each GPU's experts:
+one all-to-all sends them out ("dispatch"), and a second brings the expert outputs back
+("combine").
+
+The simple **pairwise** algorithm runs $N - 1$ steps. In step $s$, every rank sends its chunk for
+the rank $s$ positions to its right straight to it:
+
+<CollectiveSteps op="all-to-all" n={4} />
+
+$$
+T_\text{all-to-all} = (N-1)\,\alpha + \frac{N-1}{N}\,M\beta
+$$
+
+where $M$ is the size of each rank's send buffer. This looks just like all-gather, but there is an
+important difference: nothing can be combined along the way, so every byte goes directly from its
+source to its destination. In a ring collective each message only travels one hop, between
+neighbours that can be chosen to sit close together. In all-to-all, every rank talks to every
+other rank, so the traffic always crosses the most distant links in the group. In MoE layers the
+chunks are also uneven, because more tokens get routed to popular experts, and the step ends only
+when the busiest pair finishes.
+
+### Send and receive
+
+Pipeline parallelism needs no collective, just **point-to-point** messages: stage $p$ sends its
+activations to stage $p+1$ in the forward pass, and the gradients come back the other way. One
+message costs
+
+$$
+T_\text{send/recv} = \alpha + M\beta
+$$
+
+Context parallelism with ring attention uses the same building block: each rank passes its keys and
+values to its neighbour around a ring, $N - 1$ times, while it computes attention over the chunk
+it just received. The communication hides behind the computation as long as each step's attention
+takes longer than $\alpha + M\beta$.
+
+## Choosing algorithms and reading benchmarks
+
+Each collective above was shown with a single algorithm. In practice a library chooses between
+several, and the cost formulas say when each one wins. They also explain the numbers that
+benchmarks report.
+
+### Comparing all-reduce algorithms
+
+The ring is not the only option. Here are four common algorithms:
+
+| Algorithm | Latency term | Bandwidth term |
+| --- | --- | --- |
+| Reduce + broadcast (trees) | $2\log_2 N \cdot \alpha$ | $2\log_2 N \cdot M\beta$ |
+| Recursive doubling | $\log_2 N \cdot \alpha$ | $\log_2 N \cdot M\beta$ |
+| Ring | $2(N-1)\,\alpha$ | $2\frac{N-1}{N} M\beta$ |
+| Recursive halving + doubling (Rabenseifner) | $2\log_2 N \cdot \alpha$ | $2\frac{N-1}{N} M\beta$ |
+
+To get a feel for the numbers, take $\alpha = 10\ \mu\text{s}$ and $\beta = 1/(50\ \text{GB/s})$,
+and look at a small and a large message on a small and a large group:
+
+| $M$ | $N$ | Trees | Recursive doubling | Ring | Rabenseifner |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 MB | 8 | 180 µs | **90 µs** | 175 µs | 95 µs |
+| 1 MB | 1024 | 600 µs | 300 µs | 20.5 ms | **240 µs** |
+| 1 GB | 8 | 120 ms | 60 ms | **35.1 ms** | **35.1 ms** |
+| 1 GB | 1024 | 400 ms | 200 ms | 60.4 ms | **40.2 ms** |
+
+The ring is optimal for big buffers but falls apart for small buffers on large groups: a 1 MB
+all-reduce over 1024 ranks spends 20.5 ms on latency and only 40 µs moving data. Recursive
+halving and doubling only works cleanly when $N$ is a power of two, though, and maps poorly onto
+real networks. NCCL instead switches between rings, (double binary) trees and, on recent
+hardware, in-switch reductions (NVLS), based on message size and topology.
+
+### Algorithm bandwidth and bus bandwidth
+
+Benchmarks such as `nccl-tests` report two bandwidths. **Algorithm bandwidth** is just buffer size
+over time, $M / T$. That number depends on the collective and on $N$, so it can't be compared with
+the link speed. **Bus bandwidth** corrects for that, by multiplying by the bytes each rank actually
+has to move per byte of buffer:
+
+| Collective | Bus bandwidth |
+| --- | --- |
+| All-reduce | $\dfrac{M}{T} \cdot \dfrac{2(N-1)}{N}$ |
+| Reduce-scatter, all-gather, all-to-all | $\dfrac{M}{T} \cdot \dfrac{N-1}{N}$ |
+| Broadcast, reduce, send/recv | $\dfrac{M}{T}$ |
+
+These factors are exactly the bandwidth terms derived above, divided by $M\beta$. So when the
+bandwidth term dominates, bus bandwidth approaches the link bandwidth $1/\beta$ for every
+collective, which makes it the number to compare against the hardware.
+
+## Collectives on a real topology
+
+So far every link was treated as equal. In a real cluster they are not: NVLink inside a server
+is roughly ten times faster than the network between servers, and network traffic crosses
+different numbers of switches depending on where the two GPUs sit.
+
+### Ring order and rails
+
+Go back to the 32-GPU job above, and take the data-parallel group of rank 0: ranks 0, 4, 8 and 12.
+Ranks 0 and 4 share a server, and so do 8 and 12. Here is a ring all-reduce over that group, with
+each message drawn by the link it takes:
+
+<CollectiveSteps
+	op="all-reduce"
+	ranks={[0, 4, 8, 12]}
+	network={{ gpusPerServer: 8, serversPerPod: 2, spinesPerPod: 2 }}
+	title="DP all-reduce over ranks 0, 4, 8, 12, ring order 0 → 4 → 8 → 12"
+/>
+
+Two of the four ring hops stay on NVLink, but every step also has a message going between
+servers, and a synchronous step takes as long as its slowest message. Worse, those two hops cross
+**3 switches**: rank 4 is GPU 4 of its server, and its NIC hangs off rail 4, while rank 8 is GPU 0
+of the next server, on rail 0. Traffic between different rails has to go up through a spine.
+
+The ring order is up to us. Visit the ranks as $0 \to 4 \to 12 \to 8$ instead, and the inter-server
+hops connect GPU 4 with GPU 4 (rank 12 is GPU 4 of server 1) and GPU 0 with GPU 0, which share a
+rail and so a single top-of-rack switch:
+
+<CollectiveSteps
+	op="all-reduce"
+	ranks={[0, 4, 12, 8]}
+	network={{ gpusPerServer: 8, serversPerPod: 2, spinesPerPod: 2 }}
+	title="The same group in rail-aligned order 0 → 4 → 12 → 8"
+/>
+
+The amount of data moved is the same, but fewer switches mean lower latency and less contention.
+Communication libraries search for rail-aligned orders like this one when they build their
+rings.
+
+### Hierarchical all-reduce
+
+The bigger lesson is that a single flat ring is only as fast as its slowest link. A cluster of
+$S$ servers with $G$ GPUs each has two very different kinds of link: NVLink inside a server
+(about 450 GB/s per GPU on an H100) and the network between servers (about 50 GB/s per
+GPU). A **hierarchical all-reduce** uses each one for what it is good at:
+
+1. **Reduce-scatter inside each server** over NVLink. Each GPU now holds $1/G$ of the server's
+   sum.
+2. **All-reduce across servers**, run separately by each of the $G$ GPUs on its own $M/G$ shard,
+   over its own NIC, so all $G$ rails are busy at once.
+3. **All-gather inside each server** over NVLink.
+
+$$
+T_\text{hier} = \underbrace{2\left[(G-1)\,\alpha + \frac{G-1}{G} M\beta_\text{NVLink}\right]}_{\text{steps 1 and 3}}
++ \underbrace{2(S-1)\,\alpha + 2\frac{S-1}{S}\,\frac{M}{G}\,\beta_\text{net}}_{\text{step 2}}
+$$
+
+The slow network only carries $M/G$ bytes per GPU. For a 1 GB all-reduce on 8 servers of 8 GPUs
+(with $\alpha = 10\ \mu\text{s}$), a single flat ring over all 64 GPUs takes about **40.6 ms**,
+because each server's one ring link to the next server carries all the traffic over one NIC. The
+hierarchical version takes about **8.5 ms**.<Sidenote>NCCL gets a similar effect without an
+explicit hierarchy by running several rings at once, one per NIC rail, each carrying a slice of the
+buffer.</Sidenote>
+
+The same reasoning explains the layout of the job at the top of the post. Tensor parallelism
+all-reduces activations in every layer: twice in the forward pass and twice in the backward pass
+of each transformer block. That much traffic only works over NVLink, so TP groups are packed inside
+a server. Data parallelism all-reduces gradients once per step and can overlap them with the
+backward pass, so it can afford to cross the network. How a framework decides which ranks share
+a group, and so which links each group uses, is the subject of a follow-up post:
+[Distributed Topology for Training and Inference](/blog/distributed-topology/).
+
+## Summary
+
+| Collective | Result | Algorithm | Cost |
+| --- | --- | --- | --- |
+| Broadcast | Root's buffer on every rank | Binomial tree | $\lceil\log_2 N\rceil(\alpha + M\beta)$ |
+| Reduce | Sum on the root | Binomial tree | $\lceil\log_2 N\rceil(\alpha + M\beta + M\gamma)$ |
+| Reduce-scatter | Chunk $i$ of the sum on rank $i$ | Ring | $(N-1)\alpha + \frac{N-1}{N}M\beta$ |
+| All-gather | Every chunk on every rank | Ring | $(N-1)\alpha + \frac{N-1}{N}M\beta$ |
+| All-reduce | Sum on every rank | Ring (RS + AG) | $2(N-1)\alpha + 2\frac{N-1}{N}M\beta$ |
+| All-to-all | Chunk $j$ of rank $i$ at rank $j$ | Pairwise | $(N-1)\alpha + \frac{N-1}{N}M\beta$ |
+| Send/recv | Buffer moved to one peer | Direct | $\alpha + M\beta$ |
+
+Three rules of thumb fall out of the formulas:
+
+- **Large messages are bandwidth-bound**, and good algorithms move about $M$ (or $2M$ for
+  all-reduce) bytes per rank regardless of $N$.
+- **Small messages are latency-bound**, and the number of steps matters more than the bytes. This
+  is where trees beat rings.
+- **The slowest link sets the pace.** Where a group's ranks sit on the physical network matters as
+  much as the algorithm, so put the chattiest groups on the fastest links.

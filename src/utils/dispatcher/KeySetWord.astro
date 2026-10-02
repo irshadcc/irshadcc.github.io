@@ -1,0 +1,203 @@
+---
+// A DispatchKeySet's uint64_t drawn as 64 bits in two rows (63 … 32, 31 … 0), tinted by region:
+// bits 15 … 0 are backends, bits 62 … 16 are functionality keys, bit 63 is unused. Buttons pick an
+// example key or key set; its bits are filled and the panel lists the bits each runtime key sets.
+// Examples come from wordExamples() in dispatcherFigures.ts.
+// Usage in .mdx:
+//   <KeySetWord />
+//   <KeySetWord example="AutogradCPU" />
+import { hex } from "./dispatchKeys";
+import { drawWord } from "./dispatcherDraw";
+import { wordExamples } from "./dispatcherFigures";
+
+interface Props {
+	example?: string;
+	title?: string;
+}
+
+const { example, title } = Astro.props;
+const all = wordExamples();
+const ex = all.find((e) => e.id === example) ?? all[0];
+---
+
+<figure class="ksw" data-id={ex.id}>
+	{title && <figcaption class="title">{title}</figcaption>}
+	<div class="tabs" role="tablist">
+		{all.map((e) => (
+			<button type="button" role="tab" data-id={e.id} aria-selected={e.id === ex.id ? "true" : "false"}>
+				{e.label}
+			</button>
+		))}
+	</div>
+	<div class="word" set:html={drawWord(ex.ks)} />
+	<p class="hex"><code>{hex(ex.ks)}</code></p>
+	<ul class="parts">{ex.parts.map((p) => <li>{p}</li>)}</ul>
+</figure>
+
+<script>
+	import { hex } from "./dispatchKeys";
+	import { drawWord } from "./dispatcherDraw";
+	import { wordExamples } from "./dispatcherFigures";
+
+	const all = wordExamples();
+	for (const fig of document.querySelectorAll<HTMLElement>(".ksw")) {
+		const show = (id: string) => {
+			const ex = all.find((e) => e.id === id) ?? all[0];
+			for (const b of fig.querySelectorAll<HTMLElement>(".tabs button"))
+				b.setAttribute("aria-selected", String(b.dataset.id === ex.id));
+			const word = fig.querySelector(".word");
+			if (word) word.innerHTML = drawWord(ex.ks);
+			const hx = fig.querySelector(".hex code");
+			if (hx) hx.textContent = hex(ex.ks);
+			const parts = fig.querySelector(".parts");
+			if (parts) {
+				parts.replaceChildren(
+					...ex.parts.map((p) => {
+						const li = document.createElement("li");
+						li.textContent = p;
+						return li;
+					}),
+				);
+			}
+		};
+		for (const tab of fig.querySelectorAll<HTMLButtonElement>(".tabs button"))
+			tab.addEventListener("click", () => show(tab.dataset.id ?? ""));
+	}
+</script>
+
+<style>
+	.ksw {
+		--func: #3b6ea5;
+		--backend: #c27c1e;
+		--unused: #8a8a8a;
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+	}
+	@media (prefers-color-scheme: dark) {
+		.ksw {
+			--func: #6c9fd6;
+			--backend: #e0a252;
+			--unused: #777;
+		}
+	}
+	.title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.5rem;
+	}
+	.tabs {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.35rem;
+		margin-bottom: 0.4rem;
+	}
+	.tabs button {
+		padding: 0.2rem 0.65rem;
+		border: 1px solid var(--faint);
+		border-radius: 999px;
+		background: var(--bg);
+		color: var(--muted);
+		font: inherit;
+		font-family: var(--mono);
+		font-size: 0.72rem;
+		cursor: pointer;
+	}
+	.tabs button[aria-selected="true"] {
+		border-color: var(--accent);
+		background: var(--accent-soft);
+		color: var(--text);
+	}
+	.word :global(svg) {
+		display: block;
+		width: 100%;
+		max-width: 700px;
+		height: auto;
+		margin: 0 auto;
+	}
+	.word :global(.wbit rect) {
+		stroke-width: 1;
+	}
+	.word :global(.wbit.func rect) {
+		fill: color-mix(in srgb, var(--func) 22%, var(--surface));
+		stroke: color-mix(in srgb, var(--func) 45%, var(--surface));
+	}
+	.word :global(.wbit.backend rect) {
+		fill: color-mix(in srgb, var(--backend) 22%, var(--surface));
+		stroke: color-mix(in srgb, var(--backend) 45%, var(--surface));
+	}
+	.word :global(.wbit.unused rect) {
+		fill: var(--surface);
+		stroke: var(--faint);
+		stroke-dasharray: 2 1.5;
+	}
+	.word :global(.wbit.func.on rect) {
+		fill: var(--func);
+		stroke: var(--func);
+	}
+	.word :global(.wbit.backend.on rect) {
+		fill: var(--backend);
+		stroke: var(--backend);
+	}
+	.word :global(.idx) {
+		font-family: var(--mono);
+		font-size: 7px;
+		text-anchor: middle;
+		fill: var(--muted);
+	}
+	.word :global(.wbit.on .idx) {
+		fill: #fff;
+		font-weight: 600;
+	}
+	.word :global(.wname) {
+		font-family: var(--mono);
+		font-size: 7.5px;
+		fill: var(--muted);
+	}
+	.word :global(.wname.set) {
+		fill: var(--text);
+		font-weight: 700;
+	}
+	.word :global(.brace) {
+		fill: none;
+		stroke-width: 1.2;
+	}
+	.word :global(.brace.func) {
+		stroke: var(--func);
+	}
+	.word :global(.brace.backend) {
+		stroke: var(--backend);
+	}
+	.word :global(.brace.unused) {
+		stroke: var(--unused);
+	}
+	.word :global(.region) {
+		font-size: 9px;
+		font-weight: 600;
+		text-anchor: middle;
+	}
+	.word :global(.region.func) {
+		fill: var(--func);
+	}
+	.word :global(.region.backend) {
+		fill: var(--backend);
+	}
+	.word :global(.region.unused) {
+		fill: var(--unused);
+	}
+	.hex {
+		margin: 0.3rem 0 0;
+		text-align: center;
+		font-size: 0.78rem;
+	}
+	.parts {
+		margin: 0.4rem auto 0;
+		max-width: 36rem;
+		padding: 0.45rem 0.7rem 0.45rem 1.6rem;
+		border-left: 3px solid var(--accent);
+		background: var(--accent-soft);
+		font-family: var(--mono);
+		font-size: 0.7rem;
+	}
+</style>

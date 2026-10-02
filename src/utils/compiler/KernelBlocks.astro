@@ -1,0 +1,213 @@
+---
+// The programs of an Inductor-generated Triton kernel over its iteration space (drawn in
+// kernelBlocks.ts). Each colour is one program; the outlined block is the selected one, and
+// dashed cells are its masked lanes. Below the grid, one strip per pointer shows the memory
+// offsets the selected program touches. Hover or tap a cell to select its program; the tabs
+// switch block sizes.
+// Usage in .mdx:
+//   <KernelBlocks rows={8} cols={32} blocks={[[1, 32], [2, 32]]} rowVar="x0" colVar="r0_1"
+//     pointers={[{ name: "in_out_ptr0", strides: [32, 1] }]} wrap={32} />
+import {
+	type BlocksConfig,
+	type Pointer,
+	describeProgram,
+	drawBlocks,
+} from "./kernelBlocks";
+
+interface Props {
+	rows: number;
+	cols: number;
+	/** Block sizes to offer as tabs, each [rows per block, cols per block]. */
+	blocks: [number, number][];
+	pointers: Pointer[];
+	rowVar: string;
+	colVar: string;
+	/** Memory strip width in elements. */
+	wrap?: number;
+	/** Names for the block dimensions in the tab labels, e.g. ["XBLOCK", "R0_BLOCK"]. */
+	blockNames?: [string, string];
+	title?: string;
+}
+
+const {
+	rows,
+	cols,
+	blocks,
+	pointers,
+	rowVar,
+	colVar,
+	wrap = 16,
+	blockNames = ["YBLOCK", "XBLOCK"],
+	title,
+} = Astro.props;
+const cfg: BlocksConfig = { rows, cols, pointers, rowVar, colVar };
+const state = { block: blocks[0], pid: 0 };
+---
+
+<figure class="kernel-blocks" data-config={JSON.stringify({ cfg, blocks, wrap })}>
+	{title && <figcaption class="title">{title}</figcaption>}
+	{
+		blocks.length > 1 && (
+			<div class="tabs" role="tablist">
+				{blocks.map((b, i) => (
+					<button type="button" role="tab" data-i={i} aria-selected={i === 0 ? "true" : "false"}>
+						{blockNames[0]}={b[0]}, {blockNames[1]}={b[1]}
+					</button>
+				))}
+			</div>
+		)
+	}
+	<div class="canvas" set:html={drawBlocks(cfg, state, wrap)} />
+	<p class="note">
+		{describeProgram(cfg, state).map((l) => <span>{l}</span>)}
+	</p>
+</figure>
+
+<script>
+	import { describeProgram, drawBlocks } from "./kernelBlocks";
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".kernel-blocks")) {
+		const { cfg, blocks, wrap } = JSON.parse(fig.dataset.config ?? "{}");
+		const state = { block: blocks[0] as [number, number], pid: 0 };
+		const canvas = fig.querySelector<HTMLElement>(".canvas");
+		const note = fig.querySelector<HTMLElement>(".note");
+		if (!canvas || !note) continue;
+		const render = () => {
+			canvas.innerHTML = drawBlocks(cfg, state, wrap);
+			note.replaceChildren(
+				...describeProgram(cfg, state).map((l) => {
+					const s = document.createElement("span");
+					s.textContent = l;
+					return s;
+				}),
+			);
+		};
+		for (const tab of fig.querySelectorAll<HTMLButtonElement>("[role=tab]"))
+			tab.addEventListener("click", () => {
+				state.block = blocks[Number(tab.dataset.i)];
+				state.pid = 0;
+				for (const t of fig.querySelectorAll("[role=tab]")) t.setAttribute("aria-selected", String(t === tab));
+				render();
+			});
+		const pick = (e: Event) => {
+			const cell = (e.target as Element).closest<SVGRectElement>("[data-pid]");
+			if (!cell) return;
+			const pid = Number(cell.dataset.pid);
+			if (pid !== state.pid) {
+				state.pid = pid;
+				render();
+			}
+		};
+		canvas.addEventListener("pointerover", pick);
+		canvas.addEventListener("click", pick);
+	}
+</script>
+
+<style>
+	.kernel-blocks {
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+		--cell-l: 84%;
+		--cell-on-l: 62%;
+	}
+	@media (prefers-color-scheme: dark) {
+		.kernel-blocks {
+			--cell-l: 26%;
+			--cell-on-l: 46%;
+		}
+	}
+	.title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.5rem;
+	}
+	.tabs {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.25rem;
+		margin-bottom: 0.5rem;
+		font-size: 0.74rem;
+	}
+	.tabs button {
+		padding: 0.25rem 0.6rem;
+		border: 1px solid var(--faint);
+		border-radius: 999px;
+		background: var(--bg);
+		color: var(--text);
+		font-family: var(--mono);
+		font-size: inherit;
+		cursor: pointer;
+	}
+	.tabs button:hover {
+		border-color: var(--accent);
+	}
+	.tabs button[aria-selected="true"] {
+		background: var(--accent);
+		border-color: var(--accent);
+		color: var(--bg);
+	}
+	.canvas :global(svg) {
+		display: block;
+		max-width: 100%;
+		height: auto;
+		margin: 0 auto;
+	}
+	.canvas :global(.cell) {
+		fill: hsl(var(--hue) 55% var(--cell-l));
+		cursor: pointer;
+	}
+	.canvas :global(.cell.on) {
+		fill: hsl(var(--hue) 60% var(--cell-on-l));
+	}
+	.canvas :global(.cell.masked) {
+		fill: none;
+		stroke: var(--muted);
+		stroke-width: 0.8;
+		stroke-dasharray: 2 2;
+		cursor: default;
+	}
+	.canvas :global(.block) {
+		fill: none;
+		stroke: var(--text);
+		stroke-width: 1.6;
+		pointer-events: none;
+	}
+	.canvas :global(.mem) {
+		fill: var(--surface);
+		stroke: var(--faint);
+		stroke-width: 0.6;
+	}
+	.canvas :global(.mem.on) {
+		fill: hsl(var(--hue) 60% var(--cell-on-l));
+		stroke: none;
+	}
+	.canvas :global(.axis),
+	.canvas :global(.ptr) {
+		font-family: var(--mono);
+		font-size: 10px;
+		fill: var(--muted);
+	}
+	.canvas :global(.tick) {
+		font-family: var(--mono);
+		font-size: 8.5px;
+		fill: var(--muted);
+	}
+	.canvas :global(.tick.end) {
+		text-anchor: end;
+	}
+	.note {
+		display: flex;
+		flex-direction: column;
+		gap: 0.1rem;
+		margin: 0.4rem auto 0;
+		max-width: 30rem;
+		font-family: var(--mono);
+		font-size: 0.72rem;
+		color: var(--muted);
+	}
+	.note :global(span:first-child) {
+		color: var(--text);
+	}
+</style>

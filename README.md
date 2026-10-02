@@ -36,6 +36,7 @@ description: "One or two sentences. Shown under the title on the home page and i
 date: 2026-01-15
 updated: 2026-02-01   # optional: shown next to the date on the post
 draft: true           # optional: see "Drafts" below
+tags: [Compilers]     # optional: up to two, shown on post and listing pages
 ---
 ```
 
@@ -46,6 +47,7 @@ draft: true           # optional: see "Drafts" below
 | `date`        |   yes    | `YYYY-MM-DD`. Sets the order and year group on the home page. |
 | `updated`     |    no    | Adds "updated …" to the post's date line.                    |
 | `draft`       |    no    | `true` hides the post from the site. Defaults to `false`.    |
+| `tags`        |    no    | Up to two labels, shown on post and listing pages.           |
 
 The reading time on each post is calculated automatically.
 

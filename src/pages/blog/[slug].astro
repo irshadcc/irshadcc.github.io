@@ -1,6 +1,7 @@
 ---
 import { render } from "astro:content";
 import TableOfContents from "../../components/TableOfContents.astro";
+import PostTags from "../../components/PostTags.astro";
 import Layout from "../../layouts/Layout.astro";
 import { getPosts } from "../../posts";
 import { formatDate, readingTime } from "../../site";
@@ -28,5 +29,6 @@ const toc = headings.filter((h) => h.depth <= 3);
 			</>
 		)}
 	</p>
+	<PostTags tags={post.data.tags} />
 	<Content />
 </Layout>

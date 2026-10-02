@@ -1,0 +1,158 @@
+---
+// The attention score matrix cut into tiles, as FlashAttention computes it (drawn in flash.ts).
+// Each row of tiles is one thread block's work: hover or tap a row to number the tiles it visits.
+// With the causal tab, tiles above the diagonal are skipped and diagonal tiles are partly masked.
+// Usage in .mdx:
+//   <AttentionTiles />
+//   <AttentionTiles tiles={8} causal />
+import { drawTiles } from "./flash";
+
+interface Props {
+	tiles?: number;
+	causal?: boolean;
+	row?: number;
+	title?: string;
+}
+
+const { tiles = 8, causal = false, row = 5, title } = Astro.props;
+const computed = (c: boolean) => (c ? (tiles * (tiles + 1)) / 2 : tiles * tiles);
+---
+
+<figure class="tiles" data-config={JSON.stringify({ tiles, causal, row })}>
+	{title && <figcaption class="title">{title}</figcaption>}
+	<div class="tabs" role="tablist">
+		<button type="button" role="tab" data-causal="0" aria-selected={causal ? "false" : "true"}>Full attention</button>
+		<button type="button" role="tab" data-causal="1" aria-selected={causal ? "true" : "false"}>Causal</button>
+	</div>
+	<div class="canvas" set:html={drawTiles(tiles, causal, row)} />
+	<p class="note">
+		Tiles computed: <b data-n>{computed(causal)}</b> of {tiles * tiles}. Hover a row of tiles to see one thread block's loop.
+	</p>
+</figure>
+
+<script>
+	import { drawTiles } from "./flash";
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".tiles")) {
+		const cfg = JSON.parse(fig.dataset.config ?? "{}");
+		const state = { causal: cfg.causal as boolean, row: cfg.row as number };
+		const canvas = fig.querySelector<HTMLElement>(".canvas");
+		const n = fig.querySelector<HTMLElement>("[data-n]");
+		if (!canvas) continue;
+		const render = () => {
+			canvas.innerHTML = drawTiles(cfg.tiles, state.causal, state.row);
+			if (n) n.textContent = String(state.causal ? (cfg.tiles * (cfg.tiles + 1)) / 2 : cfg.tiles * cfg.tiles);
+		};
+		for (const tab of fig.querySelectorAll<HTMLButtonElement>("[role=tab]"))
+			tab.addEventListener("click", () => {
+				state.causal = tab.dataset.causal === "1";
+				for (const t of fig.querySelectorAll("[role=tab]")) t.setAttribute("aria-selected", String(t === tab));
+				render();
+			});
+		canvas.addEventListener("pointerover", (e) => {
+			const g = (e.target as Element).closest<SVGGElement>("[data-row]");
+			if (!g) return;
+			const r = Number(g.dataset.row);
+			if (r !== state.row) {
+				state.row = r;
+				render();
+			}
+		});
+	}
+</script>
+
+<style>
+	.tiles {
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+	}
+	.title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.5rem;
+	}
+	.tabs {
+		display: flex;
+		justify-content: center;
+		gap: 0.25rem;
+		margin-bottom: 0.5rem;
+		font-size: 0.78rem;
+	}
+	.tabs button {
+		padding: 0.25rem 0.6rem;
+		border: 1px solid var(--faint);
+		border-radius: 999px;
+		background: var(--bg);
+		color: var(--text);
+		font: inherit;
+		cursor: pointer;
+	}
+	.tabs button:hover {
+		border-color: var(--accent);
+	}
+	.tabs button[aria-selected="true"] {
+		background: var(--accent);
+		border-color: var(--accent);
+		color: var(--bg);
+	}
+	.canvas :global(svg) {
+		display: block;
+		max-width: 100%;
+		height: auto;
+		margin: 0 auto;
+	}
+	.canvas :global(.lab) {
+		font-size: 9.5px;
+		fill: var(--muted);
+	}
+	.canvas :global(.lab.end),
+	.canvas :global(.tick.end) {
+		text-anchor: end;
+	}
+	.canvas :global(.tick) {
+		font-family: var(--mono);
+		font-size: 9px;
+		text-anchor: middle;
+		fill: var(--muted);
+	}
+	.canvas :global(.tile rect) {
+		fill: color-mix(in oklch, var(--accent) 22%, var(--bg));
+		stroke: color-mix(in oklch, var(--accent) 45%, transparent);
+		stroke-width: 0.8;
+	}
+	.canvas :global(.tile.skip rect) {
+		fill: var(--surface);
+		stroke: var(--faint);
+		stroke-dasharray: 2 2;
+	}
+	.canvas :global(.tile.sel:not(.skip) rect) {
+		fill: color-mix(in oklch, var(--accent) 45%, var(--bg));
+	}
+	.canvas :global(.tile.on rect) {
+		stroke: var(--accent);
+		stroke-width: 1.5;
+	}
+	.canvas :global(.mask) {
+		fill: var(--surface);
+		opacity: 0.85;
+	}
+	.canvas :global(.ord) {
+		font-family: var(--mono);
+		font-size: 10px;
+		font-weight: 600;
+		text-anchor: middle;
+		fill: var(--text);
+		pointer-events: none;
+	}
+	.note {
+		margin: 0.4rem 0 0;
+		font-size: 0.76rem;
+		text-align: center;
+		color: var(--muted);
+	}
+	.note b {
+		color: var(--text);
+		font-family: var(--mono);
+	}
+</style>

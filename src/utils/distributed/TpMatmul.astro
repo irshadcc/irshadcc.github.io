@@ -1,0 +1,214 @@
+---
+// A tensor-parallel matrix multiply: which rank holds which piece of every matrix, for a
+// column-parallel layer, a row-parallel layer, or the MLP that chains them (drawn in
+// tensorParallel.ts). Pass several `modes` to get tabs; hovering a piece or a legend entry
+// highlights everything that rank holds.
+// Usage in .mdx:
+//   <TpMatmul modes={["column", "row"]} n={4} />
+//   <TpMatmul modes={["mlp"]} />
+import { type MatmulMode, RANK_COLORS, drawMatmul } from "./tensorParallel";
+
+interface Props {
+	modes?: MatmulMode[];
+	/** Ranks, 2 to 8. */
+	n?: number;
+	title?: string;
+}
+
+const { modes = ["column"], n = 4, title } = Astro.props;
+const hash = [...JSON.stringify(Astro.props)]
+	.reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7)
+	.toString(36);
+const id = `tpm-${hash}`;
+const NAMES: Record<MatmulMode, string> = {
+	column: "Column-parallel",
+	row: "Row-parallel",
+	mlp: "MLP: column, then row",
+};
+const NOTES: Record<MatmulMode, string> = {
+	column: "Each rank computes its own columns of Y. No communication.",
+	row: "Each rank computes a full-size partial sum. One all-reduce adds them up.",
+	mlp: "GeLU works column by column, so it runs on each slice. One all-reduce at the end.",
+};
+---
+
+<figure class="tp-matmul" data-id={id}>
+	{title && <figcaption class="title">{title}</figcaption>}
+	{
+		modes.length > 1 && (
+			<div class="tabs" role="tablist">
+				{modes.map((m, i) => (
+					<button type="button" role="tab" data-mode={m} aria-selected={i === 0 ? "true" : "false"}>
+						{NAMES[m]}
+					</button>
+				))}
+			</div>
+		)
+	}
+	<div class="legend">
+		{
+			Array.from({ length: n }, (_, r) => (
+				<span class="key" data-rank={r}>
+					<i class="sw" style={`background: ${RANK_COLORS[r]}`} />
+					rank {r}
+				</span>
+			))
+		}
+		<span class="key"><i class="sw rep"></i>replicated</span>
+	</div>
+	{
+		modes.map((m, i) => (
+			<div class="panel" data-mode={m} hidden={i !== 0}>
+				<div class="canvas" set:html={drawMatmul(m, n, `${id}-${m}`)} />
+				<p class="note">{NOTES[m]}</p>
+			</div>
+		))
+	}
+</figure>
+
+<script>
+	for (const fig of document.querySelectorAll<HTMLElement>(".tp-matmul")) {
+		for (const tab of fig.querySelectorAll<HTMLButtonElement>("[role=tab]"))
+			tab.addEventListener("click", () => {
+				for (const t of fig.querySelectorAll("[role=tab]")) t.setAttribute("aria-selected", String(t === tab));
+				for (const p of fig.querySelectorAll<HTMLElement>(".panel")) p.hidden = p.dataset.mode !== tab.dataset.mode;
+			});
+		const highlight = (rank: string | undefined) => {
+			fig.classList.toggle("hl", rank !== undefined);
+			for (const el of fig.querySelectorAll<SVGElement>(".slab"))
+				el.classList.toggle("on", el.dataset.rank === rank);
+		};
+		fig.addEventListener("pointerover", (e) => {
+			const el = (e.target as Element).closest<HTMLElement | SVGElement>("[data-rank]");
+			highlight(el?.dataset.rank);
+		});
+		fig.addEventListener("pointerleave", () => highlight(undefined));
+	}
+</script>
+
+<style>
+	.tp-matmul {
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+	}
+	.title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.5rem;
+	}
+	.tabs {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.25rem;
+		margin-bottom: 0.5rem;
+		font-size: 0.78rem;
+	}
+	.tabs button {
+		padding: 0.25rem 0.6rem;
+		border: 1px solid var(--faint);
+		border-radius: 999px;
+		background: var(--bg);
+		color: var(--text);
+		font: inherit;
+		cursor: pointer;
+	}
+	.tabs button:hover {
+		border-color: var(--accent);
+	}
+	.tabs button[aria-selected="true"] {
+		background: var(--accent);
+		border-color: var(--accent);
+		color: var(--bg);
+	}
+	.legend {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.3rem 1rem;
+		margin-bottom: 0.4rem;
+		font-size: 0.72rem;
+		color: var(--muted);
+	}
+	.key {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.3rem;
+		cursor: default;
+	}
+	.sw {
+		width: 0.8rem;
+		height: 0.8rem;
+		border-radius: 2px;
+		border: 1px solid color-mix(in oklch, var(--text) 25%, transparent);
+	}
+	.sw.rep {
+		background: color-mix(in oklch, var(--muted) 30%, transparent);
+	}
+	.panel[hidden] {
+		display: none;
+	}
+	.canvas {
+		overflow-x: auto;
+	}
+	.canvas :global(svg) {
+		display: block;
+		max-width: 100%;
+		height: auto;
+		margin: 0 auto;
+	}
+	.canvas :global(.m-rep) {
+		fill: color-mix(in oklch, var(--muted) 30%, transparent);
+		stroke: var(--muted);
+		stroke-width: 1;
+	}
+	.canvas :global(.m-outline) {
+		fill: none;
+		stroke: var(--muted);
+		stroke-width: 1;
+	}
+	.canvas :global(.slab) {
+		stroke: color-mix(in oklch, #1a1a1a 35%, transparent);
+		stroke-width: 0.7;
+		transition: opacity 120ms ease;
+	}
+	.tp-matmul.hl .canvas :global(.slab:not(.on)) {
+		opacity: 0.2;
+	}
+	.canvas :global(.m-label) {
+		font-family: var(--mono);
+		font-size: 11px;
+		text-anchor: middle;
+		fill: var(--text);
+	}
+	.canvas :global(.m-sub) {
+		font-size: 9.5px;
+		text-anchor: middle;
+		fill: var(--muted);
+	}
+	.canvas :global(.op) {
+		font-size: 15px;
+		text-anchor: middle;
+		fill: var(--muted);
+	}
+	.canvas :global(.comm line) {
+		stroke: var(--accent);
+		stroke-width: 1.5;
+	}
+	.canvas :global(.comm text) {
+		font-size: 10px;
+		font-weight: 600;
+		text-anchor: middle;
+		fill: var(--accent);
+	}
+	.canvas :global(.arrowhead) {
+		fill: var(--accent);
+	}
+	.note {
+		margin: 0.4rem 0 0;
+		font-size: 0.78rem;
+		color: var(--muted);
+		text-align: center;
+	}
+</style>

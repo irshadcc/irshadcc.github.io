@@ -1,0 +1,15 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import ImportanceSamplingExplorer from "../../utils/probability/ImportanceSamplingExplorer.astro";
+---
+
+<Layout title="Importance sampling explorer">
+	<main>
+		<h1>Importance sampling explorer</h1>
+		<ImportanceSamplingExplorer threshold={3} initialMean={3} />
+	</main>
+</Layout>
+
+<style>
+	main { max-width: 780px; margin: 3rem auto; padding: 0 1rem; }
+</style>

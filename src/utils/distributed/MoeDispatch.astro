@@ -1,0 +1,279 @@
+---
+// A toy MoE layer under expert parallelism (simulated in moe.ts): how many token copies each
+// expert gets, grouped by the rank that holds it, and the all-to-all matrix of copies sent
+// between ranks. The reader moves the router's skew and picks a capacity factor.
+// Usage in .mdx:
+//   <MoeDispatch />
+//   <MoeDispatch skew={1.2} capacity={1.25} />
+import { drawMoe, moeStats, simulateMoe } from "./moe";
+
+interface Props {
+	ranks?: number;
+	experts?: number;
+	tokens?: number;
+	k?: number;
+	skew?: number;
+	/** Capacity factor; omit for dropless. */
+	capacity?: number;
+	/** Show the capacity-factor control. */
+	capacityControl?: boolean;
+	title?: string;
+}
+
+const {
+	ranks = 4,
+	experts = 8,
+	tokens = 64,
+	k = 2,
+	skew = 0,
+	capacity,
+	capacityControl = false,
+	title,
+} = Astro.props;
+const cfg = { ranks, experts, tokens, k, skew, capacity: capacity ?? null };
+const result = simulateMoe(cfg);
+const stats = moeStats(result);
+const CAPS = [null, 1, 1.25, 1.5, 2];
+---
+
+<figure class="moe" data-config={JSON.stringify(cfg)}>
+	{title && <figcaption class="title">{title}</figcaption>}
+	<div class="knobs">
+		<label>
+			router skew
+			<input data-knob="skew" type="range" min="0" max="2" step="0.1" value={skew} />
+			<output>{skew.toFixed(1)}</output>
+		</label>
+		{
+			capacityControl && (
+				<label>
+					capacity factor
+					<select data-knob="capacity">
+						{CAPS.map((c) => (
+							<option value={c ?? ""} selected={c === (capacity ?? null)}>
+								{c === null ? "dropless" : c.toFixed(2)}
+							</option>
+						))}
+					</select>
+				</label>
+			)
+		}
+	</div>
+	<div class="legend">
+		<span class="key"><i class="sw bar"></i>token copies processed</span>
+		<span class="key"><i class="sw drop"></i>dropped (over capacity)</span>
+		<span class="key"><i class="sw fair"></i>perfectly balanced load</span>
+		{capacityControl && <span class="key"><i class="sw cap"></i>capacity</span>}
+	</div>
+	<div class="canvas" set:html={drawMoe(result)} />
+	<dl class="stats">
+		<div><dt>busiest rank</dt><dd data-stat="max">{stats.maxRecv}</dd></div>
+		<div><dt>average rank</dt><dd data-stat="mean">{stats.meanRecv.toFixed(0)}</dd></div>
+		<div><dt>imbalance</dt><dd data-stat="imb">{(stats.maxRecv / stats.meanRecv).toFixed(2)}×</dd></div>
+		<div><dt>dropped</dt><dd data-stat="drop">{(100 * stats.droppedFrac).toFixed(1)}%</dd></div>
+	</dl>
+</figure>
+
+<script>
+	import { drawMoe, moeStats, simulateMoe } from "./moe";
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".moe")) {
+		const cfg = JSON.parse(fig.dataset.config ?? "{}");
+		const canvas = fig.querySelector<HTMLElement>(".canvas");
+		const skew = fig.querySelector<HTMLInputElement>("[data-knob=skew]");
+		const cap = fig.querySelector<HTMLSelectElement>("[data-knob=capacity]");
+		const out = fig.querySelector("output");
+		const set = (k: string, v: string) => {
+			const el = fig.querySelector(`[data-stat=${k}]`);
+			if (el) el.textContent = v;
+		};
+		if (!canvas || !skew) continue;
+		const render = () => {
+			cfg.skew = Number(skew.value);
+			if (cap) cfg.capacity = cap.value === "" ? null : Number(cap.value);
+			if (out) out.textContent = cfg.skew.toFixed(1);
+			const r = simulateMoe(cfg);
+			const s = moeStats(r);
+			canvas.innerHTML = drawMoe(r);
+			set("max", String(s.maxRecv));
+			set("mean", s.meanRecv.toFixed(0));
+			set("imb", `${(s.maxRecv / s.meanRecv).toFixed(2)}×`);
+			set("drop", `${(100 * s.droppedFrac).toFixed(1)}%`);
+		};
+		skew.addEventListener("input", render);
+		cap?.addEventListener("input", render);
+	}
+</script>
+
+<style>
+	.moe {
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+	}
+	.title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.5rem;
+	}
+	.knobs {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.4rem 1.5rem;
+		margin-bottom: 0.5rem;
+		font-size: 0.78rem;
+		color: var(--muted);
+	}
+	.knobs label {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.4rem;
+	}
+	.knobs input {
+		width: 8rem;
+		accent-color: var(--accent);
+	}
+	.knobs output {
+		font-family: var(--mono);
+		color: var(--text);
+	}
+	.knobs select {
+		font: inherit;
+		color: var(--text);
+		background: var(--bg);
+		border: 1px solid var(--faint);
+		border-radius: 6px;
+	}
+	.legend {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.3rem 1rem;
+		margin-bottom: 0.4rem;
+		font-size: 0.72rem;
+		color: var(--muted);
+	}
+	.key {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.3rem;
+	}
+	.sw {
+		width: 0.8rem;
+		height: 0.8rem;
+		border-radius: 2px;
+	}
+	.sw.bar {
+		background: var(--accent);
+	}
+	.sw.drop {
+		background: #d0574f;
+	}
+	.sw.fair,
+	.sw.cap {
+		height: 0;
+		border-top: 2px dashed var(--muted);
+		border-radius: 0;
+	}
+	.sw.cap {
+		border-top: 2px solid #d0574f;
+	}
+	.canvas {
+		overflow-x: auto;
+	}
+	.canvas :global(svg) {
+		display: block;
+		max-width: 100%;
+		height: auto;
+		margin: 0 auto;
+	}
+	.canvas :global(.h) {
+		font-size: 10px;
+		font-weight: 600;
+		fill: var(--muted);
+	}
+	.canvas :global(.group) {
+		fill-opacity: 0.22;
+	}
+	.canvas :global(.glabel),
+	.canvas :global(.elabel) {
+		font-size: 9px;
+		text-anchor: middle;
+		fill: var(--muted);
+	}
+	.canvas :global(.bar) {
+		fill: var(--accent);
+		transition: all 150ms ease;
+	}
+	.canvas :global(.drop) {
+		fill: #d0574f;
+	}
+	.canvas :global(.fair) {
+		stroke: var(--muted);
+		stroke-dasharray: 4 3;
+	}
+	.canvas :global(.cap) {
+		stroke: #d0574f;
+		stroke-width: 1.2;
+	}
+	.canvas :global(.tick) {
+		font-family: var(--mono);
+		font-size: 8.5px;
+		text-anchor: end;
+		fill: var(--muted);
+	}
+	.canvas :global(.cap-t) {
+		fill: #d0574f;
+	}
+	.canvas :global(.mh) {
+		font-family: var(--mono);
+		font-size: 9px;
+		text-anchor: middle;
+		fill: var(--muted);
+	}
+	.canvas :global(.mh.end) {
+		text-anchor: end;
+	}
+	.canvas :global(.cell) {
+		fill: var(--accent);
+	}
+	.canvas :global(.cell.self) {
+		stroke: var(--text);
+		stroke-width: 1;
+		stroke-dasharray: 2 2;
+	}
+	.canvas :global(.cv) {
+		font-family: var(--mono);
+		font-size: 9.5px;
+		text-anchor: middle;
+		fill: var(--text);
+	}
+	.canvas :global(.sum) {
+		font-family: var(--mono);
+		font-size: 9.5px;
+		font-weight: 600;
+		text-anchor: middle;
+		fill: var(--text);
+	}
+	.stats {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.3rem 1.5rem;
+		margin: 0.5rem 0 0;
+		font-size: 0.78rem;
+	}
+	.stats div {
+		display: flex;
+		gap: 0.4rem;
+	}
+	.stats dt {
+		color: var(--muted);
+	}
+	.stats dd {
+		margin: 0;
+		font-family: var(--mono);
+		font-weight: 600;
+	}
+</style>

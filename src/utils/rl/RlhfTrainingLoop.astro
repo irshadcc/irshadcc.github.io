@@ -1,0 +1,176 @@
+---
+// Animated graph of one PPO-based RLHF iteration: rollout, scoring, advantage
+// estimation and the policy update that closes the online loop.
+// Usage in .mdx:
+//   <RlhfTrainingLoop step={0} />
+import { rlhfEdges, rlhfNodes, rlhfSteps } from "./rlhfTrainingLoop";
+
+interface Props {
+	step?: number;
+}
+const start = Math.min(
+	Math.max(Astro.props.step ?? 0, 0),
+	rlhfSteps.length - 1,
+);
+const hash = [...JSON.stringify(Astro.props)]
+	.reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 19)
+	.toString(36);
+const arrowId = `rlhf-arrow-${hash}`;
+const tokens = ["The", "answer", "is", "four", "〈eos〉"];
+---
+
+<figure class="rlhf-loop" data-step={start}>
+	<script type="application/json" set:html={JSON.stringify(rlhfSteps)} />
+	<div class="canvas">
+		<svg viewBox="0 0 700 276" role="img" aria-label="Animated graph of rollout and policy update in PPO-based RLHF">
+			<defs>
+				<marker id={arrowId} viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+					<path d="M0,0 L8,4 L0,8 z" />
+				</marker>
+			</defs>
+			<g class="edges">
+				{rlhfEdges.map((edge) => (
+					<g class="edge" data-edge={edge.id}>
+						<path d={edge.path} marker-end={"url(#" + arrowId + ")"} />
+						<circle class="packet" r="4"><animateMotion dur="1.1s" repeatCount="indefinite" path={edge.path} /></circle>
+					</g>
+				))}
+			</g>
+			<g class="nodes">
+				{rlhfNodes.map((node) => (
+					<g class:list={["node", node.tone]} data-node={node.id}>
+						<rect x={node.x - node.w / 2} y={node.y - node.h / 2} width={node.w} height={node.h} rx="9" />
+						<text class="label" x={node.x} y={node.y - 3}>{node.label}</text>
+						<text class="detail" x={node.x} y={node.y + 15}>{node.detail}</text>
+					</g>
+				))}
+			</g>
+			<g class="token-strip" transform="translate(351 119)">
+				<rect x="0" y="0" width="142" height="31" rx="6" />
+				{tokens.map((token, i) => (
+					<g class="token" data-token={i + 1} transform={"translate(" + (7 + i * 26) + " 7)"}>
+						<rect width={i === 4 ? 31 : 24} height="17" rx="3" />
+						<text x={i === 4 ? 15.5 : 12} y="12">{token}</text>
+					</g>
+				))}
+			</g>
+		</svg>
+	</div>
+	<div class="explain">
+		{rlhfSteps.map((item, i) => (
+			<div class="step-copy" data-copy={i} hidden={i !== start}>
+				<strong>{item.title}</strong><span>{item.body}</span><code>{item.metric}</code>
+			</div>
+		))}
+	</div>
+	<div class="controls">
+		<div class="buttons">
+			<button type="button" data-act="prev" aria-label="Previous step">←</button>
+			<button type="button" data-act="play" class="play" aria-label="Play">
+				<svg class="i-play" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5v11L13.5 8z" /></svg>
+				<svg class="i-pause" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 2.5h4v11H3zm6 0h4v11H9z" /></svg>
+			</button>
+			<button type="button" data-act="next" aria-label="Next step">→</button>
+		</div>
+		<div class="timeline">
+			{rlhfSteps.map((_, i) => <button type="button" data-go={i} aria-label={"Go to step " + (i + 1)} />)}
+		</div>
+		<span class="count">{start + 1} / {rlhfSteps.length}</span>
+	</div>
+	<figcaption>PPO-based RLHF is an online loop. Play the graph to follow one rollout and update.</figcaption>
+</figure>
+
+<script>
+	document.querySelectorAll<HTMLElement>(".rlhf-loop").forEach((fig) => {
+		const data = fig.querySelector<HTMLScriptElement>("script[type='application/json']");
+		const steps = JSON.parse(data?.textContent ?? "[]");
+		let at = Number(fig.dataset.step ?? 0);
+		let timer: number | undefined;
+		const play = fig.querySelector<HTMLButtonElement>("[data-act=play]");
+		const count = fig.querySelector<HTMLElement>(".count");
+		const render = (next: number) => {
+			at = Math.max(0, Math.min(steps.length - 1, next));
+			const step = steps[at];
+			fig.querySelectorAll<HTMLElement>("[data-node]").forEach((node) => node.classList.toggle("on", step.activeNodes.includes(node.dataset.node)));
+			fig.querySelectorAll<HTMLElement>("[data-edge]").forEach((edge) => edge.classList.toggle("on", step.activeEdges.includes(edge.dataset.edge)));
+			fig.querySelectorAll<HTMLElement>("[data-copy]").forEach((copy) => { copy.hidden = Number(copy.dataset.copy) !== at; });
+			fig.querySelectorAll<HTMLElement>("[data-token]").forEach((token) => token.classList.toggle("shown", Number(token.dataset.token) <= step.tokens));
+			fig.querySelectorAll<HTMLElement>("[data-go]").forEach((dot) => dot.classList.toggle("on", Number(dot.dataset.go) === at));
+			if (count) count.textContent = String(at + 1) + " / " + String(steps.length);
+		};
+		const stop = () => {
+			if (timer !== undefined) window.clearInterval(timer);
+			timer = undefined;
+			play?.classList.remove("playing");
+			play?.setAttribute("aria-label", "Play");
+		};
+		const start = () => {
+			if (at === steps.length - 1) render(0);
+			play?.classList.add("playing");
+			play?.setAttribute("aria-label", "Pause");
+			timer = window.setInterval(() => {
+				if (at === steps.length - 1) stop();
+				else render(at + 1);
+			}, 1800);
+		};
+		fig.querySelectorAll<HTMLButtonElement>("button").forEach((button) => button.addEventListener("click", () => {
+			const act = button.dataset.act;
+			if (act === "play") return timer === undefined ? start() : stop();
+			stop();
+			if (act === "prev") render(at - 1);
+			else if (act === "next") render(at + 1);
+			else if (button.dataset.go !== undefined) render(Number(button.dataset.go));
+		}));
+		render(at);
+	});
+</script>
+
+<style>
+	.rlhf-loop { margin: 1.75rem 0; }
+	.canvas { overflow-x: auto; border: 1px solid var(--faint); border-radius: .65rem; background: var(--surface); }
+	svg { display: block; width: 100%; min-width: 620px; height: auto; font-family: var(--sans); }
+	.edge path { fill: none; stroke: var(--faint); stroke-width: 2; transition: stroke .2s, stroke-width .2s; }
+	.edge .packet { display: none; fill: var(--accent); }
+	.edge.on path { stroke: var(--accent); stroke-width: 3; }
+	.edge.on .packet { display: block; }
+	marker path { fill: var(--muted); }
+	.node rect { fill: var(--surface); stroke: var(--faint); stroke-width: 1.5; transition: stroke .2s, fill .2s; }
+	.node.on rect { stroke: var(--accent); stroke-width: 3; fill: color-mix(in srgb, var(--surface) 88%, var(--accent)); }
+	.node.data.on rect { fill: color-mix(in srgb, var(--surface) 84%, #55a879); }
+	.node.score.on rect { fill: color-mix(in srgb, var(--surface) 84%, #e5a13a); }
+	.node.update.on rect { fill: color-mix(in srgb, var(--surface) 84%, #b178d3); }
+	.label, .detail { text-anchor: middle; dominant-baseline: middle; fill: var(--text); }
+	.label { font-size: 13px; font-weight: 650; }
+	.detail { font-size: 10px; fill: var(--muted); }
+	.token-strip > rect { fill: var(--surface); stroke: var(--faint); stroke-dasharray: 3 2; }
+	.token { opacity: .12; transition: opacity .2s; }
+	.token.shown { opacity: 1; }
+	.token rect { fill: color-mix(in srgb, var(--surface) 80%, var(--accent)); }
+	.token text { text-anchor: middle; font-size: 6px; fill: var(--text); }
+	.explain { min-height: 6.5rem; padding: .85rem 1rem; border: 1px solid var(--faint); border-top: 0; }
+	.step-copy { display: grid; grid-template-columns: auto 1fr; gap: .2rem .8rem; align-items: baseline; }
+	.step-copy[hidden] { display: none; }
+	.step-copy strong { color: var(--text); }
+	.step-copy span { color: var(--muted); }
+	.step-copy code { grid-column: 1 / -1; margin-top: .35rem; color: var(--accent); }
+	.controls { display: flex; align-items: center; gap: .75rem; padding: .6rem .8rem; border: 1px solid var(--faint); border-top: 0; border-radius: 0 0 .65rem .65rem; }
+	.buttons { display: flex; gap: .25rem; }
+	button { display: grid; place-items: center; width: 2rem; height: 2rem; padding: 0; border: 1px solid var(--faint); border-radius: .35rem; color: var(--text); background: var(--surface); cursor: pointer; }
+	button:hover { border-color: var(--accent); }
+	button svg { width: 13px; min-width: 0; }
+	.i-pause, .play.playing .i-play { display: none; }
+	.play.playing .i-pause { display: block; }
+	.timeline { display: flex; flex: 1; gap: .3rem; }
+	.timeline button { width: auto; height: .35rem; flex: 1; border: 0; border-radius: 999px; background: var(--faint); }
+	.timeline button.on { background: var(--accent); }
+	.count, figcaption { color: var(--muted); font-size: .82rem; }
+	figcaption { margin-top: .55rem; text-align: center; }
+	@media (max-width: 650px) {
+		.step-copy { display: block; }
+		.step-copy span, .step-copy code { display: block; margin-top: .35rem; }
+	}
+	@media (prefers-reduced-motion: reduce) {
+		.packet { display: none !important; }
+		.node rect, .token { transition: none; }
+	}
+</style>

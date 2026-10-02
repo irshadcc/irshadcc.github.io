@@ -1,0 +1,13 @@
+---
+interface Props {
+	tags?: string[];
+}
+
+const { tags = [] } = Astro.props;
+---
+
+{tags.length > 0 && (
+	<ul class="post-tags" aria-label="Tags">
+		{tags.map((tag) => <li class:list={{ "draft-tag": tag === "Draft" }}>{tag}</li>)}
+	</ul>
+)}

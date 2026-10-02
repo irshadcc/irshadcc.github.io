@@ -1,0 +1,49 @@
+---
+interface Props {
+	tags: string[];
+}
+
+const tags = [...new Set(Astro.props.tags)].sort((a, b) => a.localeCompare(b));
+---
+
+{tags.length > 0 && (
+	<nav class="tag-filter" aria-label="Filter posts by tag">
+		<span>Filter:</span>
+		<button type="button" class="active" data-tag="" aria-pressed="true">All</button>
+		{tags.map((tag) => (
+			<button type="button" data-tag={tag} aria-pressed="false">{tag}</button>
+		))}
+	</nav>
+)}
+
+<script>
+	document.querySelectorAll<HTMLElement>(".tag-filter").forEach((filter) => {
+		const buttons = filter.querySelectorAll<HTMLButtonElement>("button[data-tag]");
+		const root = filter.parentElement;
+		if (!root) return;
+		const posts = root.querySelectorAll<HTMLElement>(".post-list > li[data-tags]");
+
+		buttons.forEach((button) => {
+			button.addEventListener("click", () => {
+				const selectedTag = button.dataset.tag ?? "";
+				buttons.forEach((candidate) => {
+					const active = candidate === button;
+					candidate.classList.toggle("active", active);
+					candidate.setAttribute("aria-pressed", String(active));
+				});
+
+				posts.forEach((post) => {
+					const postTags = JSON.parse(post.dataset.tags ?? "[]") as string[];
+					post.hidden = selectedTag !== "" && !postTags.includes(selectedTag);
+				});
+
+				root.querySelectorAll<HTMLElement>("section").forEach((section) => {
+					const sectionPosts = section.querySelectorAll<HTMLElement>(".post-list > li[data-tags]");
+					if (sectionPosts.length > 0) {
+						section.hidden = ![...sectionPosts].some((post) => !post.hidden);
+					}
+				});
+			});
+		});
+	});
+</script>

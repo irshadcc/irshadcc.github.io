@@ -1,0 +1,225 @@
+---
+// A step-through sequence diagram: participants across the top, one message per step down the
+// page. Step i shows messages 0..i, highlights message i and shows its note under the figure.
+// Dashed arrows are replies, a cross marks a message that is lost on the way. Clicking a row
+// jumps to it. Drawing is in sequence.ts; the step controls are shared with the compiler figures.
+// Usage in .mdx:
+//   import { authParticipants, authMessages } from "../../utils/payments/paymentFigures";
+//   <SequenceSteps participants={authParticipants} messages={authMessages} title="Authorizing a card payment" />
+import StepControls from "../compiler/StepControls.astro";
+import {
+	type Message,
+	type Participant,
+	drawSequence,
+	validateSequence,
+} from "./sequence";
+
+interface Props {
+	participants: Participant[];
+	messages: Message[];
+	/** Step shown on load. */
+	step?: number;
+	title?: string;
+	colWidth?: number;
+}
+
+const { participants, messages, step = 0, title, colWidth } = Astro.props;
+const err = validateSequence(participants, messages);
+if (err) throw new Error(`SequenceSteps: ${err}`);
+const hash = [...JSON.stringify(Astro.props)]
+	.reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7)
+	.toString(36);
+const at = Math.max(0, Math.min(messages.length - 1, step));
+const { svg } = drawSequence(participants, messages, {
+	id: `sq-${hash}`,
+	colWidth,
+});
+---
+
+<figure class="seqf" data-step={at} tabindex="-1">
+	{title && <figcaption class="seqf-title">{title}</figcaption>}
+	<StepControls labels={messages.map((m) => m.step)} step={at} />
+	<div class="seqf-canvas" set:html={svg} />
+	<div class="seqf-notes">
+		{messages.map((m, i) => <p class="seqf-note" hidden={i !== at} set:html={m.note} />)}
+	</div>
+</figure>
+
+<script>
+	import { bindStepper } from "../compiler/stepper";
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".seqf")) {
+		const rows = [...fig.querySelectorAll<SVGGElement>(".msg, .phase")];
+		const notes = [...fig.querySelectorAll<HTMLElement>(".seqf-note")];
+		const count = notes.length;
+		bindStepper(fig, count, (i) => {
+			for (const r of rows) {
+				const k = Number(r.dataset.i);
+				r.classList.toggle("future", k > i);
+				r.classList.toggle("now", k === i && r.classList.contains("msg"));
+			}
+			notes.forEach((n, k) => {
+				n.hidden = k !== i;
+			});
+		});
+		// Clicking a drawn message jumps to its step through the timeline button.
+		const segs = [...fig.querySelectorAll<HTMLButtonElement>(".st-seg")];
+		for (const r of fig.querySelectorAll<SVGGElement>(".msg"))
+			r.addEventListener("click", () => segs[Number(r.dataset.i)]?.click());
+	}
+</script>
+
+<style>
+	.seqf {
+		--t0: var(--text);
+		--t1: #2f8a5b;
+		--t2: #b33b5e;
+		--t3: #b8742a;
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+		outline: none;
+	}
+	@media (prefers-color-scheme: dark) {
+		.seqf {
+			--t1: #5fc08b;
+			--t2: #e2708f;
+			--t3: #e0a25e;
+		}
+	}
+	.seqf-title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.3rem;
+	}
+	.seqf-canvas {
+		overflow-x: auto;
+	}
+	.seqf-canvas :global(svg) {
+		display: block;
+		max-width: 100%;
+		height: auto;
+		margin: 0 auto;
+	}
+	.seqf-canvas :global(.part rect) {
+		fill: var(--surface);
+		stroke: var(--faint);
+	}
+	.seqf-canvas :global(.pl) {
+		font-size: 11px;
+		font-weight: 600;
+		text-anchor: middle;
+		fill: var(--text);
+	}
+	.seqf-canvas :global(.ps) {
+		font-size: 9px;
+		text-anchor: middle;
+		fill: var(--muted);
+	}
+	.seqf-canvas :global(.life) {
+		stroke: var(--faint);
+		stroke-dasharray: 3 3;
+	}
+	.seqf-canvas :global(.phase line) {
+		stroke: var(--faint);
+	}
+	.seqf-canvas :global(.phase text) {
+		font-size: 9px;
+		font-weight: 600;
+		letter-spacing: 0.04em;
+		text-transform: uppercase;
+		fill: var(--muted);
+	}
+	.seqf-canvas :global(.msg) {
+		cursor: pointer;
+		transition: opacity 200ms ease;
+	}
+	.seqf-canvas :global(.hit) {
+		fill: transparent;
+	}
+	.seqf-canvas :global(.msg.now .hit) {
+		fill: var(--accent-soft);
+	}
+	.seqf-canvas :global(.line),
+	.seqf-canvas :global(.cross) {
+		fill: none;
+		stroke-width: 1.4;
+	}
+	.seqf-canvas :global(.reply .line) {
+		stroke-dasharray: 5 3;
+	}
+	.seqf-canvas :global(.cross) {
+		stroke-width: 2;
+	}
+	.seqf-canvas :global(.lbl) {
+		font-family: var(--mono);
+		font-size: 9.5px;
+	}
+	.seqf-canvas :global(.now .lbl) {
+		font-weight: 700;
+	}
+	.seqf-canvas :global(.msg:not(.now)) {
+		opacity: 0.55;
+	}
+	/* Later steps stay faintly visible, so the reader sees where the sequence is going. */
+	.seqf-canvas :global(.future) {
+		opacity: 0.12;
+	}
+	.seqf-canvas :global(.t0 .line),
+	.seqf-canvas :global(.t0 .cross) {
+		stroke: var(--t0);
+	}
+	.seqf-canvas :global(.t1 .line) {
+		stroke: var(--t1);
+	}
+	.seqf-canvas :global(.t2 .line),
+	.seqf-canvas :global(.t2 .cross),
+	.seqf-canvas :global(.lost .cross) {
+		stroke: var(--t2);
+	}
+	.seqf-canvas :global(.t3 .line) {
+		stroke: var(--t3);
+	}
+	.seqf-canvas :global(.t0 .lbl) {
+		fill: var(--t0);
+	}
+	.seqf-canvas :global(.t1 .lbl) {
+		fill: var(--t1);
+	}
+	.seqf-canvas :global(.t2 .lbl) {
+		fill: var(--t2);
+	}
+	.seqf-canvas :global(.t3 .lbl) {
+		fill: var(--t3);
+	}
+	.seqf-canvas :global(.head.t0) {
+		fill: var(--t0);
+	}
+	.seqf-canvas :global(.head.t1) {
+		fill: var(--t1);
+	}
+	.seqf-canvas :global(.head.t2) {
+		fill: var(--t2);
+	}
+	.seqf-canvas :global(.head.t3) {
+		fill: var(--t3);
+	}
+	.seqf-notes {
+		min-height: 3.2em;
+		margin-top: 0.5rem;
+		padding: 0.5rem 0.75rem;
+		border-left: 3px solid var(--accent);
+		background: var(--surface);
+		font-size: 0.82rem;
+		line-height: 1.5;
+	}
+	.seqf-note {
+		margin: 0;
+	}
+	.seqf-note[hidden] {
+		display: none;
+	}
+	.seqf-note :global(code) {
+		font-size: 0.78rem;
+	}
+</style>

@@ -1,0 +1,117 @@
+---
+// Interactive power curve for a two-sided, two-sample proportion z-test.
+// The reader changes baseline rate, minimum detectable lift and alpha; the curve and the
+// required per-arm sample size update together.
+// Usage in .mdx:
+//   <PowerExplorer baseline={0.1} lift={0.01} alpha={0.05} targetPower={0.8} />
+import { requiredSamplePerArm, twoProportionPower } from "./statistics";
+
+interface Props {
+	baseline?: number;
+	lift?: number;
+	alpha?: number;
+	targetPower?: number;
+}
+
+const {
+	baseline = 0.1,
+	lift = 0.01,
+	alpha = 0.05,
+	targetPower = 0.8,
+} = Astro.props;
+const initialRequired = requiredSamplePerArm(
+	baseline,
+	baseline + lift,
+	alpha,
+	targetPower,
+);
+const initial = Array.from({ length: 81 }, (_, i) => {
+	const n = 250 + i * 500;
+	return { n, power: twoProportionPower(baseline, baseline + lift, n, alpha) };
+});
+---
+
+<figure class="power-explorer" data-initial={JSON.stringify({ baseline, lift, alpha, targetPower, initialRequired, initial })}>
+	<div class="controls">
+		<label>Baseline <span data-out="baseline"></span><input data-key="baseline" type="range" min="0.01" max="0.5" step="0.01" value={baseline} /></label>
+		<label>Absolute lift <span data-out="lift"></span><input data-key="lift" type="range" min="0.0025" max="0.05" step="0.0025" value={lift} /></label>
+		<label>Significance α <select data-key="alpha"><option value="0.1">10%</option><option value="0.05" selected={alpha === 0.05}>5%</option><option value="0.01">1%</option></select></label>
+	</div>
+	<div class="result"><strong data-required>{initialRequired.toLocaleString()}</strong> users per arm for {(targetPower * 100).toFixed(0)}% power</div>
+	<svg viewBox="0 0 720 300" role="img" aria-label="Statistical power as sample size per arm increases">
+		<g class="grid"></g><path class="curve"></path><line class="target"></line><line class="needed"></line>
+		<g class="axes"></g><circle class="point" r="5"></circle>
+	</svg>
+	<figcaption>Power rises with sample size. Tightening α or looking for a smaller effect moves the required-sample marker to the right.</figcaption>
+</figure>
+
+<script>
+	import { requiredSamplePerArm, twoProportionPower } from "./statistics";
+	const NS = "http://www.w3.org/2000/svg";
+	const fmtPct = (x: number) => `${(x * 100).toFixed(x < 0.01 ? 2 : 1)}%`;
+	for (const root of document.querySelectorAll<HTMLElement>(".power-explorer")) {
+		const d = JSON.parse(root.dataset.initial ?? "{}") as { baseline: number; lift: number; alpha: number; targetPower: number };
+		const svg = root.querySelector("svg") as SVGSVGElement;
+		const curve = svg.querySelector(".curve") as SVGPathElement;
+		const target = svg.querySelector(".target") as SVGLineElement;
+		const needed = svg.querySelector(".needed") as SVGLineElement;
+		const point = svg.querySelector(".point") as SVGCircleElement;
+		const axes = svg.querySelector(".axes") as SVGGElement;
+		const grid = svg.querySelector(".grid") as SVGGElement;
+		const box = { left: 58, right: 700, top: 16, bottom: 254 };
+		const xMax = 50000;
+		const x = (n: number) => box.left + (Math.min(n, xMax) / xMax) * (box.right - box.left);
+		const y = (p: number) => box.bottom - p * (box.bottom - box.top);
+		const add = (parent: Element, name: string, attrs: Record<string, string>) => {
+			const el = document.createElementNS(NS, name);
+			for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+			parent.append(el);
+			return el;
+		};
+		for (const p of [0, 0.25, 0.5, 0.75, 1]) {
+			add(grid, "line", { x1: `${box.left}`, x2: `${box.right}`, y1: `${y(p)}`, y2: `${y(p)}` });
+			const t = add(axes, "text", { x: `${box.left - 10}`, y: `${y(p) + 4}`, "text-anchor": "end" }); t.textContent = `${p * 100}%`;
+		}
+		for (const n of [0, 10000, 20000, 30000, 40000, 50000]) {
+			const t = add(axes, "text", { x: `${x(n)}`, y: "278", "text-anchor": "middle" }); t.textContent = n === 0 ? "0" : `${n / 1000}k`;
+		}
+		const label = add(axes, "text", { x: "379", y: "298", "text-anchor": "middle" }); label.textContent = "users per arm";
+		function draw() {
+			const baseline = Number((root.querySelector('[data-key="baseline"]') as HTMLInputElement).value);
+			const lift = Number((root.querySelector('[data-key="lift"]') as HTMLInputElement).value);
+			const alpha = Number((root.querySelector('[data-key="alpha"]') as HTMLSelectElement).value);
+			const required = requiredSamplePerArm(baseline, baseline + lift, alpha, d.targetPower);
+			const pts = Array.from({ length: 101 }, (_, i) => {
+				const n = 250 + (i * (xMax - 250)) / 100;
+				return `${i ? "L" : "M"}${x(n).toFixed(1)},${y(twoProportionPower(baseline, baseline + lift, n, alpha)).toFixed(1)}`;
+			}).join(" ");
+			curve.setAttribute("d", pts);
+			target.setAttribute("x1", `${box.left}`); target.setAttribute("x2", `${box.right}`); target.setAttribute("y1", `${y(d.targetPower)}`); target.setAttribute("y2", `${y(d.targetPower)}`);
+			needed.setAttribute("x1", `${x(required)}`); needed.setAttribute("x2", `${x(required)}`); needed.setAttribute("y1", `${box.bottom}`); needed.setAttribute("y2", `${y(d.targetPower)}`);
+			point.setAttribute("cx", `${x(required)}`); point.setAttribute("cy", `${y(d.targetPower)}`);
+			(root.querySelector('[data-out="baseline"]') as HTMLElement).textContent = fmtPct(baseline);
+			(root.querySelector('[data-out="lift"]') as HTMLElement).textContent = `${(lift * 100).toFixed(2)} pp`;
+			(root.querySelector("[data-required]") as HTMLElement).textContent = required > xMax ? `>${xMax.toLocaleString()}` : required.toLocaleString();
+		}
+		root.querySelectorAll("input, select").forEach((el) => el.addEventListener("input", draw));
+		draw();
+	}
+</script>
+
+<style>
+	.power-explorer { margin: 2rem 0; padding: 1rem; border: 1px solid var(--faint); border-radius: .6rem; background: var(--surface); }
+	.controls { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; font: .85rem var(--sans); color: var(--muted); }
+	label { display: grid; grid-template-columns: 1fr auto; gap: .3rem; }
+	input { grid-column: 1 / -1; width: 100%; accent-color: var(--accent); }
+	select { color: var(--text); background: var(--surface); border: 1px solid var(--faint); }
+	.result { margin: 1rem 0 .25rem; text-align: center; color: var(--text); }
+	svg { display: block; width: 100%; overflow: visible; }
+	.grid line { stroke: var(--faint); }
+	.axes { fill: var(--muted); font: 12px var(--sans); }
+	.curve { fill: none; stroke: var(--accent); stroke-width: 3; }
+	.target { stroke: var(--muted); stroke-dasharray: 5 5; }
+	.needed { stroke: var(--accent); stroke-dasharray: 3 4; }
+	.point { fill: var(--surface); stroke: var(--accent); stroke-width: 3; }
+	figcaption { color: var(--muted); font-size: .85rem; text-align: center; }
+	@media (max-width: 650px) { .controls { grid-template-columns: 1fr; } }
+</style>

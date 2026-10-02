@@ -1,0 +1,15 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import LoweringExplorer from "../../utils/mlir/LoweringExplorer.astro";
+---
+
+<Layout title="LoweringExplorer demo">
+	<h1>LoweringExplorer demo</h1>
+	<p>Real <code>mlir-opt</code> output from <code>loweringStages.ts</code>, coloured by <code>mlirView.ts</code>.</p>
+
+	<h2>Starting at the loops</h2>
+	<LoweringExplorer stage="loops" />
+
+	<h2>Vectorized</h2>
+	<LoweringExplorer stage="vectorized" />
+</Layout>

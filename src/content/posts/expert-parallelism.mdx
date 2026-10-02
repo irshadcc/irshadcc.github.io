@@ -1,0 +1,611 @@
+---
+title: "Expert Parallelism and the All-to-All"
+description: "A mixture-of-experts layer sends every token to a few of many expert networks. Expert parallelism puts those experts on different GPUs and moves the tokens to them with two all-to-alls. This post builds an expert-parallel MoE layer in PyTorch, shows why the busiest GPU sets the pace, and works out what the all-to-alls cost on a model the size of DeepSeek-V3."
+date: 2026-10-02
+tags: [Distributed training, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import MarginNote from "../../components/MarginNote.astro";
+import CollectiveSteps from "../../utils/distributed/CollectiveSteps.astro";
+import MoeDispatch from "../../utils/distributed/MoeDispatch.astro";
+import EplbPlacement from "../../utils/distributed/EplbPlacement.astro";
+
+## Background
+
+A **mixture-of-experts** (MoE) layer replaces a transformer's single MLP with many smaller ones,
+the **experts**, and a **router** that sends each token to only a few of them. The model gets
+the capacity of all the experts while each token pays for the compute of only a few. Mixtral 8x7B
+has 8 experts per layer and uses 2 per token: 47B parameters, of which 13B are active for any one
+token. DeepSeek-V3 has 256 routed experts per layer plus one shared expert, and uses 8 of the
+routed ones per token: 671B parameters, 37B active.
+
+All those parameters have to live somewhere. **Expert parallelism** (EP) gives each GPU a few
+whole experts, and moves each token to the GPUs that hold its experts. The exchange is an
+**all-to-all**, the one collective where every rank sends something different to every other
+rank. This post builds an expert-parallel layer, looks at what happens when the router doesn't
+spread the tokens evenly, and works out what the all-to-alls cost.
+
+It's the last of the four parallel dimensions in
+[Distributed Topology](/blog/distributed-topology/), after
+[tensor](/blog/tensor-parallelism/), [data](/blog/zero-and-fsdp/) and
+[pipeline](/blog/pipeline-parallelism/) parallelism. The all-to-all and its cost are covered in
+[How GPUs Talk](/blog/collective-communication/).
+
+## The MoE layer
+
+The router is a linear layer that scores every expert for every token. For a token with hidden
+state $x$ and $E$ experts with router weights $w_1, \ldots, w_E$, the router computes
+probabilities, keeps the top $k$, and renormalizes them into gate weights:
+
+$$
+p = \text{softmax}(W_r x), \qquad \mathcal{T} = \text{top-}k(p), \qquad g_e = \frac{p_e}{\sum_{j \in \mathcal{T}} p_j} \text{ for } e \in \mathcal{T}
+$$
+
+The layer's output is the gated sum of the chosen experts' outputs:
+
+$$
+y = \sum_{e \in \mathcal{T}} g_e \, \text{FFN}_e(x)
+$$
+
+Here it is in PyTorch, as you would write it for one GPU. It loops over the experts and, for each
+one, gathers the tokens that chose it, runs them through it and adds the weighted result back
+into those tokens' rows:
+
+```python
+import copy
+
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+import torch.nn.functional as F
+
+D, FFN, EXPERTS, TOP_K, TOKENS = 32, 64, 8, 2, 64  # TOKENS per rank
+
+
+class Expert(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.up, self.down = nn.Linear(D, FFN), nn.Linear(FFN, D)
+
+    def forward(self, x):
+        return self.down(F.gelu(self.up(x)))
+
+
+class MoE(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.router = nn.Linear(D, EXPERTS, bias=False)
+        self.experts = nn.ModuleList(Expert() for _ in range(EXPERTS))
+
+    def route(self, x):
+        probs = self.router(x).softmax(dim=-1)
+        weights, ids = probs.topk(TOP_K, dim=-1)  # (tokens, k) each
+        return weights / weights.sum(dim=-1, keepdim=True), ids
+
+    def forward(self, x):
+        weights, ids = self.route(x)
+        out = torch.zeros_like(x)
+        for e, expert in enumerate(self.experts):
+            token, slot = (ids == e).nonzero(as_tuple=True)
+            out = out.index_add(0, token, weights[token, slot, None] * expert(x[token]))
+        return out
+```
+
+The router's gradient flows through the gate weights $g_e$: an expert that helped the loss gets
+its weight pushed up. The top-$k$ choice itself has no gradient.<Sidenote>Models differ in the
+details. Mixtral takes the top $k$ of the logits and applies the softmax to just those $k$, which
+gives the same gates as above. DeepSeek-V3 uses a sigmoid instead of a softmax for the scores, and
+then normalizes the top $k$ in the same way.</Sidenote>
+
+## Expert parallelism
+
+With EP over $N$ ranks, each rank holds $E/N$ experts. Everything else in the model, including the
+router, is replicated as in data parallelism, and each rank runs its own batch of tokens. An MoE
+layer then has three steps:
+
+1. **Dispatch.** Each rank routes its tokens and sends each token, once per chosen expert, to the
+   rank that holds that expert.
+2. **Compute.** Each rank runs its experts on the tokens it received, from every rank.
+3. **Combine.** Each rank sends the results back to where the tokens came from, and each token
+   adds up its $k$ results, weighted by its gates.
+
+Dispatch and combine are both all-to-alls. In dispatch, rank $i$'s buffer holds one chunk for every
+rank $j$ (the tokens bound for rank $j$'s experts), and chunk $j$ must end up at rank $j$. Combine is
+the same exchange with the arrows reversed:
+
+<CollectiveSteps op="all-to-all" n={4} title="All-to-all: chunk j of every rank goes to rank j" />
+
+Unlike the figure, the chunks are uneven. Rank $i$ sends rank $j$ exactly as many tokens as chose
+$j$'s experts, which changes from batch to batch. So before the tokens can move, the ranks have to
+tell each other how many to expect.
+
+## Building it
+
+The expert-parallel layer keeps the router and its own slice of the experts, and turns the three
+steps into code.
+
+### An all-to-all with a gradient
+
+PyTorch's `dist.all_to_all_single` takes a list of how many rows to send to each rank and how many
+to receive from each. Wrapped in an autograd function, its backward pass is the same exchange
+reversed: each token's gradient travels back along the path the token took, so the send and
+receive counts swap:
+
+```python
+class AllToAll(torch.autograd.Function):
+    """Send send_counts[j] rows to rank j; receive recv_counts[j] rows from rank j."""
+
+    @staticmethod
+    def forward(ctx, x, send_counts, recv_counts):
+        ctx.counts = send_counts, recv_counts
+        out = x.new_empty(sum(recv_counts), x.shape[1])
+        dist.all_to_all_single(out, x.contiguous(), recv_counts, send_counts)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):
+        send_counts, recv_counts = ctx.counts  # the gradient retraces the same paths, reversed
+        out = grad.new_empty(sum(send_counts), grad.shape[1])
+        dist.all_to_all_single(out, grad.contiguous(), send_counts, recv_counts)
+        return out, None, None
+```
+
+### The layer
+
+```python
+class ExpertParallelMoE(nn.Module):
+    def __init__(self, full, rank, world):
+        super().__init__()
+        self.world, self.local = world, EXPERTS // world
+        first = rank * self.local
+        self.router = full.router  # replicated, like any dense layer
+        self.experts = full.experts[first : first + self.local]  # only my experts
+        self.route = full.route
+
+    def forward(self, x):
+        weights, ids = self.route(x)
+
+        # 1. Line up the token copies by expert, so each rank's tokens are contiguous.
+        order = ids.flatten().argsort(stable=True)
+        token = order // TOP_K  # which token each copy is
+        per_expert = torch.bincount(ids.flatten(), minlength=EXPERTS)
+        send = per_expert.view(self.world, self.local).sum(dim=1)
+
+        # 2. Tell every rank how many tokens it will get for each of its experts.
+        recv_per_expert = torch.empty_like(per_expert)
+        dist.all_to_all_single(recv_per_expert, per_expert)
+        recv = recv_per_expert.view(self.world, self.local).sum(dim=1)
+
+        # 3. Dispatch: send each token copy to the rank that holds its expert.
+        inbox = AllToAll.apply(x[token], send.tolist(), recv.tolist())
+
+        # 4. Run the local experts. The inbox is grouped by sender, then by expert.
+        chunks = inbox.split(recv_per_expert.tolist())
+        outbox = torch.cat([self.experts[i % self.local](c) for i, c in enumerate(chunks)])
+
+        # 5. Combine: send the results back, and add them up, weighted, per token.
+        back = AllToAll.apply(outbox, recv.tolist(), send.tolist())
+        weight = weights.flatten()[order, None]
+        return torch.zeros_like(x).index_add(0, token, weight * back)
+```
+
+Step by step:
+
+1. **Permute.** `ids` holds $k$ expert numbers per token. Sorting them puts all the copies bound
+   for expert 0 first, then expert 1, and so on. Experts are numbered so that rank $j$ holds a
+   contiguous block of them, so the copies for each rank end up contiguous too. `order` remembers
+   where each copy came from.
+2. **Exchange counts.** `per_expert` counts this rank's copies for every expert. Its slice for
+   rank $j$'s experts goes to rank $j$, with an even all-to-all of $E/N$ numbers per rank. Now
+   every rank knows how many tokens it will receive, from whom, and for which expert.
+3. **Dispatch.** The first real all-to-all, with uneven counts.
+4. **Compute.** The received tokens are grouped by sender, and within each sender by expert, so
+   splitting by `recv_per_expert` gives one chunk per (sender, expert) pair.
+5. **Combine.** The second all-to-all sends the outputs back in the same order they arrived, and
+   `index_add` multiplies each copy by its gate and sums the $k$ copies of every token.
+
+The counts in step 2 have to reach the CPU before step 3 can be launched, because they decide the
+sizes of the buffers. On a GPU, that `.tolist()` is a synchronization point, one reason real
+implementations work hard on this step.<MarginNote>DeepEP, for example, keeps the exchange on the
+GPU and receives into buffers sized for the worst case.</MarginNote>
+
+### Checking it
+
+Every rank builds the same full MoE layer, and the reference runs it on every rank's tokens at
+once:
+
+```python
+def main():
+    dist.init_process_group("gloo")
+    rank, world = dist.get_rank(), dist.get_world_size()
+
+    torch.manual_seed(0)
+    ref = MoE()
+    ep = ExpertParallelMoE(copy.deepcopy(ref), rank, world)
+    x = torch.randn(world * TOKENS, D)  # every rank's tokens; this rank owns one slice
+    x_local = x.chunk(world)[rank]
+
+    out_ref = ref(x)
+    out_ref.square().mean().backward()
+    out_ep = ep(x_local)
+    (out_ep.square().sum() / out_ref.numel()).backward()
+    dist.all_reduce(ep.router.weight.grad)  # the router is data-parallel: sum its gradient
+
+    out_err = (out_ref.chunk(world)[rank] - out_ep).abs().max().item()
+    first = rank * EXPERTS // world
+    mine = [p for e in ref.experts[first : first + EXPERTS // world] for p in e.parameters()]
+    grad_err = max((a.grad - b.grad).abs().max().item() for a, b in zip(mine, ep.experts.parameters()))
+    router_err = (ref.router.weight.grad - ep.router.weight.grad).abs().max().item()
+    print(f"rank {rank}: output error {out_err:.1e}, expert grad error {grad_err:.1e}, router grad error {router_err:.1e}")
+    dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+```bash
+torchrun --nproc-per-node 4 ep.py
+```
+
+On 2, 4 or 8 ranks, the output errors are around $10^{-7}$ and the gradient errors around
+$10^{-10}$. Notice the two kinds of gradient. Each expert's gradient is already complete on the
+one rank that holds it, because the backward all-to-all delivered the gradients of every token
+that used it, from every rank. No all-reduce is needed. The router is different: it is
+replicated, and each rank only saw its own tokens, so its gradient needs the usual data-parallel
+all-reduce.
+
+## The busiest rank sets the pace
+
+The code above has a weakness the figure of the all-to-all hides: nothing makes the chunks equal.
+If the router likes some experts more than others, the ranks holding them receive more tokens,
+and both the all-to-all and the expert computation take as long as the busiest rank needs. The
+others wait.
+
+The figure below routes 64 tokens per rank, top-2, to 8 experts on 4 ranks. The bars are the
+token copies each expert receives, and the matrix is the dispatch all-to-all: how many copies each
+rank sends each other rank. Move the skew to make the router prefer some experts:
+
+<MoeDispatch skew={0} title="8 experts on 4 ranks, 64 tokens per rank, top-2" />
+
+With a balanced router, each rank receives about 128 copies and the busiest rank only a few
+percent more. At skew 1, the busiest rank receives 196, so the layer takes about 1.5 times as long
+as it would if the tokens were spread evenly. The quietest rank receives only 60 and sits idle for
+most of the layer. Imbalance is wasted hardware, and in a model with dozens of MoE layers it compounds.
+
+Training therefore pushes the router toward balance. The standard tool is an **auxiliary
+load-balancing loss**. Switch Transformer's version is
+
+$$
+\mathcal{L}_\text{aux} = \alpha \, E \sum_{e=1}^{E} f_e \, P_e
+$$
+
+where $f_e$ is the fraction of tokens routed to expert $e$ and $P_e$ is the mean router probability
+for expert $e$ over the batch. Under perfect balance both are $1/E$ and the sum is $1/E$, so the
+loss is at its minimum of $\alpha$. $f_e$ comes from the top-$k$ choice, which has no gradient, but
+$P_e$ does, so the loss lowers the probability of experts that are over-used. A small $\alpha$,
+around 0.01, is enough.
+
+The catch is that this loss pulls against the language-modelling loss: it can make the router
+send a token to a worse expert for the sake of balance. DeepSeek-V3 drops it (almost entirely) in
+favour of an **auxiliary-loss-free** scheme. Each expert gets a bias $b_e$ that is added to its
+score only when choosing the top $k$, and not when computing the gate weights. After every step,
+the bias of each overloaded expert goes down by a small amount $\gamma$ and that of each
+underloaded expert goes up. The bias steers tokens toward idle experts without adding anything to
+the loss.
+
+## Capacity and dropped tokens
+
+Balance on average still leaves some batches lopsided. Older MoE systems put a hard cap on it.
+Each expert gets a **capacity**, a fixed number of token slots:
+
+$$
+\text{capacity} = \text{capacity factor} \times \frac{\text{tokens} \times k}{E}
+$$
+
+A capacity factor of 1 is exactly the balanced share. Tokens that arrive at a full expert are
+**dropped**: they skip the expert, and only the residual connection carries them through the
+layer. In exchange, every buffer has a fixed size, every all-to-all chunk is the same length,
+and the expert computation is one batched matrix multiply. GShard and Switch Transformer worked
+this way. Pick a capacity factor below:
+
+<MoeDispatch skew={1} capacity={1.25} capacityControl title="The same layer, with a capacity factor" />
+
+At skew 1 with a capacity factor of 1.25, a fifth of the token copies are dropped. Raising the
+capacity factor drops fewer but wastes more padding on the experts that don't fill up.
+
+Modern systems are **dropless**. MegaBlocks (Gale et al., 2022) showed that an expert layer can be
+computed as one block-sparse matrix multiply over variable-sized groups of tokens, so nothing has
+to be padded or dropped. Today this is usually a **grouped GEMM**: one kernel launch that
+multiplies each expert's weights by its own, differently sized, batch of tokens. With dropless
+experts, balance is the router's job, and the auxiliary loss or the bias above is what keeps the
+busiest rank from falling too far behind.
+
+## What it costs
+
+Per MoE layer, every token is sent out $k$ times in the dispatch and brought back $k$ times in the
+combine. Each copy is one hidden vector of $h$ values. With $T$ tokens per rank, each rank sends
+
+$$
+M_\text{dispatch} = M_\text{combine} = T k h \times \text{bytes per value}
+$$
+
+and the backward pass repeats both, in reverse. With the pairwise all-to-all from the collectives
+post, each takes $(N-1)\alpha + \frac{N-1}{N}M\beta$, assuming balanced chunks.
+
+That traffic grows with the number of tokens, like the compute, so the useful number is the ratio
+between them per token copy. Take DeepSeek-V3's shapes: $h = 7168$, and each expert is a gated MLP
+with three $7168 \times 2048$ matrices, so one token copy costs $2 \times 3 \times 7168 \times
+2048 \approx 88$ MFLOP in the forward pass. Moving that copy costs 7 KB to dispatch, in FP8, and
+14 KB to combine, in BF16. On an H800 at its bf16 peak of 989 TFLOP/s, the compute takes about
+90 ns. Over a 50 GB/s InfiniBand link, the 21 KB take about 430 ns. If every token went across the
+network, the all-to-alls would take nearly five times as long as the experts.
+
+DeepSeek-V3's training setup is shaped around this:
+
+- **Node-limited routing.** Each token may only pick experts on at most 4 of the 8 nodes its
+  EP group spans. A token is sent across InfiniBand once per node, and then forwarded over
+  NVLink, which is about three times faster, to the GPUs in that node that hold its experts.
+- **FP8 dispatch.** Tokens are cast to FP8 before the dispatch, halving its bytes. The combine
+  stays in BF16 for accuracy.
+- **Overlap.** The [DualPipe](/blog/pipeline-parallelism/) schedule runs the forward pass of one
+  microbatch and the backward pass of another together, so one's all-to-all runs while the
+  other's experts compute, with 20 of the GPU's SMs dedicated to communication.
+- **DeepEP.** The all-to-all kernels themselves were released as a library, with one set of
+  kernels tuned for throughput in training and prefill, and another for latency in decoding.
+
+The comparison with tensor parallelism is instructive. TP all-reduces every token's $h$ values
+twice per layer, over a small group that must stay inside a server. EP sends each token $k$ times
+per MoE layer, but only point to point, and keeps each expert's matrices whole, so the expert GEMMs
+stay large and efficient. Expert MLPs are small (DeepSeek-V3's are 2048 wide); splitting them
+further with TP would leave each GPU only slivers to multiply.
+
+## EP alongside the other dimensions
+
+EP is rarely used alone. The attention and other dense layers run with TP, DP and PP as usual,
+and the MoE layers reuse the same GPUs in a different arrangement. If 64 GPUs are data-parallel for
+the dense layers, the experts might be split EP 8 × expert-DP 8: each expert lives on 8 GPUs, each
+serving a different eighth of the tokens. How Megatron-LM chooses that arrangement is
+[below](#megatron-lm).
+
+That changes the gradient synchronization. Dense parameters, like the router, are all-reduced over
+the full data-parallel group. Expert parameters are all-reduced only over the **expert-DP** group,
+the GPUs that hold copies of the same expert, as the check above showed for a single copy.
+[Distributed Topology](/blog/distributed-topology/) walks through how Megatron builds these groups,
+and which of them each MoE step uses.
+
+## In inference
+
+Serving changes the balance between the two costs. During decoding, each step processes one token
+per sequence, so the all-to-all messages are tiny and latency-bound, like the TP all-reduces in
+the [topology post's inference section](/blog/distributed-topology/). And with no gradients or
+optimizer state, the memory limit that set the EP size in training is gone, so serving systems
+choose it for speed. DeepSeek-V3's own deployment uses EP 32 across 4 nodes for prefill, and EP 320
+across 40 nodes for decoding, where each GPU holds only one routed expert. A large EP size means
+each GPU's expert sees a large batch of tokens from all the sequences in flight, which is what
+makes decoding efficient. The cost is an all-to-all over 320 GPUs on every layer, which is why
+DeepEP's low-latency kernels exist.
+
+## Redundant experts and EPLB
+
+The balancing tools from earlier act on the router during training. They make the load even on
+average over training data, but a deployed model sees whatever its users send: a service that
+mostly answers coding questions leans on different experts than one that mostly chats. Nothing
+can be retrained in the middle of serving, so the imbalance has to be fixed on the hardware side.
+
+DeepSeek's answer is **redundant experts**: give the most heavily loaded experts extra copies on
+other GPUs, and split their tokens between the copies. In DeepSeek-V3's prefill deployment, each
+of the 32 GPUs holds its 8 routed experts plus one redundant copy of a busy expert, 32 copies in
+all, and which experts get them is recomputed from the observed loads periodically (the report
+says about every ten minutes). In the decode deployment, 64 of the 320 GPUs hold the shared
+expert and the redundant copies.
+
+Deciding which experts to copy and where to put the copies is a small optimization problem, and
+DeepSeek open-sourced the heuristic it uses as
+[EPLB](https://github.com/deepseek-ai/EPLB), the expert-parallelism load balancer. Its input is
+the expected load of every expert in every layer (in practice, a moving average of recent token
+counts), and the number of copies, nodes and GPUs. Its output is a placement: the logical expert
+behind each physical slot (`phy2log`), the slots holding each expert (`log2phy`), and each expert's
+number of copies (`logcnt`).
+
+### The algorithm
+
+EPLB uses two greedy building blocks. The first gives out copies, one at a time, always to the
+expert with the highest load per copy:
+
+```python
+for i in range(num_log, num_phy):
+    redundant_indices = (weight / logcnt).max(dim=-1).indices
+    phy2log[:, i] = redundant_indices
+    rank[:, i] = logcnt[arangen, redundant_indices]
+    logcnt[arangen, redundant_indices] += 1
+```
+
+Each copy is assumed to take an equal share of its expert's tokens, so an expert with load 183
+and two copies becomes two items of load 91.5. The second building block, `balanced_packing`,
+packs items into bins that must each hold the same number of items: sort the items by load,
+heaviest first, and put each one into the lightest bin that still has room. That is the classic
+longest-processing-time heuristic, with an extra constraint, because every GPU has the same number
+of expert slots.
+
+The **hierarchical** policy chains them in three steps, to respect DeepSeek-V3's node-limited
+routing:
+
+1. **Pack groups onto nodes.** The router picks experts from a few *groups* of experts, and on
+   DeepSeek-V3 the groups are the nodes. EPLB moves whole groups onto nodes, balancing the nodes'
+   total load, so that a token's experts still sit on at most as many nodes as the router allows.
+2. **Replicate within each node.** Each node gets its share of the copies, and gives them to its
+   hottest experts.
+3. **Pack the copies onto the node's GPUs**, balancing the GPUs within the node.
+
+The **global** policy skips the grouping: it replicates over all experts and packs the copies onto
+all GPUs at once. DeepSeek uses hierarchical placement for prefill, where the EP group is small and
+spans few nodes, and global placement for decode, where EP is large enough that it spans many
+nodes anyway.
+
+### An example
+
+Here is the example from EPLB's README: two MoE layers of 12 experts in 4 groups, with 4 redundant
+copies per layer, so 16 physical experts on 2 nodes of 4 GPUs each. The figure runs a TypeScript
+port of `eplb.py` that produces the same placements as the original:
+
+<EplbPlacement title="EPLB on 12 experts, 16 copies, 2 nodes × 4 GPUs" />
+
+Take layer 0. The GPUs' mean load is 129, but expert 10 alone has load 183, so without copies some
+GPU would carry at least 1.42 times the mean, however the experts were arranged. EPLB gives
+experts 10, 5, 1 and 4 a second copy, and the busiest GPU drops to 1.21 times the mean.
+
+The hierarchical policy can't do better than that here, because groups can't be split across
+nodes. The four groups' loads are 262, 330, 116 and 325, and the best split onto two nodes is
+446 against 587. Switch to the global policy and the imbalance falls to 1.07, at the price of
+letting each group's experts spread across both nodes, which means more traffic between nodes. On
+layer 1, the global policy happens to put both copies of expert 8 on GPU 6. The greedy packing
+doesn't forbid it, though two copies on one GPU balance nothing.
+
+A placement is only half the job. The serving engine also has to send each token to one of its
+expert's copies, using `log2phy`, and move expert weights between GPUs whenever the plan changes.
+vLLM and SGLang both implement EPLB-based rebalancing. Recent DeepEP releases add primitives for
+doing the same during training, where the copies' gradients also have to be summed back into the
+original expert: prefetching a redundant expert's weights over NVLink before it computes, and
+reducing its gradients back afterwards.
+
+## How the frameworks implement it
+
+The layer built in this post has the same structure as production implementations. The
+differences are in how they avoid synchronizing with the CPU, how they lay out the tokens, and how
+they fit EP in with the other parallel dimensions.
+
+### Megatron-LM
+
+Megatron-LM's MoE layer (`megatron/core/transformer/moe/`) is a router, a token dispatcher, the
+experts and an optional shared expert:
+
+- **Router** (`router.py`, `moe_utils.py`). A linear layer with a softmax or sigmoid score
+  function and top-$k$ selection, which the documentation recommends keeping in FP32. *Group-limited*
+  routing (`--moe-router-num-groups`, `--moe-router-group-topk`) first picks the best groups for
+  each token, scoring each group by the sum of its top $k / g$ expert scores, where $g$ is the
+  number of groups chosen. Setting the groups to the nodes reproduces DeepSeek-V3's node-limited
+  routing. For balancing, it offers the Switch-style auxiliary loss computed per micro-batch, per
+  sequence or over the global batch, a Sinkhorn variant, a z-loss, and DeepSeek's auxiliary-free
+  expert bias. The bias update is literally a sign: after summing token counts over the
+  TP × DP × CP group, every expert below the mean has its bias raised by the update rate
+  (`--moe-router-bias-update-rate`, default $10^{-3}$) and every expert above it lowered.
+- **Dispatcher** (`token_dispatcher.py`). Three choices. `alltoall` follows the steps above:
+  permute, all-to-all, sort the received tokens by local expert, and the reverse to combine.
+  `allgather` instead gathers every token onto every rank and lets each keep its own, which suits
+  small EP sizes. `flex` hands the exchange to DeepEP, or to NVIDIA's HybridEP (aimed at
+  multi-node NVLink systems such as GB200 NVL72), which fuse the NVLink and network transfers.
+- **Experts** (`experts.py`). With `--moe-grouped-gemm`, all of a rank's local experts run as one
+  grouped GEMM over their differently sized token groups.
+
+The `alltoall` dispatcher differs from this post's code in a few instructive ways. It shares the
+token counts with an all-gather over the TP × EP group, so every rank knows the full matrix, not
+just its own column. The device-to-host copy of the counts, the `.tolist()` in the toy version,
+happens on a side stream at a configurable point, so the CPU waits as late as possible. It sends
+the gate probabilities along with the tokens and multiplies them in inside the experts' activation
+function rather than during the combine, a change the release notes list as a memory saving. Dropping is optional
+(`--moe-expert-capacity-factor`); with `--moe-pad-expert-input-to-capacity` every shape becomes
+static, which is what allows CUDA graphs to capture the MoE layers.
+
+The bigger design decision is **MoE Parallel Folding**. Older frameworks carved the EP group out of
+the data-parallel group, so EP could be at most the DP size, and the experts had to use the same
+TP and CP sizes as attention. Megatron now gives the MoE layers their own decomposition of the
+same GPUs: attention uses TP × CP × DP × PP, and the MoE layers use expert-TP × EP × expert-DP × PP.
+The README's example: with TP 4, CP 2, DP 8 and PP 4, the old scheme allows at most EP 8, while
+folding allows EP 64 with expert-TP 1. Its general advice is to keep expert-TP at 1 (expert
+matrices are too small to split further) and to keep EP × TP within one NVLink domain where
+possible. Finally, `--overlap-moe-expert-parallel-comm --delay-wgrad-compute` runs the forward pass
+of one micro-batch alongside the backward pass of another, like DualPipe's pairs, to hide the
+all-to-alls, which the README says can otherwise take 30 to 40% of training time.
+
+### DeepSpeed
+
+DeepSpeed's `deepspeed.moe.layer.MoE` came out of DeepSpeed-MoE (Rajbhandari et al., 2022) and
+follows GShard's algorithm closely. It is built around **fixed capacity**:
+
+- **Gating** (`sharded_moe.py`). Top-1 or top-2 gating, and general top-$k$ in recent versions,
+  with the Switch auxiliary loss, `l_aux = sum(me * ce) * num_experts`. Optional noise is added to
+  the logits for exploration (`Jitter` or Gumbel `RSample`).
+- **Capacity.** Each expert gets $\lceil \text{tokens} / E \times \text{capacity factor}\rceil$
+  slots (at least `min_capacity`, 4 by default). Tokens are scattered into a dense buffer of shape
+  $E \times C \times d$, so every all-to-all chunk is exactly $C$ rows, and no counts need to be
+  exchanged. When an expert has more candidates than slots, **Random Token Selection** (on by
+  default) keeps a random subset instead of the first ones in the batch, so tokens late in a
+  sequence aren't the ones that are always dropped. With `drop_tokens=False`, the capacity is
+  raised to the largest expert's count, agreed with a max all-reduce over the EP group. That never
+  drops anything, but every rank pads to the busiest expert.
+- **Tensor parallelism.** If the non-expert layers are tensor-parallel, every TP rank holds the same
+  tokens. DeepSpeed drops the duplicates before the all-to-all, so each TP rank sends only its
+  share of the capacity slots, and all-gathers them afterwards. This divides the all-to-all
+  volume by the TP size.
+- **Groups.** Expert parameters are tagged `allreduce=False` with a group name like `ep_size_8`, so
+  the engine reduces their gradients over the expert-data-parallel group instead of the full
+  data-parallel group.
+- **Residual MoE** (`use_residual=True`), from the DeepSpeed-MoE paper, runs a dense MLP alongside
+  the experts, and mixes the two outputs with a learned per-token softmax coefficient.
+
+Recent DeepSpeed versions add a second, dropless path, AutoEP, ported from TorchTitan: a
+token-choice top-$k$ router with optional node-limited routing, and grouped-GEMM experts.
+
+### DeepSeek-V3
+
+DeepSeek-V3 is the most detailed public account of EP at scale, and several of its pieces have
+come up already. Gathered in one place:
+
+- **The architecture** follows DeepSeekMoE (Dai et al., 2024): many small, fine-grained experts
+  instead of a few large ones, plus one **shared expert** that every token goes through. The shared
+  expert learns what all tokens need, which frees the routed experts to specialize. Each of the 58
+  MoE layers has 256 routed experts with an intermediate size of 2048, and each token uses 8.
+- **Routing.** Expert affinities are sigmoids, $s_e = \sigma(u^\top c_e)$. The top 8 are chosen
+  from $s_e + b_e$, where $b_e$ is the balancing bias, but the gates are the chosen $s_e$ alone,
+  normalized to sum to 1. The 256 experts are in 8 groups, one per node of the EP group. Each
+  token first picks the 4 groups with the highest sum of their top-2 affinities, then picks its 8
+  experts from those groups. There is no token dropping in training or inference, and a tiny
+  sequence-level balance loss guards against extreme imbalance within a single sequence.
+- **Training layout.** PP 16 with DualPipe, EP 64 across 8 nodes, ZeRO-1 data parallelism, and no
+  tensor parallelism at all.
+- **Communication kernels.** A token bound for another node crosses InfiniBand once, to the GPU
+  with the same index on the target node, and is forwarded from there over NVLink to every GPU on
+  that node that needs it. The report notes that with 4 nodes per token and about 3.2 experts
+  per node reachable at no extra cost, the same traffic could serve up to 13 experts per token.
+  The kernels use 20 of the H800's 132 SMs, with warps specialized for each stage: sending over
+  InfiniBand, forwarding to NVLink, and receiving, and the mirror image for the combine, where
+  partial results are also summed on the way.
+- **Inference.** Prefill runs on 32 GPUs: attention with TP 4, sequence parallelism and DP 8, and the
+  MoE layers with EP 32 and redundant experts from EPLB. Decode runs on 320 GPUs: attention with
+  TP 4 and DP 80, and EP 320, with one routed expert per GPU and 64 GPUs for the shared and
+  redundant experts. Prefill overlaps two micro-batches, so one's attention and experts run during
+  the other's dispatch and combine, and the report describes the same idea for decode.
+
+**DeepEP** is the open-source form of those kernels. One buffer per EP group serves training,
+prefill and decode. `dispatch` takes the hidden states (optionally in FP8, with their scale
+factors), the top-$k$ indices and the gate weights, and returns each rank's received tokens laid
+out contiguously per expert, aligned for a grouped GEMM, along with a handle. `combine` takes the
+expert outputs in BF16 and the handle, and sums each token's results back on its home rank. As in
+this post's `AllToAll`, the backward pass of dispatch is a combine, and the backward pass of
+combine is a dispatch. For training and prefill, it can synchronize with the CPU to get exact
+output sizes; for decoding, it skips that and allocates for the worst case, keeping the CPU out of
+the loop, which is also what lets a decode step be captured in a CUDA graph. The number of SMs it uses is set explicitly, so the rest of the GPU
+stays free for computation.
+
+## Summary
+
+- An MoE layer routes each token to $k$ of $E$ experts. **Expert parallelism** gives each GPU
+  $E/N$ whole experts and moves the tokens: an all-to-all to dispatch, the local experts, and an
+  all-to-all to combine. The backward pass runs both in reverse.
+- The chunks are uneven, so ranks first exchange counts, and the **busiest rank sets the pace**.
+  An auxiliary loss, or DeepSeek's per-expert bias, keeps the router balanced.
+- **Capacity factors** bound the imbalance by dropping tokens. Dropless systems use grouped GEMMs
+  instead and rely on the router for balance.
+- Across the network, moving a token copy can take several times longer than computing on it. So
+  routing is limited to a few nodes, tokens are cast to FP8 for the dispatch, and the all-to-alls
+  are overlapped with computation.
+- Expert gradients need no all-reduce across the EP group, only across the copies of the same
+  expert. Dense parameters still need the full data-parallel all-reduce.
+- At serving time, **redundant experts** absorb the imbalance the router leaves: EPLB copies the
+  hottest experts and packs the copies onto GPUs, keeping each routing group on one node when it
+  can.
+- Megatron-LM, DeepSpeed and DeepEP all follow the dispatch, compute, combine pattern. Megatron
+  decouples the MoE layers' parallel layout from attention's, DeepSpeed's classic path pads to a
+  fixed capacity, and DeepEP fuses the NVLink and network hops into one kernel.
