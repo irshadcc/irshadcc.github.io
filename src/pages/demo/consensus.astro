@@ -1,0 +1,22 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import PaxosRun from "../../utils/consensus/PaxosRun.astro";
+import RaftRun from "../../utils/consensus/RaftRun.astro";
+---
+
+<Layout title="Paxos and Raft demo">
+	<h1>Paxos and Raft demo</h1>
+	<p>Figures from <code>paxos.ts</code> and <code>raft.ts</code>.</p>
+
+	<h2>PaxosRun, all scenarios</h2>
+	<PaxosRun />
+
+	<h2>PaxosRun, one scenario mid-way</h2>
+	<PaxosRun only="preempt" step={3} />
+
+	<h2>RaftRun, all scenarios</h2>
+	<RaftRun step={5} />
+
+	<h2>RaftRun, Figure 8 (d) at the overwrite</h2>
+	<RaftRun only="fig8d" step={16} />
+</Layout>

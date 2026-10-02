@@ -68,7 +68,9 @@ const lastTerm = (log: Entry[]) => (log.length ? log[log.length - 1].term : 0);
 
 /** §5.4.1: is log a at least as up-to-date as log b? */
 export const atLeastAsUpToDate = (a: Entry[], b: Entry[]) =>
-	lastTerm(a) !== lastTerm(b) ? lastTerm(a) > lastTerm(b) : a.length >= b.length;
+	lastTerm(a) !== lastTerm(b)
+		? lastTerm(a) > lastTerm(b)
+		: a.length >= b.length;
 
 const clone = (s: Server): Server => ({
 	...s,
@@ -78,7 +80,10 @@ const clone = (s: Server): Server => ({
 });
 
 /** unsafeCommit drops the "log[N].term == currentTerm" check, to show why it is needed. */
-export const run = (sc: Scenario, opts: { unsafeCommit?: boolean } = {}): Frame[] => {
+export const run = (
+	sc: Scenario,
+	opts: { unsafeCommit?: boolean } = {},
+): Frame[] => {
 	const N = sc.servers;
 	const majority = Math.floor(N / 2) + 1;
 	const sv: Server[] = Array.from({ length: N }, (_, i) => ({
@@ -108,7 +113,9 @@ export const run = (sc: Scenario, opts: { unsafeCommit?: boolean } = {}): Frame[
 		}
 	};
 	const others = (i: number, to?: number[]) =>
-		(to ?? Array.from({ length: N }, (_, k) => k)).filter((k) => k !== i && sv[k].up);
+		(to ?? Array.from({ length: N }, (_, k) => k)).filter(
+			(k) => k !== i && sv[k].up,
+		);
 	const frame = (title: string, note: string, messages: Message[]): Frame => ({
 		title,
 		note,
@@ -116,13 +123,22 @@ export const run = (sc: Scenario, opts: { unsafeCommit?: boolean } = {}): Frame[
 		messages,
 		committed: Math.max(...sv.map((s) => s.commit)),
 	});
-	const frames: Frame[] = [frame("Start", sc.init ? "The cluster's state when the scenario begins." : "Five servers, all followers in term 0 with empty logs.", [])];
+	const frames: Frame[] = [
+		frame(
+			"Start",
+			sc.init
+				? "The cluster's state when the scenario begins."
+				: "Five servers, all followers in term 0 with empty logs.",
+			[],
+		),
+	];
 
 	for (const ev of sc.events) {
 		const s = sv[ev.s];
 		const messages: Message[] = [];
 		let title = "";
-		if (!s.up && ev.kind !== "restart") throw new Error(`${name(ev.s)} is down`);
+		if (!s.up && ev.kind !== "restart")
+			throw new Error(`${name(ev.s)} is down`);
 		switch (ev.kind) {
 			case "timeout": {
 				// Candidates (§5.2): increment currentTerm, vote for self, send RequestVote to all.
@@ -138,7 +154,9 @@ export const run = (sc: Scenario, opts: { unsafeCommit?: boolean } = {}): Frame[
 					// RequestVote receiver: reply false if term < currentTerm; grant if not voted
 					// for someone else and the candidate's log is at least as up-to-date.
 					const grant =
-						s.term >= r.term && (r.votedFor === null || r.votedFor === ev.s) && atLeastAsUpToDate(s.log, r.log);
+						s.term >= r.term &&
+						(r.votedFor === null || r.votedFor === ev.s) &&
+						atLeastAsUpToDate(s.log, r.log);
 					if (grant) r.votedFor = ev.s;
 					const why = grant
 						? "vote granted"
@@ -160,7 +178,7 @@ export const run = (sc: Scenario, opts: { unsafeCommit?: boolean } = {}): Frame[
 				title =
 					s.role === "leader"
 						? `${name(ev.s)} times out, wins term ${s.term} with ${votes} votes`
-						: `${name(ev.s)} times out, starts term ${s.term}, gets ${votes} of ${majority} needed votes`;
+						: `${name(ev.s)} times out, starts term ${s.term}, gets ${votes} vote${votes === 1 ? "" : "s"} (needs ${majority})`;
 				break;
 			}
 			case "client": {
@@ -184,7 +202,10 @@ export const run = (sc: Scenario, opts: { unsafeCommit?: boolean } = {}): Frame[
 						if (s.term < r.term) why = `refused: term ${r.term} > ${s.term}`;
 						else {
 							r.role = "follower";
-							if (prev > 0 && (r.log.length < prev || r.log[prev - 1].term !== prevTerm))
+							if (
+								prev > 0 &&
+								(r.log.length < prev || r.log[prev - 1].term !== prevTerm)
+							)
 								why = `refused: no entry ${prev} with term ${prevTerm}`;
 							else {
 								ok = true;
@@ -202,7 +223,9 @@ export const run = (sc: Scenario, opts: { unsafeCommit?: boolean } = {}): Frame[
 								why = `${entries.length ? `appended ${entries.length}` : "heartbeat"}${deleted ? `, deleted ${deleted} conflicting` : ""}`;
 							}
 						}
-						const what = entries.length ? `${entries.length} entr${entries.length === 1 ? "y" : "ies"}` : "no entries";
+						const what = entries.length
+							? `${entries.length} entr${entries.length === 1 ? "y" : "ies"}`
+							: "no entries";
 						messages.push({
 							from: ev.s,
 							to: k,
@@ -222,8 +245,12 @@ export const run = (sc: Scenario, opts: { unsafeCommit?: boolean } = {}): Frame[
 				if (s.role === "leader") {
 					// Commit rule: N > commitIndex, a majority of matchIndex >= N, log[N].term == currentTerm.
 					for (let n = s.log.length; n > s.commit; n--) {
-						const count = 1 + s.matchIndex.filter((m, k) => k !== ev.s && m >= n).length;
-						if (count >= majority && (opts.unsafeCommit || s.log[n - 1].term === s.term)) {
+						const count =
+							1 + s.matchIndex.filter((m, k) => k !== ev.s && m >= n).length;
+						if (
+							count >= majority &&
+							(opts.unsafeCommit || s.log[n - 1].term === s.term)
+						) {
 							s.commit = n;
 							break;
 						}
@@ -260,7 +287,8 @@ export const checkSafety = (frames: Frame[]): string[] => {
 		f.servers.forEach((s, i) => {
 			if (s.role === "leader" && s.up) {
 				const other = leaders.get(s.term);
-				if (other !== undefined && other !== i) bad.push(`frame ${t}: two leaders in term ${s.term}`);
+				if (other !== undefined && other !== i)
+					bad.push(`frame ${t}: two leaders in term ${s.term}`);
 				leaders.set(s.term, i);
 			}
 			for (let n = 1; n <= s.commit; n++) {
@@ -295,29 +323,52 @@ const FIG8_INIT: Init = {
 };
 
 const FIG8_PREFIX: Event[] = [
-	{ kind: "client", s: 0, cmd: "b", note: "(a) S1 leads term 2 and appends b at index 2." },
-	{ kind: "replicate", s: 0, to: [1], note: "S1 manages to replicate b only to S2 before it crashes." },
-	{ kind: "crash", s: 0, note: "(b) S1 crashes. b is on 2 of 5 servers: not committed." },
+	{
+		kind: "client",
+		s: 0,
+		cmd: "b",
+		note: "(a) S1 leads term 2 and appends b at index 2.",
+	},
+	{
+		kind: "replicate",
+		s: 0,
+		to: [1],
+		note: "S1 manages to replicate b only to S2 before it crashes.",
+	},
+	{
+		kind: "crash",
+		s: 0,
+		note: "(b) S1 crashes. b is on 2 of 5 servers: not committed.",
+	},
 	{
 		kind: "timeout",
 		s: 4,
 		to: [2, 3],
 		note: "S5 (log [a]) is elected for term 3 by S3, S4 and itself. S2, which would refuse (its log ends in term 2), is not reached.",
 	},
-	{ kind: "client", s: 4, cmd: "c", note: "S5 appends c at index 2, in term 3, and crashes before replicating it." },
+	{
+		kind: "client",
+		s: 4,
+		cmd: "c",
+		note: "S5 appends c at index 2, in term 3, and crashes before replicating it.",
+	},
 	{ kind: "crash", s: 4, note: "" },
 	{ kind: "restart", s: 0, note: "(c) S1 restarts. Its term is still 2." },
 	{
 		kind: "timeout",
 		s: 0,
-		note: "S1 tries term 3, but S3 and S4 already voted in term 3 (for S5). S1 learns nothing new and stays a candidate.",
+		note: "S1 tries term 3. S2 grants, but S3 and S4 already voted for S5 in term 3, so S1 has 2 votes of the 3 it needs and stays a candidate.",
 	},
-	{ kind: "timeout", s: 0, note: "S1 times out again and wins term 4: its log [a, b] is more up-to-date than S3's and S4's [a]." },
+	{
+		kind: "timeout",
+		s: 0,
+		note: "S1 times out again and wins term 4: its log [a, b] is more up-to-date than S3's and S4's [a].",
+	},
 	{
 		kind: "replicate",
 		s: 0,
 		to: [1, 2],
-		note: "S1 replicates b to S3. b (term 2) is now on S1, S2 and S3, a majority. But it is from an older term, so S1 does not count it as committed: commitIndex stays 1.",
+		note: "S1 replicates b to S3. b (term 2) is now on S1, S2 and S3, a majority. But b is from an older term, so S1 may not count replicas to commit it: its commitIndex does not move.",
 	},
 	{ kind: "client", s: 0, cmd: "d", note: "S1 appends d (term 4) at index 3." },
 ];
@@ -339,7 +390,12 @@ export const SCENARIOS: Scenario[] = [
 				s: 2,
 				note: "The new leader sends empty AppendEntries (heartbeats) so that no one else starts an election.",
 			},
-			{ kind: "client", s: 2, cmd: "x←1", note: "The entry is only in S3's log, so it is not committed yet." },
+			{
+				kind: "client",
+				s: 2,
+				cmd: "x←1",
+				note: "The entry is only in S3's log, so it is not committed yet.",
+			},
 			{ kind: "client", s: 2, cmd: "y←2", note: "" },
 			{
 				kind: "replicate",
@@ -356,17 +412,31 @@ export const SCENARIOS: Scenario[] = [
 	{
 		id: "repair",
 		label: "Leader crash and log repair",
-		summary: "S1 crashes with an uncommitted entry; the new leader must be up-to-date, and it repairs every follower's log.",
+		summary:
+			"S1 crashes with an uncommitted entry; the new leader must be up-to-date, and it repairs every follower's log.",
 		servers: 5,
 		events: [
 			{ kind: "timeout", s: 0, note: "S1 wins term 1." },
 			{ kind: "client", s: 0, cmd: "x", note: "" },
 			{ kind: "replicate", s: 0, note: "x is on all five servers: committed." },
-			{ kind: "crash", s: 4, note: "S5 crashes; four servers are still a majority." },
+			{
+				kind: "crash",
+				s: 4,
+				note: "S5 crashes; four servers are still a majority.",
+			},
 			{ kind: "client", s: 0, cmd: "y", note: "" },
-			{ kind: "replicate", s: 0, note: "y reaches S1–S4 and is committed (4 of 5). S5 misses it." },
+			{
+				kind: "replicate",
+				s: 0,
+				note: "y reaches S1–S4 and is committed (4 of 5). S5 misses it.",
+			},
 			{ kind: "client", s: 0, cmd: "z", note: "" },
-			{ kind: "replicate", s: 0, to: [1], note: "z reaches only S2 before S1 crashes: not committed." },
+			{
+				kind: "replicate",
+				s: 0,
+				to: [1],
+				note: "z reaches only S2 before S1 crashes: not committed.",
+			},
 			{ kind: "crash", s: 0, note: "" },
 			{ kind: "restart", s: 4, note: "S5 comes back with only [x]." },
 			{
@@ -374,7 +444,12 @@ export const SCENARIOS: Scenario[] = [
 				s: 2,
 				note: "S3 runs for term 2. S2 refuses: its log [x, y, z] is longer with the same last term, so it is more up-to-date. S4 and S5 grant, which is enough. S3 has y, as every possible winner must.",
 			},
-			{ kind: "client", s: 2, cmd: "w", note: "S3 appends w at index 3, in term 2." },
+			{
+				kind: "client",
+				s: 2,
+				cmd: "w",
+				note: "S3 appends w at index 3, in term 2.",
+			},
 			{
 				kind: "replicate",
 				s: 2,
@@ -391,14 +466,23 @@ export const SCENARIOS: Scenario[] = [
 	{
 		id: "fig8d",
 		label: "Figure 8: why old entries can't be counted",
-		summary: "The paper's Figure 8 (a)–(d): an entry stored on a majority is overwritten, which is safe only because Raft never counted it as committed.",
+		summary:
+			"The paper's Figure 8 (a)–(d): an entry stored on a majority is overwritten, which is safe only because Raft never counted it as committed.",
 		servers: 5,
 		init: FIG8_INIT,
 		events: [
 			...FIG8_PREFIX,
 			{ kind: "crash", s: 0, note: "(d) S1 crashes before d is replicated." },
-			{ kind: "restart", s: 4, note: "S5 restarts with [a, c]: c is from term 3." },
-			{ kind: "timeout", s: 4, note: "S5's term 4 is already taken (S2–S4 voted for S1), so it is refused." },
+			{
+				kind: "restart",
+				s: 4,
+				note: "S5 restarts with [a, c]: c is from term 3.",
+			},
+			{
+				kind: "timeout",
+				s: 4,
+				note: "S5's term 4 is already taken (S2–S4 voted for S1), so it is refused.",
+			},
 			{
 				kind: "timeout",
 				s: 4,
@@ -414,7 +498,8 @@ export const SCENARIOS: Scenario[] = [
 	{
 		id: "fig8e",
 		label: "Figure 8: committing in the current term",
-		summary: "Figure 8 (e): S1 replicates d from its own term to a majority, which commits b too, and S5 can no longer win.",
+		summary:
+			"Figure 8 (e): S1 replicates d from its own term to a majority, which commits b too, and S5 can no longer win.",
 		servers: 5,
 		init: FIG8_INIT,
 		events: [

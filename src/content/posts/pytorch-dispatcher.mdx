@@ -9,6 +9,7 @@ import Sidenote from "../../components/Sidenote.astro";
 import MarginNote from "../../components/MarginNote.astro";
 import KeySetSteps from "../../utils/dispatcher/KeySetSteps.astro";
 import DispatchTable from "../../utils/dispatcher/DispatchTable.astro";
+import KeySetWord from "../../utils/dispatcher/KeySetWord.astro";
 
 ## Background
 
@@ -109,6 +110,13 @@ backends (bit $b$ for the backend with enum value $b + 1$), and functionality ke
 $15 + f$, so the functionality bits run from 16 (`Dense`) to 62 (`PythonDispatcher`). A runtime
 key like `AutogradCPU` sets two bits: its functionality bit and its backend bit.
 
+The figure draws the 64 bits as two rows of 32, highest bit at the top left. The orange cells on
+the right of the bottom row are the backend bits, the blue cells are the functionality bits, and
+bit 63 is left unused. Pick `AutogradCPU` to see its two bits, bit 37 and bit 0, or `BackendSelect`
+to see a key that sets only a functionality bit. Hover a cell for its key.
+
+<KeySetWord example="AutogradCPU" />
+
 Why not one bit per key? Because 16 backends times 6 per-backend functionalities is already 96
 keys, more than 64 bits can hold. Splitting a key into a functionality part and a backend part
 makes the cross product cost $16 + 6$ bits instead of $96$.<Sidenote>`DispatchKey.h` has a
@@ -146,7 +154,8 @@ $$
 2^{40} + 2^{37} + 2^{35} + 2^{16} + 2^{0} = \texttt{0x12800010001},
 $$
 
-which is exactly what `torch._C._dispatch_keys(x).raw_repr()` returns.
+which is exactly what `torch._C._dispatch_keys(x).raw_repr()` returns. Pick `tensor x` in the figure above to see
+the same five bits.
 
 ## The operator table
 

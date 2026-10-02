@@ -9,6 +9,10 @@ import MarginNote from "../../components/MarginNote.astro";
 import LayoutGrid from "../../utils/matrix/LayoutGrid.astro";
 import InductorPipeline from "../../utils/compiler/InductorPipeline.astro";
 import KernelBlocks from "../../utils/compiler/KernelBlocks.astro";
+import CodeStages from "../../utils/compiler/CodeStages.astro";
+import BoxDiagram from "../../utils/payments/BoxDiagram.astro";
+import { kernelGrowthStages, kernelGrowthTags } from "../../utils/compiler/inductorCodegen";
+import { codegenNodes, codegenEdges } from "../../utils/compiler/inductorInterfaces";
 
 ## Background
 
@@ -32,13 +36,30 @@ This post follows one function through Inductor and opens up each step:
 2. **The IR**: Inductor's define-by-run loop representation, buffers and layouts.
 3. **Lowering**: turning each ATen op into IR, and deciding which results get a buffer.
 4. **Scheduling**: dependencies, fusion and buffer reuse.
-5. **Code generation**: the Triton kernel line by line, tiling, reductions, the C++ backend and
-   the Python wrapper that calls everything.
+5. **Code generation**: the backend interface, the Triton kernel line by line, tiling,
+   reductions, the C++ backend and the Python wrapper that calls everything.
+
+Along the way each section shows the internal interfaces involved (the `ops` protocol, IR nodes,
+`register_lowering`, scheduler nodes, `InductorChoices`, `BaseScheduling`, kernels and wrapper
+lines) and, where Inductor offers one, the hook for plugging in your own code.
 
 All the IR, logs and generated code below were produced by running torch 2.13.0, and every link
 to Inductor's source points at the commit that build came from.<Sidenote>Version `2.13.0`, git
 `cf30153c`. The installed Python files are byte-identical to the files at that commit on GitHub,
 so the line numbers in the links match what ran.</Sidenote>
+
+The code lives in `torch/_inductor`, and a handful of files hold most of what this post covers:
+
+| File | Role |
+| --- | --- |
+| `compile_fx.py` | Entry point: runs the graph passes and drives everything below |
+| `graph.py` | `GraphLowering`, the FX interpreter that lowers each node and then calls the scheduler |
+| `lowering.py` | The table from ATen ops to the functions that build IR for them |
+| `ir.py` | The IR classes: boxes, views, layouts, loops, buffers, extern kernels |
+| `loop_body.py` | `LoopBody`, which traces an `inner_fn` into an FX graph that can be analyzed |
+| `virtualized.py`, `ops_handler.py` | The `ops` and `V` globals, and the protocol every `ops` handler follows |
+| `scheduler.py` | Dependencies, fusion, ordering, and dispatch to backends |
+| `codegen/` | The Triton, C++ and other backends, and the wrapper generators |
 
 ## The running example
 
@@ -116,6 +137,11 @@ is Inductor's entry point. Its docstring lists the steps:
 
 ### Decompositions
 
+Before decomposing, AOTAutograd **functionalizes** the program: in-place ops such as `add_`
+become out-of-place ones, and views become explicit view ops, so almost all of the graph Inductor
+receives is free of mutation. That is what lets Inductor treat every node as a value it can
+inline, reorder or fuse.
+
 A **decomposition** rewrites an ATen op as a small graph of simpler ATen ops. AOTAutograd applies
 them while tracing, using the table from
 [`select_decomp_table`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/decomposition.py#L972),
@@ -149,6 +175,43 @@ small FX graph, a replacement is another, and the pass swaps every match. They r
 views and copies, fold constants, reorder nodes for locality, and replace known subgraphs with
 better kernels. For our
 function no pass fires: `fx_graph_transformed.py` is identical to the graph above.
+
+#### Custom passes
+
+You can add your own passes without editing Inductor. `torch._inductor.config` has one slot per
+stage: `pre_grad_custom_pass`, `joint_custom_pre_pass`, `joint_custom_post_pass`,
+`post_grad_custom_pre_pass` and `post_grad_custom_post_pass` (the post-grad pair run before and
+after the built-in pattern matcher). A pass implements
+[`CustomGraphPass`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/custom_graph_pass.py#L53):
+`__call__` edits the `torch.fx.Graph` in place, and `uuid` returns a value that goes into the
+compiled-graph cache key, so that changing the pass invalidates cached results. This one
+rewrites `x * 2` as `x + x`:
+
+```python
+from torch._inductor.custom_graph_pass import CustomGraphPass, get_hash_for_files
+
+class MulTwoToAdd(CustomGraphPass):
+    def __call__(self, graph: torch.fx.Graph) -> None:
+        aten = torch.ops.aten
+        for node in list(graph.nodes):
+            if node.target == aten.mul.Tensor and node.args[1] == 2:
+                with graph.inserting_before(node):
+                    add = graph.call_function(aten.add.Tensor, (node.args[0], node.args[0]))
+                add.meta = dict(node.meta)      # keep the fake tensor in meta["val"]
+                node.replace_all_uses_with(add)
+                graph.erase_node(node)
+
+    def uuid(self):
+        return get_hash_for_files((__file__,))
+
+with torch._inductor.config.patch(post_grad_custom_post_pass=MulTwoToAdd()):
+    torch.compile(f)(x, w)
+```
+
+The graph the pass leaves behind ends in `add_tensor = aten.add.Tensor(div, div)`, and the last
+two lines of the fused kernel change from a multiply by the constant `2.0` to
+`tmp14 = tmp13 + tmp13`. Copying `meta` matters: lowering reads each node's shape and dtype from
+`meta["val"]`.
 
 ## The IR
 
@@ -205,7 +268,8 @@ class Evaluator:                     # every ops.* call computes a float
     def sub(self, a, b): return a - b
     def exp(self, x): return math.exp(x)
 
-with V.set_ops_handler(Printer()) as p:
+p = Printer()
+with V.set_ops_handler(p):
     pw.inner_fn([i0, i1])            # symbolic index: sympy symbols
 with V.set_ops_handler(Evaluator({"buf0": buf0, "buf1": buf1})):
     v = pw.inner_fn([1, 0])          # a concrete index
@@ -237,7 +301,66 @@ And to generate code, it runs it with a handler whose `ops.exp(x)` returns the s
 `"libdevice.exp(x)"` (Triton) or `"x.exp()"` (vectorized C++). One representation, many
 interpretations.
 
-### Nodes, boxes and buffers
+#### The `ops` protocol
+
+What a handler must provide is written down in
+[`OpsHandler[T]`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/ops_handler.py#L64),
+a class with 154 ops in this build. `T` is the handler's **domain**, the type every method
+takes and returns: `str` for a printer, a `CSEVariable` for code generation, a `ValueRanges`
+interval for bounds analysis. The docstring sets the rules: every op works on **one element** at
+a time, and none of them promote types, because type promotion was already done during lowering.
+The methods fall into a few groups:
+
+| Group | Methods | Notes |
+| --- | --- | --- |
+| Memory | `load(name, index)`, `store(name, index, value, mode)` | `index` is a sympy expression; `mode` can ask for an atomic store |
+| Reductions | `reduction(dtype, src_dtype, reduction_type, value)`, `store_reduction(name, index, value)` | `reduction_type` is one of 16 strings, such as `"sum"`, `"max"`, `"argmax"`, `"welford_reduce"` |
+| Indexing | `index_expr(expr, dtype)`, `indirect_indexing(x, size, check)` | Turn an index into a value, or a loaded value into an index (for gather) |
+| Control | `masked(mask, body, other)`, `where(cond, a, b)` | `masked` skips the loads in `body` where `mask` is false |
+| Values | `constant(value, dtype)`, `to_dtype(x, dtype)` | |
+| Math | `exp`, `relu`, `add`, `maximum`, `erf`, `bitwise_and`, ... | Pointwise ops with torch semantics |
+
+Most handlers don't implement all 154 by hand. They subclass
+[`DefaultHandler`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/ops_handler.py#L786),
+which routes every op to one method, `_default(name, args, kwargs)`, and override only the ops
+that need special treatment. The `Printer` above, written that way:
+
+```python
+from torch._inductor.ops_handler import DefaultHandler
+
+class Printer(DefaultHandler):
+    def __init__(self): self.n, self.lines = 0, []
+    def _default(self, name, args, kwargs):
+        v = f"t{self.n}"; self.n += 1
+        self.lines.append(f"{v} = {name}({', '.join(map(str, args))})")
+        return v
+```
+
+Two more pieces make `inner_fn` read like ordinary Python. The global `ops` is an
+[`OpsWrapper`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/virtualized.py#L329):
+it forwards each call to the current handler and wraps the result in an
+[`OpsValue`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/virtualized.py#L243),
+whose `__sub__`, `__mul__` and friends call `ops.sub`, `ops.mul` and so on. That is why the IR
+prints `tmp3 = tmp1 - tmp2` and not `ops.sub(tmp1, tmp2)`. And "the current handler" is a
+[`Virtualized`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/virtualized.py#L112)
+variable: a thread-local slot that `V.set_ops_handler(h)` fills and that the returned context
+manager restores on exit, so handlers nest. `V` holds other such slots too, among them
+`V.graph` (the `GraphLowering` being compiled), `V.kernel` (the kernel being generated) and
+`V.choices` (the heuristics, below).
+
+Here are the handlers Inductor itself installs, and what each one turns a loop body into:
+
+| Handler | File | Running `inner_fn` under it gives |
+| --- | --- | --- |
+| `RecordLoadStore` | `dependencies.py` | The `MemoryDep`s the scheduler uses |
+| `CaptureIndexing` | `loop_body.py` | A `LoopBody`: an FX graph of the ops, with every index pulled out as a named sympy expression |
+| `OpCounterCSE` | `ops_handler.py` | Op counts, which the realize heuristic uses to spot large bodies |
+| `ValueRangeAnalysis` | `bounds.py` | An interval for every value, which lets codegen drop some bounds checks |
+| `SimplifyIndexing` | `sizevars.py` | The same calls, with indices simplified using the loop ranges |
+| `CSEProxy` | `codegen/common.py` | Deduplicated kernel variables (see the backend section) |
+| `TritonKernelOverrides`, `CppOverrides`, `CppVecOverrides`, `MetalOverrides`, `HalideOverrides` | `codegen/` | A line of source code in the backend's language |
+
+### Nodes, buffers and layouts
 
 The IR classes live in
 [`ir.py`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/ir.py).
@@ -247,6 +370,7 @@ The ones that matter here:
 | --- | --- |
 | `Pointwise` | `inner_fn(index)` over `ranges`: one value per output element |
 | `Reduction` | `inner_fn(index, rindex)` over `ranges` and `reduction_ranges`, plus a `reduction_type` such as `"max"` or `"sum"` |
+| `Scan`, `Sort` | The other two loop kinds, for `cumsum`-style scans and sorts along one dimension |
 | `ComputedBuffer` | A `Pointwise` or `Reduction` that has been given memory: a name like `buf2` and a layout |
 | `InputBuffer` | A graph input |
 | `ExternKernel` | A call to an existing kernel (ATen, cuBLAS) instead of generated code |
@@ -280,7 +404,97 @@ def realize(self) -> str | None:
 Because the swap happens inside the box, every IR node that already holds this `StorageBox` now
 sees a buffer, without being rebuilt.
 
-### Layouts
+Views add one more layer. The
+[note at the top of `ir.py`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/ir.py#L168)
+describes the two shapes a tensor can take:
+
+> Tensors that directly own storage are represented as a chain of:
+> TensorBox -> StorageBox -> Buffer
+> ...
+> Tensors backed by views add one more indirection to the IR.
+> TensorBox -> View -> StorageBox -> Buffer
+> In these cases, the underlying StorageBox/Buffer will be shared with the pre-view TensorBox.
+
+Lowering `x.t() + (y + 1).t()` and printing the class chain of each result shows both forms, and
+shows that the view's class depends on what it views:
+
+| FX node | IR chain |
+| --- | --- |
+| `permute` (`x.t()`, `x` an input) | `TensorBox → ReinterpretView → StorageBox → InputBuffer` |
+| `add` (`y + 1`) | `TensorBox → StorageBox → Pointwise` |
+| `permute_1` (`(y + 1).t()`) | `TensorBox → PermuteView → StorageBox → Pointwise` |
+| `add_1` (the output) | `TensorBox → StorageBox → ComputedBuffer → Pointwise` |
+
+An input has a fixed layout, so its transpose can be a `ReinterpretView`: the same storage under
+new strides. `y + 1` has no storage yet, so its transpose is a `PermuteView`, which only remaps
+the index when something loads through it. The same note explains mutation: an in-place op on a
+tensor swings its `StorageBox` to a new buffer, leaving the old one unchanged, which is how
+mutation stays functional inside the IR.
+
+#### Buffers and operations
+
+A realized node plays two roles, and Inductor gives each its own base class. A **buffer** is
+named memory with a layout: what other nodes read. An
+[**operation**](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/ir.py#L909)
+is the work that writes it: what the scheduler schedules. Most realized nodes are both. The class
+hierarchy of `buf2` (our realized `exp`) is:
+
+```text
+ComputedBuffer → OperationBuffer → Buffer → IRNode
+                                 ↘ Operation
+```
+
+So it has two names. As a buffer it is `buf2`; as an operation it is `op2`, the name the
+scheduler logs use. After lowering, `V.graph.buffers` lists `buf0` to `buf4` and
+`V.graph.operations` lists `op0` to `op4`. An extern kernel such as the matmul is also both, an
+`ExternKernelOut` that is `op0` and `buf0`. Here is what the main
+[`IRNode`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/ir.py#L559)
+methods return for `buf2`, captured during compilation:
+
+| Method | Returns for `buf2` |
+| --- | --- |
+| `get_name()` / `get_operation_name()` | `"buf2"` / `"op2"` |
+| `get_size()`, `get_stride()` | `[8, 32]`, `[32, 1]` |
+| `get_layout()` | `FixedLayout('cpu', torch.float32, size=[8, 32], stride=[32, 1])` |
+| `get_dtype()`, `get_device()` | `torch.float32`, `cpu` |
+| `data` | the `Pointwise` it wraps |
+| `get_read_names()` | `{"buf0", "buf1"}` |
+| `make_loader()` | a function `index → ops.load("buf2", 32*i0 + i1)` |
+| `get_read_writes()` | reads `MemoryDep('buf0', 32*d0 + d1, {d0: 8, d1: 32})` and `MemoryDep('buf1', d0, {d0: 8})`; writes `buf2` at `32*d0 + d1` |
+
+`get_read_writes` returns `MemoryDep`s, the access records the scheduling section explains, and
+it comes from the define-by-run trick again. A `ComputedBuffer` has a
+[**store function**](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/ir.py#L5342)
+that computes one element and stores it into the buffer's layout:
+
+```python
+def get_store_function(self) -> Callable[..., None]:
+    indexer = self.get_layout().as_fixed().make_indexer()
+    if isinstance(self.data, (Reduction, Scan, Sort)):
+        return partial(self.data.store_reduction, self.name, indexer)
+    else:
+        assert isinstance(self.data, Pointwise), type(self.data)
+        return partial(self.data.store_output, self.name, indexer)
+```
+
+For a `Pointwise`, `store_output` is a single line, `ops.store(name, indexer(vars),
+self.inner_fn(vars))`. Run `buf2`'s store function under the `Printer` handler from the define-by-run section and the whole contract of the node appears, ending in the store:
+
+```text
+t0 = load(buf0, 32*i0 + i1)
+t1 = relu(t0)
+t2 = load(buf1, i0)
+t3 = sub(t1, t2)
+t4 = exp(t3)
+t5 = store(buf2, 32*i0 + i1, t4)
+```
+
+Run it under `RecordLoadStore` instead and the loads and the store become the `MemoryDep`s in
+the table. A `Reduction`'s store function calls `ops.reduction(dtype, src_dtype, reduction_type,
+inner_fn(index, rindex))` and then `ops.store_reduction`. Every later stage (dependency
+analysis, fusion, code generation) starts from this store function.
+
+#### Layouts
 
 A **layout** gives a buffer its device, dtype, size and strides (see
 [strided tensors](/blog/strided-tensors/) for how strides map an index to a memory offset). A
@@ -295,7 +509,7 @@ proposed stride that later changed, the code would be wrong, so
 asserts `FlexibleLayout.allow_indexing`. Code that needs the offsets first freezes the layout
 into a `FixedLayout`, which is the moment Inductor commits to strides.
 
-### Views are index expressions
+#### Views are index expressions
 
 A view never copies in Inductor: it only changes the index expression its readers compute. Take
 `x.t() + y` with `x` of shape $32 \times 64$ (decomposed into `aten.permute`). Since `x` is an
@@ -350,6 +564,14 @@ if target not in lowerings:
 out = lowerings[target](*args, **kwargs)
 ```
 
+That is the shape of it; the real method does a few more things, in this order. If the op has no
+lowering, it creates a fallback, choosing a **layout constraint** from the op's tags (for example
+that inputs must be contiguous, or must have the strides eager would give them). Then it applies
+the op's layout constraint, if any, to the IR arguments, which can force a realize or a copy. If
+the FX node asks to run in eager mode (`should_fallback`, or `fallback_to_eager` in its custom
+metadata), it calls the eager kernel. Otherwise it tries `user_lowerings` first and the built-in
+`lowerings` table second.
+
 In this build `lowerings` has 1,345 `OpOverload` keys. An op with no lowering gets a
 **fallback**: an `ExternKernel` that calls the eager ATen kernel at run time. Fallbacks are
 correct but opaque, since nothing can fuse into or out of them; 357 ops are registered as
@@ -365,7 +587,7 @@ Our eight nodes are lowered by these functions:
 | `sum_1` | `sum_` → `make_reduction("sum")` | `Reduction` |
 | `div`, `mul` | `div`, `mul` → `make_pointwise` | `Pointwise` |
 
-### Pointwise lowerings
+#### Pointwise lowerings
 
 Most pointwise ops are one line each, for example
 [`relu = register_pointwise(aten.relu)`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/lowering.py#L7972).
@@ -392,7 +614,7 @@ just function composition. It is also why `register_lowering` handles broadcasti
 promotion before the lowering runs: by the time `inner_fn` is built, all inputs have the same
 rank.
 
-### Reductions
+#### Reductions
 
 [`make_reduction`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/lowering.py#L6971)
 builds a `Reduction` whose `inner_fn(index, rindex)` takes a second index over the reduced
@@ -416,6 +638,127 @@ result = Reduction.create(reduction_type=reduction_type, input_node=x, **kwargs)
 if isinstance(result.data.data, Reduction):  # Only realize if reduction isn't unrolled
     result.realize()
 ```
+
+The reason is the change of iteration space. `amax` turns $8 \times 32$ values into 8, and its
+consumer `sub` runs over all 256 elements. If the reduction were inlined like a pointwise node,
+each of the 256 elements would recompute the max of its whole row, 32 times more work than
+needed. Realized, the max is computed once per row and read back, and the scheduler can still
+fuse the two loops into one kernel, as it does here.
+
+The reduced dimension does not have to be the last. For `x.sum(dim=1)` with `x` of shape
+$4 \times 8 \times 16$, the kept dimensions become `ranges` and the reduced one becomes
+`reduction_ranges`:
+
+```python
+# ranges=[4, 16], reduction_ranges=[8], reduction_type=sum
+def inner_fn(index, rindex):
+    i0, i1 = index
+    r0_0 = rindex
+    tmp0 = ops.load(arg0_1, i1 + 16 * r0_0 + 128 * i0)    # x[i0, r0_0, i1]
+    return tmp0
+```
+
+With strides $(128, 16, 1)$, the load reads $x(i_0, r_0, i_1)$; check one entry: output
+$(1, 3)$ sums offsets $3 + 16 r_0 + 128$ for $r_0 = 0, \dots, 7$, that is 131, 147, ..., 243. In
+the Triton kernel the two kept dimensions are flattened into one `x` index of 64 and split back
+with `x0 = xindex % 16` and `x1 = xindex // 16`, and the load becomes
+`in_ptr0 + (x0 + 16*r0_2 + 128*x1)`. Consecutive reduction steps are 16 elements apart in memory,
+unlike the contiguous rows of the softmax example.
+
+#### Writing a lowering
+
+Almost every entry in `lowerings` is added by the
+[`register_lowering`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/lowering.py#L532)
+decorator:
+
+```python
+def register_lowering(
+    aten_fn,                    # an OpOverload, an OpOverloadPacket, or a list of them
+    broadcast=False,            # broadcast tensor inputs to a common shape first
+    type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,  # None: no promotion
+    convert_input_to_bool=False,
+    lowering_dict=lowerings,
+)
+```
+
+The function it decorates receives the inputs as IR nodes (`TensorBox`es), plus any plain Python
+arguments, and must return IR. The wrapper
+[`_register_lowering`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/lowering.py#L479)
+puts around it first broadcasts and promotes the inputs as requested (`transform_args`), and
+afterwards checks that the result is valid IR (`validate_ir`). An overload packet registers every
+overload at once.
+
+The same decorator works for your own ops, which is the most useful way to see the interface at
+work. Take a custom op that eager PyTorch knows but Inductor doesn't:
+
+```python
+@torch.library.custom_op("blog::scaled_relu", mutates_args=())
+def scaled_relu(x: torch.Tensor, alpha: float) -> torch.Tensor:
+    return torch.relu(x) * alpha
+
+@scaled_relu.register_fake          # shape and dtype, so tracing can run
+def _(x, alpha):
+    return torch.empty_like(x)
+
+def g(x):
+    return torch.ops.blog.scaled_relu(x, 2.0) + 1
+```
+
+Compiled as is, for an $8 \times 32$ `x`, the op has no lowering and becomes a fallback. The
+wrapper calls the eager op, then a Triton kernel adds 1 in place:
+
+```python
+buf0 = torch.ops.blog.scaled_relu.default(arg0_1, 2.0)
+...
+triton_poi_fused_add_0.run(buf2, 256, stream=raw_streamNone)   # tmp2 = tmp0 + 1.0
+```
+
+Now give it a lowering. It builds a `Pointwise` from the input's loader, just as `make_pointwise`
+does:
+
+```python
+from torch._inductor.ir import Pointwise
+from torch._inductor.lowering import register_lowering
+from torch._inductor.virtualized import ops
+
+@register_lowering(torch.ops.blog.scaled_relu.default)
+def lower_scaled_relu(x, alpha):
+    load = x.make_loader()
+
+    def inner_fn(index):
+        return ops.relu(load(index)) * ops.constant(alpha, x.get_dtype())
+
+    return Pointwise.create(device=x.get_device(), dtype=x.get_dtype(),
+                            inner_fn=inner_fn, ranges=x.get_size())
+```
+
+Compiled again, the op is inlined into the add and both run in one kernel:
+
+```python
+@triton.jit
+def triton_poi_fused_add_scaled_relu_0(in_ptr0, out_ptr0, xnumel, XBLOCK : tl.constexpr):
+    xnumel = 256
+    xoffset = tl.program_id(0) * XBLOCK
+    xindex = xoffset + tl.arange(0, XBLOCK)[:]
+    xmask = xindex < xnumel
+    x0 = xindex
+    tmp0 = tl.load(in_ptr0 + (x0), xmask)
+    tmp1 = tl.full([1], 0, tl.int32)
+    tmp2 = triton_helpers.maximum(tmp1, tmp0)       # relu
+    tmp3 = tl.full([1], 2.0, tl.float32)
+    tmp4 = tmp2 * tmp3                              # * alpha
+    tmp5 = tl.full([1], 1.0, tl.float32)
+    tmp6 = tmp4 + tmp5                              # + 1
+    tl.store(out_ptr0 + (x0), tmp6, xmask)
+```
+
+Memory traffic halves, from 4,096 bytes (the fallback reads and writes `x`, then the add reads
+and writes it again) to 2,048. `alpha` reached the lowering as a plain float and was baked into
+the kernel as a constant.<Sidenote>`register_lowering` writes to Inductor's global table, so the
+lowering above applies to every later compilation in the process. There is also a second table,
+`user_lowerings`, that `GraphLowering.call_function` checks first; in this build it is filled by
+`register_custom_op_autotuning` in `kernel/custom_op.py`, which lets Inductor benchmark several
+implementations of a custom op.</Sidenote>
 
 ### Realize or inline
 
@@ -444,12 +787,15 @@ A node with one user is never realized for reuse; there is nothing to share. A n
 users is realized if it is expensive to recompute, or if it reads more than
 `realize_reads_threshold = 4` buffers. A few other rules realize nodes too: graph outputs get the
 strides eager would give them, inputs to ops that need a fixed layout (like `mm`) are realized,
-and a pointwise node that has accumulated too many reads or too big a body is realized to keep
-`inner_fn` from growing without bound. Applied to our graph:
+a pointwise node that has accumulated too many reads or too big a body is realized to keep
+`inner_fn` from growing without bound, and inputs coming from a different CUDA stream are
+realized
+([`_realize_inputs_at_stream_boundaries`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/graph.py#L1805)),
+since a node inlined across streams could no longer be split into kernels on separate streams. Applied to our graph:
 
 | Node | Users | Decision |
 | --- | ---: | --- |
-| `mm` | 2 | Extern kernels always own a buffer: `buf0` |
+| `mm` | 1 | Extern kernels always own a buffer: `buf0` |
 | `relu` | 2 | 1 read, no heavy op: **inlined** into `amax` and `sub` |
 | `amax` | 1 | Reduction: `buf1` |
 | `sub` | 1 | **inlined** into `exp` |
@@ -463,7 +809,7 @@ Stage 3 of the figure shows the result; click `exp` to see its body, which now s
 reads) would stay inlined and be recomputed by both of its users. I checked what that changes by
 patching `ir.is_cpu` to return `False`: the fused Triton kernel for this example comes out
 identical, because common-subexpression elimination merges the two copies inside one kernel.
-The long-row softmax in the reductions section below is a case where it does change the code.</Sidenote>
+The long-row softmax under looped reductions below is a case where it does change the code.</Sidenote>
 
 <InductorPipeline step={2} title="Stage 3: four buffers survive, three nodes are inlined" />
 
@@ -521,7 +867,42 @@ because two nodes can only share a memory access if their dependencies compare e
 inputs) are available from the start. The scheduler topologically sorts nodes by unmet
 dependencies, removes dead nodes, and logs the result as `ir_pre_fusion.txt`.
 
+#### Scheduler node classes
+
+Every scheduler node derives from
+[`BaseSchedulerNode`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/scheduler.py#L1167),
+which wraps one IR `Operation` and adds what scheduling needs:
+
+| Field | Holds |
+| --- | --- |
+| `node` | The IR `Operation` (`None` for fused nodes, which hold a list of nodes instead) |
+| `read_writes` | The `MemoryDep`s and `StarDep`s read and written |
+| `unmet_dependencies` | The reads produced by other nodes in this graph |
+| `ancestors` | Names of every operation this node depends on, directly or not; used for the cycle check |
+| `group` | `(device, (numel, rnumel))`, the key for backend fusion rules |
+| `outputs` | One [`SchedulerBuffer`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/scheduler.py#L1055) per output buffer, each with its list of `users` |
+| `last_usage` | Buffers whose last read is in this node, which the wrapper may free after it |
+| `min_order`, `max_order` | Positions in the original order, used by the proximity part of the fusion score |
+
+The subclasses differ in what code they produce:
+
+| Class | Becomes |
+| --- | --- |
+| `SchedulerNode` | One loop nest: a `ComputedBuffer`, or a template |
+| `ExternKernelSchedulerNode` | One call to an existing kernel; never fused, except templates that accept epilogues |
+| `NopKernelSchedulerNode` | Nothing: a node with no work, such as a buffer that only aliases another |
+| `FusedSchedulerNode` | Several `SchedulerNode`s that become one kernel |
+| `ForeachKernelSchedulerNode` | Independent nodes launched together as one **combo kernel** (for example the per-parameter updates of an optimizer) |
+
 ### Fusion
+
+Inductor fuses in two separate places, and it helps to keep them apart. **Lowering-time
+inlining** happens before any buffer exists: an unrealized node's `inner_fn` is called from its
+consumer's, so relu, sub and div never get a buffer or a scheduler node. **Scheduler fusion**
+happens after realization: nodes that did get buffers (`op1` to `op4`) are merged into one
+kernel, and their intermediate buffers are removed afterwards. Inlining can repeat work (each user
+recomputes the inlined body) but never adds memory traffic; scheduler fusion never repeats work
+but only applies to nodes with compatible loops. This section is about the second.
 
 [`Scheduler.fuse_nodes`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/scheduler.py#L4986)
 runs up to ten rounds of
@@ -548,10 +929,40 @@ nothing.
 checks rules that hold for every backend: same device, no extern kernel (unless it is a template
 accepting an epilogue), and no **cycle**. Fusing two nodes is illegal if some third node needs the
 first one's output and produces an input of the second, since the fused kernel would have to run
-both before and after it. Then it asks the backend. For Triton the rule is in
+both before and after it.
+
+Then the check splits in two. If the second node depends on the first, the fusion is
+**vertical** (producer into consumer). Otherwise it is **horizontal**: two nodes that only share
+reads, merged so the shared input is loaded once. Each kind asks three layers in turn, and all
+three must agree:
+
+```python
+if node1.get_operation_names() & node2.ancestors:
+    # node2 depends on node1 outputs
+    if (
+        self.can_fuse_vertical(node1, node2, ...)          # scheduler: correctness
+        and V.choices.can_fuse_vertical(self, node1, node2, shared_data_score)  # heuristics
+        and self.get_backend(device).can_fuse_vertical(node1, node2)            # backend
+    ):
+        return True
+    ...
+else:  # nodes don't depend on each other, but may have common reads
+    return V.choices.can_fuse_horizontal(
+        self, node1, node2, shared_data_score
+    ) and self.get_backend(device).can_fuse_horizontal(node1, node2)
+```
+
+The middle layer, `V.choices`, is an `InductorChoices` object, Inductor's collection of
+performance heuristics (its docstring: "We try to not put correctness requirements in this
+file"). Before either branch,
+[`InductorChoices.can_fuse`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/choices.py#L569)
+has already rejected pairs that share no data, pairs that would put more than
+`config.max_fusion_size = 64` nodes in one kernel, and pairs whose fusion would raise peak
+memory. For Triton the backend rule is in
 [`SIMDScheduling.can_fuse`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/codegen/simd.py#L1998)
-and compares each node's **group** `(numel, rnumel)`: the number of output elements and the
-length of the reduction loop (1 for pointwise nodes).
+(the class sets `can_fuse_vertical = can_fuse_horizontal = can_fuse`) and compares each node's
+**group** `(numel, rnumel)`: the number of output elements and the length of the reduction loop
+(1 for pointwise nodes).
 
 - Two pointwise nodes fuse if their `numel` match.
 - Two reductions fuse if both `numel` and `rnumel` match.
@@ -614,10 +1025,49 @@ reads its inputs and writes its outputs once:
 | Inductor: one fused kernel | 1 | 2,048 | 128 |
 
 The fused kernel reads the matmul output once and writes the result once: the minimum possible.
-Decomposition alone would make things twice as bad as eager; decomposition plus fusion makes them
-three times better.<Sidenote>Eager's softmax kernel reads its input at least once and writes its
+Decomposition alone would make things up to twice as bad as eager; decomposition plus fusion
+makes them three times better.<Sidenote>Eager's softmax kernel reads its input at least once and writes its
 output once; depending on the row length it may read the input more than once, hence the ≥. The
 other numbers were computed by summing input and output sizes per kernel.</Sidenote>
+
+#### Changing the heuristics
+
+Because the heuristics live in one object, you can swap them out: subclass
+[`InductorChoices`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/choices.py#L115),
+override a method, and install the instance with `V.set_choices_handler`. Its other methods
+cover the decisions seen earlier, such as `should_use_persistent_reduction`,
+`reduction_split_factor` and `score_fusion`. To see how much the single kernel depends on
+vertical fusion, here is a rule that never fuses a reduction into a pointwise consumer:
+
+```python
+from torch._inductor.choices import InductorChoices
+from torch._inductor.virtualized import V
+
+class NoEpilogueAfterReduction(InductorChoices):
+    @staticmethod
+    def can_fuse_vertical(scheduler, node1, node2, shared_data_score):
+        return not (node1.is_reduction() and not node2.is_reduction())
+
+with V.set_choices_handler(NoEpilogueAfterReduction()):
+    torch.compile(f)(x, w)
+```
+
+The fusion rounds change. In round 1 the rule refuses `op1` + `op2` (amax into exp) and `op3` +
+`op4` (sum into div), so the best remaining pair, `op2` + `op3` (exp into sum), fuses. In round 2
+`op1` fuses with `op2_op3`: a fused node counts as a reduction if any node in it is one, so the
+rule lets it through. `op4` stays alone, and the result is two kernels:
+
+```python
+triton_per_fused__softmax_relu_0.run(buf2, buf3, 8, 32, ...)   # amax, exp, sum: writes exp and the row sums
+buf4 = buf2; del buf2  # reuse
+triton_poi_fused__softmax_mul_1.run(buf4, buf3, 256, ...)      # reads them back, divides, scales
+```
+
+`exp(x - max)` now makes a round trip through memory, so traffic grows from 2,048 to 4,160 bytes
+($1024 + 1056$ for the first kernel, $1056 + 1024$ for the second), and at $4096 \times 4096$
+from 128 MiB to 256 MiB. For a cached, reusable setting, set `config.inductor_choices_class`
+to a factory that returns your object; the class must then implement `uuid()`, which becomes part
+of the cache key.
 
 ### Buffer planning
 
@@ -640,11 +1090,13 @@ memory close to what eager would use, often lower.
 ## Code generation
 
 Each scheduler node, fused or not, becomes one kernel. The scheduler hands each node to the
-backend for its device:
+**backend** for its device:
 [`TritonScheduling`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/codegen/triton.py#L7153)
-for GPUs, `CppScheduling` for CPUs by default. The backend creates a **kernel** object, installs
-it as the `ops` handler, and runs every loop body in the node through it. Each `ops` call
-appends a line of code and returns the name of a variable holding the result.
+for GPUs (on CUDA, by way of a `CUDACombinedScheduling` that delegates to it), `CppScheduling`
+for CPUs by default. The backend creates a **kernel** object, installs it as the `ops` handler,
+and runs every loop body in the node through it. Each `ops` call appends a line of code and
+returns the name of a variable holding the result. The next section shows these interfaces in
+detail; the sections after it look at the code they produce.
 
 The Triton output below was captured by running the same function through Inductor's Triton
 backend for CPU (`cpu_backend="triton"`).<Sidenote>Triton cannot be installed on the macOS
@@ -652,7 +1104,191 @@ machine I used, so I stubbed out Triton's compile step and captured the generate
 before it would have been compiled. The source comes from the same `TritonKernel` class used for
 CUDA; only the device metadata in the decorator differs. None of these kernels was executed.</Sidenote>
 
-### The Triton kernel, line by line
+### The backend interface
+
+The figure shows the objects involved and which one calls which. Click a box to read its role;
+the rest of this section goes through them from the top.
+
+<BoxDiagram
+	nodes={codegenNodes}
+	edges={codegenEdges}
+	grid={{ cellW: 160, cellH: 50, gapX: 84, gapY: 40 }}
+	selected="backend"
+	title="Who calls whom during code generation"
+/>
+
+#### Registering a backend
+
+Backends are looked up by device type in a registry, filled by
+[`register_backend_for_device`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/codegen/common.py#L407):
+
+```python
+def register_backend_for_device(
+    device: str,                                         # "cpu", "cuda", "xpu", ...
+    device_scheduling: SchedulingConstructor,            # Scheduler -> BaseScheduling
+    device_wrapper_codegen: WrapperConstructor,          # the Python wrapper
+    device_cpp_wrapper_codegen: WrapperConstructor | None = None,   # for cpp_wrapper=True
+    device_fx_wrapper_codegen: WrapperConstructor | None = None,    # wrapper as an FX graph
+    device_custom_pass: CustomGraphModulePass | None = None,
+    device_custom_config: ConfigModule | None = None,
+) -> None:
+```
+
+[`init_backend_registration`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/codegen/common.py#L499)
+registers the built-in backends, each only if nothing is registered for that device yet, so an
+out-of-tree backend registered first takes precedence:
+
+| Device | Scheduling class | Alternatives |
+| --- | --- | --- |
+| `cpu` | `CppScheduling` | `HalideScheduling`, `TritonScheduling`, `PallasScheduling`, chosen by `config.cpu_backend` |
+| `cuda` | `CUDACombinedScheduling` | `HalideScheduling`, `PallasScheduling`, chosen by `config.cuda_backend` |
+| `xpu` | `XPUCombinedScheduling` | |
+| `mps` | `MetalScheduling` | |
+| `mtia` | `TritonScheduling` | |
+| `tpu` | `PallasScheduling` | |
+
+`CUDACombinedScheduling` is a dispatcher, not a code generator. It sends ordinary nodes to a
+`TritonScheduling` and GEMM templates to the CUTLASS, CuTe DSL or ROCm C++ backends, which is how
+max-autotune can mix kernel languages in one graph. A device added through PyTorch's
+`PrivateUse1` mechanism gets its classes from the device's own Python module.
+
+#### `BaseScheduling`
+
+A backend is a subclass of
+[`BaseScheduling`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/scheduler.py#L9722).
+The scheduler calls these methods:
+
+| Method | Called for |
+| --- | --- |
+| `group_fn(sizes)` | Turning a node's loop sizes into its group. Triton multiplies them out into `(numel, rnumel)`; C++ keeps the size tuples |
+| `can_fuse_vertical(n1, n2)`, `can_fuse_horizontal(n1, n2)` | The backend layer of the fusion check |
+| `codegen_node(node)` | Writing and launching the kernel for a `SchedulerNode` or `FusedSchedulerNode` |
+| `codegen_template(template, epilogue, prologue)` | Template kernels (GEMMs) with fused prologues and epilogues |
+| `ready_to_flush()`, `flush()` | Writing out batched kernels. The C++ backend collects several nodes into one kernel group and emits it at a flush; Triton writes each kernel at once and its `flush` does nothing |
+| `codegen_sync()` | A device synchronize after each kernel, for debugging (`config.triton.debug_sync_kernel`) |
+| `benchmark_fused_nodes(nodes)` | Timing a candidate fusion, with `config.benchmark_fusion` on |
+
+The scheduler's main loop,
+[`Scheduler._codegen`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/scheduler.py#L9368),
+walks the fused nodes in order and dispatches each one by kind (abridged):
+
+```python
+for node in nodes:
+    ...
+    if device != self.current_device or node.is_extern() or node.is_template():
+        self.flush()
+    ...
+    if node.is_template():
+        prologue, template_node, epilogue = node.get_prologue_template_epilogue(...)
+        self.get_backend(device).codegen_template(template_node, epilogue, prologue)
+    elif node.is_extern():
+        self.codegen_extern_call(node)        # the scheduler writes extern calls itself
+    elif node.is_foreach():
+        backend.codegen_combo_kernel(node)
+    elif isinstance(node, (FusedSchedulerNode, SchedulerNode)):
+        self.get_backend(device).codegen_node(node)
+    else:
+        assert isinstance(node, NopKernelSchedulerNode)
+        node.mark_run()
+    self.available_buffer_names.update(node.get_buffer_names())
+```
+
+#### From `codegen_node` to a kernel
+
+For Triton,
+[`SIMDScheduling.codegen_node`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/codegen/simd.py#L2943)
+unpacks the fused node into its `SchedulerNode`s and orders them into a **node schedule**, a
+list of nodes with markers where the code leaves the reduction loop. Then
+[`codegen_node_schedule`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/codegen/simd.py#L3036)
+does four things: picks a tiling, creates the kernel object, runs every node's body inside it,
+and turns the kernel into source:
+
+```python
+tiling, tiling_score = self.get_tiling_and_scores(node_schedule, numel, rnumel, ...)
+kernels = self.create_kernel_choices(kernel_features, [tiling], {...})   # usually one TritonKernel
+for kernel in kernels:
+    self.codegen_node_schedule_with_kernel(node_schedule, kernel)
+for kernel in kernels:
+    src_code = kernel.codegen_kernel()                          # the @triton.jit text
+    kernel_name = self.define_kernel(src_code, node_schedule, kernel)
+...
+self._launch_kernel_and_cleanup(final_kernel, ...)              # kernel.call_kernel(): a wrapper line
+```
+
+The middle step is where the loop bodies run. Its core, from
+[`codegen_node_schedule_with_kernel`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/codegen/simd.py#L3150),
+is:
+
+```python
+with kernel:
+    for node in node_schedule:
+        ...
+        index_vars = kernel.split_and_set_ranges(node.get_ranges())
+        node.codegen(index_vars)      # calls node._body(*index_vars) under SimplifyIndexing
+```
+
+`split_and_set_ranges` maps the node's loop sizes onto the kernel's dimensions, which is how
+`buf2`'s `[8, 32]` loop becomes the index variables `x0` and `r0_1`.
+
+#### Inside a kernel object
+
+A [`Kernel`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/codegen/common.py#L2160)
+collects code in several `IndentedBuffer`s: `loads`, `compute` and `stores` in the base class,
+and `TritonKernel` adds others such as `post_loop_store`, for code that runs after the
+reduction. It also has `args`, a `KernelArgs` that maps buffer names to the kernel's parameters
+(`buf0` to `in_out_ptr0`, for example), and `cse`, the cache of expressions already computed.
+Entering the kernel with `with kernel:` installs the handlers:
+
+```python
+def __enter__(self) -> Self:
+    super().__enter__()
+    assert self.overrides
+    self.exit_stack.enter_context(
+        V.set_ops_handler(CSEProxy(self, self.overrides()))
+    )
+    self.exit_stack.enter_context(V.set_kernel_handler(self))
+    return self
+```
+
+So while a loop body runs, an `ops.exp(...)` call passes through a chain of handlers. I recorded
+the chain at the moment `exp` was generated for our kernel: the global `OpsWrapper`, then
+`SimplifyIndexing` (installed by `node.codegen`), then
+[`CSEProxy`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/codegen/common.py#L2653),
+then `TritonKernelOverrides`. `CSEProxy` does the bookkeeping. For a math op it computes value
+bounds, asks `TritonKernelOverrides` for the expression text (`"libdevice.exp(tmp7)"`), works out
+the result's dtype and shape, and hands the text to `kernel.cse.generate(kernel.compute, ...)`.
+That method returns the existing variable if the same text was generated before, and otherwise
+writes `tmp8 = libdevice.exp(tmp7)` to `compute` and returns a new `CSEVariable` named `tmp8`.
+Loads, stores and reductions skip the overrides and go to the kernel's own `load`, `store` and
+`reduction` methods. Before a load, `CSEProxy` checks a **store cache**: if this kernel already
+stored the buffer, the load returns the stored variable instead of reading memory.
+
+Step through the fused kernel being built, one scheduler node at a time. Lines are coloured by
+the node that produced them, and the note under each stage lists the `ops` calls that node made
+and what they returned:
+
+<CodeStages
+	stages={kernelGrowthStages}
+	tags={kernelGrowthTags}
+	step={1}
+	maxLines={28}
+	title="The fused kernel's buffers after each node's body runs"
+/>
+
+Three mechanisms keep the kernel small. The CSE cache makes `op2`'s load and relu free, since
+`op1` already generated them. The store cache turns every read of `buf1`, `buf2` and `buf3`
+into a register reference. And because each store is written as a
+[`DeferredLine`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/codegen/common.py#L1516),
+a line that renders as nothing once its buffer is marked removed, `Kernel.__exit__` can delete
+the stores to `buf1`, `buf2` and `buf3` after the fact. This is
+`remove_kernel_local_buffers` from the buffer planning section, seen from inside the kernel.
+
+### Triton kernels
+
+First the fused kernel for our example, then three variations on it: 2D tiling, reductions too
+long for one block, and how block sizes are chosen.
+
+#### The fused kernel, line by line
 
 The fused kernel, `triton_per_fused__softmax_mul_relu_0`. The name says it is a **persistent
 reduction** (`per`) that fused `_softmax`, `mul` and `relu`.
@@ -763,7 +1399,7 @@ cache, keyed on the expression's text. Recall that relu was inlined into both `o
 `relu` of it. The second request hits the cache, so the load and the relu appear once, as `tmp0`
 and `tmp2`. Inlining duplicates work in the IR; CSE removes the duplicates inside a kernel.
 
-### Tiling
+#### Tiling
 
 The `x.t() + y` example from the views section needs a different kernel. One of its loads walks
 memory along rows and the other along columns, so any 1D order makes one of them strided.
@@ -819,7 +1455,7 @@ and its masked lanes are dashed.
 	]}
 />
 
-### Looped reductions
+#### Looped reductions
 
 When a row is too long to keep in registers, Inductor writes a **looped reduction** (`red`)
 that walks the row in chunks of `R0_BLOCK`. Here is `torch.softmax(x, dim=-1)` for `x` of shape
@@ -871,7 +1507,7 @@ Recomputing an `exp` is cheap on a GPU next to an extra round trip to memory.<Ma
 "read the row several times" structure is what [FlashAttention](/blog/flash-attention/)'s
 online softmax avoids, by rescaling a running sum when the maximum changes.</MarginNote>
 
-### Autotuning
+#### Autotuning
 
 The decorator above each kernel, for example
 `@triton_heuristics.persistent_reduction(size_hints={'x': 8, 'r0_': 32}, ...)`, is not Triton's.
@@ -981,8 +1617,52 @@ def call(self, args):
 Everything decided earlier is visible here. The inputs' sizes and strides are asserted, because
 the kernels were specialized to them. `args.clear()` and `del` drop references as early as
 possible so memory is freed. One buffer is allocated, `buf0` is reused in place as `buf4`, and
-two kernels run. `buf1`, `buf2` and `buf3` never appear. The comments map each kernel back to
-the user's code.
+two kernels run. `buf1` and `buf3` never appear, and `buf2` is only a name in the reuse chain.
+The comments map each kernel back to the user's code.
+
+#### Wrapper lines and memory planning
+
+The wrapper is not written as text straight away. While the scheduler generates code, the
+wrapper object collects a list of **line objects**, and the text is produced at the end. Most
+are simple: an `ExternKernelOutLine` for the matmul call, a `KernelDefinitionLine` and a
+`KernelCallLine` for each generated kernel, an `AssertSizeStrideLine` per input. Allocation and
+freeing are
+[`MemoryPlanningLine`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/codegen/wrapper.py#L759)s,
+which have a two-pass interface:
+
+```python
+class MemoryPlanningLine(WrapperLine):
+    def plan(self, state: MemoryPlanningState) -> MemoryPlanningLine:
+        """First pass to find reuse"""
+        return self
+
+    def codegen(self, code: IndentedBuffer) -> None:
+        """Second pass to output code"""
+```
+
+[`memory_plan_reuse`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/codegen/wrapper.py#L2306)
+calls `plan` on every line in order, threading one `MemoryPlanningState` through them, and
+replaces each line with what `plan` returns. A `FreeIfNotReusedLine` puts its buffer in the
+state's reuse pool, keyed by device, dtype, symbolic storage size, alignment and stream. A later `AllocateLine` with the same key
+takes the buffer from the pool and turns into a `ReuseLine`. An `AllocateLine` for a buffer that
+codegen removed turns into a `NullLine`, which prints nothing. Here are the memory lines of our
+example before and after planning, captured from the run:
+
+| Before `plan` | After `plan` | Printed as |
+| --- | --- | --- |
+| `AllocateLine(buf0)` | unchanged | `buf0 = empty_strided_cpu((8, 32), (32, 1), torch.float32)` |
+| `AllocateLine(buf1)` | `NullLine` | nothing: `buf1` lives in registers |
+| `ReuseLine(buf0 → buf2)` | unchanged | `buf2 = buf0; del buf0  # reuse` |
+| `AllocateLine(buf3)` | `NullLine` | nothing |
+| `ReuseLine(buf2 → buf4)` | unchanged | `buf4 = buf2; del buf2  # reuse` |
+
+The two `ReuseLine`s existed before planning. They come from the in-place decision made during
+kernel codegen: when a node's output can overwrite an input that dies in the same kernel,
+`SchedulerBuffer.allocate` calls
+[`codegen_inplace_reuse`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/codegen/wrapper.py#L3951)
+instead of allocating. Planning handles the reuse that needs the whole program in view: an
+allocation can take over a buffer freed earlier, as long as that does not raise the estimated
+peak memory.
 
 The wrapper costs some Python overhead per call. Two options remove it: **CUDA graphs**
 (`mode="reduce-overhead"`) record the kernel launches once and replay them, and
@@ -1031,16 +1711,20 @@ The mask is now essential, since `xnumel` is unknown when the kernel is compiled
   of simple ops, and graph passes rewrite known patterns, so everything left is pointwise math,
   reductions or extern calls.
 - Its IR is **define-by-run**: a loop body is a Python function calling `ops.*`, and installing
-  a different `ops` handler turns the same function into a dependency analysis, an FX graph, or
-  Triton or C++ source.
+  a different `OpsHandler` turns the same function into a dependency analysis, an FX graph, or
+  Triton or C++ source. A realized node is both a buffer (`buf2`) and an operation (`op2`), and
+  its store function is what every later stage runs.
 - **Lowering** composes those functions, so unrealized nodes are inlined for free. A node is
   **realized** into a buffer only when it is reused and expensive, is a reduction or extern
   call, or is an output.
 - The **scheduler** fuses nodes greedily: legal pairs (same device, no cycle, compatible
   `(numel, rnumel)`) ranked by the bytes they share. Buffers that become kernel-local disappear,
   and outputs reuse dead inputs in place.
-- **Codegen** writes one kernel per fused node. Persistent or looped reductions, 1D or 2D tiling,
-  CSE and masks shape the Triton kernel, and a Python wrapper allocates and launches everything.
+- **Codegen** writes one kernel per fused node. A device's `BaseScheduling` runs each node's body
+  inside a kernel object, where `CSEProxy` deduplicates expressions and serves reloads from a store
+  cache; a Python wrapper, built from line objects and memory-planned, launches everything. Your
+  own code plugs in through `register_lowering`, `CustomGraphPass`, `InductorChoices` and
+  `register_backend_for_device`.
 
 ## References
 

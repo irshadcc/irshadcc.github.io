@@ -1,0 +1,917 @@
+---
+title: "Designing a Payment Gateway: Card Networks, MySQL and Sharding"
+description: "What happens between tapping a Visa or Mastercard and the merchant getting paid, how a payment gateway keeps every payment exactly-once with idempotency keys and a double-entry ledger in MySQL, and how to shard that MySQL by merchant when one server is no longer enough."
+date: 2026-10-02
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import MarginNote from "../../components/MarginNote.astro";
+import SequenceSteps from "../../utils/payments/SequenceSteps.astro";
+import BoxDiagram from "../../utils/payments/BoxDiagram.astro";
+import ShardRouting from "../../utils/payments/ShardRouting.astro";
+import {
+	cardParticipants,
+	authMessages,
+	settleMessages,
+	retryParticipants,
+	retryMessages,
+	reshardParticipants,
+	reshardMessages,
+	transferParticipants,
+	transferMessages,
+	gatewayNodes,
+	gatewayEdges,
+	stateNodes,
+	stateEdges,
+	shardedNodes,
+	shardedEdges,
+	ndbNodes,
+	ndbEdges,
+	fracturedParticipants,
+	fracturedMessages,
+	consensusParticipants,
+	consensusMessages,
+} from "../../utils/payments/paymentFigures";
+
+## Background
+
+You tap a card, the terminal beeps, and about a second later you have your coffee. Behind that
+beep, at least five companies exchanged messages: the shop, its payment gateway, the shop's bank,
+Visa or Mastercard, and your bank. Your bank agreed to pay, but no money has moved yet. It will
+move days later, in batches, and the shop is paid only after that.
+
+A **payment gateway** is the service a merchant calls to take card payments: Stripe, Adyen and
+Braintree are examples. Its job sounds simple, "charge this card €42", but it has to be done with
+unusual care. Networks time out, clients retry, servers crash halfway through a request. A
+gateway that loses track of one payment either charges a customer twice or pays a merchant for
+money it never received. Both are real money, and both are hard to undo.
+
+This post builds the design from the outside in:
+
+1. **How a card payment moves** through the card networks: authorization, then capture, clearing
+   and settlement.
+2. **Inside the gateway**: the API, idempotency keys, the payment state machine and a
+   double-entry ledger.
+3. **Why MySQL**: what the design needs from its database, and why a relational database with
+   transactions fits.
+4. **Scaling MySQL by sharding**: why InnoDB cannot do it alone (and whether NDB Cluster helps),
+   choosing a shard key, routing keys to shards, adding shards without downtime, and handling the
+   operations that cross shards.
+5. **Databases that shard for you**: what strong consistency across shards means, PostgreSQL with
+   Citus, and distributed SQL databases such as Spanner, CockroachDB, YugabyteDB and TiDB.
+6. **A worked sizing example** that estimates how many shards a large gateway needs.
+
+## How a card payment moves
+
+### The parties
+
+A card payment involves four parties plus the network that connects them. This is called the
+**four-party model**:
+
+| Party | Who | Role |
+| --- | --- | --- |
+| **Cardholder** | You | Owns the card |
+| **Merchant** | The shop | Sells something and wants to be paid |
+| **Acquirer** | The merchant's bank | Accepts card payments on the merchant's behalf and pays the merchant |
+| **Issuer** | The cardholder's bank | Issued the card; decides whether to approve; bills the cardholder |
+| **Card network** | Visa, Mastercard | Routes messages between acquirers and issuers, and settles money between them |
+
+The **gateway** sits between the merchant and the acquirer. It turns a simple HTTPS API into the
+acquirer's protocols, stores card numbers safely, and keeps the record of every payment. In
+this post the gateway is also a **payment facilitator**: it receives the funds from the acquirer
+and pays them on to its merchants, as Stripe and Adyen do. That makes it responsible for
+knowing, to the cent, what it owes each merchant.
+
+Visa and Mastercard are not banks and do not lend money. They run the network and set its rules.
+The issuer takes the credit risk, and the acquirer takes the risk that the merchant does not
+deliver.
+
+### Authorization
+
+A card payment happens in two phases. The first is **authorization**: the issuer is asked "will
+you pay €42 for this card?" and answers within about a second.
+
+The figure steps through it. Press play or use the arrow keys, and watch two things: the gateway
+writes to its database *before* it calls anyone outside, and the reply that comes back is a
+promise (a hold on the cardholder's balance), not money.
+
+<SequenceSteps
+	participants={cardParticipants}
+	messages={authMessages}
+	title="Authorizing a €42.00 card payment"
+/>
+
+Between the acquirer, the network and the issuer, the messages follow **ISO 8583**, a binary
+message standard from the 1980s that every card network still uses in some form. Each message has
+a four-digit **message type indicator (MTI)** and a set of numbered fields:
+
+| MTI | Meaning |
+| --- | --- |
+| `0100` / `0110` | Authorization request / response |
+| `0200` / `0210` | Financial request / response (authorize and capture at once, for example at an ATM) |
+| `0400` / `0410` | Reversal request / response (undo an earlier message) |
+
+| Field | Contents | In our example |
+| ---: | --- | --- |
+| 2 | Primary account number (the card number) | `4111…1111` |
+| 4 | Amount, in minor units | `000000004200` |
+| 11 | System trace audit number | `000731` |
+| 38 | Authorization code (response) | `A1B2C3` |
+| 39 | Response code (response) | `00` = approved, `05` = do not honor, `51` = insufficient funds, `91` = issuer unavailable |
+| 49 | Currency code | `978` (euro) |
+
+The gateway never sees these messages directly; the acquirer speaks ISO 8583 to the network and
+usually offers the gateway its own API or a variant of ISO 8583. What the gateway does need is
+the outcome (field 39), the authorization code and the network's reference numbers, because
+everything that arrives later, clearing records, settlement files and disputes, is matched by
+them.
+
+### Capture, clearing and settlement
+
+The second phase moves the money. It has three steps, each slower than the last:
+
+- **Capture** is the merchant saying "I want the money now". An online shop that ships goods
+  usually captures when the order ships; a coffee shop captures immediately.
+- **Clearing** is the exchange of the final transaction details between banks, in daily
+  batches. Visa clears through a system called BASE II, Mastercard through its Global Clearing
+  Management System (GCMS). The network calculates **interchange**, the fee the acquirer's side
+  pays the issuer for each transaction.
+- **Settlement** is the actual movement of money. The network nets every bank's position for the
+  day, so each bank sends or receives one amount instead of one payment per transaction.
+
+This split, authorize first and clear later, is called **dual-message** processing. It is why a
+hotel can hold €500 on your card at check-in and charge €342 at checkout.
+
+<SequenceSteps
+	participants={cardParticipants}
+	messages={settleMessages}
+	title="Capture, clearing and settlement"
+/>
+
+The last two steps are the gateway's own. When the acquirer's money arrives, it comes with a
+**settlement file** that lists every transaction and fee. The gateway **reconciles** the file
+against its own records, line by line, and only then pays merchants. A gateway that cannot
+reconcile does not know whether it is solvent.
+
+### When things go wrong
+
+Most of the design effort goes into the unhappy paths:
+
+- **The acquirer times out.** The gateway does not know whether the issuer approved. It must not
+  simply retry, which could authorize twice. Instead it sends a **reversal** (`0400`) for the
+  original request, which cancels any hold the issuer may have placed, and then fails the payment
+  or retries with a new trace number.
+- **The issuer is down.** The network can answer on the issuer's behalf. Visa calls this
+  **Stand-In Processing**: it approves or declines within limits the issuer set in advance.
+  <Sidenote>The issuer is still bound by stand-in decisions: it must settle any transaction that
+  stand-in approved.</Sidenote>
+- **The merchant's request times out.** The merchant does not know whether it was charged and will
+  retry. This is the problem idempotency keys solve, below.
+- **The cardholder disputes the payment** weeks later. The issuer pulls the money back (a
+  **chargeback**) and the gateway must find the original payment, debit the merchant and supply
+  evidence.
+
+## Inside the gateway
+
+The figure shows the parts of a gateway. Click a box to read what it does. The ones that matter
+most for this post are the payment service, the ledger and the MySQL shards underneath them.
+
+<BoxDiagram
+	nodes={gatewayNodes}
+	edges={gatewayEdges}
+	selected="svc"
+	title="A payment gateway's main services"
+/>
+
+Card numbers live only in the **card vault**. Any system that stores, processes or transmits card
+numbers falls under the **Payment Card Industry Data Security Standard (PCI DSS)**, an audit
+regime with strict rules on network segmentation, encryption and access. Keeping the card number
+inside one small service, and passing a token everywhere else, keeps the rest of the gateway out
+of that scope. The payments database never holds a card number, only a token and the last four
+digits.
+
+### Idempotency keys
+
+Networks lose responses. When a merchant's request times out, the merchant cannot know whether the
+payment was created, and the only safe thing to do is retry. Without help, a retry creates a
+second payment and charges the customer twice.
+
+An **idempotency key** is a unique string the client sends with a request; any request with the
+same key gets the result of the first one. Stripe's API, for example, takes it in an
+`Idempotency-Key` header, saves the status code and body of the first request with that key
+(even if it was an error), and returns the same response to every retry. It also compares the
+parameters and rejects a retry whose body differs.<Sidenote>Stripe may prune keys once they are at
+least 24 hours old; a key reused after that starts a new request. See the
+[idempotent requests](https://docs.stripe.com/api/idempotent_requests) page.</Sidenote>
+
+The database does the hard part. A unique key on `(merchant_id, idempotency_key)` means that, of
+two concurrent requests with the same key, exactly one insert succeeds. The figure follows a
+request whose response is lost and the retry that follows.
+
+<SequenceSteps
+	participants={retryParticipants}
+	messages={retryMessages}
+	colWidth={150}
+	title="A lost response and a safe retry"
+/>
+
+```sql
+CREATE TABLE idempotency_keys (
+  merchant_id     BIGINT UNSIGNED NOT NULL,
+  idem_key        VARCHAR(255)    NOT NULL,
+  request_hash    BINARY(32)      NOT NULL,  -- SHA-256 of the request body
+  payment_id      BIGINT UNSIGNED NULL,
+  response_code   SMALLINT        NULL,      -- NULL while in progress
+  response_body   JSON            NULL,
+  created_at      DATETIME(3)     NOT NULL,
+  PRIMARY KEY (merchant_id, idem_key)
+);
+```
+
+The API's first statement for every `POST` is an `INSERT` into this table. If it succeeds, the
+request owns the key. If it fails with a duplicate-key error, the API reads the row: a stored
+response is returned as-is, and an empty one means the first request is still running, so the
+retry gets `409 Conflict` and tries again later.
+
+### The payment state machine
+
+A payment moves through a fixed set of states, and only along certain edges: a payment can be
+captured only if it was authorized, and refunded only if it was captured. Click a state to see
+what it means.
+
+<BoxDiagram
+	nodes={stateNodes}
+	edges={stateEdges}
+	grid={{ cellW: 96, cellH: 34, gapX: 60, gapY: 36 }}
+	title="Payment states and the transitions between them"
+/>
+
+Two requests can race to move the same payment, for example a capture and a void sent a few
+milliseconds apart. The database settles the race with a conditional update that names the state
+it expects:
+
+```sql
+UPDATE payments
+   SET status = 'captured', captured_amount = 4200, version = version + 1
+ WHERE merchant_id = 1042 AND payment_id = 198950938220371975
+   AND status = 'authorized';
+```
+
+InnoDB locks the row while it runs the update, so only one of the two can match
+`status = 'authorized'`. The application checks the affected-row count: `1` means this request
+won, `0` means another transition got there first and this request must re-read the payment and
+report its actual state.
+
+### The ledger
+
+The payments table says what *happened* to each payment. A **ledger** says who owes whom. It is
+**double-entry**: every movement of money is recorded as a set of **entries** on named
+**accounts** that sum to zero, so money is never created or lost, only moved. By convention here,
+a debit is positive and a credit is negative, and amounts are integers in cents: never floating
+point, because $0.1 + 0.2 \ne 0.3$ in binary floating point.
+
+Follow the €42.00 payment through the ledger. Assume, for illustration, that the gateway charges
+the merchant 1.5% + €0.25, and that interchange and network fees together cost the gateway
+€0.50 on this payment:<MarginNote>Both fee numbers are illustrative. Real interchange varies by
+card type, region and merchant category.</MarginNote>
+
+**At capture**, the gateway is owed €42.00 by the acquirer, owes the merchant the amount less its
+fee, and earns the fee. The fee is $4200 \times 0.015 + 25 = 63 + 25 = 88$ cents:
+
+| Account | Entry (cents) |
+| --- | ---: |
+| acquirer receivable | +4,200 |
+| merchant payable: acct_1042 | −4,112 |
+| fee revenue | −88 |
+| **sum** | **0** |
+
+**At settlement**, the acquirer pays €42.00 less €0.50 of card costs, which clears the receivable:
+
+| Account | Entry (cents) |
+| --- | ---: |
+| cash | +4,150 |
+| card costs | +50 |
+| acquirer receivable | −4,200 |
+| **sum** | **0** |
+
+**At payout**, the gateway pays the merchant:
+
+| Account | Entry (cents) |
+| --- | ---: |
+| merchant payable: acct_1042 | +4,112 |
+| cash | −4,112 |
+| **sum** | **0** |
+
+Afterwards the receivable and the merchant payable are both back at zero, and the gateway's
+cash has grown by $4150 - 4112 = 38$ cents, which is exactly its fee revenue less card costs,
+$88 - 50 = 38$. Checks like this one, run continuously over every account, are how a gateway
+finds bugs before its auditors do.
+
+The rule that makes the ledger trustworthy is that its entries are written **in the same database
+transaction** as the state change that caused them:
+
+```sql
+START TRANSACTION;
+UPDATE payments SET status = 'captured', version = version + 1
+ WHERE merchant_id = 1042 AND payment_id = 198950938220371975 AND status = 'authorized';
+-- the application checks that exactly one row changed, otherwise ROLLBACK
+INSERT INTO ledger_entries (merchant_id, payment_id, account, amount_cents) VALUES
+  (1042, 198950938220371975, 'acquirer_receivable',  4200),
+  (1042, 198950938220371975, 'merchant_payable',    -4112),
+  (1042, 198950938220371975, 'fee_revenue',           -88);
+INSERT INTO outbox (merchant_id, event_type, payload)
+  VALUES (1042, 'payment.captured', '{"payment_id": 198950938220371975}');
+COMMIT;
+```
+
+The last insert is the **transactional outbox**. Webhooks and downstream services learn about the
+capture from an event, but publishing the event to a message queue inside the transaction is not
+possible, and publishing it after the commit can fail. Instead, the event is a row written in
+the same transaction; a separate **relay** reads committed outbox rows and publishes them. The
+event is then sent if and only if the capture committed, and at least once (consumers use the
+event ID to ignore duplicates).
+
+## Why MySQL
+
+Look back at what the design asked of its database:
+
+1. **Atomic multi-row transactions.** A capture changes a payment, inserts three ledger entries and
+   an outbox row. All five writes happen, or none.
+2. **Durability on commit.** Once the gateway tells a merchant "authorized", the record must
+   survive a power cut a millisecond later.
+3. **Uniqueness that holds under concurrency.** Idempotency keys and "apply this transfer once"
+   both rely on a unique index rejecting the second insert.
+4. **Row-level locking and conditional updates** for state transitions.
+5. **Secondary indexes** for the queries merchants run: "my payments from last week", "the payment
+   with this network reference".
+6. **Replicas that can take over without losing a committed transaction.**
+
+These are exactly what a relational database with transactions provides. MySQL with the InnoDB
+engine provides all six:
+
+| Requirement | How MySQL (InnoDB) meets it |
+| --- | --- |
+| Atomic transactions | `START TRANSACTION … COMMIT`; crash recovery applies a transaction entirely or not at all |
+| Durability | `innodb_flush_log_at_trx_commit = 1` flushes the redo log at every commit; `sync_binlog = 1` syncs the binary log before commit. Both are the defaults. |
+| Uniqueness | `UNIQUE` and `PRIMARY KEY` indexes, checked under lock |
+| Locking | Row locks, `SELECT … FOR UPDATE`, conditional `UPDATE` |
+| Indexes | B+tree secondary indexes; the table itself is clustered on the primary key |
+| Failover without loss | Semi-synchronous replication: commit waits until a replica has the transaction on disk |
+
+The durability settings deserve a closer look, because they are a trade-off people are tempted to
+undo. The MySQL manual says the default `innodb_flush_log_at_trx_commit = 1` "is required for full
+ACID compliance"; with `0` or `2`, the log is flushed about once a second and up to a second of
+committed transactions can be lost in a crash. For a payments database, losing a second of
+authorizations means customers who were charged with no record of it. The cost of `1` is an
+`fsync` per commit, which InnoDB amortizes by flushing many concurrent commits together (group
+commit).<Sidenote>For a replication setup that uses InnoDB, the manual recommends both
+`sync_binlog=1` and `innodb_flush_log_at_trx_commit=1`. See the
+[InnoDB parameters](https://dev.mysql.com/doc/refman/8.4/en/innodb-parameters.html#sysvar_innodb_flush_log_at_trx_commit)
+and [binary log options](https://dev.mysql.com/doc/refman/8.4/en/replication-options-binary-log.html#sysvar_sync_binlog).</Sidenote>
+
+Replication matters for the same reason. MySQL's default replication is asynchronous: the primary
+commits and replicas catch up later, so if the primary's disk dies, its last few transactions die
+with it. With **semi-synchronous replication**, a commit on the primary waits until at least one
+replica acknowledges that it has written the transaction's events to its relay log and flushed
+them to disk. In the default `AFTER_SYNC` mode the primary waits after syncing its binary log but
+before committing to the storage engine, so no client sees a transaction that a replica does not
+have.<Sidenote>One caveat: if no replica answers within `rpl_semi_sync_source_timeout`, the primary
+falls back to asynchronous replication. Alert on that. See
+[Semisynchronous Replication](https://dev.mysql.com/doc/refman/8.4/en/replication-semisync.html).</Sidenote>
+Put the replica in another availability zone and the gateway survives the loss of a whole data
+centre without losing a committed payment.
+
+### Why not something else?
+
+MySQL is not the only good answer, and it is worth being precise about what it beats.
+
+| Option | Fits | Gives up |
+| --- | --- | --- |
+| **MySQL / PostgreSQL** | All six requirements on one server; decades of operational tooling | Scaling writes past one server needs sharding |
+| **Key-value stores** (DynamoDB, Cassandra) | Huge write throughput, built-in partitioning | Multi-row transactions are limited or absent; uniqueness and ledger invariants move into application code |
+| **Distributed SQL** (Spanner, CockroachDB, YugabyteDB, TiDB) | Transactions across shards, automatic sharding | Higher commit latency from consensus; retries under contention |
+
+PostgreSQL meets every requirement just as well, and Adyen, for example, runs on
+it.<Sidenote>Adyen has written about [updating a 50 terabyte PostgreSQL
+database](https://medium.com/adyen/updating-a-50-terabyte-postgresql-database-f64384b799e7).</Sidenote> The case for
+MySQL specifically is mostly about the sharding ecosystem: **Vitess**, the MySQL sharding layer
+that came out of YouTube, lets an application keep speaking SQL to what looks like one database
+while it is split across many. Cash App runs its MySQL on Vitess, and Shopify and Slack also
+run sharded MySQL. The next section uses Vitess's ideas, but they apply to any sharded
+relational database; the section after it looks at
+[databases that shard by themselves](#databases-that-shard-for-you).
+
+## Scaling MySQL
+
+A single MySQL primary on a large server can take a lot of traffic. Before sharding, a gateway
+should use the cheaper tools:
+
+- **Bigger hardware.** More memory keeps the working set in the InnoDB buffer pool; fast NVMe
+  disks make each `fsync` cheap.
+- **Read replicas** for reads that may be slightly stale: dashboards, reports, search. Reads that
+  must see the latest write, like the idempotency check, stay on the primary.
+- **Archiving.** Payments older than any dispute window rarely change. Moving them to cheaper
+  storage keeps the hot tables small.
+
+Eventually one of two limits is hit: the primary cannot commit writes fast enough, or the data no
+longer fits comfortably on one server. Data size is often the first: a 20 TB MySQL instance still
+works, but restoring it from backup, building a new replica or changing a table's schema takes
+days, and every one of those is something an on-call engineer needs to finish in hours.
+
+### Sharding
+
+**Sharding** splits one logical database into many independent MySQL databases, called
+**shards**, each holding a subset of the rows. Each shard is a complete MySQL setup with its own
+primary and replicas, and the shards share nothing. A **shard key** is the column that decides
+which shard a row belongs to, and a **router** sends each query to the right shard.
+
+<BoxDiagram
+	nodes={shardedNodes}
+	edges={shardedEdges}
+	grid={{ cellW: 82, cellH: 38, gapX: 18, gapY: 34 }}
+	title="Three of the shards behind a shard router; each primary replicates to two zones"
+/>
+
+The appeal is that each shard is just MySQL, with all six guarantees from the previous section,
+and the system scales by adding shards. The cost is that those guarantees now hold only *within*
+a shard. A transaction that touches two shards is no longer atomic. So the most important
+decision is the shard key: it decides which operations stay inside one shard.
+
+### Does MySQL shard by itself?
+
+A natural question is why the sharding lives in a layer like Vitess, above MySQL, rather than in
+MySQL. The short answer: InnoDB does not shard, MySQL's other built-in features that sound like
+sharding do something else, and the one MySQL engine that does shard, NDB, is a different
+database with different guarantees.
+
+#### InnoDB, partitioning and Group Replication
+
+**InnoDB** is a single-server storage engine: every row of a table lives in files on one MySQL
+server. The MySQL manual's own comparison of InnoDB and NDB says it plainly: for InnoDB, scaling
+out writes "requires application-level partitioning (sharding)".<Sidenote>See [Differences Between
+the NDB and InnoDB Storage
+Engines](https://dev.mysql.com/doc/refman/8.4/en/mysql-cluster-ndb-innodb-engines.html).</Sidenote>
+
+Two built-in features are often mistaken for sharding:
+
+- **Partitioning** (`PARTITION BY RANGE`, `HASH` or `KEY`) splits a table into pieces, but all the
+  pieces stay on the same server. It helps queries that touch one partition, and it makes
+  archiving cheap: dropping a month's partition is much faster than deleting its rows. It does not
+  add capacity. It also has rules that bite a payments schema: every unique key, including the
+  primary key, must contain every column of the partitioning expression, and partitioned InnoDB
+  tables cannot have foreign keys.
+- **Group Replication** (the basis of InnoDB Cluster) keeps several servers in sync. But in the
+  manual's words, each server in the group "has a complete copy of the data". It adds
+  availability and read capacity; every member still stores and applies every write.
+
+So with InnoDB, sharding means many independent MySQL servers and something that routes between
+them: the application, a library, or a proxy such as Vitess.
+
+#### NDB Cluster: sharding inside MySQL
+
+**MySQL NDB Cluster** is the exception. NDB is a separate storage engine (`ENGINE=NDB`) that
+stores tables on a set of **data nodes**, not on the MySQL server. The `mysqld` processes become
+stateless **SQL nodes** that parse queries and forward them to the data nodes. NDB hashes each
+row's primary key to a **partition**, and each partition is held by one **node group**: a set of
+data nodes (usually two) that keep synchronous copies of it. Click the boxes to see what each
+part does.
+
+<BoxDiagram
+	nodes={ndbNodes}
+	edges={ndbEdges}
+	grid={{ cellW: 120, cellH: 40, gapX: 18, gapY: 36 }}
+	title="An NDB Cluster with 4 data nodes in 2 node groups (illustrative partition assignment)"
+/>
+
+The number of node groups is the number of data nodes divided by `NoOfReplicas`, and by default
+the number of partitions is the number of data nodes times the number of local data manager (LDM)
+threads on each. With 4 data nodes, `NoOfReplicas=2` and one LDM thread each, that is
+$4 / 2 = 2$ node groups and $4 \times 1 = 4$ partitions. Writes scale with node groups, failover takes
+"typically < 1 second" according to the manual, and the application sees one database.
+
+So does a payment gateway need NDB to shard? No, and for its ledger NDB is a poor fit. The NDB
+manual lists the reasons:
+
+| NDB property (from the manual) | Why it matters for a payment ledger |
+| --- | --- |
+| Supports only `READ COMMITTED`, implemented per row, with no MVCC | A query that reads several rows while a transfer commits can see "before" values for some rows and "after" values for others, so a balance check can see money that does not exist (the figure in the next section shows this exact failure) |
+| Data is held in memory; only non-indexed columns can be stored on disk | 22 TB of ledger history (from the sizing example below) would mostly have to sit in RAM |
+| Large transactions are handled poorly and limited by `MaxNoOfConcurrentOperations` | Batch jobs such as settlement and payouts touch many rows |
+| Semisynchronous replication between clusters is not supported | Disaster recovery to another region is asynchronous |
+
+The first row can be worked around by taking locks (`SELECT … LOCK IN SHARE MODE`) for every read
+that must be consistent, at the cost of more lock waits. NDB was built for a different job:
+small, latency-critical transactions on data that fits in memory, with sub-second failover. For
+a ledger, the usual answer is InnoDB on many servers with a routing layer, or one of the
+databases in the [next section](#databases-that-shard-for-you).
+
+### Choosing the shard key
+
+The rule is to shard by the entity that transactions are about. Cash App describes the same
+choice: its main entity group was the customer, and "transactions inside the data for a single
+customer is always safe and fully ACID."<Sidenote>From Cash App's
+[Sharding Cash](https://developer.squareup.com/blog/sharding-cash/). Transactions between
+customers needed separate precautions, as the cross-shard section below describes.</Sidenote>
+
+For a gateway, the candidates are the payment and the merchant:
+
+| Shard key | Single-shard operations | Cross-shard operations | Risk |
+| --- | --- | --- | --- |
+| `payment_id` | Everything about one payment | "List my payments", the merchant's ledger balance, payouts | Every dashboard query fans out to every shard |
+| **`merchant_id`** | A payment and all its ledger entries, the merchant's balance, payouts, listing and search | Transfers between merchants; lookups by network reference | One very large merchant can outgrow a shard |
+| Time (`created_at`) | Range scans by date | Almost everything else | All new writes hit the newest shard |
+
+`merchant_id` wins. A capture's payment row, ledger entries, idempotency key and outbox row all
+belong to one merchant, so the whole capture transaction stays on one shard. Every table gets
+`merchant_id` as the first column of its primary key.
+
+Two kinds of lookup do not come with a merchant ID. `GET /payments/{id}` has only the payment ID,
+which the next sections solve by putting the shard inside the ID. Clearing records and
+chargebacks arrive with the network's reference number, which is solved by a small **lookup
+table**, itself sharded by the reference, that maps it to `(merchant_id, payment_id)`. Cash App
+and Vitess both use this pattern, and Vitess calls it a lookup vindex.
+
+### Routing keys to shards
+
+There are three common ways to map a shard key to a shard. The figure places 32 merchant accounts,
+`acct_1001` to `acct_1032`, on shards with each of them. Switch the strategy and the shard count.
+Keys outlined with a dashed border moved when the shard count went up by one, and the arrow shows
+the shard they came from. Hover a key to see its hash.
+
+<ShardRouting shards={4} keys={32} buckets={16} title="32 merchants on N shards" />
+
+**Range sharding** gives each shard a contiguous range of keys: accounts 1001 to 1008 on shard 0,
+1009 to 1016 on shard 2, and so on (shards are numbered in the order they were created). Adding a
+shard means splitting one range in half, so few keys move (from 4 to 5 shards, 4 of 32). But merchant IDs are assigned in order, so the newest merchants, often the
+fastest-growing ones, all land on the last shard. The figure balances by key count; real traffic
+would not be balanced.
+
+**Hash mod N** computes a hash of the key and takes it modulo the number of shards. Hashing
+spreads keys evenly regardless of how they were assigned. Here the hash is 32-bit FNV-1a. Check
+one by hand: the hash of `acct_1001` is `0x5E0D50E1`, and with 4 shards
+$\texttt{0x5E0D50E1} \bmod 4 = 1$ (the last hex digit is 1, and $16$ is a multiple of $4$), so the
+account lives on shard 1. The problem shows up when $N$ changes. Go from 4 to 5 shards in the
+figure: 28 of the 32 keys move. A key stays only if $h \bmod 4 = h \bmod 5$, which holds for 4 of
+every 20 hash values, so on average **80% of the data moves** for a 25% increase in capacity.
+Moving 80% of a payments database is weeks of copying.
+
+**Hash → bucket → shard** adds a level of indirection. The hash picks one of a fixed number of
+**buckets** (sometimes called logical or virtual shards), $b = h \bmod B$, and a small
+**directory** maps each bucket to a shard. $B$ never changes. Adding a shard only reassigns some
+buckets: from 4 to 5 shards, the new shard takes $\lfloor 16/5 \rfloor = 3$ of the 16 buckets, and
+in the figure 4 of the 32 keys move. With a realistic $B$, the moved fraction approaches the
+minimum, $1/N$.
+
+| Going from | hash mod N | buckets ($B = 4096$) |
+| --- | ---: | ---: |
+| 4 → 5 shards | 80.0% | 19.9% |
+| 8 → 9 shards | 89.0% | 11.0% |
+
+<MarginNote>Measured over 100,000 keys with FNV-1a and the directory algorithm used by the figure.
+The ideal is $1/N$: 20.0% and 11.1%.</MarginNote>
+
+The figure uses 16 buckets to stay readable; a real system uses thousands. Instagram, for example,
+used several thousand logical shards mapped to far fewer physical database servers, so it could
+start small and grow by moving logical shards between servers without re-bucketing any data. Vitess
+does the same with a 64-bit **keyspace ID**: each shard owns a range of it, named like `-80`
+(below `0x80…`) and `80-` (from `0x80…` up), and resharding splits a range in two.
+
+This post uses $B = 4096$ buckets. `acct_1042` hashes to `0x6302CB64`; the bucket is the low 12
+bits, `0xB64` $= 2916$, and the directory says which shard owns bucket 2916 today.
+
+### IDs that carry their shard
+
+A payment ID can carry its bucket, so `GET /payments/{id}` can be routed without a lookup. This
+post uses a 64-bit layout like Instagram's (which used 41 bits of time, 13 bits of logical shard
+and 10 bits of sequence):
+
+| Bits | Field | Range |
+| ---: | --- | --- |
+| 41 | Milliseconds since 2026-01-01 | about 69.7 years |
+| 12 | Bucket of the merchant | 4,096 buckets |
+| 11 | Sequence within the millisecond | 2,048 IDs per bucket per ms |
+
+Build the ID for a payment by `acct_1042` at 2026-10-02 12:00:00.000 UTC, sequence number 7:
+
+- time: $23{,}716{,}800{,}000$ ms since the epoch
+- bucket: $2916$
+- ID $= 23{,}716{,}800{,}000 \cdot 2^{23} + 2916 \cdot 2^{11} + 7 = 198{,}950{,}938{,}220{,}371{,}975$
+
+Reading it back, $\lfloor \text{ID} / 2^{11} \rfloor \bmod 4096 = 2916$ gives the bucket. Because
+the time is in the high bits, IDs sort by creation time, which keeps inserts at the right edge of
+the InnoDB primary-key B+tree, where they are cheapest.
+
+### Adding a shard without downtime
+
+Moving a bucket from one shard to another while it takes payments is the riskiest operation in
+the system. The method Vitess uses for resharding, and that Cash App used for its splits, is: copy
+a snapshot, catch up from the binary log, verify, then cut over in a few seconds. Step through it.
+
+<SequenceSteps
+	participants={reshardParticipants}
+	messages={reshardMessages}
+	colWidth={130}
+	title="Moving bucket 3 from shard 0 to a new shard 4"
+/>
+
+The design keeps the dangerous window short and reversible. Hours of copying and catching up
+happen while shard 0 still serves bucket 3. Writes for the bucket pause only for the few seconds
+between "freeze" and "resume", and the reverse replication stream lets the move be undone. In
+Vitess these steps are the `Reshard` workflow's copy phase, `VDiff`, and `SwitchTraffic`, and
+`ReverseTraffic` undoes a switch.
+
+### Operations that cross shards
+
+Some operations touch two merchants on different shards: a marketplace paying a seller, or one
+account transferring to another. There is no single MySQL transaction that covers both.
+
+MySQL does support **XA transactions** (two-phase commit across servers), but they hold locks on
+both shards until a coordinator decides, and a coordinator crash at the wrong moment leaves
+transactions stuck in a prepared state that someone has to resolve. Vitess has an atomic `TwoPC`
+transaction mode built on the same idea, and its documentation warns that it guarantees
+all-or-nothing commits but not isolation: other queries can see the transaction half-applied
+(the [next section](#strong-consistency-across-shards) shows what that means). Most payment systems
+avoid both and build cross-shard operations from single-shard transactions instead: the outbox
+from earlier, plus an idempotent apply on the other side.
+
+<SequenceSteps
+	participants={transferParticipants}
+	messages={transferMessages}
+	colWidth={130}
+	title="A transfer from shard 1 to shard 3"
+/>
+
+The transfer is not atomic: for a moment the money has left the platform's account but has not
+reached the seller. The ledger makes that visible instead of hiding it. The debit goes to a
+**transfers in transit** account, and the credit clears it, so at any instant the ledger still
+sums to zero and a non-zero in-transit balance that stays for more than a few seconds is an alert.
+
+### Hot merchants
+
+Sharding by merchant has one weak spot: a merchant that is much bigger than the rest. If one
+merchant produces 5% of all payments, its bucket's shard takes far more than its share of the
+load, and moving buckets does not help because a bucket cannot be split.
+
+The usual fixes, from simplest:
+
+- **A dedicated shard.** Map the big merchant's bucket to a shard of its own, on bigger hardware.
+- **Split the merchant.** Shard its data by `(merchant_id, payment_id)` across $k$ buckets.
+  Single-payment operations stay on one shard, but its balance and listings now span $k$ shards, so
+  its ledger balance is kept as $k$ sub-balances that are summed when read.
+
+## Databases that shard for you
+
+Everything so far keeps cross-shard work out of the database: the application picks a shard key so
+that transactions stay on one shard, and handles the rest with outboxes. A different family of
+databases shards data by itself *and* runs transactions across shards with the same guarantees
+as on one server. To compare them, it helps to be precise about what "strong consistency" means
+once data is split.
+
+### Strong consistency across shards
+
+Two separate questions decide whether a sharded database is strongly consistent.
+
+**First, is each shard's data safe?** A shard is a set of replicas. If a commit is acknowledged
+before enough replicas have it, a failover can lose it. MySQL with semi-synchronous replication
+answers this per shard, as earlier. Distributed SQL databases replicate each shard with a
+**consensus protocol** (Paxos or Raft): a write commits once a majority of replicas have it on
+disk, and a new leader is elected automatically from that majority.
+
+**Second, does a transaction that spans shards behave like one on a single server?** That needs
+two properties:
+
+- **Atomicity across shards**: the transaction commits on every shard or on none. Two-phase commit
+  (2PC) provides this.
+- **Isolation across shards**: no other transaction can see it half-applied. Atomicity does not
+  give you this. If shard 1 applies its commit a few milliseconds before shard 3, a reader in
+  between sees one half. This is a **fractured read**.
+
+Step through the transfer from earlier, now as one atomic transaction, with a balance check that
+runs at the wrong moment.
+
+<SequenceSteps
+	participants={fracturedParticipants}
+	messages={fracturedMessages}
+	colWidth={140}
+	title="Atomic but not isolated: a balance check sees €70 of €100"
+/>
+
+The check reads €70 + €0 = €70 although the transfer was atomic. To rule this out, the database must
+give every transaction a consistent **snapshot** across all shards: a point in time at which it
+sees each other transaction either completely or not at all. Databases that do this order every
+commit with a timestamp and read "as of" a timestamp. The strongest guarantees, from weaker to
+stronger:
+
+| Level | Guarantee |
+| --- | --- |
+| **Snapshot isolation** | Each transaction reads from one consistent snapshot; two transactions that write different rows based on the same snapshot can both commit (**write skew**) |
+| **Serializable** | The result equals some one-at-a-time order of the transactions |
+| **Strict serializable** (Spanner calls it **external consistency**) | Serializable, and that order respects real time: if T1 commits before T2 starts, T1 comes first |
+
+For the ledger, any of these prevents the fractured read. Serializable also rules out write skew,
+such as two concurrent payouts that each check the same balance and together overdraw it, which
+under snapshot isolation needs an explicit `SELECT … FOR UPDATE` on the balance row.
+
+### PostgreSQL and Citus
+
+PostgreSQL, like MySQL, is a single-server database. Its declarative partitioning keeps all
+partitions on one server and has the same rule as MySQL's: a unique or primary key must include
+all the partition key columns. Partitions can be foreign tables on other servers through
+`postgres_fdw`, but the manual warns that keeping their contents correct is then the user's job;
+this is not a consistent sharding system.
+
+**Citus** is the common way to shard PostgreSQL. It is an extension: one **coordinator** node holds
+metadata and routes queries, and **worker** nodes hold the shards, each an ordinary PostgreSQL
+table. A table is distributed by a **distribution column**, which is Citus's name for the shard key,
+and tables distributed by the same column are **co-located**, so their matching rows are on the
+same worker. A gateway on Citus would distribute payments, ledger entries and idempotency keys by
+`merchant_id`, the same design as before.
+
+The difference is in cross-shard transactions. When a transaction writes to several workers, Citus
+runs PostgreSQL's built-in two-phase commit across them, stores a commit record on the
+coordinator, and a background daemon finishes or rolls back any prepared transaction left behind
+by a crash. So cross-shard writes are atomic. But the Citus source documentation is explicit that
+they are not isolated: "A multi-shard query may see a concurrently committing transaction as
+committed on one node, but not yet committed on another node."<Sidenote>From the "No distributed
+snapshot isolation" section of the [Citus technical
+README](https://github.com/citusdata/citus/blob/2aebefc7856ffe54541124b07af1507c7347a056/src/backend/distributed/README.md),
+which works through an example with more possible outcomes than any serial order allows.</Sidenote>
+That is the fractured read above. Transactions that stay on one worker get all of PostgreSQL's
+usual guarantees, which is why the shard key matters just as much with Citus as with Vitess.
+
+### Distributed SQL databases
+
+**Distributed SQL** databases were designed for transactions across shards from the start. They
+split every table into ranges of the primary key (called **splits** in Spanner, **ranges** in
+CockroachDB, **tablets** in YugabyteDB and **Regions** in TiDB's storage layer, TiKV), split and
+move them automatically as they grow, and replicate each one with consensus. A transaction that
+touches several ranges runs two-phase commit where every participant is itself a consensus group.
+The Spanner paper puts it this way: "Running two-phase commit over Paxos mitigates the
+availability problems."
+
+Step through the cross-shard transfer as one transaction in such a database.
+
+<SequenceSteps
+	participants={consensusParticipants}
+	messages={consensusMessages}
+	colWidth={124}
+	title="Two-phase commit where every participant is a consensus group"
+/>
+
+Two things differ from MySQL XA. The coordinator's decision is replicated through consensus, so
+losing one server cannot leave the transaction in doubt. And every commit gets a timestamp that
+reads respect, so a balance check sees the transfer completely or not at all.
+
+| Database | SQL dialect | Shard unit | Replication | Isolation across shards |
+| --- | --- | --- | --- | --- |
+| **Spanner** | GoogleSQL or PostgreSQL dialect (managed service) | split | Paxos | Strict serializable (external consistency) |
+| **CockroachDB** | PostgreSQL wire protocol | range | Raft | `SERIALIZABLE` by default |
+| **YugabyteDB** | PostgreSQL-compatible (YSQL) | tablet | Raft | Serializable, Snapshot or Read Committed (Read Committed by default in new v2025.2+ deployments) |
+| **TiDB** | MySQL-compatible | Region | Raft | Snapshot isolation, advertised as `REPEATABLE-READ`; no `SERIALIZABLE` |
+| Citus | PostgreSQL extension | shard | PostgreSQL replication | Atomic 2PC, no cross-shard snapshot |
+| Vitess (`TwoPC`) | MySQL | shard | MySQL replication | Atomic 2PC, fractured reads possible |
+| NDB Cluster | MySQL | partition | Synchronous within a node group | `READ COMMITTED`, per row |
+
+<MarginNote>Isolation levels are from each project's documentation, listed in References.</MarginNote>
+
+#### What strong consistency costs
+
+These guarantees are not free, and the costs land in places a payment system feels.
+
+- **Commit latency.** Every commit waits for a consensus round, which is a round trip from the
+  leader to a majority of replicas. That is comparable to MySQL with semi-sync. A transaction across
+  ranges needs more: classic 2PC over consensus takes two rounds, one to prepare and one to record
+  the decision. CockroachDB's **parallel commits** overlap them and, in its documentation's words,
+  cut commit latency "from two rounds of consensus down to one". Spanner adds **commit wait**: it
+  waits out the uncertainty $\varepsilon$ of its clocks before making a commit visible, which the
+  2012 paper measured at about 4 ms most of the time. How much a round costs depends on where the
+  replicas are: if three zones in one region are about 1 ms apart (an assumption; measure your
+  own), a round costs about that, but with replicas in different regions every round is a
+  cross-region round trip, tens of milliseconds.
+- **Retries.** Under `SERIALIZABLE`, a transaction that conflicts with a concurrent one and cannot be
+  ordered after it is aborted, and when the database cannot retry it internally the client must run
+  it again; CockroachDB signals this with `SQLSTATE 40001`. A merchant's
+  balance row that every payment updates is exactly such a conflict. Retrying is safe only because
+  each operation carries an idempotency key, so the design from earlier still applies.
+- **Hotspots from ordered keys.** Range-sharded databases put adjacent keys in the same range. The
+  time-ordered payment ID from earlier is a problem here: as a leading key it sends every new
+  payment to the last range. Spanner's schema guide warns that "a common cause of hotspots is using a
+  key that monotonically increases" and suggests UUIDv4 keys, bit-reversed sequences, or putting a
+  hash or another column first. Keeping `merchant_id` as the first primary-key column already does
+  the last; a global index on `payment_id` alone needs one of the others.
+- **External calls are still outside the transaction.** No database transaction can include the
+  call to the acquirer. Idempotency keys, the `created` state written before the call, and the
+  outbox for webhooks are needed exactly as before.
+
+### Choosing for a payment gateway
+
+| Approach | Good fit when |
+| --- | --- |
+| **Sharded MySQL (Vitess) or PostgreSQL (Citus), sharded by merchant** | Almost every transaction belongs to one merchant, the team knows MySQL or PostgreSQL well, and the few cross-merchant operations can be built from an outbox and idempotent apply |
+| **Distributed SQL** (Spanner, CockroachDB, YugabyteDB) | Many transactions move money between accounts that could be on any shard (wallets, peer-to-peer transfers), writes must be served from several regions, or the team does not want to run resharding itself |
+| **NDB Cluster** | Small, latency-critical data that fits in memory; not the ledger |
+
+A card gateway is usually the first case: a payment, its ledger entries and its merchant's
+balance all belong to one merchant, so a sharded single-server database gives full ACID where it
+matters and the cross-merchant cases are rare. A wallet or peer-to-peer app, where most transfers
+cross accounts, is where distributed SQL earns its extra commit latency.
+
+## Worked example: how many shards?
+
+Estimate the size of a large gateway. Every input below is an assumption chosen for
+illustration; the method is the point.
+
+| Input | Value |
+| --- | ---: |
+| Payments per day | 20,000,000 |
+| Peak traffic / average traffic | 4 |
+| MySQL transactions per payment (authorize, capture) | 2 |
+| Rows written per payment | 9 |
+| Bytes stored per payment, with indexes and ledger entries | 2,048 |
+| Days of history kept online | 540 |
+| Growth to plan for before resharding | 3× |
+| Planning limit per shard: write transactions per second | 2,000 |
+| Planning limit per shard: data | 2 TB |
+
+<MarginNote>The per-shard limits are planning numbers, not benchmarks: they leave headroom for
+failover, backups and schema changes. Measure your own hardware.</MarginNote>
+
+**Throughput.** $20{,}000{,}000 / 86{,}400 = 231.5$ payments per second on average, so
+$4 \times 231.5 = 926$ at peak. With 2 transactions per payment that is $1{,}852$ transactions per
+second, writing $926 \times 9 = 8{,}333$ rows per second. With 3× growth,
+$\lceil 3 \times 1{,}852 / 2{,}000 \rceil = 3$ shards would carry the writes.
+
+**Storage.** $20{,}000{,}000 \times 2{,}048$ bytes $= 41.0$ GB per day, and 540 days of that is
+$22.1$ TB. With 3× growth, $\lceil 3 \times 22.1 / 2 \rceil = 34$ shards.
+
+| Limit | Shards needed |
+| --- | ---: |
+| Writes | 3 |
+| Storage | 34 |
+
+Storage, not throughput, decides the shard count here: about **34 shards**, each with a primary and
+two replicas. With 4,096 buckets that is about 120 buckets per shard, so later growth can be
+absorbed one bucket at a time. Two things follow. First, archiving old payments is worth as much
+as any sharding scheme, because it directly cuts the shard count. Second, the write path has
+plenty of headroom, which is what lets every commit afford a disk flush and a round trip to a
+replica in another zone.
+
+## Summary
+
+- A card payment is **authorized** in about a second through acquirer, network and issuer, but
+  money moves days later through **clearing** and **settlement**. The gateway must keep a record
+  that matches every step and **reconcile** it against the acquirer's files.
+- Correctness comes from the database: **idempotency keys** with a unique index make retries
+  safe, **conditional updates** keep the state machine honest, and a **double-entry ledger** written
+  in the same transaction as each state change keeps the money accounted for.
+- **MySQL** fits because it gives atomic multi-row transactions, durable commits
+  (`innodb_flush_log_at_trx_commit=1`, `sync_binlog=1`), unique indexes, row locks and
+  semi-synchronous replicas. **InnoDB does not shard**; partitioning and Group Replication do not
+  add write capacity, and **NDB Cluster** shards but offers only per-row `READ COMMITTED` on
+  in-memory data, so sharding is done above MySQL, for example with **Vitess**.
+- **Shard by merchant**, so each payment's transaction stays on one shard. Route through a fixed
+  set of **buckets** and a directory, so adding a shard moves about $1/N$ of the data instead of
+  most of it, and put the bucket in the **payment ID**.
+- Build **cross-shard** operations from single-shard transactions, an **outbox** and idempotent
+  apply, and make in-flight money visible in the ledger.
+- **Atomic is not isolated.** Two-phase commit across shards (MySQL XA, Vitess `TwoPC`, Citus) can
+  still expose **fractured reads**. Distributed SQL databases (Spanner, CockroachDB, YugabyteDB,
+  TiDB) give cross-shard snapshots by running 2PC over consensus groups, at the cost of commit
+  latency and retries.
+
+## References
+
+- [ISO 8583](https://en.wikipedia.org/wiki/ISO_8583): message types, data elements and response
+  codes.
+- Visa, [Stand-In Processing](https://nilsonreport.com/articles/visa-adds-artificial-intelligence-to-stand-in-processing/)
+  (Nilson Report).
+- Stripe, [Idempotent requests](https://docs.stripe.com/api/idempotent_requests).
+- MySQL 8.4 Reference Manual:
+  [`innodb_flush_log_at_trx_commit`](https://dev.mysql.com/doc/refman/8.4/en/innodb-parameters.html#sysvar_innodb_flush_log_at_trx_commit),
+  [`sync_binlog`](https://dev.mysql.com/doc/refman/8.4/en/replication-options-binary-log.html#sysvar_sync_binlog),
+  [semisynchronous replication](https://dev.mysql.com/doc/refman/8.4/en/replication-semisync.html),
+  [transaction isolation levels](https://dev.mysql.com/doc/refman/8.4/en/innodb-transaction-isolation-levels.html).
+- Cash App, [Sharding Cash](https://developer.squareup.com/blog/sharding-cash/),
+  [Cross-Shard Queries & Lookup Tables](https://code.cash.app/cross-shard-queries-lookup-tables) and
+  [Shard Splits with Consistent Snapshots](https://code.cash.app/shard-splits-with-consistent-snapshots).
+- Slack, [Scaling Datastores at Slack with Vitess](https://slack.engineering/scaling-datastores-at-slack-with-vitess/);
+  Shopify, [Shard Balancing](https://shopify.engineering/mysql-database-shard-balancing-terabyte-scale).
+- Instagram, [Sharding & IDs at Instagram](https://instagram-engineering.com/sharding-ids-at-instagram-1cf5a71e5a5c).
+- MySQL 8.4 Reference Manual, NDB Cluster:
+  [NDB and InnoDB compared](https://dev.mysql.com/doc/refman/8.4/en/mysql-cluster-ndb-innodb-engines.html),
+  [nodes, node groups and partitions](https://dev.mysql.com/doc/refman/8.4/en/mysql-cluster-nodes-groups.html),
+  [transaction limits](https://dev.mysql.com/doc/refman/8.4/en/mysql-cluster-limitations-transactions.html);
+  [partitioning keys and unique keys](https://dev.mysql.com/doc/refman/8.4/en/partitioning-limitations-partitioning-keys-unique-keys.html),
+  [partitioning limitations](https://dev.mysql.com/doc/refman/8.4/en/partitioning-limitations.html),
+  [Group Replication](https://dev.mysql.com/doc/refman/8.4/en/group-replication-summary.html).
+- PostgreSQL, [Table Partitioning](https://www.postgresql.org/docs/current/ddl-partitioning.html);
+  Citus, [Concepts](https://docs.citusdata.com/en/stable/get_started/concepts.html) and the
+  [technical README](https://github.com/citusdata/citus/blob/2aebefc7856ffe54541124b07af1507c7347a056/src/backend/distributed/README.md).
+- Corbett et al., [Spanner: Google's Globally-Distributed Database](https://research.google.com/archive/spanner-osdi2012.pdf),
+  OSDI 2012; Spanner [schema design](https://docs.cloud.google.com/spanner/docs/schema-design).
+- CockroachDB, [Transaction Layer](https://docs.cockroachlabs.com/docs/stable/architecture/transaction-layer)
+  and [transaction retry errors](https://docs.cockroachlabs.com/docs/stable/transaction-retry-error-reference);
+  YugabyteDB, [isolation levels](https://docs.yugabyte.com/stable/architecture/transactions/isolation-levels/);
+  TiDB, [transaction isolation levels](https://docs.pingcap.com/tidb/stable/transaction-isolation-levels).
+- Vitess documentation: [Distributed transactions](https://vitess.io/docs/25.0/reference/features/distributed-transaction/), [Shard](https://vitess.io/docs/25.0/concepts/shard/),
+  [Reshard](https://vitess.io/docs/25.0/reference/vreplication/reshard/).

@@ -1,0 +1,420 @@
+---
+// Every pass of Triton's NVIDIA pipeline (TTIR, TTGIR, LLVM), run on two Inductor kernels for
+// sm_90, with what each pass changed. The list shows each pass with +added / -removed lines
+// (passes that change nothing are dimmed); the panel shows the pass's description and the diff of
+// the IR it produced. Data: tritonPasses.ts (generated from MLIR_ENABLE_DUMP), descriptions:
+// tritonPassInfo.ts. The step buttons walk through the passes that change the IR.
+// Usage in .mdx:
+//   <TritonPasses />
+//   <TritonPasses kernel="mm" start="TritonGPUPipeline" />
+import { PASS_INFO } from "./tritonPassInfo";
+import { type PassStep, mmPasses, softmaxPasses } from "./tritonPasses";
+
+interface Props {
+	/** Which kernel's tab is open first. */
+	kernel?: "softmax" | "mm";
+	/** Name of the pass selected first (its first occurrence). */
+	start?: string;
+	title?: string;
+}
+
+const { kernel = "softmax", start, title } = Astro.props;
+const kernels: { key: "softmax" | "mm"; label: string; steps: PassStep[] }[] = [
+	{
+		key: "softmax",
+		label: "Fused softmax (persistent reduction)",
+		steps: softmaxPasses,
+	},
+	{ key: "mm", label: "Matmul template + relu", steps: mmPasses },
+];
+const STAGES = {
+	ttir: "make_ttir",
+	ttgir: "make_ttgir",
+	llir: "make_llir",
+} as const;
+const firstIndex = (steps: PassStep[]) => {
+	const i = start ? steps.findIndex((s) => s.name === start) : -1;
+	return i >= 0 ? i : steps.findIndex((s) => s.added || s.removed);
+};
+const lineClass = (l: string) =>
+	l.startsWith("@")
+		? "hunk"
+		: l.startsWith("+")
+			? "add"
+			: l.startsWith("-")
+				? "del"
+				: "ctx";
+---
+
+<figure class="triton-passes" data-kernel={kernel}>
+	{title && <figcaption class="title">{title}</figcaption>}
+	<div class="tabs" role="tablist">
+		{
+			kernels.map((k) => (
+				<button type="button" role="tab" data-k={k.key} aria-selected={k.key === kernel ? "true" : "false"}>
+					{k.label}
+				</button>
+			))
+		}
+	</div>
+	{
+		kernels.map((k) => {
+			const first = firstIndex(k.steps);
+			return (
+				<div class="kernel" data-k={k.key} data-first={first} hidden={k.key !== kernel}>
+					<div class="body">
+						<ol class="list">
+							{k.steps.map((s, i) => (
+								<li>
+									{(i === 0 || k.steps[i - 1].stage !== s.stage) && <span class="stage">{STAGES[s.stage]}</span>}
+									<button
+										type="button"
+										class:list={["pass", { same: !s.added && !s.removed }]}
+										data-i={i}
+										aria-current={i === first ? "true" : "false"}
+									>
+										<span class="name">{s.name}</span>
+										{(s.added > 0 || s.removed > 0) && (
+											<span class="delta">
+												<span class="a">+{s.added}</span> <span class="r">−{s.removed}</span>
+											</span>
+										)}
+									</button>
+								</li>
+							))}
+						</ol>
+						<div class="panels">
+							{k.steps.map((s, i) => (
+								<div class="panel" data-i={i} hidden={i !== first}>
+									<p class="head">
+										<span class="idx">
+											{i + 1}/{k.steps.length}
+										</span>{" "}
+										<b>{s.name}</b> <code>{s.arg}</code>
+									</p>
+									<p class="info">{PASS_INFO[s.name] ?? ""}</p>
+									{s.diff.length ? (
+										<pre class="diff">{[...s.diff, ...(s.more > 0 ? [`@ … ${s.more} more lines`] : [])].map((l) => <span class={lineClass(l)}>{l}</span>)}</pre>
+									) : (
+										<p class="nochange">No change to the IR ({s.lines} lines in, same lines out).</p>
+									)}
+								</div>
+							))}
+						</div>
+					</div>
+				</div>
+			);
+		})
+	}
+	<div class="controls">
+		<div class="buttons">
+			<button type="button" data-act="first" aria-label="First changing pass">
+				<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 3v10M13 3 6 8l7 5z"></path></svg>
+			</button>
+			<button type="button" data-act="prev" aria-label="Previous changing pass">
+				<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M11 3 4 8l7 5z"></path></svg>
+			</button>
+			<button type="button" data-act="play" class="play" aria-label="Play">
+				<svg class="i-play" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5v11L13.5 8z"></path></svg>
+				<svg class="i-pause" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 3h3v10H4zM9 3h3v10H9z"></path></svg>
+			</button>
+			<button type="button" data-act="next" aria-label="Next changing pass">
+				<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 3l7 5-7 5z"></path></svg>
+			</button>
+		</div>
+		<span class="hint">steps through the passes that change the IR</span>
+	</div>
+</figure>
+
+<script>
+	for (const fig of document.querySelectorAll<HTMLElement>(".triton-passes")) {
+		let current = fig.querySelector<HTMLElement>(".kernel:not([hidden])");
+		let timer: number | undefined;
+		const play = fig.querySelector<HTMLButtonElement>("[data-act=play]");
+		const passes = () => [...(current?.querySelectorAll<HTMLButtonElement>(".pass") ?? [])];
+		const at = () => passes().findIndex((b) => b.getAttribute("aria-current") === "true");
+		const select = (i: number) => {
+			if (!current) return;
+			passes().forEach((b, k) => b.setAttribute("aria-current", String(k === i)));
+			for (const p of current.querySelectorAll<HTMLElement>(".panel")) p.hidden = Number(p.dataset.i) !== i;
+			const btn = passes()[i];
+			const list = current.querySelector<HTMLElement>(".list");
+			if (btn && list) list.scrollTop = btn.offsetTop - list.offsetTop - list.clientHeight / 2 + btn.clientHeight;
+		};
+		const changing = () =>
+			passes()
+				.map((b, k) => (b.classList.contains("same") ? -1 : k))
+				.filter((k) => k >= 0);
+		const step = (dir: 1 | -1) => {
+			const ch = changing();
+			const now = at();
+			const next = dir > 0 ? ch.find((k) => k > now) : [...ch].reverse().find((k) => k < now);
+			if (next !== undefined) select(next);
+			return next !== undefined;
+		};
+		const stop = () => {
+			if (timer !== undefined) clearInterval(timer);
+			timer = undefined;
+			play?.classList.remove("playing");
+			play?.setAttribute("aria-label", "Play");
+		};
+		fig.querySelectorAll<HTMLButtonElement>("[data-act]").forEach((b) =>
+			b.addEventListener("click", () => {
+				const act = b.dataset.act;
+				if (act === "play") {
+					if (timer !== undefined) return stop();
+					play?.classList.add("playing");
+					play?.setAttribute("aria-label", "Pause");
+					timer = window.setInterval(() => {
+						if (!step(1)) stop();
+					}, 2500);
+					return;
+				}
+				stop();
+				if (act === "first") select(changing()[0] ?? 0);
+				if (act === "prev") step(-1);
+				if (act === "next") step(1);
+			}),
+		);
+		for (const tab of fig.querySelectorAll<HTMLButtonElement>("[role=tab]"))
+			tab.addEventListener("click", () => {
+				stop();
+				for (const t of fig.querySelectorAll("[role=tab]")) t.setAttribute("aria-selected", String(t === tab));
+				for (const k of fig.querySelectorAll<HTMLElement>(".kernel")) k.hidden = k.dataset.k !== tab.dataset.k;
+				current = fig.querySelector<HTMLElement>(".kernel:not([hidden])");
+			});
+		for (const k of fig.querySelectorAll<HTMLElement>(".kernel"))
+			for (const b of k.querySelectorAll<HTMLButtonElement>(".pass"))
+				b.addEventListener("click", () => {
+					stop();
+					select(Number(b.dataset.i));
+				});
+	}
+</script>
+
+<style>
+	.triton-passes {
+		--add: #2f9e44;
+		--del: #d6336c;
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+	}
+	@media (prefers-color-scheme: dark) {
+		.triton-passes {
+			--add: #5cc46c;
+			--del: #ff6b9a;
+		}
+	}
+	.title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.5rem;
+	}
+	.tabs {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.25rem;
+		margin-bottom: 0.6rem;
+		font-size: 0.76rem;
+	}
+	.tabs button {
+		padding: 0.25rem 0.6rem;
+		border: 1px solid var(--faint);
+		border-radius: 999px;
+		background: var(--bg);
+		color: var(--text);
+		font: inherit;
+		cursor: pointer;
+	}
+	.tabs button:hover {
+		border-color: var(--accent);
+	}
+	.tabs button[aria-selected="true"] {
+		background: var(--accent);
+		border-color: var(--accent);
+		color: var(--bg);
+	}
+	.body {
+		display: grid;
+		grid-template-columns: minmax(0, 15rem) minmax(0, 1fr);
+		gap: 0.75rem;
+	}
+	@media (max-width: 40rem) {
+		.body {
+			grid-template-columns: minmax(0, 1fr);
+		}
+		.list {
+			max-height: 12rem;
+		}
+	}
+	.list {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		max-height: 26rem;
+		overflow-y: auto;
+		border: 1px solid var(--faint);
+		border-radius: 6px;
+		font-size: 0.72rem;
+		position: relative;
+	}
+	.list li {
+		margin: 0;
+	}
+	.stage {
+		display: block;
+		padding: 0.3rem 0.5rem 0.15rem;
+		font-family: var(--mono);
+		font-size: 0.68rem;
+		font-weight: 600;
+		color: var(--muted);
+		background: var(--surface);
+		border-top: 1px solid var(--faint);
+	}
+	.pass {
+		display: flex;
+		justify-content: space-between;
+		gap: 0.4rem;
+		width: 100%;
+		padding: 0.18rem 0.5rem;
+		border: 0;
+		background: none;
+		color: var(--text);
+		font: inherit;
+		text-align: left;
+		cursor: pointer;
+	}
+	.pass .name {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.pass.same {
+		color: var(--muted);
+		opacity: 0.75;
+	}
+	.pass:hover {
+		background: var(--surface);
+	}
+	.pass[aria-current="true"] {
+		background: var(--accent);
+		color: var(--bg);
+		opacity: 1;
+	}
+	.pass[aria-current="true"] .a,
+	.pass[aria-current="true"] .r {
+		color: var(--bg);
+	}
+	.delta {
+		font-family: var(--mono);
+		white-space: nowrap;
+	}
+	.a {
+		color: var(--add);
+	}
+	.r {
+		color: var(--del);
+	}
+	.panel .head {
+		margin: 0 0 0.25rem;
+		font-size: 0.8rem;
+	}
+	.panel .head code {
+		font-size: 0.72rem;
+		color: var(--muted);
+	}
+	.idx {
+		font-family: var(--mono);
+		font-size: 0.72rem;
+		color: var(--muted);
+	}
+	.info {
+		margin: 0 0 0.4rem;
+		font-size: 0.78rem;
+		line-height: 1.45;
+	}
+	.nochange {
+		font-size: 0.76rem;
+		color: var(--muted);
+	}
+	.diff {
+		margin: 0;
+		padding: 0.5rem 0;
+		max-height: 20rem;
+		overflow: auto;
+		font-family: var(--mono);
+		font-size: 0.66rem;
+		line-height: 1.4;
+		background: var(--surface);
+		border: 1px solid var(--faint);
+		border-radius: 6px;
+	}
+	.diff span {
+		display: block;
+		padding: 0 0.6rem;
+		white-space: pre;
+	}
+	.diff .add {
+		background: color-mix(in oklch, var(--add) 16%, transparent);
+	}
+	.diff .del {
+		background: color-mix(in oklch, var(--del) 14%, transparent);
+	}
+	.diff .hunk {
+		color: var(--muted);
+		font-style: italic;
+	}
+	.controls {
+		display: flex;
+		align-items: center;
+		gap: 0.75rem;
+		margin-top: 0.6rem;
+	}
+	.buttons {
+		display: flex;
+		gap: 0.3rem;
+	}
+	.buttons button {
+		display: grid;
+		place-items: center;
+		width: 2rem;
+		height: 2rem;
+		padding: 0;
+		border: 1px solid var(--faint);
+		border-radius: 8px;
+		background: var(--bg);
+		color: var(--text);
+		cursor: pointer;
+		transition: border-color 150ms ease;
+	}
+	.buttons button:hover {
+		border-color: var(--accent);
+	}
+	.buttons svg {
+		width: 0.8rem;
+		height: 0.8rem;
+		fill: currentColor;
+		stroke: currentColor;
+		stroke-width: 1.2;
+		stroke-linejoin: round;
+	}
+	.buttons .play {
+		width: 2.6rem;
+		background: var(--accent);
+		border-color: var(--accent);
+		color: var(--bg);
+	}
+	.play .i-pause,
+	.play.playing .i-play {
+		display: none;
+	}
+	.play.playing .i-pause {
+		display: block;
+	}
+	.hint {
+		font-size: 0.72rem;
+		color: var(--muted);
+	}
+</style>

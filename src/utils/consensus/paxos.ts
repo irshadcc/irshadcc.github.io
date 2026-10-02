@@ -68,30 +68,53 @@ const fmt = (p?: Proposal) => (p ? `(${p.n}, ${p.v})` : "–");
 
 export const run = (s: Scenario): Frame[] => {
 	const majority = Math.floor(s.acceptors / 2) + 1;
-	const acc: AcceptorState[] = Array.from({ length: s.acceptors }, () => ({ promised: 0 }));
-	const props: ProposerState[] = s.values.map((own) => ({ own, n: 0, promises: new Map() }));
+	const acc: AcceptorState[] = Array.from({ length: s.acceptors }, () => ({
+		promised: 0,
+	}));
+	const props: ProposerState[] = s.values.map((own) => ({
+		own,
+		n: 0,
+		promises: new Map(),
+	}));
 	// Every (acceptor, proposal) acceptance that ever happened, for the learner's view.
 	const acceptances = new Map<number, Set<number>>();
 	const values = new Map<number, string>();
 	let chosen: Proposal | undefined;
 
-	const snapshot = (title: string, note: string, messages: Message[]): Frame => ({
+	const snapshot = (
+		title: string,
+		note: string,
+		messages: Message[],
+	): Frame => ({
 		title,
 		note,
 		messages,
-		acceptors: acc.map((a) => ({ promised: a.promised, accepted: a.accepted && { ...a.accepted } })),
-		proposers: props.map((p) => ({ n: p.n, value: p.value, promises: p.promises.size })),
+		acceptors: acc.map((a) => ({
+			promised: a.promised,
+			accepted: a.accepted && { ...a.accepted },
+		})),
+		proposers: props.map((p) => ({
+			n: p.n,
+			value: p.value,
+			promises: p.promises.size,
+		})),
 		chosen: chosen && { ...chosen },
 	});
 
-	const frames: Frame[] = [snapshot("Start", "No acceptor has promised or accepted anything.", [])];
+	const frames: Frame[] = [
+		snapshot("Start", "No acceptor has promised or accepted anything.", []),
+	];
 	for (const act of s.actions) {
 		const prop = props[act.p - 1];
 		const pname = `P${act.p}`;
 		const messages: Message[] = [];
 		if (act.kind === "prepare") {
-			if (act.n % 10 !== act.p) throw new Error(`P${act.p} may not use number ${act.n}`);
-			if (act.n <= prop.n) throw new Error(`P${act.p} must use a new, higher number than ${prop.n}`);
+			if (act.n % 10 !== act.p)
+				throw new Error(`P${act.p} may not use number ${act.n}`);
+			if (act.n <= prop.n)
+				throw new Error(
+					`P${act.p} must use a new, higher number than ${prop.n}`,
+				);
 			prop.n = act.n;
 			prop.promises = new Map();
 			prop.value = undefined;
@@ -107,7 +130,9 @@ export const run = (s: Scenario): Frame[] => {
 					from: pname,
 					to: `A${i + 1}`,
 					req: `prepare(${act.n})`,
-					reply: ok ? `promise(${act.n}, ${fmt(a.accepted)})` : `nack(${a.promised})`,
+					reply: ok
+						? `promise(${act.n}, ${fmt(a.accepted)})`
+						: `nack(${a.promised})`,
 					ok,
 					p: act.p,
 					a: i,
@@ -116,7 +141,8 @@ export const run = (s: Scenario): Frame[] => {
 			if (prop.promises.size >= majority) {
 				// Phase 2a's value rule: the highest-numbered accepted proposal among the promises.
 				let best: Proposal | undefined;
-				for (const r of prop.promises.values()) if (r && (!best || r.n > best.n)) best = r;
+				for (const r of prop.promises.values())
+					if (r && (!best || r.n > best.n)) best = r;
 				prop.value = best ? best.v : prop.own;
 			}
 		} else {
@@ -148,7 +174,10 @@ export const run = (s: Scenario): Frame[] => {
 			for (const [n, set] of acceptances) {
 				if (set.size < majority) continue;
 				const p = { n, v: values.get(n) as string };
-				if (chosen && chosen.v !== p.v) throw new Error(`safety violated: ${chosen.v} and ${p.v} both chosen`);
+				if (chosen && chosen.v !== p.v)
+					throw new Error(
+						`safety violated: ${chosen.v} and ${p.v} both chosen`,
+					);
 				if (!chosen || n < chosen.n) chosen = p;
 			}
 		}
@@ -190,11 +219,18 @@ export const SCENARIOS: Scenario[] = [
 	{
 		id: "adopt",
 		label: "A second proposer",
-		summary: "X is chosen by A1–A3; then P2 runs phase 1 with A3–A5 and must propose X too.",
+		summary:
+			"X is chosen by A1–A3; then P2 runs phase 1 with A3–A5 and must propose X too.",
 		acceptors: 5,
 		values: ["X", "Y"],
 		actions: [
-			{ kind: "prepare", p: 1, n: 11, to: [0, 1, 2], note: "P1 only needs a majority: A1, A2 and A3 promise." },
+			{
+				kind: "prepare",
+				p: 1,
+				n: 11,
+				to: [0, 1, 2],
+				note: "P1 only needs a majority: A1, A2 and A3 promise.",
+			},
 			{
 				kind: "accept",
 				p: 1,
@@ -221,11 +257,18 @@ export const SCENARIOS: Scenario[] = [
 	{
 		id: "preempt",
 		label: "Promises block a slow proposer",
-		summary: "P1's accept reaches only A1 before P2 runs phase 1; P2 is free to choose Y, and P1's late accepts are refused.",
+		summary:
+			"P1's accept reaches only A1 before P2 runs phase 1; P2 is free to choose Y, and P1's late accepts are refused.",
 		acceptors: 5,
 		values: ["X", "Y"],
 		actions: [
-			{ kind: "prepare", p: 1, n: 11, to: [0, 1, 2], note: "A1, A2 and A3 promise for 11." },
+			{
+				kind: "prepare",
+				p: 1,
+				n: 11,
+				to: [0, 1, 2],
+				note: "A1, A2 and A3 promise for 11.",
+			},
 			{
 				kind: "accept",
 				p: 1,
@@ -240,7 +283,13 @@ export const SCENARIOS: Scenario[] = [
 				to: [2, 3, 4],
 				note: "P2 asks A3, A4, A5. None has accepted anything, so P2 may propose its own value. A3's promise for 12 replaces its promise for 11.",
 			},
-			{ kind: "accept", p: 2, n: 12, to: [2, 3, 4], note: "A3, A4, A5 accept (12, Y): Y is chosen." },
+			{
+				kind: "accept",
+				p: 2,
+				n: 12,
+				to: [2, 3, 4],
+				note: "A3, A4, A5 accept (12, Y): Y is chosen.",
+			},
 			{
 				kind: "accept",
 				p: 1,
@@ -253,12 +302,25 @@ export const SCENARIOS: Scenario[] = [
 	{
 		id: "duel",
 		label: "Duelling proposers",
-		summary: "Two proposers keep preempting each other's phase 1, so nothing is ever chosen (section 2.4).",
+		summary:
+			"Two proposers keep preempting each other's phase 1, so nothing is ever chosen (section 2.4).",
 		acceptors: 5,
 		values: ["X", "Y"],
 		actions: [
-			{ kind: "prepare", p: 1, n: 11, to: [0, 1, 2], note: "P1 completes phase 1 for 11." },
-			{ kind: "prepare", p: 2, n: 12, to: [0, 1, 2], note: "Before P1's accepts arrive, P2 completes phase 1 for 12." },
+			{
+				kind: "prepare",
+				p: 1,
+				n: 11,
+				to: [0, 1, 2],
+				note: "P1 completes phase 1 for 11.",
+			},
+			{
+				kind: "prepare",
+				p: 2,
+				n: 12,
+				to: [0, 1, 2],
+				note: "Before P1's accepts arrive, P2 completes phase 1 for 12.",
+			},
 			{
 				kind: "accept",
 				p: 1,
@@ -266,9 +328,27 @@ export const SCENARIOS: Scenario[] = [
 				to: [0, 1, 2],
 				note: "P1's accept(11, X) is refused: every acceptor has promised 12.",
 			},
-			{ kind: "prepare", p: 1, n: 21, to: [0, 1, 2], note: "P1 retries with 21, which preempts P2's 12." },
-			{ kind: "accept", p: 2, n: 12, to: [0, 1, 2], note: "P2's accept(12, Y) is refused." },
-			{ kind: "prepare", p: 2, n: 22, to: [0, 1, 2], note: "P2 retries with 22, preempting 21. And so on: safe, but no progress." },
+			{
+				kind: "prepare",
+				p: 1,
+				n: 21,
+				to: [0, 1, 2],
+				note: "P1 retries with 21, which preempts P2's 12.",
+			},
+			{
+				kind: "accept",
+				p: 2,
+				n: 12,
+				to: [0, 1, 2],
+				note: "P2's accept(12, Y) is refused.",
+			},
+			{
+				kind: "prepare",
+				p: 2,
+				n: 22,
+				to: [0, 1, 2],
+				note: "P2 retries with 22, preempting 21. And so on: safe, but no progress.",
+			},
 			{
 				kind: "accept",
 				p: 1,

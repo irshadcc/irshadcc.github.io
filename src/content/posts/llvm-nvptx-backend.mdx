@@ -1,0 +1,695 @@
+---
+title: "Inside LLVM: IR, TableGen and the NVPTX Backend"
+description: "How a CUDA kernel becomes PTX inside LLVM. This post reads LLVM IR and SSA form, watches the optimizer shrink a kernel pass by pass, follows the backend through the SelectionDAG, instruction selection and Machine IR, opens up TableGen, and ends with what makes the NVPTX backend different. Every listing is real LLVM 23 output."
+date: 2026-10-02
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import MarginNote from "../../components/MarginNote.astro";
+import LlvmOverview from "../../utils/compiler/LlvmOverview.astro";
+import CodeStages from "../../utils/compiler/CodeStages.astro";
+import IrCfg from "../../utils/compiler/IrCfg.astro";
+import SelectionDag from "../../utils/compiler/SelectionDag.astro";
+import BackendPhases from "../../utils/compiler/BackendPhases.astro";
+import {
+	dotIr,
+	optStages,
+	saxpyStages,
+	saxpyTags,
+	tablegenStages,
+	tablegenTags,
+} from "../../utils/compiler/llvmData";
+
+## Background
+
+You write a CUDA kernel, and a few hundred milliseconds later the GPU runs it. In between, a
+compiler has turned C++ into instructions for NVIDIA's hardware. For a large share of GPU code
+that compiler is **LLVM**: Clang compiles CUDA with it, Triton (and so
+[TorchInductor](/blog/torch-inductor/)) generates GPU code through it, and the
+[MLIR](/blog/mlir/) stacks under Triton and the CuTe DSL end by handing LLVM IR to it.
+
+Knowing how LLVM works explains things you see every day when you read generated code. Why does
+`a * x[i] + y[i]` become a single `fma` instruction? Why does the PTX declare loads as
+`ld.global` when the source only had plain pointers? Why does PTX never spill a register, while
+the same kernel in SASS (the GPU's real machine code) does? Each answer lives in a specific part
+of LLVM.
+
+This post follows one small kernel through all of it. It starts with the big picture, then reads
+**LLVM IR**, the language at the centre. Next comes the **optimizer**, then the **backend** that
+turns IR into machine code: the SelectionDAG, instruction selection, Machine IR and code
+emission. Then **TableGen**, the language that describes a target to the backend, and finally
+what is special about the **NVPTX backend**, LLVM's code generator for NVIDIA GPUs. Every listing
+is real output from LLVM 23.1.2, and every link into LLVM's source points at the same pinned
+commit.
+
+## The big picture
+
+### Three phases
+
+A compiler for $M$ languages and $N$ machines could be $M \times N$ separate programs. LLVM is
+built so it needs only $M + N$ pieces. A **front end** turns one language into **LLVM IR** (its
+intermediate representation). An **optimizer** improves the IR without caring where it came from.
+A **back end** turns IR into code for one machine. Any front end can then pair with any back end,
+and every language gets every optimization for free.
+
+<LlvmOverview />
+
+The highlighted path is the one this post follows. **Clang** compiles a CUDA kernel to IR, the
+optimizer (the `opt` tool) improves it, and the **NVPTX** back end (run by the `llc` tool) turns
+it into **PTX**, NVIDIA's virtual instruction set. NVIDIA's own assembler, **ptxas**, then
+compiles PTX into **SASS** for a specific GPU. That last step is outside LLVM.
+
+### One kernel, end to end
+
+The running example is `saxpy`, $y \leftarrow a x + y$, one thread per element:
+
+```cpp
+extern "C" __global__ void saxpy(int n, float a, const float *x, float *y) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n)
+    y[i] = a * x[i] + y[i];
+}
+```
+
+Two commands take it to PTX, with LLVM IR in between:<Sidenote>The listings come from Homebrew's
+LLVM 23.1.2 on macOS, which has no CUDA toolkit. So the clang command also passes `-nocudainc
+-nocudalib`, the file includes clang's own `__clang_cuda_builtin_vars.h` (which defines
+`threadIdx` and friends), and `__global__` is defined as `__attribute__((global))`, which is what
+the CUDA headers define it as. None of this changes the generated code.</Sidenote>
+
+```bash
+clang++ -x cuda --cuda-device-only --cuda-gpu-arch=sm_90 -O2 -S -emit-llvm saxpy.cu -o saxpy.ll
+llc -mtriple=nvptx64-nvidia-cuda -mcpu=sm_90 -O2 saxpy.ll -o saxpy.ptx
+```
+
+Step through the stages below. Each colour follows one piece of the source: blue is the index
+computation, orange the bounds check, green the memory accesses and red the multiply-add. Watch
+the red lines: two instructions, `fmul` and `fadd`, in IR, one `llvm.fma` call just before
+instruction selection, and one `fma.rn.f32` in PTX. Hover a legend entry to dim everything else.
+
+<CodeStages stages={saxpyStages} tags={saxpyTags} step={0} title="saxpy, from CUDA to PTX" />
+
+The rest of the post explains each step of that journey.
+
+## LLVM IR
+
+### Modules, functions and blocks
+
+Here is the optimized IR of `saxpy`, with attribute lists and metadata dropped:
+
+```llvm
+target datalayout = "e-p6:32:32-i64:64-i128:128-i256:256-v16:16-v32:32-n16:32:64"
+target triple = "nvptx64-nvidia-cuda"
+
+define dso_local ptx_kernel void @saxpy(i32 noundef %0, float noundef %1, ptr nofree noundef readonly captures(none) %2, ptr nofree noundef captures(none) %3) local_unnamed_addr {
+  %5 = tail call noundef i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
+  %6 = tail call noundef i32 @llvm.nvvm.read.ptx.sreg.ntid.x()
+  %7 = mul i32 %5, %6
+  %8 = tail call noundef i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %9 = add i32 %7, %8
+  %10 = icmp slt i32 %9, %0
+  br i1 %10, label %11, label %19
+
+11:                                               ; preds = %4
+  %12 = sext i32 %9 to i64
+  %13 = getelementptr inbounds [4 x i8], ptr %2, i64 %12
+  %14 = load float, ptr %13, align 4
+  %15 = fmul contract float %1, %14
+  %16 = getelementptr inbounds [4 x i8], ptr %3, i64 %12
+  %17 = load float, ptr %16, align 4
+  %18 = fadd contract float %15, %17
+  store float %18, ptr %16, align 4
+  br label %19
+
+19:                                               ; preds = %11, %4
+  ret void
+}
+
+declare noundef range(i32 0, 2147483647) i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
+declare noundef range(i32 1, 1025) i32 @llvm.nvvm.read.ptx.sreg.ntid.x()
+declare noundef range(i32 0, 1024) i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+```
+
+It has four levels, each inside the one before:
+
+- A **module** is one file of IR. It starts with the **target triple** (here
+  `nvptx64-nvidia-cuda`) and the **data layout**, which records facts the optimizer needs about
+  the target, such as type sizes and alignments.
+- A **function** is a `define` with a body, or a `declare` without one. Its parameters are
+  `%0` to `%3`, in source order: `n`, `a`, `x`, `y`.
+- A **basic block** is a straight run of instructions with one way in (the top) and one way out
+  (its last instruction). This function has three: the entry block, `%11` (the `if` body) and
+  `%19` (the return).
+- The last instruction of every block is a **terminator**: a branch (`br`) or a return (`ret`).
+
+Values without a source name are numbered in order: `%0` to `%3` are the parameters, `%4` is the
+entry block (which has no label line), and so on.<Sidenote>That is why the entry block's number,
+`%4`, appears only in the `; preds = %4` comments. Names like `%x` show up instead when the front
+end keeps the source names, as Clang does in debug builds.</Sidenote>
+
+### Types and instructions
+
+IR is **typed**. `i32` is a 32-bit integer, `i1` a single bit (a boolean), `float` a 32-bit float,
+and `ptr` a pointer. There are vectors (`<4 x float>`) and arrays (`[4 x i8]`) too. Integer types
+carry no sign: the instruction says how to treat the bits, so the comparison is `icmp slt`
+("signed less than") and the widening of `i` is `sext` ("sign extend").
+
+Most instructions read like assembly for a machine with unlimited registers. The one that
+surprises people is **getelementptr** (GEP), which only computes an address and never touches
+memory:
+
+```llvm
+%13 = getelementptr inbounds [4 x i8], ptr %2, i64 %12
+```
+
+reads "start at `%2` (that is `x`) and step `%12` elements of type `[4 x i8]`", which is $4 \cdot
+i$ bytes. Check one entry: for $i = 3$, `%13` is `x + 12`, the address of `x[3]`. The `load` on
+the next line then reads it.
+
+### SSA form and φ-nodes
+
+Look again at the listing: every `%name` is assigned exactly once. That is **static single
+assignment** (SSA) form, and all of LLVM's optimizer relies on it. Because a value has a single
+definition, "where does this value come from?" has a single answer, so passes can follow a value
+from its definition straight to its uses.
+
+Loops seem to break this, since a loop counter changes on every trip. SSA handles it with a
+**φ-node** (`phi`) at the start of a block, which picks a value depending on which block control
+came from. Here is a dot product, $s = \sum_i x_i y_i$, compiled the same way:<Sidenote>Compiled
+with `-O2 -fno-unroll-loops`, so the loop stays one iteration per trip and the graph stays
+small.</Sidenote>
+
+```cpp
+extern "C" __device__ float dot(const float *x, const float *y, int n) {
+  float s = 0.0f;
+  for (int i = 0; i < n; ++i)
+    s += x[i] * y[i];
+  return s;
+}
+```
+
+Its IR, drawn as a **control-flow graph** (CFG), with one box per basic block. Hover any
+`%value` to see its single definition and all its uses; `%16`, the running sum, is highlighted to
+start.
+
+<IrCfg ir={dotIr} focus="%16" title="dot(), optimized IR as a control-flow graph" />
+
+Block `%7` is the loop body, and it branches back to itself. Its first instruction,
+
+```llvm
+%8 = phi i32 [ %17, %7 ], [ 0, %3 ]
+```
+
+reads "`%8` is `%17` if we arrived from `%7` (the previous trip), or `0` if we arrived from the
+entry block `%3`". So `%8` is `i`, and `%17 = %8 + 1` is `i + 1`, ready for the next trip. In the
+same way `%9` is the sum coming into a trip and `%16` the sum going out. Running it with $n = 3$,
+$x = (1, 2, 3)$ and $y = (4, 5, 6)$:
+
+| trip | `%8` ($i$) | `%9` ($s$ in) | `%12` ($x_i$) | `%14` ($y_i$) | `%16` ($s$ out) | `%17` ($i+1$) |
+| ---: | ---------: | ------------: | ------------: | ------------: | --------------: | ------------: |
+|    1 |          0 |             0 |             1 |             4 |               4 |             1 |
+|    2 |          1 |             4 |             2 |             5 |              14 |             2 |
+|    3 |          2 |            14 |             3 |             6 |              32 |             3 |
+
+After the third trip `%17 = 3` equals $n$, so the branch goes to `%5`, whose φ-node picks `%16 =
+32` and returns it. Check: $1 \cdot 4 + 2 \cdot 5 + 3 \cdot 6 = 32$. The φ in `%5` also has an
+entry for arriving straight from `%3`, when $n \le 0$ and the loop never runs: then the result is
+`0.0`.
+
+### Intrinsics, flags and address spaces
+
+Three more things in the `saxpy` IR are worth knowing, because the NVPTX backend leans on them.
+
+**Intrinsics** are functions whose names start with `llvm.` and which the compiler understands
+itself. `threadIdx.x` became a call to `@llvm.nvvm.read.ptx.sreg.tid.x`, which reads a PTX
+**special register**. Its declaration carries `range(i32 0, 1024)`: a block has at most 1024
+threads, and telling the optimizer so lets it prove facts like "this index can't overflow".
+Target-independent intrinsics exist too, such as `@llvm.fma.f32`.
+
+**Flags** on instructions grant extra freedom. `contract` on `fmul` and `fadd` allows the two to
+be fused into one fused multiply-add, which rounds once instead of twice. Clang adds it because
+CUDA compiles with `-ffp-contract=fast` by default. Without the flag LLVM must not fuse them,
+since the result can differ in the last bit: compiled with `-ffp-contract=off`, the same line
+becomes a separate `mul.rn.f32` and `add.rn.f32` in PTX.
+
+**Address spaces** say which kind of memory a pointer points to. A plain `ptr` is in address
+space 0, the **generic** space, which can point anywhere. NVPTX numbers the others like
+this:<Sidenote>From `NVPTXAddrSpace.h` ([source](https://github.com/llvm/llvm-project/blob/85ac560262434c9ccfc0c183ec22d4138ed647fb/llvm/include/llvm/Support/NVPTXAddrSpace.h#L21-L31)).
+Two newer ones, tensor (6) and shared memory across a cluster (7), are left out of the table.</Sidenote>
+
+| Address space | Memory | Holds |
+| ------------: | ------ | ----- |
+| 0 | generic | any of the below; the hardware works out which |
+| 1 | global | device memory, `cudaMalloc` buffers |
+| 3 | shared | per-block scratchpad, `__shared__` |
+| 4 | constant | `__constant__` data |
+| 5 | local | per-thread stack |
+| 101 | param | kernel parameters |
+
+A load through a generic pointer has to check where the address falls; a load through a global
+pointer doesn't. We'll see the backend turn `saxpy`'s generic pointers into global ones in the
+[NVPTX section](#kernel-parameters-and-address-spaces).
+
+## The optimizer
+
+Clang's IR at `-O0` is simple-minded on purpose. Every parameter and local variable gets a stack
+slot (an `alloca`), every write stores to the slot, and every read loads from it. That makes the
+front end easy to write: it never has to build SSA form itself.<Sidenote>Clang marks `-O0`
+functions `optnone`, which tells `opt` to leave them alone. The `-O0` listings here were made
+with `-Xclang -disable-O0-optnone` so `opt -O2` could then be run on them.</Sidenote>
+
+The optimizer is a sequence of **passes**. A **transform pass** rewrites the IR; an **analysis
+pass** only computes facts (a dominator tree, alias information) for transforms to use. `opt -O2`
+runs a fixed pipeline of them, and `-print-changed` shows the IR after each pass that changed
+something:
+
+```bash
+opt -O2 -print-changed=quiet saxpy.O0.ll -S -o saxpy.opt.ll
+```
+
+On `saxpy` the pipeline makes 118 pass runs (83 different passes), and only seven of them change
+anything. Step through them:
+
+<CodeStages stages={optStages} tags={saxpyTags} step={0} title="saxpy through opt -O2, one changing pass at a time" />
+
+| Pass | Instructions after | What it did |
+| ---- | -----------------: | ----------- |
+| (clang `-O0`) | 39 | five stack slots, a load before every use |
+| SROA | 20 | deleted the slots and wired values directly: now true SSA |
+| EarlyCSE | 17 | computed `sext i` and `&y[i]` once instead of three and two times |
+| GlobalOpt | 17 | deleted the unused `blockIdx`, `blockDim` and `threadIdx` globals |
+| InstCombine | 17 | rewrote GEPs to the canonical byte form, `[4 x i8]` |
+| PostOrderFunctionAttrs (×2), TailCallElim | 17 | attributes and `tail` markers only |
+
+**SROA** (scalar replacement of aggregates) does almost all the work. It sees that no stack
+slot's address escapes, so each slot is just a variable in disguise, and it replaces every load
+with the value last stored. This is the job textbooks call **mem2reg**, and it is how SSA form
+gets built in practice: front ends emit memory, and the optimizer promotes it to registers.
+
+The optimizer is mostly target-independent, but not target-blind. Passes ask the target
+questions through **TargetTransformInfo** (TTI), such as "is this instruction cheap?" or "which
+address space can this pointer be assumed to be in?". The second question comes back in the NVPTX
+section.
+
+## The backend
+
+### The code generation pipeline
+
+The backend, `llc`, turns optimized IR into machine code. It is a pipeline of passes too, but the
+code changes form along the way:
+
+1. **LLVM IR**, still: target-aware IR passes prepare the code for selection.
+2. **SelectionDAG**: each basic block becomes a graph, which is legalized and matched against the
+   target's instructions.
+3. **Machine IR** (MIR) in SSA form: real target instructions on virtual registers.
+4. **Machine IR** after SSA: φ-nodes removed and, on most targets, physical registers assigned.
+5. **MC layer**: instructions as `MCInst`, printed as assembly text or encoded as bytes.
+
+These are the passes `llc -O2` runs on `saxpy` for NVPTX, grouped by phase. Click a phase to list
+its passes; the ones written for NVPTX are highlighted.
+
+<BackendPhases phase="isel" title="llc -O2 for NVPTX: the passes, by phase" />
+
+Notice phase 4: on a CPU target it would include a **register allocator**. For NVPTX it doesn't,
+for reasons explained [below](#machine-ir-and-register-allocation).
+
+### Building the SelectionDAG
+
+**Instruction selection** chooses target instructions for each IR operation. NVPTX does it with
+the **SelectionDAG** (`SelectionDAGISel`), which works on one basic block at a time and represents
+it as a directed acyclic graph.<Sidenote>LLVM has a second instruction selector, **GlobalISel**,
+which works on whole functions. Several targets use it (AArch64 does at `-O0`); NVPTX uses only
+the SelectionDAG.</Sidenote> Each node is one operation; each edge points from an operand to the
+node that uses it.
+
+Here is the DAG of `saxpy`'s `if` body, block `%11`, at four points during selection, drawn from
+`llc -debug-only=isel` dumps. Operands are above their users, so data flows downward.
+
+<SelectionDag example="saxpy" step={0} title="The SelectionDAG of saxpy's if-body" />
+
+Things to notice in the first step, **Built**:
+
+- **CopyFromReg** nodes bring in values computed in other blocks: `%2` is `i`, `%0` and `%1` are
+  the pointers `x` and `y`, `%3` is `a`. One DAG covers one block, so anything from outside
+  enters this way.
+- Each node lists its results. `load` produces two: the `f32` value and a `ch`.
+- The **chain** (`ch`, dashed) is an ordering edge, not data. The two loads and the store all hang
+  off it, so the store can't move above the loads that read the same address. `TokenFactor`
+  merges two chains into one.
+- The GEP is gone. It became plain arithmetic: `sign_extend` $i$ to 64 bits, shift left by 2
+  (times 4 bytes), and `add` to the base pointer.
+
+### Combining and legalizing
+
+Selection then alternates two kinds of rewrite.
+
+The **DAG combiner** simplifies small patterns. In step 2, **Combined**, it made two changes, both
+outlined. `fmul` + `fadd` became one `fma`, because both carry `contract`. And `sign_extend` +
+`shl` became `NVPTXISD::MUL_WIDE_SIGNED`, a node of NVPTX's own: PTX has a `mul.wide.s32`
+instruction that multiplies two 32-bit values into a 64-bit result, which is exactly "widen $i$,
+then times 4". The target adds rewrites like this one through its `PerformDAGCombine` hook (here,
+`TryMULWIDECombine` in
+[`NVPTXISelLowering.cpp`](https://github.com/llvm/llvm-project/blob/85ac560262434c9ccfc0c183ec22d4138ed647fb/llvm/lib/Target/NVPTX/NVPTXISelLowering.cpp#L6444-L6511)).<Sidenote>By
+default the fma is formed even earlier, by an IR pass, `NVPTXIRPeephole`, that runs just before
+selection; that is the `llvm.fma` call in the "IR before isel" stage above. The DAG figure was made
+with `-disable-nvptx-ir-peephole` to show the combiner doing the same job. The final PTX is
+identical either way.</Sidenote>
+
+**Legalization** makes the DAG use only types and operations the target supports. A target
+declares its legal types by giving each a register class; NVPTX has 1-, 16-, 32- and
+64-bit register classes ([source](https://github.com/llvm/llvm-project/blob/85ac560262434c9ccfc0c183ec22d4138ed647fb/llvm/lib/Target/NVPTX/NVPTXISelLowering.cpp#L594-L605)).
+For each operation and type, it then says whether it is **Legal**, should be **Promoted** to a
+wider type, **Expanded** into other operations, or handled by **Custom** C++. In `saxpy`
+everything is `i32`, `i64` or `f32`, all legal, so step 3 changes nothing.
+
+For legalization to do something, the type must be missing. There are no 8-bit registers, so
+here is an 8-bit add, `store (a + b)` with `a` and `b` of type `i8`:
+
+<SelectionDag example="add8" step={0} title="An i8 add on NVPTX: promoted to i16" />
+
+**Type legalization** promotes every `i8` to `i16`: the loads now extend to 16 bits, the add
+happens in 16 bits, and the store truncates back to 8 (`trunc to i8` in its dump line; hover it).
+**Operation legalization** then fixes an operation NVPTX can't do as written: the loads extend
+with *any* upper bits, which the target turns into a zero-extending load. The PTX is `ld.param.b8`
+into a 16-bit register, `add.s16`, and `st.global.b8`.
+
+### Instruction selection
+
+The last step, **Selected** (step 4 in both figures), replaces every generic node with a machine
+node: an actual NVPTX instruction. `fma` became `FMA_F32rrr`, `add` became `ADD64rr`, `load`
+became `LD_i32`. The selector does this by pattern matching: it walks the DAG from the root and,
+at each node, tries patterns such as "an `fma` on three `f32` registers is `FMA_F32rrr`". Those
+patterns are not hand-written C++. They are written in TableGen and compiled into a table, as the
+[TableGen section](#patterns-and-the-generated-c) shows.
+
+Selection also picks the cheapest of several matches. The `mul` and `add` that compute
+`i = blockIdx.x * blockDim.x + threadIdx.x` (in the entry block, not drawn) match both "`mul`,
+then `add`" and the single pattern `MAD_LO_S32rrr` for `add (mul a, b), c`. The bigger pattern
+wins, so the PTX has one `mad.lo.s32`.
+
+### Machine IR and register allocation
+
+After selection the function is **Machine IR**: a list of target instructions in basic blocks,
+still in SSA form, on **virtual registers** (`%0`, `%1`, ...) that each belong to a **register
+class** (`b1`, `b32`, `b64`). This is the `if` body, from `llc -stop-after=finalize-isel`:
+
+```
+bb.1 (%ir-block.13):
+  successors: %bb.2(0x80000000)
+
+  %11:b64 = MUL_WIDEs32_ri %2, 4
+  %12:b64 = ADD64rr %0, %11
+  %13:b32 = LD_i32 0, 0, 1, 3, 32, -1, killed %12, 0 :: (load (s32) from %ir.15, addrspace 1)
+  %14:b64 = ADD64rr %1, %11
+  %15:b32 = LD_i32 0, 0, 1, 3, 32, -1, %14, 0 :: (load (s32) from %ir.17, addrspace 1)
+  %16:b32 = contract FMA_F32rrr %3, killed %13, killed %15, 0
+  ST_i32 killed %16, 0, 0, 1, 32, %14, 0 :: (store (s32) into %ir.17, addrspace 1)
+```
+
+The bare numbers are instruction operands that TableGen defined, such as the address space (`1`,
+global) and access width (`32`) of the load. `killed` marks the last use of a register. Machine
+IR is where the late optimizations run: machine common-subexpression elimination, loop-invariant
+code motion, sinking, and peephole rewrites.
+
+Then the function leaves SSA form. φ-nodes become copies, and on a CPU the **register allocator**
+maps the unlimited virtual registers onto the few physical ones (16 general-purpose registers on
+x86-64), **spilling** values to the stack when they don't fit. This is one of the most expensive
+and most important phases of a CPU compiler.
+
+NVPTX skips it. In
+[`NVPTXTargetMachine.cpp`](https://github.com/llvm/llvm-project/blob/85ac560262434c9ccfc0c183ec22d4138ed647fb/llvm/lib/Target/NVPTX/NVPTXTargetMachine.cpp#L441-L443):
+
+```cpp
+FunctionPass *NVPTXPassConfig::createTargetRegisterAllocator(bool) {
+  return nullptr; // No reg alloc
+}
+```
+
+PTX has unlimited virtual registers, so LLVM keeps its own and prints them. Real allocation,
+onto the GPU's register file of up to 255 registers per thread, happens later in ptxas, which is
+why spills show up in SASS but never in PTX.<Sidenote>This is also why NVPTX's register file in
+TableGen defines only five registers per class (`%r0` to `%r4` and so on;
+[source](https://github.com/llvm/llvm-project/blob/85ac560262434c9ccfc0c183ec22d4138ed647fb/llvm/lib/Target/NVPTX/NVPTXRegisterInfo.td#L35-L41)):
+they exist to satisfy the framework, and are never allocated to.</Sidenote>
+
+### Emitting PTX
+
+The final pass is the **AsmPrinter**. It turns each machine instruction into an `MCInst`, the
+**MC layer**'s representation, and hands it to an `MCStreamer`. For CPU targets the streamer
+either prints assembly or encodes bytes into an object file; NVPTX only ever prints text. The
+`NVPTXAsmPrinter` also writes everything around the instructions: the `.entry` header, the
+parameter list, and one declaration per register class, such as `.reg .b32 %r<10>;`, which
+declares `%r0` to `%r9`.
+
+## TableGen
+
+### Records and classes
+
+A backend needs a lot of tables: every instruction with its operands, assembly syntax and
+selection pattern; every register and register class; every processor and feature. Writing those
+in C++ would be thousands of lines of near-repetition. LLVM writes them in **TableGen**
+(`.td` files), a small language whose only job is to produce **records**: named bags of typed
+fields.
+
+A **class** is a template for records, with parameters and default fields. A **def** creates one
+record from one or more classes. For example, NVPTX's registers:
+
+```tablegen
+class NVPTXReg<string n> : Register<n> {
+  let Namespace = "NVPTX";
+}
+
+foreach i = 0...4 in {
+  def P#i  : NVPTXReg<"%p"#i>;  // Predicate
+  def RS#i : NVPTXReg<"%rs"#i>; // 16-bit
+  def R#i  : NVPTXReg<"%r"#i>;  // 32-bit
+  def RL#i : NVPTXReg<"%rd"#i>; // 64-bit
+  def RQ#i : NVPTXReg<"%rq"#i>; // 128-bit
+}
+```
+
+`NVPTXReg` inherits from LLVM's generic `Register` class and sets one field. The `foreach` loop
+defines 25 records, `P0` to `RQ4`, and `#` pastes strings together, so `R3` gets the assembly
+name `%r3`.
+
+### Multiclasses and defm
+
+A **multiclass** is a template for *several* records at once, and **defm** instantiates one,
+prefixing every record name with its own. Below is how NVPTX defines the instructions that read
+special registers like `%tid.x`. Step through it to see the source, the record TableGen produces
+for `INT_PTX_SREG_TID_x`, and the C++ generated from that record.
+
+<CodeStages stages={tablegenStages} tags={tablegenTags} step={0} maxLines={20} title="From TableGen to C++: the instruction that reads %tid.x" />
+
+The `defm INT_PTX_SREG_TID` line runs the multiclass with `regname = "tid"`. Its `foreach` makes
+four records with suffixes `_x`, `_y`, `_z`, `_w`, each from class `PTX_READ_SREG_R32`. In
+`INT_PTX_SREG_TID_x`, the asm string has become `mov.u32 $d, %tid.x;` and the pattern says "an
+`i32` produced by the intrinsic `int_nvvm_read_ptx_sreg_tid_x`". That intrinsic is itself a
+TableGen record, defined in
+[`IntrinsicsNVVM.td`](https://github.com/llvm/llvm-project/blob/85ac560262434c9ccfc0c183ec22d4138ed647fb/llvm/include/llvm/IR/IntrinsicsNVVM.td#L2362),
+and it is the `@llvm.nvvm.read.ptx.sreg.tid.x` that Clang emitted for `threadIdx.x`. So the whole
+chain, from IR call to selected instruction to printed PTX, is described by these few lines.
+
+### Patterns and the generated C++
+
+The pattern is what connects TableGen to instruction selection. Here is the FMA multiclass, from
+[`NVPTXInstrInfo.td`](https://github.com/llvm/llvm-project/blob/85ac560262434c9ccfc0c183ec22d4138ed647fb/llvm/lib/Target/NVPTX/NVPTXInstrInfo.td#L1278-L1315),
+shortened to its first two variants:
+
+```tablegen
+multiclass FMA<RegTyInfo t, bit allow_ftz = true, list<Predicate> preds = []> {
+  defvar flag_str = !if(allow_ftz, "$ftz", "");
+  defvar flag_ops = !if(allow_ftz, (ins FTZFlag:$ftz), (ins));
+  defvar op_str = "fma.rn" # flag_str # "." # t.PtxType;
+
+  let Predicates = preds in {
+    def rrr : BasicFlagsNVPTXInst<(outs t.RC:$dst), (ins t.RC:$a, t.RC:$b, t.RC:$c),
+                        flag_ops, op_str,
+                        [(set t.Ty:$dst, (fma t.Ty:$a, t.Ty:$b, t.Ty:$c))]>;
+
+    if t.SupportsImm then {
+      def rri : BasicFlagsNVPTXInst<(outs t.RC:$dst),
+                          (ins t.RC:$a, t.RC:$b, t.Imm:$c),
+                          flag_ops, op_str,
+                          [(set t.Ty:$dst, (fma t.Ty:$a, t.Ty:$b, fpimm:$c))]>;
+      // ... rir, rii, iir: the other register/immediate combinations
+    }
+  }
+}
+
+defm FMA_F32    : FMA<F32RT,    allow_ftz = true>;
+defm FMA_F64    : FMA<F64RT,    allow_ftz = false>;
+```
+
+`defm FMA_F32` makes `FMA_F32rrr` (three registers), `FMA_F32rri` (third operand an immediate)
+and so on. The suffix names the operand kinds, which is why the selected DAG showed
+`FMA_F32rrr` and `MUL_WIDEs32_ri` (a register times the immediate 4). The pattern `(fma $a, $b,
+$c)` is a DAG fragment; the selector matches it against the SelectionDAG. `$ftz` is an extra
+operand that selects the flush-to-zero variant, `fma.rn.ftz.f32`; `saxpy` gets the plain one.
+
+Separate **TableGen backends** read the same records and each write one C++ file (a `.inc`) that
+the hand-written backend `#include`s. NVPTX runs six of them
+([CMakeLists.txt](https://github.com/llvm/llvm-project/blob/85ac560262434c9ccfc0c183ec22d4138ed647fb/llvm/lib/Target/NVPTX/CMakeLists.txt#L5-L10)):
+
+| Backend flag | Generates | Lines |
+| ------------ | --------- | ----: |
+| `-gen-dag-isel` | the instruction selector's matcher table | 67,210 |
+| `-gen-asm-writer` | the code that prints each instruction | 41,939 |
+| `-gen-instr-info` | the opcode enum and per-instruction descriptions | 29,579 |
+| `-gen-register-info` | registers and register classes (5 files) | 1,044 |
+| `-gen-subtarget` | processors and features (`sm_90`, PTX versions) | 638 |
+| `-gen-sd-node-info` | NVPTX's own DAG nodes, such as `MUL_WIDE_SIGNED` | 371 |
+
+That is 140,781 lines of C++ from 9,422 lines of `.td` in the NVPTX directory (which also pulls
+in LLVM's shared `.td` files). In total TableGen produces 6,410 instruction records for
+NVPTX.<Sidenote>Line counts are from an LLVM 23.1.2 release build, which leaves the pattern
+comments out of the matcher table. Regenerated with `-omit-comments=false`, each entry is annotated
+with its source pattern: a `// Src: (fma ...)` comment followed by `// Dst: (FMA_F32rrr ...)`.</Sidenote> MLIR reuses TableGen for its operation definitions (ODS); the
+[MLIR post](/blog/mlir/) touches on that.
+
+## The NVPTX backend
+
+### PTX, a virtual ISA
+
+Most backends emit the instructions a chip executes. NVPTX doesn't: it emits **PTX**, a virtual
+instruction set that NVIDIA keeps stable across GPU generations. ptxas, or the CUDA driver at
+load time, compiles PTX into SASS for the actual GPU. That split explains a lot of NVPTX's design:
+
+- **Registers are virtual**, as above, so there is no register allocation in LLVM.
+- **Scheduling for the real pipeline** happens in ptxas, which knows the exact hardware.
+- **The output is text.** The header records what the code needs: `.version 7.8` (the PTX
+  version), `.target sm_90` and `.address_size 64`.
+- **The same PTX runs on newer GPUs**: the driver can compile PTX for an architecture that didn't
+  exist when it was written.
+
+### Kernel parameters and address spaces
+
+A kernel is declared `.entry` (a device function would be `.func`), and its parameters live in
+the **param** state space, readable only with `ld.param`. In the PTX of `saxpy`, the first
+instructions load them:
+
+```ptx
+ld.param.b64 	%rd3, [saxpy_param_2];
+cvta.to.global.u64 	%rd1, %rd3;
+```
+
+The second line is the address-space story from earlier. `x` arrived as a generic pointer;
+`cvta.to.global` converts it to a global address, and from then on loads use `ld.global` instead
+of a generic `ld`. Where does LLVM learn that `x` points to global memory? Not from the source.
+The NVPTX target answers the optimizer's TTI question in
+[`NVPTXTargetTransformInfo.cpp`](https://github.com/llvm/llvm-project/blob/85ac560262434c9ccfc0c183ec22d4138ed647fb/llvm/lib/Target/NVPTX/NVPTXTargetTransformInfo.cpp#L602-L622):
+
+```cpp
+unsigned NVPTXTTIImpl::getAssumedAddrSpace(const Value *V) const {
+  if (isa<AllocaInst>(V))
+    return ADDRESS_SPACE_LOCAL;
+
+  if (const Argument *Arg = dyn_cast<Argument>(V)) {
+    if (isKernelFunction(*Arg->getParent())) {
+      const NVPTXTargetMachine &TM =
+          static_cast<const NVPTXTargetMachine &>(getTLI()->getTargetMachine());
+      if (TM.getDrvInterface() == NVPTX::CUDA && !Arg->hasByValAttr())
+        return ADDRESS_SPACE_GLOBAL;
+  // ...
+```
+
+In CUDA, a pointer passed to a kernel can only point to global memory, because the host can't
+hand out pointers to anything else. So the `InferAddressSpaces` pass, among `llc`'s IR passes,
+adds `addrspacecast ptr %2 to ptr addrspace(1)` for both pointer arguments and rewrites the GEPs,
+loads and store to use the global pointers. You can see the casts in the "IR before isel" stage of
+the first figure.
+
+Structs passed by value are trickier, since they sit in param space and the code may want to
+take their address. The `NVPTXLowerArgs` pass handles those: it reads them in place when it can,
+and copies them to local memory when the code writes to them
+([source](https://github.com/llvm/llvm-project/blob/85ac560262434c9ccfc0c183ec22d4138ed647fb/llvm/lib/Target/NVPTX/NVPTXLowerArgs.cpp#L9-L41)).
+
+### Special registers, intrinsics and NVVMReflect
+
+CUDA's built-in variables map to PTX special registers through intrinsics, as the TableGen
+section traced: `threadIdx.x` → `@llvm.nvvm.read.ptx.sreg.tid.x` → `INT_PTX_SREG_TID_x` →
+`mov.u32 %r6, %tid.x;`. NVPTX defines over a thousand `llvm.nvvm.*` intrinsics this way, for
+barriers, warp shuffles, atomics, asynchronous copies and tensor-core instructions.
+
+One more NVPTX pass is unusual. NVIDIA's math library, **libdevice**, ships as LLVM bitcode and
+must behave differently depending on compiler options, such as whether denormal floats are
+flushed to zero. It asks with `__nvvm_reflect("__CUDA_FTZ")`. The **NVVMReflect** pass replaces
+each such call with a constant read from the module, here the flag `!{i32 4,
+!"nvvm-reflect-ftz", i32 0}` that Clang put in `saxpy`'s module, and later passes delete the
+branch not taken
+([source](https://github.com/llvm/llvm-project/blob/85ac560262434c9ccfc0c183ec22d4138ed647fb/llvm/lib/Target/NVPTX/NVVMReflect.cpp#L9-L18)).
+It is conditional compilation, decided at link time instead of preprocessing time.
+
+### saxpy, line by line
+
+Putting it together, here is the PTX of `saxpy` with the IR each line came from:
+
+| PTX | From IR | Why it looks like this |
+| --- | ------- | ---------------------- |
+| `ld.param.b32 %r3, [saxpy_param_0]` | parameter `%0` (`n`) | kernel params live in param space |
+| `ld.param.b64` + `cvta.to.global.u64` (×2) | parameters `x`, `y` | assumed global, so converted once |
+| `mov.u32 %r4, %ctaid.x` (and `%ntid.x`, `%tid.x`) | `llvm.nvvm.read.ptx.sreg.*` | special registers, via `INT_PTX_SREG_*` |
+| `mad.lo.s32 %r1, %r4, %r5, %r6` | `mul` + `add` | `MAD_LO_S32rrr` pattern covers both |
+| `setp.ge.s32 %p1, %r1, %r3` + `@%p1 bra $L__BB0_2` | `icmp slt` + `br` | condition inverted: skip the body if $i \ge n$ |
+| `ld.param.b32 %r2, [saxpy_param_1]` | parameter `%1` (`a`) | sunk into the only block that uses it |
+| `mul.wide.s32 %rd5, %r1, 4` | `sext` + GEP scaling | DAG combine to `MUL_WIDE_SIGNED` |
+| `add.s64` + `ld.global.b32` (×2) | GEP + `load` | global loads, thanks to the cast |
+| `fma.rn.f32 %r9, %r2, %r7, %r8` | `fmul contract` + `fadd contract` | fused because of `contract` |
+| `st.global.b32 [%rd7], %r9` | `store` | |
+
+Check the index with numbers: in block 2 of 256 threads, thread 5 computes `mad.lo.s32` $= 2
+\cdot 256 + 5 = 517$, and its loads read 4 bytes at byte offset `mul.wide.s32` $= 517 \cdot 4 =
+2068$ from `x` and from `y`.<MarginNote>`setp.ge` has comparison mode 5 in Machine IR, `GE` in
+NVPTX's `CmpMode` enum.</MarginNote> Note also that `%r9` holds a float: NVPTX uses one untyped
+32-bit register class, `B32`, for both `i32` and `f32`, and the instruction (`fma.rn.f32`) says
+how to treat the bits.
+
+## Trying it yourself
+
+Every listing in this post can be reproduced with these commands. All of them work with a release
+build of LLVM, except `-debug-only`, which needs one built with `-DLLVM_ENABLE_ASSERTIONS=ON`.
+
+| To see | Run |
+| ------ | --- |
+| IR straight from Clang | `clang++ -x cuda --cuda-device-only --cuda-gpu-arch=sm_90 -O0 -Xclang -disable-O0-optnone -S -emit-llvm` |
+| what each optimizer pass changed | `opt -O2 -print-changed=quiet file.ll` |
+| one pass alone | `opt -passes=sroa file.ll -S` |
+| the IR after every backend pass | `llc -O2 -print-after-all file.ll` |
+| the backend's pass list | `llc -O2 -debug-pass=Structure file.ll` |
+| SelectionDAG at each phase | `llc -O2 -debug-only=isel file.ll` |
+| Machine IR right after selection | `llc -O2 -stop-after=finalize-isel file.ll` |
+| TableGen's expanded records | `llvm-tblgen --print-records -I llvm/include -I lib/Target/NVPTX NVPTX.td` |
+
+For `llc`, add `-mtriple=nvptx64-nvidia-cuda -mcpu=sm_90`.
+
+## Summary
+
+- LLVM splits a compiler into front ends, one optimizer and many back ends, connected by **LLVM
+  IR**: a typed, SSA-form language of modules, functions and basic blocks, where φ-nodes merge
+  values at control-flow joins.
+- The **optimizer** is a pipeline of passes. On `saxpy`, SROA turned Clang's stack-slot code into
+  SSA (39 → 20 instructions) and EarlyCSE removed repeated work (→ 17); most other passes changed
+  nothing.
+- The **backend** builds a **SelectionDAG** per basic block, combines and legalizes it, and
+  selects target instructions by pattern matching. That is where `fmul` + `fadd` became `fma`,
+  `sext` + `shl` became `mul.wide`, and `i8` became `i16`. It then optimizes **Machine IR** and
+  prints it through the MC layer.
+- **TableGen** describes the target as records (instructions, operands, asm strings, selection
+  patterns, registers), and its backends generate the C++ tables; NVPTX's 9,422 lines of `.td`
+  produce about 141,000 lines of C++.
+- **NVPTX** emits PTX, a virtual ISA, so it skips register allocation and leaves it to ptxas. It
+  uses target hooks to turn kernel pointers into global ones, maps CUDA built-ins to special
+  registers through intrinsics, and resolves libdevice's options with NVVMReflect.
+
+## References
+
+- LLVM Language Reference Manual, [llvm.org/docs/LangRef.html](https://llvm.org/docs/LangRef.html).
+- The LLVM Target-Independent Code Generator, [llvm.org/docs/CodeGenerator.html](https://llvm.org/docs/CodeGenerator.html):
+  SelectionDAG, legalization, Machine IR and the MC layer.
+- TableGen Overview and Programmer's Reference, [llvm.org/docs/TableGen/](https://llvm.org/docs/TableGen/).
+- User Guide for NVPTX Back-end, [llvm.org/docs/NVPTXUsage.html](https://llvm.org/docs/NVPTXUsage.html).
+- NVIDIA, Parallel Thread Execution ISA, [docs.nvidia.com/cuda/parallel-thread-execution](https://docs.nvidia.com/cuda/parallel-thread-execution/).
+- Chris Lattner, "LLVM", in *The Architecture of Open Source Applications*, Volume 1,
+  [aosabook.org/en/v1/llvm.html](https://aosabook.org/en/v1/llvm.html): the three-phase design.
+- LLVM source at commit [`85ac560`](https://github.com/llvm/llvm-project/tree/85ac560262434c9ccfc0c183ec22d4138ed647fb/llvm/lib/Target/NVPTX)
+  (tag `llvmorg-23.1.2`), `llvm/lib/Target/NVPTX/`.

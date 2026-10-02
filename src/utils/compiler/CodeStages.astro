@@ -151,8 +151,8 @@ const marker = (stage: CodeStage) => {
 		text-align: center;
 		margin-bottom: 0.3rem;
 	}
-	/* All panes share one grid cell, so the figure is as tall as the longest listing and
-	   doesn't jump while stepping. */
+	/* Only the current pane is shown, at its own height (up to --rows lines, then it scrolls).
+	   The controls sit above it, so they stay put while stepping. */
 	.cs-panes {
 		display: grid;
 	}
@@ -161,7 +161,7 @@ const marker = (stage: CodeStage) => {
 		min-width: 0;
 	}
 	.cs-pane[aria-hidden="true"] {
-		visibility: hidden;
+		display: none;
 	}
 	.cs-tool {
 		margin: 0 0 0.2rem;
@@ -172,7 +172,6 @@ const marker = (stage: CodeStage) => {
 	.cs-pane :global(pre.astro-code) {
 		margin: 0;
 		max-height: calc(var(--rows) * 1.5em + 1.4rem);
-		height: calc(var(--rows) * 1.5em + 1.4rem);
 		overflow: auto;
 		font-size: 0.72rem;
 		line-height: 1.5;

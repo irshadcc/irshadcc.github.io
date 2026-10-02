@@ -114,6 +114,9 @@ has a demo page under `src/pages/demo/`, listed at `/demo`.
 | `PhysicalClusterTopology` | `src/utils/distributed/PhysicalClusterTopology.astro` | Servers, switches and links of a cluster |
 | `CollectiveSteps` | `src/utils/distributed/CollectiveSteps.astro` | Step-through broadcast, reduce, reduce-scatter, all-gather, all-reduce, all-to-all with α–β cost |
 | `PipelineSchedule` | `src/utils/distributed/PipelineSchedule.astro` | Pipeline-parallel schedules as timelines |
+| `SequenceSteps` | `src/utils/payments/SequenceSteps.astro` | Step-through sequence diagram (participants, messages, replies, lost messages) |
+| `BoxDiagram` | `src/utils/payments/BoxDiagram.astro` | Clickable boxes-and-arrows diagram on a grid: architectures, state machines, deployments |
+| `ShardRouting` | `src/utils/payments/ShardRouting.astro` | Keys placed on shards by range, hash mod N or bucket directory, with keys moved when a shard is added |
 
 ### Building a new component
 

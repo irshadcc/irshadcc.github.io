@@ -1,0 +1,272 @@
+---
+// Which shard each key lands on, for three ways of routing: range of IDs, hash mod N, and
+// hash → bucket → shard directory. The reader picks the strategy and the shard count; keys that
+// changed shard since one shard fewer are outlined and marked with their old shard, so the cost
+// of adding a shard is visible. Hover a key for its hash. Logic and drawing are in sharding.ts.
+// Usage in .mdx:
+//   <ShardRouting strategies={["mod", "buckets"]} shards={4} keys={32} buckets={16} />
+import { STRATEGY_NAMES, type Strategy, drawShards } from "./sharding";
+
+interface Props {
+	strategies?: Strategy[];
+	shards?: number;
+	/** Number of keys, named acct_1001, acct_1002, ... */
+	keys?: number;
+	buckets?: number;
+	maxShards?: number;
+	title?: string;
+}
+
+const {
+	strategies = ["range", "mod", "buckets"],
+	shards = 4,
+	keys: nKeys = 32,
+	buckets = 16,
+	maxShards = 8,
+	title,
+} = Astro.props;
+const keys = Array.from({ length: nKeys }, (_, i) => `acct_${1001 + i}`);
+const first = drawShards(keys, {
+	strategy: strategies[0],
+	shards,
+	buckets,
+	showMoves: true,
+});
+const counts = Array.from({ length: maxShards - 1 }, (_, i) => i + 2);
+const pct = (k: number) =>
+	`${k} of ${nKeys} (${Math.round((100 * k) / nKeys)}%)`;
+---
+
+<figure class="shr" data-config={JSON.stringify({ strategies, shards, nKeys, buckets })}>
+	{title && <figcaption class="shr-title">{title}</figcaption>}
+	<div class="shr-bar">
+		{
+			strategies.length > 1 && (
+				<div class="shr-tabs" role="tablist" data-knob="strategy">
+					{strategies.map((s, i) => (
+						<button type="button" role="tab" data-v={s} aria-selected={String(i === 0)}>
+							{STRATEGY_NAMES[s]}
+						</button>
+					))}
+				</div>
+			)
+		}
+		<div class="shr-tabs" role="tablist" data-knob="shards" aria-label="Shards">
+			<span class="shr-lab">shards</span>
+			{
+				counts.map((n) => (
+					<button type="button" role="tab" data-v={n} aria-selected={String(n === shards)}>
+						{n}
+					</button>
+				))
+			}
+		</div>
+	</div>
+	<div class="shr-canvas" set:html={first.svg} />
+	<dl class="shr-stats">
+		<div>
+			<dt>moved when going from <span data-s="prev">{shards - 1}</span> to <span data-s="n">{shards}</span> shards</dt>
+			<dd data-s="moved">{pct(first.moved)}</dd>
+		</div>
+		<div>
+			<dt>largest shard / mean</dt>
+			<dd data-s="imb">{((Math.max(...first.load) * shards) / nKeys).toFixed(2)}×</dd>
+		</div>
+	</dl>
+</figure>
+
+<script>
+	import { type Strategy, drawShards } from "./sharding";
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".shr")) {
+		const cfg = JSON.parse(fig.dataset.config ?? "{}");
+		const keys = Array.from({ length: cfg.nKeys }, (_, i) => `acct_${1001 + i}`);
+		const state = { strategy: cfg.strategies[0] as Strategy, shards: cfg.shards as number };
+		const canvas = fig.querySelector<HTMLElement>(".shr-canvas");
+		const set = (k: string, v: string) => {
+			const el = fig.querySelector(`[data-s=${k}]`);
+			if (el) el.textContent = v;
+		};
+		const render = () => {
+			const r = drawShards(keys, { ...state, buckets: cfg.buckets, showMoves: true });
+			if (canvas) canvas.innerHTML = r.svg;
+			set("prev", String(state.shards - 1));
+			set("n", String(state.shards));
+			set("moved", `${r.moved} of ${keys.length} (${Math.round((100 * r.moved) / keys.length)}%)`);
+			set("imb", `${((Math.max(...r.load) * state.shards) / keys.length).toFixed(2)}×`);
+		};
+		for (const list of fig.querySelectorAll<HTMLElement>("[role=tablist]"))
+			for (const tab of list.querySelectorAll<HTMLButtonElement>("[role=tab]"))
+				tab.addEventListener("click", () => {
+					for (const t of list.querySelectorAll("[role=tab]")) t.setAttribute("aria-selected", String(t === tab));
+					if (list.dataset.knob === "strategy") state.strategy = tab.dataset.v as Strategy;
+					else state.shards = Number(tab.dataset.v);
+					render();
+				});
+	}
+</script>
+
+<style>
+	.shr {
+		--s0: #2f6fb0;
+		--s1: #b8742a;
+		--s2: #2f8a5b;
+		--s3: #b33b5e;
+		--s4: #7a62b8;
+		--s5: #5f7380;
+		--s6: #2b8c96;
+		--s7: #9a7b1f;
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+	}
+	@media (prefers-color-scheme: dark) {
+		.shr {
+			--s0: #6aa8e6;
+			--s1: #e0a25e;
+			--s2: #5fc08b;
+			--s3: #e2708f;
+			--s4: #a993e6;
+			--s5: #98aab5;
+			--s6: #5cc4cf;
+			--s7: #d6b552;
+		}
+	}
+	.shr-title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.5rem;
+	}
+	.shr-bar {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.4rem 1.5rem;
+		margin-bottom: 0.5rem;
+		font-size: 0.78rem;
+	}
+	.shr-tabs {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 0.25rem;
+	}
+	.shr-lab {
+		color: var(--muted);
+		margin-right: 0.2rem;
+	}
+	.shr-tabs button {
+		padding: 0.25rem 0.6rem;
+		border: 1px solid var(--faint);
+		border-radius: 999px;
+		background: var(--bg);
+		color: var(--text);
+		font: inherit;
+		cursor: pointer;
+	}
+	.shr-tabs button:hover {
+		border-color: var(--accent);
+	}
+	.shr-tabs button[aria-selected="true"] {
+		background: var(--accent);
+		border-color: var(--accent);
+		color: var(--bg);
+	}
+	.shr-canvas {
+		overflow-x: auto;
+	}
+	.shr-canvas :global(svg) {
+		display: block;
+		max-width: 100%;
+		height: auto;
+		margin: 0 auto;
+	}
+	.shr-canvas :global(.s0) {
+		--c: var(--s0);
+	}
+	.shr-canvas :global(.s1) {
+		--c: var(--s1);
+	}
+	.shr-canvas :global(.s2) {
+		--c: var(--s2);
+	}
+	.shr-canvas :global(.s3) {
+		--c: var(--s3);
+	}
+	.shr-canvas :global(.s4) {
+		--c: var(--s4);
+	}
+	.shr-canvas :global(.s5) {
+		--c: var(--s5);
+	}
+	.shr-canvas :global(.s6) {
+		--c: var(--s6);
+	}
+	.shr-canvas :global(.s7) {
+		--c: var(--s7);
+	}
+	.shr-canvas :global(.col),
+	.shr-canvas :global(.bk) {
+		fill: var(--c);
+	}
+	.shr-canvas :global(.chip) {
+		fill: color-mix(in oklch, var(--c) 18%, var(--bg));
+		stroke: var(--c);
+		stroke-width: 1;
+	}
+	.shr-canvas :global(.mv .chip),
+	.shr-canvas :global(.mv .bk) {
+		stroke: var(--text);
+		stroke-width: 1.8;
+		stroke-dasharray: 3 2;
+	}
+	.shr-canvas :global(.ch),
+	.shr-canvas :global(.bt) {
+		font-size: 10px;
+		font-weight: 600;
+		text-anchor: middle;
+		fill: #fff;
+		pointer-events: none;
+	}
+	@media (prefers-color-scheme: dark) {
+		.shr-canvas :global(.ch),
+		.shr-canvas :global(.bt) {
+			fill: var(--bg);
+		}
+	}
+	.shr-canvas :global(.kt) {
+		font-family: var(--mono);
+		font-size: 9px;
+		text-anchor: middle;
+		fill: var(--text);
+		pointer-events: none;
+	}
+	.shr-canvas :global(.mv .kt) {
+		font-weight: 700;
+	}
+	.shr-canvas :global(.sh-h) {
+		font-size: 9px;
+		font-weight: 600;
+		fill: var(--muted);
+	}
+	.shr-stats {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.3rem 1.5rem;
+		margin: 0.5rem 0 0;
+		font-size: 0.78rem;
+	}
+	.shr-stats div {
+		display: flex;
+		gap: 0.4rem;
+	}
+	.shr-stats dt {
+		color: var(--muted);
+	}
+	.shr-stats dd {
+		margin: 0;
+		font-family: var(--mono);
+		font-weight: 600;
+	}
+</style>

@@ -1,0 +1,51 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import BoxDiagram from "../../utils/payments/BoxDiagram.astro";
+import SequenceSteps from "../../utils/payments/SequenceSteps.astro";
+import ShardRouting from "../../utils/payments/ShardRouting.astro";
+import {
+	authMessages,
+	cardParticipants,
+	gatewayEdges,
+	gatewayNodes,
+	retryMessages,
+	retryParticipants,
+	settleMessages,
+	shardedEdges,
+	shardedNodes,
+	stateEdges,
+	stateNodes,
+} from "../../utils/payments/paymentFigures";
+---
+
+<Layout title="Payments and sharding demo">
+	<h1>Payments and sharding demo</h1>
+	<p>
+		Figures from <code>src/utils/payments</code>: a step-through sequence diagram, a clickable box diagram and a
+		shard-routing explorer.
+	</p>
+
+	<h2>SequenceSteps: card authorization</h2>
+	<SequenceSteps participants={cardParticipants} messages={authMessages} title="Authorizing a card payment" />
+
+	<h2>SequenceSteps with phases, starting at step 6</h2>
+	<SequenceSteps participants={cardParticipants} messages={settleMessages} step={6} />
+
+	<h2>SequenceSteps with a lost message</h2>
+	<SequenceSteps participants={retryParticipants} messages={retryMessages} colWidth={150} step={5} />
+
+	<h2>BoxDiagram: architecture</h2>
+	<BoxDiagram nodes={gatewayNodes} edges={gatewayEdges} selected="svc" title="Inside the gateway" />
+
+	<h2>BoxDiagram: state machine</h2>
+	<BoxDiagram nodes={stateNodes} edges={stateEdges} grid={{ cellW: 96, cellH: 34, gapX: 60, gapY: 36 }} />
+
+	<h2>BoxDiagram with containers</h2>
+	<BoxDiagram nodes={shardedNodes} edges={shardedEdges} grid={{ cellW: 82, cellH: 38, gapX: 18, gapY: 34 }} />
+
+	<h2>ShardRouting: all strategies</h2>
+	<ShardRouting shards={4} />
+
+	<h2>ShardRouting: 8 shards, 64 keys, 32 buckets</h2>
+	<ShardRouting strategies={["buckets", "mod"]} shards={8} keys={64} buckets={32} />
+</Layout>

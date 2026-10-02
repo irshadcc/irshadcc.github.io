@@ -1,7 +1,17 @@
 ---
 import Layout from "../../layouts/Layout.astro";
+import CodeStages from "../../utils/compiler/CodeStages.astro";
 import InductorPipeline from "../../utils/compiler/InductorPipeline.astro";
 import KernelBlocks from "../../utils/compiler/KernelBlocks.astro";
+import {
+	kernelGrowthStages,
+	kernelGrowthTags,
+} from "../../utils/compiler/inductorCodegen";
+import {
+	codegenEdges,
+	codegenNodes,
+} from "../../utils/compiler/inductorInterfaces";
+import BoxDiagram from "../../utils/payments/BoxDiagram.astro";
 ---
 
 <Layout title="TorchInductor demo">
@@ -48,5 +58,16 @@ import KernelBlocks from "../../utils/compiler/KernelBlocks.astro";
 			{ name: "in_ptr0", strides: [8, 1] },
 			{ name: "in_ptr1", strides: [1, 6] },
 		]}
+	/>
+
+	<h2>CodeStages, the fused kernel growing node by node (inductorCodegen.ts)</h2>
+	<CodeStages stages={kernelGrowthStages} tags={kernelGrowthTags} step={4} maxLines={28} />
+
+	<h2>BoxDiagram, code generation interfaces (inductorInterfaces.ts)</h2>
+	<BoxDiagram
+		nodes={codegenNodes}
+		edges={codegenEdges}
+		grid={{ cellW: 160, cellH: 50, gapX: 84, gapY: 40 }}
+		selected="cse"
 	/>
 </Layout>

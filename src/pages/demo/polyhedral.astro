@@ -1,0 +1,25 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import PolyhedralSchedule from "../../utils/compiler/PolyhedralSchedule.astro";
+import TritonPasses from "../../utils/compiler/TritonPasses.astro";
+---
+
+<Layout title="Polyhedral and Triton pipeline demo">
+	<h1>Polyhedral and Triton pipeline demo</h1>
+	<p>
+		Figures from <code>polyhedral.ts</code> and from <code>tritonPasses.ts</code> (generated from Triton's
+		<code>MLIR_ENABLE_DUMP</code>) with <code>tritonPassInfo.ts</code>.
+	</p>
+
+	<h2>PolyhedralSchedule, all schedules</h2>
+	<PolyhedralSchedule title="A[i][j] = A[i-1][j+1] + A[i][j-1]" />
+
+	<h2>PolyhedralSchedule, two schedules, larger domain</h2>
+	<PolyhedralSchedule n={9} schedules={["original", "wavefront"]} />
+
+	<h2>TritonPasses, softmax first</h2>
+	<TritonPasses />
+
+	<h2>TritonPasses, matmul at the pipeliner</h2>
+	<TritonPasses kernel="mm" start="TritonGPUPipeline" />
+</Layout>

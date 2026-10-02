@@ -1,0 +1,328 @@
+---
+// Step through single-decree Paxos runs (simulated by paxos.ts, following "Paxos Made Simple").
+// Proposers P1 and P2 sit at the edges and acceptors A1..A5 in between; each step is one band of
+// requests (upper arrows) and replies (lower arrows, red if refused). Under the lifelines: what
+// each acceptor has promised and accepted after the step, and whether a value is chosen.
+// Usage in .mdx:
+//   <PaxosRun />                      all scenarios, with tabs
+//   <PaxosRun only="adopt" step={4} />
+import { drawPaxos } from "./consensusDraw";
+import { SCENARIOS, run } from "./paxos";
+
+interface Props {
+	scenario?: string;
+	only?: string;
+	step?: number;
+	title?: string;
+}
+
+const { scenario, only, step, title } = Astro.props;
+const list = only ? SCENARIOS.filter((s) => s.id === only) : SCENARIOS;
+const sc = list.find((s) => s.id === (only ?? scenario)) ?? list[0];
+const frames = run(sc);
+const at = Math.max(0, Math.min(step ?? frames.length - 1, frames.length - 1));
+const f = frames[at];
+---
+
+<figure class="pxr" data-config={JSON.stringify({ ids: list.map((s) => s.id), id: sc.id, step: at })}>
+	{title && <figcaption class="title">{title}</figcaption>}
+	{
+		list.length > 1 && (
+			<div class="tabs" role="tablist">
+				{list.map((s) => (
+					<button type="button" role="tab" data-id={s.id} aria-selected={s.id === sc.id ? "true" : "false"}>
+						{s.label}
+					</button>
+				))}
+			</div>
+		)
+	}
+	<p class="summary">{sc.summary}</p>
+	<div class="controls">
+		<button type="button" class="play" aria-label="Play">
+			<svg class="i-play" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5v11L13.5 8z"></path></svg>
+			<svg class="i-pause" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 3h3v10H4zM9 3h3v10H9z"></path></svg>
+		</button>
+		<label>
+			step
+			<input type="range" min="0" max={frames.length - 1} value={at} />
+			<output>{at}/{frames.length - 1}</output>
+		</label>
+	</div>
+	<p class="step-title">{f.title}</p>
+	<p class="step-note">{f.note}</p>
+	<div class="diagram" set:html={drawPaxos(sc, frames, at)} />
+</figure>
+
+<script>
+	import { drawPaxos } from "./consensusDraw";
+	import { SCENARIOS, run } from "./paxos";
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".pxr")) {
+		const cfg = JSON.parse(fig.dataset.config ?? "{}");
+		const list = SCENARIOS.filter((s) => cfg.ids.includes(s.id));
+		let sc = list.find((s) => s.id === cfg.id) ?? list[0];
+		let frames = run(sc);
+		const range = fig.querySelector<HTMLInputElement>("input[type=range]");
+		const out = fig.querySelector("output");
+		const play = fig.querySelector<HTMLButtonElement>(".play");
+		const q = (sel: string) => fig.querySelector<HTMLElement>(sel);
+		if (!range) continue;
+		let timer: number | undefined;
+
+		const render = () => {
+			const t = Number(range.value);
+			const f = frames[t];
+			if (out) out.textContent = `${t}/${frames.length - 1}`;
+			const set = (sel: string, text: string) => {
+				const el = q(sel);
+				if (el) el.textContent = text;
+			};
+			set(".summary", sc.summary);
+			set(".step-title", f.title);
+			set(".step-note", f.note);
+			const d = q(".diagram");
+			if (d) d.innerHTML = drawPaxos(sc, frames, t);
+		};
+		const stop = () => {
+			if (timer !== undefined) clearInterval(timer);
+			timer = undefined;
+			play?.classList.remove("playing");
+			play?.setAttribute("aria-label", "Play");
+		};
+		for (const tab of fig.querySelectorAll<HTMLButtonElement>(".tabs button")) {
+			tab.addEventListener("click", () => {
+				stop();
+				sc = list.find((s) => s.id === tab.dataset.id) ?? sc;
+				frames = run(sc);
+				for (const b of fig.querySelectorAll(".tabs button")) b.setAttribute("aria-selected", String(b === tab));
+				range.max = String(frames.length - 1);
+				range.value = "0";
+				render();
+			});
+		}
+		range.addEventListener("input", () => {
+			stop();
+			render();
+		});
+		play?.addEventListener("click", () => {
+			if (timer !== undefined) return stop();
+			if (Number(range.value) >= frames.length - 1) range.value = "0";
+			play.classList.add("playing");
+			play.setAttribute("aria-label", "Pause");
+			render();
+			timer = window.setInterval(() => {
+				if (Number(range.value) >= frames.length - 1) return stop();
+				range.value = String(Number(range.value) + 1);
+				render();
+			}, 2200);
+		});
+	}
+</script>
+
+<style>
+	.pxr {
+		--px-ok: #2f8f6a;
+		--px-no: #c0504d;
+		--px-req: #3b6ea5;
+		--px-chosen: #e3f1ea;
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+	}
+	@media (prefers-color-scheme: dark) {
+		.pxr {
+			--px-ok: #5cc196;
+			--px-no: #e07a76;
+			--px-req: #6c9fd6;
+			--px-chosen: #1d3329;
+		}
+	}
+	.title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.5rem;
+	}
+	.tabs {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.35rem;
+		margin-bottom: 0.4rem;
+	}
+	.tabs button {
+		padding: 0.2rem 0.65rem;
+		border: 1px solid var(--faint);
+		border-radius: 999px;
+		background: var(--bg);
+		color: var(--muted);
+		font: inherit;
+		font-size: 0.75rem;
+		cursor: pointer;
+	}
+	.tabs button[aria-selected="true"] {
+		border-color: var(--accent);
+		background: var(--accent-soft);
+		color: var(--text);
+	}
+	.summary {
+		margin: 0 0 0.4rem;
+		font-size: 0.78rem;
+		color: var(--muted);
+		text-align: center;
+	}
+	.controls {
+		display: flex;
+		justify-content: center;
+		align-items: center;
+		gap: 0.75rem;
+		margin-bottom: 0.5rem;
+		font-size: 0.78rem;
+		color: var(--muted);
+	}
+	.controls label {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.4rem;
+	}
+	.controls input {
+		width: 12rem;
+		accent-color: var(--accent);
+	}
+	.controls output {
+		min-width: 2.4rem;
+		font-family: var(--mono);
+		color: var(--text);
+	}
+	.play {
+		display: inline-grid;
+		place-items: center;
+		width: 1.9rem;
+		height: 1.9rem;
+		border: 1px solid var(--faint);
+		border-radius: 999px;
+		background: var(--bg);
+		color: var(--text);
+		cursor: pointer;
+	}
+	.play:hover {
+		border-color: var(--accent);
+	}
+	.play svg {
+		width: 0.8rem;
+		height: 0.8rem;
+		fill: currentColor;
+	}
+	.play .i-pause,
+	.play.playing .i-play {
+		display: none;
+	}
+	.play.playing .i-pause {
+		display: block;
+	}
+	.step-title {
+		margin: 0;
+		font-size: 0.85rem;
+		font-weight: 600;
+		text-align: center;
+	}
+	.step-note {
+		margin: 0.15rem auto 0.5rem;
+		max-width: 36rem;
+		min-height: 2.6em;
+		font-size: 0.78rem;
+		color: var(--muted);
+		text-align: center;
+	}
+	.diagram :global(svg) {
+		display: block;
+		width: 100%;
+		max-width: 620px;
+		height: auto;
+		margin: 0 auto;
+	}
+	.diagram :global(.lane-name) {
+		font-family: var(--mono);
+		font-size: 12px;
+		font-weight: 600;
+		text-anchor: middle;
+		fill: var(--text);
+	}
+	.diagram :global(.lane-name.proposer) {
+		fill: var(--accent);
+	}
+	.diagram :global(.lane) {
+		stroke: var(--faint);
+		stroke-width: 1.2;
+	}
+	.diagram :global(.band-bg) {
+		fill: var(--accent-soft);
+		opacity: 0.6;
+	}
+	.diagram :global(.band.past) {
+		opacity: 0.35;
+	}
+	.diagram :global(.msg) {
+		stroke-width: 1.2;
+	}
+	.diagram :global(.msg.req) {
+		stroke: var(--px-req);
+	}
+	.diagram :global(.msg.rep.ok) {
+		stroke: var(--px-ok);
+	}
+	.diagram :global(.msg.rep.no) {
+		stroke: var(--px-no);
+		stroke-dasharray: 3 2;
+	}
+	.diagram :global(.arrowhead) {
+		fill: var(--muted);
+	}
+	.diagram :global(.req-label) {
+		font-family: var(--mono);
+		font-size: 9.5px;
+		font-weight: 600;
+		fill: var(--px-req);
+	}
+	.diagram :global(.rep-label) {
+		font-family: var(--mono);
+		font-size: 8px;
+		text-anchor: middle;
+	}
+	.diagram :global(.rep-label.ok) {
+		fill: var(--px-ok);
+	}
+	.diagram :global(.rep-label.no) {
+		fill: var(--px-no);
+	}
+	.diagram :global(.state) {
+		fill: var(--surface);
+		stroke: var(--faint);
+	}
+	.diagram :global(.state.chosen) {
+		fill: var(--px-chosen);
+		stroke: var(--px-ok);
+	}
+	.diagram :global(.state-k),
+	.diagram :global(.state-v) {
+		font-family: var(--mono);
+		font-size: 9px;
+		text-anchor: middle;
+		fill: var(--text);
+	}
+	.diagram :global(.state-v) {
+		font-weight: 600;
+	}
+	.diagram :global(.state-k.faint) {
+		fill: var(--muted);
+	}
+	.diagram :global(.verdict) {
+		font-size: 12px;
+		font-weight: 600;
+		text-anchor: middle;
+		fill: var(--muted);
+	}
+	.diagram :global(.verdict.yes) {
+		fill: var(--px-ok);
+	}
+</style>

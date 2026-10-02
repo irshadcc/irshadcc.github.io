@@ -6,6 +6,7 @@ import {
 	type Entry,
 	FUNCTIONALITIES,
 	type Kernel,
+	NUM_BACKENDS,
 	OFFSETS_AND_MASKS,
 	OperatorTable,
 	computeDispatchKeySet,
@@ -14,6 +15,7 @@ import {
 	isPerBackend,
 	keySet,
 	minus,
+	parseKey,
 	runtimeKeys,
 	tableIndex,
 	tensorKeySet,
@@ -420,3 +422,45 @@ export const keySetScenarios = (): Scenario[] => {
 /** The bits that are set in any stage of a scenario, for labelling the bit strip. */
 export const scenarioBits = (s: Scenario) =>
 	s.stages.reduce((acc, st) => acc | st.ks, 0n);
+
+// ---------- KeySetWord: one key set as a 64-bit word ----------
+
+export interface WordExample {
+	id: string;
+	label: string;
+	ks: bigint;
+	/** How the set is built, one line per runtime key. */
+	parts: string[];
+}
+
+/** One line per runtime key: its functionality bit, plus its backend bit if it is per-backend. */
+const keyParts = (name: string) => {
+	const { f, b } = parseKey(name);
+	const fbit = NUM_BACKENDS + f - 1;
+	const func = `${FUNCTIONALITIES[f]} (f = ${f}) → bit ${fbit}`;
+	return b < 0
+		? `${name}: functionality f = ${f} → bit ${fbit}, not per-backend, so no backend bit`
+		: `${name} = ${func} + ${BACKENDS[b]} (backend ${b}) → bit ${b}`;
+};
+
+export const wordExamples = (): WordExample[] => {
+	const single = (name: string): WordExample => ({
+		id: name,
+		label: name,
+		ks: keySet(name),
+		parts: [keyParts(name)],
+	});
+	const xks = tensorKeySet("CPU");
+	return [
+		single("CPU"),
+		single("AutogradCPU"),
+		single("SparseCUDA"),
+		single("BackendSelect"),
+		{
+			id: "x",
+			label: "tensor x",
+			ks: xks,
+			parts: runtimeKeys(xks).map(keyParts),
+		},
+	];
+};

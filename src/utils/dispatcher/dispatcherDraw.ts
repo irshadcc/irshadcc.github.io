@@ -200,3 +200,81 @@ export const drawTable = (
 	});
 	return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Operator dispatch table">${parts.join("")}</svg>`;
 };
+
+// ---------- The 64-bit word of a key set ----------
+
+const WCELL = 20;
+const WROW = 32;
+
+/**
+ * The key set's uint64_t as two rows of 32 bits (63 … 32 on top, 31 … 0 below), each cell tinted
+ * by its region: bit 63 unused, bits 62 … 16 functionality, bits 15 … 0 backend. Set bits are
+ * filled. Names sit above the top row and below the bottom row; braces between the rows mark the
+ * regions.
+ */
+export const drawWord = (ks: bigint) => {
+	const left = 8;
+	const labelH = 128;
+	const rowA = labelH;
+	const braceA = rowA + WCELL + 4;
+	const rowB = braceA + 62;
+	const braceB = rowB - 4;
+	const width = left + WROW * WCELL + 44;
+	const height = rowB + WCELL + labelH + 4;
+	const parts: string[] = [];
+	const nameOf = (bit: number) =>
+		bit === 63
+			? "(unused)"
+			: bit >= NUM_BACKENDS
+				? FUNCTIONALITIES[bit - NUM_BACKENDS + 1]
+				: BACKENDS[bit];
+	const regionOf = (bit: number) =>
+		bit === 63 ? "unused" : bit >= NUM_BACKENDS ? "func" : "backend";
+	for (let bit = 63; bit >= 0; bit--) {
+		const top = bit >= WROW;
+		const i = top ? 63 - bit : WROW - 1 - bit;
+		const x = left + i * WCELL;
+		const y = top ? rowA : rowB;
+		const on = (ks & (1n << BigInt(bit))) !== 0n;
+		const name = nameOf(bit);
+		const detail =
+			bit === 63
+				? "bit 63: unused"
+				: bit >= NUM_BACKENDS
+					? `bit ${bit}: functionality ${name} (f = ${bit - NUM_BACKENDS + 1})`
+					: `bit ${bit}: backend ${name}`;
+		parts.push(
+			`<g class="wbit ${regionOf(bit)}${on ? " on" : ""}"><rect x="${x + 0.5}" y="${y}" width="${WCELL - 1}" height="${WCELL}" rx="2"></rect>` +
+				`<text class="idx" x="${x + WCELL / 2}" y="${y + WCELL / 2 + 3}">${bit}</text><title>${esc(detail)}</title></g>`,
+		);
+		const cx = x + WCELL / 2;
+		parts.push(
+			top
+				? `<text class="wname${on ? " set" : ""}" transform="translate(${cx + 2},${y - 4}) rotate(-60)">${esc(name)}</text>`
+				: `<text class="wname${on ? " set" : ""}" transform="translate(${cx - 2},${y + WCELL + 4}) rotate(60)">${esc(name)}</text>`,
+		);
+	}
+	// A brace from cell i0 to cell i1 (inclusive), opening towards the row at y (down = row below).
+	const brace = (
+		i0: number,
+		i1: number,
+		y: number,
+		down: boolean,
+		cls: string,
+		label: string,
+	) => {
+		const x0 = left + i0 * WCELL + 2;
+		const x1 = left + (i1 + 1) * WCELL - 2;
+		const d = down ? 6 : -6;
+		const mid = (x0 + x1) / 2;
+		parts.push(
+			`<path class="brace ${cls}" d="M${x0} ${y} v${-d} H${mid - 4} l4 ${-d} l4 ${d} H${x1} v${d}"></path>`,
+			`<text class="region ${cls}" x="${mid}" y="${y - 2 * d + (down ? -3 : 9)}">${esc(label)}</text>`,
+		);
+	};
+	brace(0, 0, braceA, false, "unused", "63");
+	brace(1, WROW - 1, braceA, false, "func", "functionality bits 62 … 32");
+	brace(0, 15, braceB, true, "func", "functionality bits 31 … 16");
+	brace(16, WROW - 1, braceB, true, "backend", "backend bits 15 … 0");
+	return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="The 64 bits of a DispatchKeySet">${parts.join("")}</svg>`;
+};

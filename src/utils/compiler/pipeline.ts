@@ -121,6 +121,21 @@ const REALIZE: Record<string, string> = {
 const fxLine = (n: (typeof fxNodes)[number]) =>
 	`${n.name}: "f32[${n.shape.join(", ")}]" = torch.ops.${n.target}(${n.args.join(", ")})`;
 
+/** Wraps prose into "# " comment lines of at most `width` characters. */
+export function comment(text: string, width = 64): string {
+	const lines: string[] = [];
+	let line = "#";
+	for (const word of text.split(" ")) {
+		if (line.length + 1 + word.length > width && line !== "#") {
+			lines.push(line);
+			line = "#";
+		}
+		line += ` ${word}`;
+	}
+	lines.push(line);
+	return lines.join("\n");
+}
+
 const DECOMPOSED = new Set(["amax", "sub", "exp", "sum_1", "div"]);
 
 export function buildStages(): Stage[] {
@@ -169,7 +184,7 @@ export function buildStages(): Stage[] {
 		details: Object.fromEntries(
 			fxNodes.map((n) => [
 				n.name,
-				`# lowering: ${LOWERING[n.name]}\n${n.body}`,
+				`${comment(`lowering: ${LOWERING[n.name]}`)}\n${n.body}`,
 			]),
 		),
 		focus: 3,
@@ -191,7 +206,7 @@ export function buildStages(): Stage[] {
 		details: Object.fromEntries(
 			fxNodes.map((n) => [
 				n.name,
-				`# ${REALIZE[n.name]}${n.buffer ? `\n${n.body}` : ""}`,
+				`${comment(REALIZE[n.name])}${n.buffer ? `\n${n.body}` : ""}`,
 			]),
 		),
 		focus: 4,
