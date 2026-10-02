@@ -1,0 +1,45 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import BackendPhases from "../../utils/compiler/BackendPhases.astro";
+import CodeStages from "../../utils/compiler/CodeStages.astro";
+import IrCfg from "../../utils/compiler/IrCfg.astro";
+import LlvmOverview from "../../utils/compiler/LlvmOverview.astro";
+import SelectionDag from "../../utils/compiler/SelectionDag.astro";
+import {
+	dotIr,
+	optStages,
+	saxpyStages,
+	saxpyTags,
+	tablegenStages,
+	tablegenTags,
+} from "../../utils/compiler/llvmData";
+---
+
+<Layout title="Compiler and LLVM demo">
+	<h1>Compiler and LLVM demo</h1>
+	<p>Figures built from real LLVM 23.1.2 output stored in <code>llvmData.ts</code>.</p>
+
+	<h2>LlvmOverview</h2>
+	<LlvmOverview />
+
+	<h2>CodeStages, saxpy from CUDA to PTX</h2>
+	<CodeStages stages={saxpyStages} tags={saxpyTags} step={5} />
+
+	<h2>CodeStages, the optimizer pass by pass</h2>
+	<CodeStages stages={optStages} tags={saxpyTags} step={1} />
+
+	<h2>CodeStages, TableGen</h2>
+	<CodeStages stages={tablegenStages} tags={tablegenTags} maxLines={20} />
+
+	<h2>IrCfg</h2>
+	<IrCfg ir={dotIr} focus="%16" />
+
+	<h2>SelectionDag, saxpy</h2>
+	<SelectionDag example="saxpy" step={1} />
+
+	<h2>SelectionDag, i8 add</h2>
+	<SelectionDag example="add8" step={1} />
+
+	<h2>BackendPhases</h2>
+	<BackendPhases phase="mssa" />
+</Layout>

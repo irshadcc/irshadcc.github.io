@@ -1,0 +1,606 @@
+---
+title: "Pipeline Parallelism, from GPipe to DualPipe"
+description: "Pipeline parallelism splits a model's layers across GPUs and streams microbatches through them. This post builds a working pipeline in about a hundred lines of PyTorch, then walks through the schedules that shrink its idle time: GPipe, 1F1B, Megatron-LM's virtual pipeline (interleaved 1F1B), zero-bubble pipelines and DeepSeek's DualPipe, with a simulator to compare them."
+date: 2026-10-02
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import MarginNote from "../../components/MarginNote.astro";
+import PipelineSchedule from "../../utils/distributed/PipelineSchedule.astro";
+
+## Background
+
+Tensor parallelism splits every layer across GPUs, and pays for it with an all-reduce inside every
+transformer block. That is affordable over NVLink but not over the network, so tensor parallelism
+stays inside a server.<Sidenote>[How GPUs Talk](/blog/collective-communication/) works through
+what each collective costs and why the chattiest groups go on the fastest links.</Sidenote> When a
+model still does not fit in one server's memory, the next split is by depth: give the first few
+layers to one group of GPUs, the next few to another, and so on. That is **pipeline
+parallelism** (PP), and each group of layers is a **stage**.
+
+The appeal is the communication. A stage only sends its output activations to the next stage, and
+in the backward pass the gradient of those activations back to the previous one. That is one
+point-to-point send of a $b \times s \times h$ tensor per microbatch per stage boundary, with no
+collective at all, so pipeline stages can sit on different servers, or even different racks.
+
+The cost is idle time. Stage 2 cannot start until stage 1 has finished, and stage 1 has nothing
+to do while it waits for the gradients to come back. This idle time is the **pipeline bubble**,
+and every schedule in this post is a different answer to the question of how to shrink it without
+running out of memory.
+
+## The naive pipeline
+
+Split a model over 4 GPUs and run one batch through it. The figure below is a timeline: one row
+per GPU, time to the right, and one block per piece of work. **F** is a stage's forward pass of a
+microbatch and **B** its backward. I'll take a backward to cost twice a forward, which is about
+right for a transformer.
+
+<PipelineSchedule schedules={["gpipe"]} p={4} m={1} title="One batch through 4 stages" />
+
+Each GPU works for 3 of the 12 time units, so 75% of the time is bubble. In general, with $p$
+stages, only one GPU is busy at a time, and the bubble is $1 - 1/p$. A pipeline like this has
+four times the memory of one GPU and the speed of one GPU.
+
+## GPipe: microbatches
+
+GPipe's fix is to split the batch into $m$ **microbatches** and stream them through the pipeline.
+As soon as stage 0 finishes the forward of microbatch 0, it sends it on and starts microbatch 1,
+so the stages work on different microbatches at the same time. The backward passes run once all
+the forwards are done, and the gradients from all microbatches are summed before the optimizer
+step, so the result is exactly the same as running the whole batch at once.
+
+<PipelineSchedule schedules={["gpipe"]} p={4} m={8} controls title="GPipe: 8 microbatches through 4 stages" />
+
+Hover a block to follow one microbatch through the pipeline. The bubble is now only at the ends:
+a triangle of idle time while the pipeline fills, and another while the backwards drain. Write
+$t_F$ and $t_B$ for the time of one stage's forward and backward of one microbatch. Each device
+does $m(t_F + t_B)$ of work, and there are $p - 1$ steps of filling and draining, each costing
+$t_F + t_B$:
+
+$$
+\text{bubble} = \frac{(p-1)(t_F + t_B)}{m(t_F + t_B) + (p-1)(t_F + t_B)} = \frac{p-1}{m+p-1}
+$$
+
+So the bubble shrinks as $m$ grows: try moving the $m$ slider. With $p = 4$ you need
+$m = 24$ to get the bubble down to 11%.
+
+The catch is memory. Each forward has to keep its activations until the matching backward, and
+GPipe runs every forward before any backward. Stage 0 ends up holding the activations of all $m$
+microbatches at once (the *peak activations* readout under the figure), so a large $m$ costs as
+much memory as the large batch we were trying to avoid. GPipe's answer was to recompute the
+activations in the backward pass instead of storing them, which trades memory for about a third
+more compute.
+
+## Building a pipeline
+
+Before improving the schedule, let's build the pipeline itself. The whole thing is a stage object
+that can run the forward or backward of one microbatch, plus a loop that decides the order. It
+runs with `torchrun` on CPUs, so you can try it on a laptop:
+
+```bash
+torchrun --nproc-per-node 4 pipeline.py
+```
+
+### The model and its stages
+
+The model is a stack of identical blocks. Every rank builds it with the same seed and keeps only
+its own slice of layers:<Sidenote>Building the whole model on every rank is wasteful, but it
+guarantees every stage starts from the same weights as a single-GPU run, which makes the result
+easy to check. A real job builds only its own layers, often on the `meta` device first.</Sidenote>
+
+```python
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+import torch.nn.functional as F
+
+D, LAYERS, BATCH, MICRO = 256, 8, 64, 8
+ACT, GRAD = 0, 1  # message tags: activations flow forward, gradients backward
+
+
+def build_model():
+    torch.manual_seed(0)
+    return nn.Sequential(*[nn.Sequential(nn.Linear(D, D), nn.GELU()) for _ in range(LAYERS)])
+
+
+def split(model, rank, world):
+    per = len(model) // world
+    return model[rank * per : (rank + 1) * per]
+```
+
+### A stage
+
+A `Stage` runs the forward or backward of one microbatch through its layers. The forward receives
+its input from the previous rank (unless it is the first stage), runs its layers, and sends the
+output to the next rank (unless it is the last, which computes the loss instead). It saves the
+input and output, because the backward needs both:
+
+```python
+class Stage:
+    def __init__(self, module, rank, world, act_shape):
+        self.module, self.rank, self.world = module, rank, world
+        self.first, self.last = rank == 0, rank == world - 1
+        self.prev, self.next = rank - 1, rank + 1
+        self.act_shape = act_shape
+        self.inputs, self.outputs = {}, {}  # per microbatch, kept for the backward
+        self.sends = []  # in-flight isends; their tensors must stay alive
+        self.losses = []
+
+    def send(self, tensor, dst, tag):
+        self.sends.append((dist.isend(tensor, dst, tag=tag), tensor))
+
+    def forward(self, i, x, y):
+        if self.first:
+            inp = x
+        else:
+            inp = torch.empty(self.act_shape)
+            dist.recv(inp, src=self.prev, tag=ACT)
+            inp.requires_grad_()
+        out = self.module(inp)
+        if self.last:
+            out = F.mse_loss(out, y) / MICRO  # mean over the whole batch
+            self.losses.append(out.item())
+        else:
+            self.send(out.detach(), self.next, ACT)
+        self.inputs[i], self.outputs[i] = inp, out
+```
+
+The received activation is a fresh leaf tensor, so `requires_grad_()` makes autograd compute its
+gradient. That gradient is exactly what the previous stage needs for its own backward. Dividing
+each microbatch's loss by the number of microbatches makes the summed gradients equal those of
+the mean loss over the full batch.
+
+The backward mirrors the forward. The last stage starts from its loss. Every other stage receives
+the gradient of its output from the next rank and pushes it through its layers with
+`out.backward(grad)`. Autograd accumulates the parameter gradients in `.grad` across
+microbatches, and leaves the input gradient in `inp.grad` to send back:
+
+```python
+    def backward(self, i):
+        inp, out = self.inputs.pop(i), self.outputs.pop(i)
+        if self.last:
+            out.backward()
+        else:
+            grad = torch.empty(self.act_shape)
+            dist.recv(grad, src=self.next, tag=GRAD)
+            out.backward(grad)
+        if not self.first:
+            self.send(inp.grad, self.prev, GRAD)
+
+    def flush(self):
+        for work, _ in self.sends:
+            work.wait()
+        self.sends.clear()
+```
+
+Sends are non-blocking (`isend`) and receives are blocking. That combination is what keeps the
+pipeline from deadlocking: if both neighbours sent with a blocking call at the same moment, each
+would wait for the other to receive. `flush` waits for the outstanding sends at the end of the
+step. The tags keep activations and gradients apart, and `prev` and `next` name the neighbouring
+ranks. Neither matters yet, but both will when the pipeline [wraps
+around](#megatron-lms-virtual-pipeline).<Sidenote>This works with the `gloo` backend, whose sends really are asynchronous. With NCCL
+on GPUs, the send and the receive between the same pair of ranks are queued on the same stream, so
+a stage that sends forward and then receives backward can still deadlock with its neighbour.
+Megatron-LM avoids this by posting each pair of transfers together with
+`dist.batch_isend_irecv`.</Sidenote>
+
+### The schedule
+
+With the stage in place, a schedule is just a loop. GPipe runs every forward, then every
+backward:
+
+```python
+def gpipe(stage, xs, ys):
+    m = len(xs)
+    for i in range(m):
+        stage.forward(i, xs[i], ys[i])
+    for i in range(m):
+        stage.backward(i)
+```
+
+And the training loop calls it once per step, then steps the optimizer on the stage's own
+parameters:
+
+```python
+def main(schedule):
+    dist.init_process_group("gloo")
+    rank, world = dist.get_rank(), dist.get_world_size()
+    module = split(build_model(), rank, world)
+    stage = Stage(module, rank, world, (BATCH // MICRO, D))
+    opt = torch.optim.SGD(module.parameters(), lr=0.1)
+
+    torch.manual_seed(1)
+    x, y = torch.randn(BATCH, D), torch.randn(BATCH, D)
+    for step in range(5):
+        opt.zero_grad()
+        schedule(stage, x.chunk(MICRO), y.chunk(MICRO))
+        stage.flush()
+        opt.step()
+        if stage.last:
+            print(f"step {step}: loss {sum(stage.losses):.6f}")
+            stage.losses.clear()
+    dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main(gpipe)
+```
+
+Every rank generates the same batch. Only the first stage reads `x` and only the last reads `y`.
+The losses this prints match a single-process run of the full model on the full batch to every
+printed digit, with 2, 4 or 8 stages: microbatching changes when the work happens, not what is
+computed.
+
+Notice that the order of `forward` and `backward` calls is the only thing that distinguishes one
+schedule from another. Everything else in this post is a different loop.
+
+## 1F1B: bounding the memory
+
+GPipe holds $m$ microbatches of activations because every forward runs before any backward. But
+the last stage can start the backward of microbatch 0 as soon as its forward is done, and once it
+does, that gradient flows back and frees memory on every stage. **1F1B** (one forward, one
+backward) runs the backward of a microbatch as early as possible:
+
+1. **Warm-up.** Stage $d$ runs $p - d - 1$ forwards, just enough to fill the pipeline below it.
+2. **Steady state.** It alternates one forward and one backward.
+3. **Cool-down.** It runs the backwards that are left.
+
+In code, it's a different loop over the same stage:
+
+```python
+def one_f_one_b(stage, xs, ys):
+    m = len(xs)
+    warmup = min(stage.world - stage.rank - 1, m)
+    for i in range(warmup):
+        stage.forward(i, xs[i], ys[i])
+    for i in range(warmup, m):
+        stage.forward(i, xs[i], ys[i])
+        stage.backward(i - warmup)
+    for i in range(m - warmup, m):
+        stage.backward(i)
+```
+
+Compare the two schedules on the same pipeline:
+
+<PipelineSchedule schedules={["gpipe", "1f1b"]} p={4} m={8} controls title="GPipe and 1F1B, 4 stages, 8 microbatches" />
+
+The step time and the bubble are identical: 1F1B moves work around but doesn't fill any of the
+triangles. What it changes is memory. Stage $d$ never has more than $p - d$ microbatches in
+flight, so the peak is $p$ microbatches of activations no matter how large $m$ gets. With memory
+no longer tied to $m$, we can raise $m$ to shrink the bubble, and 1F1B (from PipeDream-Flush) is
+the baseline that every schedule below improves on.
+
+A large $m$ is not free, though. The global batch is fixed by the optimization, and it is shared
+by $m$ microbatches times the data-parallel size. Many microbatches means small ones, which run
+the GPU less efficiently. So the schedules below attack the bubble itself.
+
+## Megatron-LM's virtual pipeline
+
+The bubble is $p - 1$ stage-times long, so one way to shrink it is to make each stage shorter
+without adding devices. That is the idea behind Megatron-LM's **virtual pipeline parallelism**
+(VPP), from Narayanan et al. (2021). Its schedule is called **interleaved 1F1B**.
+
+### Virtual stages
+
+In plain pipeline parallelism, each of the $p$ devices holds one contiguous block of $L/p$
+layers. With VPP, each device holds $v$ smaller **model chunks** of $L/(pv)$ layers each. The
+model is cut into $pv$ **virtual stages**, and they are dealt out to the devices round-robin:
+virtual stage $s$ lives on device $s \bmod p$, as its chunk $\lfloor s/p \rfloor$. For a 16-layer
+model on 4 devices with $v = 2$:
+
+| | GPU 0 | GPU 1 | GPU 2 | GPU 3 |
+| --- | --- | --- | --- | --- |
+| Chunk 0 | layers 0–1 | layers 2–3 | layers 4–5 | layers 6–7 |
+| Chunk 1 | layers 8–9 | layers 10–11 | layers 12–13 | layers 14–15 |
+
+A microbatch runs down the devices through chunk 0, wraps around from GPU 3 back to GPU 0, and runs
+down them again through chunk 1. Each device does the same total work as before, but in $v$
+shorter pieces, and a shorter stage-time means a thinner fill-and-drain triangle.
+
+In Megatron you turn this on with `--virtual-pipeline-model-parallel-size` (or
+`--num-layers-per-virtual-pipeline-stage`). Each rank's model then becomes a list of $v$ modules
+rather than one. Chunk $c$ on pipeline rank $d$ starts at layer
+$c \cdot L/v + d \cdot L/(pv)$, which is the table above.
+
+### The interleaved schedule
+
+The schedule is `forward_backward_pipelining_with_interleaving` in Megatron Core's
+`pipeline_parallel/schedules.py`. It is still 1F1B (a warm-up of forwards, a steady state that
+alternates forward and backward, then a cool-down of backwards), but each operation is now one
+microbatch through one *chunk*, and the device has to decide which chunk.
+
+It does that by sending microbatches through the chunks in **groups of $p$**. Number a device's
+forward operations $k = 0, 1, 2, \ldots$. Operation $k$ runs microbatch
+$\lfloor k / pv \rfloor \cdot p + (k \bmod p)$ through chunk $\lfloor (k \bmod pv) / p \rfloor$.
+The backwards use the same numbering with the chunks in reverse order. With $p = 4$, $v = 2$ and
+$m = 8$, GPU 0 runs (writing F3.1 for the forward of microbatch 3 through chunk 1):
+
+```text
+warm-up   F0.0 F1.0 F2.0 F3.0  F0.1 F1.1 F2.1 F3.1  F4.0 F5.0
+steady    F6.0 B0.1  F7.0 B1.1  F4.1 B2.1  F5.1 B3.1  F6.1 B0.0  F7.1 B1.0
+cool-down B2.0 B3.0 B4.1 B5.1 B6.1 B7.1 B4.0 B5.0 B6.0 B7.0
+```
+
+Why groups of $p$? Microbatch 0 leaves GPU 0's chunk 0 and needs $p$ chunk-times to come back
+around to its chunk 1. In those $p$ chunk-times GPU 0 runs the chunk-0 forwards of microbatches 0
+to $p - 1$, and finishes just as microbatch 0 returns. So the device never waits, and never has
+to hold a returning microbatch while it finishes a group. This is also why the schedule needs
+$m$ to be a multiple of $p$.<Sidenote>Older versions of Megatron assert this. Newer ones make the
+group size a setting, `microbatch_group_size_per_vp_stage`, which defaults to $p$.</Sidenote>
+
+The warm-up on device $d$ is
+
+$$
+\text{warm-up} = 2(p - d - 1) + (v - 1)\,p
+$$
+
+forwards. The $(v-1)p$ term pushes the first group of microbatches through every chunk but the
+last. The $2(p - d - 1)$ term covers the rest of the round trip: microbatch 0 still has to reach
+the last device and its gradient has to come back to device $d$, and device $d$ keeps running
+forwards meanwhile.
+
+### Implementing it
+
+Our `Stage` needs only two changes to become a model chunk. Its neighbours wrap around, since the
+last rank's chunk 0 feeds rank 0's chunk 1. And whether it is the first or last stage now depends
+on its virtual stage index, not its rank:
+
+```python
+class VirtualStage(Stage):
+    """Model chunk `chunk` of `v` on this rank: stage chunk * world + rank of world * v."""
+
+    def __init__(self, module, chunk, v, rank, world, act_shape):
+        super().__init__(module, rank, world, act_shape)
+        index = chunk * world + rank
+        self.first, self.last = index == 0, index == world * v - 1
+        self.prev, self.next = (rank - 1) % world, (rank + 1) % world
+
+
+def build_virtual_stages(model, rank, world, v):
+    per = len(model) // (world * v)
+    return [
+        VirtualStage(model[(c * world + rank) * per : (c * world + rank + 1) * per],
+                     c, v, rank, world, (BATCH // MICRO, D))
+        for c in range(v)
+    ]
+```
+
+This is where the message tags earn their place. With $p = 2$, rank 1 sends rank 0 both the
+gradients for chunk 0's backward and, wrapping around, the activations for chunk 1's forward. The
+tags keep the two streams apart. Within each stream the messages arrive in the order they were
+sent, because every rank walks through the same sequence of $k$.
+
+The schedule is Megatron's loop, with `chunk` and `microbatch` mapping each operation number to
+the work it does:
+
+```python
+def interleaved_1f1b(stages, xs, ys):
+    p, v, m = stages[0].world, len(stages), len(xs)
+    rank = stages[0].rank
+    assert m % p == 0, "microbatches go through the chunks in groups of p"
+
+    def chunk(k, forward):
+        c = k % (p * v) // p
+        return c if forward else v - 1 - c
+
+    def microbatch(k):
+        return k // (p * v) * p + k % p
+
+    def forward(k):
+        i = microbatch(k)
+        stages[chunk(k, True)].forward(i, xs[i], ys[i])
+
+    def backward(k):
+        stages[chunk(k, False)].backward(microbatch(k))
+
+    total = m * v
+    warmup = min((p - rank - 1) * 2 + (v - 1) * p, total)
+    for k in range(warmup):
+        forward(k)
+    for k in range(warmup, total):
+        forward(k)
+        backward(k - warmup)
+    for k in range(total - warmup, total):
+        backward(k)
+```
+
+In `main`, build the stages with `build_virtual_stages(build_model(), rank, world, v)`, give the
+optimizer the parameters of every chunk, and `flush` each chunk after the step. With 8 layers this
+runs on 2 ranks with $v = 2$ or $4$, or on 4 ranks with $v = 2$, and prints the same losses as the
+single-process run.
+
+### What it costs
+
+Here is the schedule next to plain 1F1B. The darker blocks are chunk 1:
+
+<PipelineSchedule schedules={["1f1b", "interleaved"]} p={4} m={8} controls title="1F1B and interleaved 1F1B (v = 2)" />
+
+Each chunk takes $1/v$ of a stage's time, so the fill and drain triangles are $v$ times thinner:
+
+$$
+\text{bubble time} = \frac{(p-1)(t_F + t_B)}{v}
+\qquad\qquad
+\text{bubble fraction} = \frac{1}{v} \cdot \frac{p-1}{m}
+$$
+
+With $p = 4$ and $m = 8$, the step drops from 33 to 28.5 time units. The cost comes in three
+parts:
+
+- **Communication.** A microbatch now crosses $pv - 1$ stage boundaries instead of $p - 1$, so the
+  point-to-point traffic grows by about $v\times$. Megatron batches each pair of sends and
+  receives, and can overlap them with computation (`--overlap-p2p-comm`).
+- **Memory.** The longer warm-up means device 0 starts $2(p-1) + (v-1)p + 1$ chunk-forwards before
+  its first backward, each holding $1/v$ of a stage's activations. That is
+  $p + (p-1)/v$ microbatches' worth, against $p$ for 1F1B: 5.5 against 4 in the figure. Try
+  $v = 4$.
+- **Constraints.** $m$ must be a multiple of $p$ (or of the group size), and $L$ must split evenly
+  into $pv$ chunks.
+
+So $v$ is a dial between bubble and communication. Raise it when the bubble is the bottleneck and
+the links between pipeline stages have bandwidth to spare.
+
+## Zero-bubble pipelines
+
+So far a backward has been a single block, B. But a backward through a linear layer
+$Y = XW^\top$ computes two different things:
+
+$$
+\frac{\partial L}{\partial X} = \frac{\partial L}{\partial Y} W
+\qquad\qquad
+\frac{\partial L}{\partial W} = \left(\frac{\partial L}{\partial Y}\right)^{\!\top} X
+$$
+
+The previous stage is waiting on the first one, the input gradient. Nothing is waiting on the
+second, the weight gradient, until the optimizer step. The **Zero Bubble** paper (Qi et al.,
+2023) splits the backward in two: **B** computes only the input gradient and sends it on, and
+**W** computes the weight gradient later, whenever the device would otherwise be idle. From now
+on B means just the input-gradient half, and the full backward is B + W.
+
+In PyTorch you can split a stage's backward with `torch.autograd.grad`, asking for the input
+gradient first and keeping the graph for the weight gradient:
+
+```python
+# B: the gradient the previous stage is waiting for.
+(dx,) = torch.autograd.grad(out, inp, grad_out, retain_graph=True)
+stage.send(dx, stage.prev, GRAD)
+
+# W: later, when the device has nothing better to do.
+dws = torch.autograd.grad(out, list(stage.module.parameters()), grad_out)
+```
+
+This gives the same gradients as `out.backward(grad_out)`, but the second call walks the graph
+again, so real implementations split the work inside each layer instead.<Sidenote>PyTorch's
+`torch.distributed.pipelining` does this in `stage_backward_input` and `stage_backward_weight`,
+which save the intermediate gradients from the first pass so the second only computes the weight
+gradients.</Sidenote>
+
+Splitting the backward helps twice. The backward chain that drains the pipeline now moves at the
+speed of B alone, so the stages before the last get their gradients sooner. And the W's are
+flexible filler for the gaps. **ZB-H1** keeps 1F1B's order of F's and B's and slots the W's into
+the idle time. Stage $d$ may defer up to $d$ W's: later stages defer more, which gets their B's
+out to the waiting stages sooner, and stage $d$ never holds more than $p$ microbatches of
+activations, the same peak as 1F1B.
+
+<PipelineSchedule schedules={["1f1b", "zb-h1"]} p={4} m={8} controls title="1F1B and ZB-H1, with F, B and W each one time unit" />
+
+The bubble drops to $(p-1)(t_F + t_B - t_W)$, a third of 1F1B's when the three are equal. The
+remaining idle time is the warm-up triangle, which W can't fill because no backward has run yet.
+The paper's **ZB-H2** goes further by running extra forwards in the warm-up, which fills the
+triangle at the cost of about twice the activation memory, and **ZB-V** gives each device two
+chunks in a V shape (device 0 holds the first and last chunk) to get close to zero bubble with
+1F1B's memory.
+
+## DualPipe
+
+DeepSeek-V3 trains a mixture-of-experts model with 16-way pipeline parallelism and 64-way expert
+parallelism, and its pipeline has a problem none of the schedules above address. Expert
+parallelism sends every token to the GPUs that hold its experts with an all-to-all, and back with
+another one. Those all-to-alls cross the network between nodes, and in DeepSeek's setup they take
+about as long as the computation. That is roughly half of each forward and backward spent waiting
+on communication, which is a bubble of its own.
+
+**DualPipe**, from the DeepSeek-V3 technical report, attacks both bubbles at once with two ideas.
+
+### Feed the pipeline from both ends
+
+Half the microbatches enter at device 0 and flow down the pipeline, as usual. The other half
+enter at device $p - 1$ and flow *up*. To make that possible, device $d$ holds two stages: stage
+$d$ of the downward pipeline and stage $p - 1 - d$ of the upward one, with two copies of the
+parameters. Each direction's fill triangle starts at its own end, so the warm-up of one direction
+fills the idle time of the other.
+
+### Overlap a forward with a backward
+
+In the steady state, each device runs the forward of one microbatch and the backward of another,
+from opposite directions, at the same time. Each is split into its pieces (attention, the
+all-to-all dispatch, the MLP, and the all-to-all combine) and interleaved so that one chunk's
+computation runs while the other's all-to-all is on the wire.<Sidenote>DeepSeek gives the
+communication its own SMs (20 of the 132 on an H800) and tunes their split by hand, so the
+computation can keep the rest of the GPU busy.</Sidenote> In the figure these overlapped pairs are
+the outlined blocks with the forward on top and the backward below.
+
+<PipelineSchedule schedules={["dualpipe"]} p={4} m={10} controls title="DualPipe, 4 devices, 10 microbatches (5 from each end)" />
+
+The lighter blocks are microbatches 0 to 4, flowing down from device 0, and the darker ones are 5
+to 9, flowing up from device 3. The schedule follows the eight phases of DeepSeek's reference
+implementation (`dualpipe.py`):
+
+| Phase | What device $d$ runs |
+| --- | --- |
+| 1 | Forwards of its first direction, filling the pipeline |
+| 2 | Forwards of both directions, alternating |
+| 3 | Backward with deferred W, the W, then a forward |
+| 4 | The steady state: overlapped forward + backward pairs |
+| 5 | A backward, then an overlapped pair |
+| 6 | Backwards of both directions, deferring half the W's |
+| 7 | A deferred W, then a backward with its W deferred |
+| 8 | The remaining W's |
+
+The simulator here only counts computation, so it doesn't show DualPipe's main win, the hidden
+all-to-alls. Even so, the bubble is smaller than ZB-H1's. The report gives it as
+$(p/2 - 1)(t_{F\&B} + t_B - 2t_W)$, where $t_{F\&B}$ is the time of an overlapped
+pair.<Sidenote>The report writes B for the full backward, so its formula reads
+$(PP/2-1)(F\&B + B - 3W)$. I write B for the input-gradient half only, as in the Zero Bubble
+section, which turns $-3W$ into $-2W$.</Sidenote> The $p - 1$ of every other schedule becomes
+$p/2 - 1$, because each direction only fills half the pipeline before the other direction's
+microbatches arrive.
+
+The costs are the second copy of the parameters, and one more microbatch of activations than 1F1B
+($p + 1$). DeepSeek's argument is that with 64-way expert parallelism each device holds only a
+small slice of the expert weights, so doubling them is cheap. It also needs $p$ and $m$ to be
+even, and $m \geq 2p$ in this implementation.
+
+**DualPipeV**, from Sea AI Lab, later removed the duplicated parameters. It cuts the bidirectional schedule in half
+and folds it into a V: each device holds two chunks, stage $d$ and stage $2p - 1 - d$ of a
+$2p$-stage model, so a microbatch goes down the devices and back up. It keeps the overlapped
+forward-backward pairs with one copy of the weights, and PyTorch ships it as
+`ScheduleDualPipeV`.
+
+## Comparing the schedules
+
+Here are all five on the same pipeline. Switch between them, and change $p$ and $m$ to see where
+each one pays off:
+
+<PipelineSchedule schedules={["gpipe", "1f1b", "interleaved", "zb-h1", "dualpipe"]} p={4} m={8} controls title="All five schedules" />
+
+The simulator counts F, B and W as one time unit each (so a full backward takes two), and
+communication as free. Under those assumptions, for $p$ devices and $m$ microbatches:
+
+| Schedule | Bubble (idle time per device) | Peak activations | Parameters |
+| --- | --- | --- | --- |
+| GPipe | $(p-1)(t_F + t_B + t_W)$ | $m$ | $1\times$ |
+| 1F1B | $(p-1)(t_F + t_B + t_W)$ | $p$ | $1\times$ |
+| Interleaved 1F1B (VPP) | $(p-1)(t_F + t_B + t_W)/v$ | $p + (p-1)/v$ | $1\times$ |
+| ZB-H1 | $(p-1)(t_F + t_B - t_W)$ | $p$ | $1\times$ |
+| DualPipe | $(p/2-1)(t_{F\&B} + t_B - 2t_W)$ | $p + 1$ | $2\times$ |
+
+With $p = 8$ and equal F, B and W, those are 21, 21, 10.5, 7 and 6 time units, and the simulator
+reproduces each of them.
+
+## Using PyTorch's schedules
+
+The loop in this post is the core of every pipeline implementation, but you don't need to write
+one. PyTorch's `torch.distributed.pipelining` has a `PipelineStage` much like ours, plus
+`ScheduleGPipe`, `Schedule1F1B`, `ScheduleInterleaved1F1B`, `ScheduleInterleavedZeroBubble`,
+`ScheduleZBVZeroBubble` and `ScheduleDualPipeV`. Swapping schedules is a one-line change:
+
+```python
+from torch.distributed.pipelining import PipelineStage, Schedule1F1B
+
+stage = PipelineStage(module, stage_index=rank, num_stages=world, device=device)
+schedule = Schedule1F1B(stage, n_microbatches=8, loss_fn=nn.MSELoss())
+
+if rank == 0:
+    schedule.step(x)
+elif rank == world - 1:
+    losses = []
+    schedule.step(target=y, losses=losses)
+else:
+    schedule.step()
+```
+
+Which schedule to use comes down to the same trade-offs as the table. 1F1B is the safe default.
+Interleaving buys a shorter bubble for more communication. The zero-bubble schedules fill the
+bubble with weight gradients, for some complexity in the backward. And if the pipeline also has
+heavy expert-parallel all-to-alls to hide, DualPipe and DualPipeV turn the second half of every
+forward and backward pair into time to do it.

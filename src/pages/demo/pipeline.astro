@@ -1,0 +1,25 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import PipelineSchedule from "../../utils/distributed/PipelineSchedule.astro";
+---
+
+<Layout title="PipelineSchedule demo">
+	<h1>PipelineSchedule demo</h1>
+	<p>
+		Pipeline-parallel schedules from <code>pipeline.ts</code>, timed by its simulator. Hover a block to follow its
+		microbatch.
+	</p>
+
+	<h2>All schedules, with controls</h2>
+	<PipelineSchedule schedules={["gpipe", "1f1b", "interleaved", "zb-h1", "dualpipe"]} p={4} m={8} controls />
+
+	<h2>No pipelining</h2>
+	<PipelineSchedule schedules={["gpipe"]} p={4} m={1} />
+
+	<h2>Interleaved 1F1B, four chunks per device</h2>
+	<PipelineSchedule schedules={["interleaved"]} p={4} m={8} v={4} unit={24} />
+
+	<h2>DualPipe as in the DeepSeek-V3 report</h2>
+	<p>8 devices, 20 microbatches: 10 from each end.</p>
+	<PipelineSchedule schedules={["dualpipe"]} p={8} m={20} unit={12} />
+</Layout>

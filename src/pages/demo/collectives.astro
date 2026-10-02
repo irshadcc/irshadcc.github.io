@@ -1,0 +1,37 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import CollectiveSteps from "../../utils/distributed/CollectiveSteps.astro";
+import { COLLECTIVE_OPS } from "../../utils/distributed/collectives";
+---
+
+<Layout title="CollectiveSteps demo">
+	<h1>CollectiveSteps demo</h1>
+	<p>
+		Every collective in <code>collectives.ts</code>, stepped through one synchronous step at a time. Use the
+		buttons, the timeline or the arrow keys.
+	</p>
+
+	{
+		COLLECTIVE_OPS.map((op) => (
+			<>
+				<h2>{op}</h2>
+				<CollectiveSteps op={op} n={4} />
+			</>
+		))
+	}
+
+	<h2>Eight ranks, starting mid-way</h2>
+	<CollectiveSteps op="all-reduce" n={8} step={7} />
+
+	<h2>Odd group size</h2>
+	<CollectiveSteps op="broadcast" n={5} />
+
+	<h2>On a network</h2>
+	<p>Global ranks label the columns, and each message is drawn by the link it crosses.</p>
+	<CollectiveSteps
+		op="all-to-all"
+		ranks={[0, 8, 16, 24]}
+		step={1}
+		network={{ gpusPerServer: 8, serversPerPod: 2, spinesPerPod: 2 }}
+	/>
+</Layout>

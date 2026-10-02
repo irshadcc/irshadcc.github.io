@@ -1,0 +1,338 @@
+---
+// The 138-slot dispatch table of aten::add.Tensor, filled in one group of registrations at a
+// time. Each row is one functionality: per-backend ones (Dense, Quantized, Sparse, SparseCsr,
+// NestedTensor, Autograd) get 16 slots, one per backend; the other functionalities get one slot
+// each and are wrapped 16 to a row. Colours say where each slot's kernel came from; slots changed
+// by the current step are outlined. Hover or focus a slot to see its key and registration site.
+// Data: real registrations from PyTorch 2.9.1 (dispatcherData.ts), table computed by
+// OperatorTable in dispatchKeys.ts.
+// Usage in .mdx:
+//   <DispatchTable />
+//   <DispatchTable step={7} highlight={["AutogradCPU", "CPU"]} />
+import { drawTable } from "./dispatcherDraw";
+import { addTableSteps, tableRows } from "./dispatcherFigures";
+
+interface Props {
+	step?: number;
+	highlight?: string[];
+	title?: string;
+}
+
+const { step = 0, highlight = [], title } = Astro.props;
+const steps = addTableSteps();
+const rows = tableRows();
+const last = steps.length - 1;
+const at = Math.max(0, Math.min(step, last));
+const s = steps[at];
+const legend = [
+	["kernel", "kernel registered to this key"],
+	["alias", "default backend kernel (alias key)"],
+	["autograd", "autograd kernel (Autograd alias)"],
+	["fallback", "backend fallback"],
+	["fallthrough", "fallthrough"],
+	["missing", "empty (error if reached)"],
+];
+---
+
+<figure class="dtable" data-config={JSON.stringify({ last, highlight })}>
+	{title && <figcaption class="title">{title}</figcaption>}
+	<div class="controls">
+		<button type="button" class="play" aria-label="Play">
+			<svg class="i-play" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5v11L13.5 8z"></path></svg>
+			<svg class="i-pause" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 3h3v10H4zM9 3h3v10H9z"></path></svg>
+		</button>
+		<label>
+			step
+			<input type="range" min="0" max={last} value={at} />
+			<output>{at}</output>
+		</label>
+	</div>
+	<p class="step-title">{s.title}</p>
+	<p class="step-note">{s.note}</p>
+	<div class="grid" set:html={drawTable(s.table, rows, s.changed, highlight)} />
+	<p class="detail" aria-live="polite">Hover a slot to see its key and where its kernel was registered.</p>
+	<ul class="legend">
+		{
+			legend.map(([cls, text]) => (
+				<li>
+					<span class={`swatch ${cls}`} />
+					{text}
+				</li>
+			))
+		}
+	</ul>
+</figure>
+
+<script>
+	import { drawTable } from "./dispatcherDraw";
+	import { addTableSteps, tableRows } from "./dispatcherFigures";
+
+	const steps = addTableSteps();
+	const rows = tableRows();
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".dtable")) {
+		const cfg = JSON.parse(fig.dataset.config ?? "{}");
+		const range = fig.querySelector<HTMLInputElement>("input[type=range]");
+		const out = fig.querySelector("output");
+		const play = fig.querySelector<HTMLButtonElement>(".play");
+		const grid = fig.querySelector<HTMLElement>(".grid");
+		const detail = fig.querySelector<HTMLElement>(".detail");
+		const titleEl = fig.querySelector<HTMLElement>(".step-title");
+		const noteEl = fig.querySelector<HTMLElement>(".step-note");
+		if (!range || !grid) continue;
+		let timer: number | undefined;
+
+		const render = () => {
+			const t = Number(range.value);
+			const s = steps[t];
+			if (out) out.textContent = String(t);
+			if (titleEl) titleEl.textContent = s.title;
+			if (noteEl) noteEl.textContent = s.note;
+			grid.innerHTML = drawTable(s.table, rows, s.changed, cfg.highlight);
+		};
+		const show = (target: EventTarget | null) => {
+			const g = (target as Element | null)?.closest?.("g.slot") as SVGGElement | null;
+			if (!g || !detail) return;
+			const { slot, key, src, site } = g.dataset;
+			detail.textContent = `slot ${slot} · ${key} · ${src}${site ? ` · ${site}` : ""}`;
+		};
+		grid.addEventListener("mouseover", (e) => show(e.target));
+		grid.addEventListener("focusin", (e) => show(e.target));
+		const stop = () => {
+			if (timer !== undefined) clearInterval(timer);
+			timer = undefined;
+			play?.classList.remove("playing");
+			play?.setAttribute("aria-label", "Play");
+		};
+		range.addEventListener("input", () => {
+			stop();
+			render();
+		});
+		play?.addEventListener("click", () => {
+			if (timer !== undefined) return stop();
+			if (Number(range.value) >= cfg.last) range.value = "0";
+			play.classList.add("playing");
+			play.setAttribute("aria-label", "Pause");
+			render();
+			timer = window.setInterval(() => {
+				if (Number(range.value) >= cfg.last) return stop();
+				range.value = String(Number(range.value) + 1);
+				render();
+			}, 1600);
+		});
+	}
+</script>
+
+<style>
+	.dtable {
+		--k-kernel: #3b6ea5;
+		--k-alias: #3f9a8c;
+		--k-autograd: #7e62ad;
+		--k-fallback: #e0b45a;
+		--k-fallthrough: #c9c6bc;
+		--k-on-dark: #ffffff;
+		--k-on-light: #1c1c1a;
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+	}
+	@media (prefers-color-scheme: dark) {
+		.dtable {
+			--k-kernel: #5d8fc7;
+			--k-alias: #4fb3a3;
+			--k-autograd: #9a80c8;
+			--k-fallback: #c99a3e;
+			--k-fallthrough: #55575c;
+			--k-on-dark: #ffffff;
+			--k-on-light: #131417;
+		}
+	}
+	.title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.5rem;
+	}
+	.controls {
+		display: flex;
+		justify-content: center;
+		align-items: center;
+		gap: 0.75rem;
+		margin-bottom: 0.5rem;
+		font-size: 0.78rem;
+		color: var(--muted);
+	}
+	.controls label {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.4rem;
+	}
+	.controls input {
+		width: 12rem;
+		accent-color: var(--accent);
+	}
+	.controls output {
+		min-width: 1.6rem;
+		font-family: var(--mono);
+		color: var(--text);
+	}
+	.play {
+		display: inline-grid;
+		place-items: center;
+		width: 1.9rem;
+		height: 1.9rem;
+		border: 1px solid var(--faint);
+		border-radius: 999px;
+		background: var(--bg);
+		color: var(--text);
+		cursor: pointer;
+	}
+	.play:hover {
+		border-color: var(--accent);
+	}
+	.play svg {
+		width: 0.8rem;
+		height: 0.8rem;
+		fill: currentColor;
+	}
+	.play .i-pause,
+	.play.playing .i-play {
+		display: none;
+	}
+	.play.playing .i-pause {
+		display: block;
+	}
+	.step-title {
+		margin: 0;
+		font-size: 0.85rem;
+		font-weight: 600;
+		text-align: center;
+	}
+	.step-note {
+		margin: 0.15rem auto 0.6rem;
+		max-width: 36rem;
+		min-height: 2.6em;
+		font-size: 0.78rem;
+		color: var(--muted);
+		text-align: center;
+	}
+	.grid :global(svg) {
+		display: block;
+		width: 100%;
+		max-width: 680px;
+		height: auto;
+		margin: 0 auto;
+	}
+	.grid :global(.row-label) {
+		font-family: var(--mono);
+		font-size: 9px;
+		text-anchor: end;
+		fill: var(--muted);
+	}
+	.grid :global(.slot rect) {
+		stroke: color-mix(in oklch, var(--text) 18%, transparent);
+		stroke-width: 0.6;
+	}
+	.grid :global(.slot text) {
+		font-family: var(--mono);
+		font-size: 8px;
+		text-anchor: middle;
+		pointer-events: none;
+	}
+	.grid :global(.slot) {
+		cursor: default;
+		outline: none;
+	}
+	.grid :global(.kernel rect) {
+		fill: var(--k-kernel);
+	}
+	.grid :global(.alias rect) {
+		fill: var(--k-alias);
+	}
+	.grid :global(.autograd rect) {
+		fill: var(--k-autograd);
+	}
+	.grid :global(.kernel text),
+	.grid :global(.alias text),
+	.grid :global(.autograd text) {
+		fill: var(--k-on-dark);
+	}
+	.grid :global(.fallback rect) {
+		fill: var(--k-fallback);
+	}
+	.grid :global(.fallthrough rect) {
+		fill: var(--k-fallthrough);
+	}
+	.grid :global(.fallback text),
+	.grid :global(.fallthrough text) {
+		fill: var(--k-on-light);
+	}
+	.grid :global(.missing rect) {
+		fill: var(--surface);
+		stroke: var(--faint);
+	}
+	.grid :global(.missing text) {
+		fill: var(--muted);
+	}
+	.grid :global(.changed rect) {
+		stroke: var(--text);
+		stroke-width: 2;
+	}
+	.grid :global(.hl rect) {
+		stroke: #d1495b;
+		stroke-width: 2.4;
+	}
+	.grid :global(.slot:hover rect),
+	.grid :global(.slot:focus rect) {
+		stroke: var(--accent);
+		stroke-width: 2.4;
+	}
+	.detail {
+		margin: 0.5rem 0 0;
+		min-height: 1.4em;
+		font-family: var(--mono);
+		font-size: 0.72rem;
+		text-align: center;
+		color: var(--text);
+		overflow-wrap: anywhere;
+	}
+	.legend {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.25rem 1rem;
+		margin: 0.5rem 0 0;
+		padding: 0;
+		list-style: none;
+		font-size: 0.72rem;
+		color: var(--muted);
+	}
+	.legend li {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.35rem;
+	}
+	.swatch {
+		width: 0.8rem;
+		height: 0.8rem;
+		border-radius: 2px;
+		border: 1px solid color-mix(in oklch, var(--text) 18%, transparent);
+	}
+	.swatch.kernel {
+		background: var(--k-kernel);
+	}
+	.swatch.alias {
+		background: var(--k-alias);
+	}
+	.swatch.autograd {
+		background: var(--k-autograd);
+	}
+	.swatch.fallback {
+		background: var(--k-fallback);
+	}
+	.swatch.fallthrough {
+		background: var(--k-fallthrough);
+	}
+	.swatch.missing {
+		background: var(--surface);
+	}
+</style>

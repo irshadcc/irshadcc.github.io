@@ -1,0 +1,407 @@
+---
+// A pipeline-parallel schedule drawn as a timeline: one row per device, one block per forward
+// (F), backward (B) or weight-gradient (W) of a microbatch through a stage, and hatching where the
+// device sits idle. The schedules and the simulator that times them are in pipeline.ts.
+//
+// Pass several `schedules` to get tabs that switch between them on the same p and m; with
+// `controls` the reader can also change p, m and (for interleaved 1F1B) v, and the timeline is
+// rebuilt in the browser. Hovering a block highlights its microbatch on every device.
+// Usage in .mdx:
+//   <PipelineSchedule schedules={["gpipe"]} p={4} m={1} />
+//   <PipelineSchedule schedules={["1f1b", "zb-h1", "dualpipe"]} p={4} m={8} controls />
+import {
+	type Config,
+	SCHEDULE_NAMES,
+	type ScheduleKind,
+	drawSchedule,
+	simulate,
+	summarize,
+	validate,
+} from "./pipeline";
+
+interface Props {
+	schedules?: ScheduleKind[];
+	p?: number;
+	m?: number;
+	/** Model chunks per device for interleaved 1F1B. */
+	v?: number;
+	/** Let the reader change p, m and v. */
+	controls?: boolean;
+	/** Pixels per F's worth of time. */
+	unit?: number;
+	title?: string;
+}
+
+const {
+	schedules = ["1f1b"],
+	p = 4,
+	m = 8,
+	v = 2,
+	controls = false,
+	unit = 18,
+	title,
+} = Astro.props;
+const hash = [...JSON.stringify(Astro.props)]
+	.reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7)
+	.toString(36);
+const id = `pp-${hash}`;
+const first: Config = { kind: schedules[0], p, m, v };
+const err = validate(first);
+if (err) throw new Error(`PipelineSchedule: ${err}`);
+const result = simulate(first);
+const svg = drawSchedule(result, { unit, id });
+const stats = summarize(result);
+const hasVariants = schedules.some((k) => k === "interleaved" || k === "dualpipe");
+const hasW = schedules.some((k) => k === "zb-h1" || k === "dualpipe");
+---
+
+<figure class="pipeline" data-config={JSON.stringify({ schedules, p, m, v, unit, id })}>
+	{title && <figcaption class="title">{title}</figcaption>}
+	{
+		(schedules.length > 1 || controls) && (
+			<div class="bar">
+				{schedules.length > 1 && (
+					<div class="tabs" role="tablist">
+						{schedules.map((k, i) => (
+							<button type="button" role="tab" data-kind={k} aria-selected={i === 0 ? "true" : "false"}>
+								{SCHEDULE_NAMES[k]}
+							</button>
+						))}
+					</div>
+				)}
+				{controls && (
+					<div class="knobs">
+						<label>
+							p
+							<select data-knob="p">
+								{[2, 4, 6, 8].map((n) => (
+									<option value={n} selected={n === p}>
+										{n}
+									</option>
+								))}
+							</select>
+						</label>
+						<label>
+							m
+							<input data-knob="m" type="range" min="1" max="24" value={m} />
+							<output>{m}</output>
+						</label>
+						<label class="v-knob" hidden={schedules[0] !== "interleaved"}>
+							v
+							<select data-knob="v">
+								{[2, 3, 4].map((n) => (
+									<option value={n} selected={n === v}>
+										{n}
+									</option>
+								))}
+							</select>
+						</label>
+					</div>
+				)}
+			</div>
+		)
+	}
+	<div class="legend">
+		<span class="key"><i class="sw F v0"></i>F forward</span>
+		<span class="key"><i class="sw B v0"></i>B backward</span>
+		{hasW && <span class="key"><i class="sw W v0"></i>W weight gradient</span>}
+		{
+			hasVariants && (
+				<span class="key">
+					<i class="sw F v1" />
+					<i class="sw B v1" />
+					second chunk or direction
+				</span>
+			)
+		}
+		{schedules.includes("dualpipe") && <span class="key"><i class="sw pair"></i>F and B overlapped</span>}
+		<span class="key"><i class="sw idle"></i>idle</span>
+	</div>
+	<div class="canvas" set:html={svg} />
+	<p class="error" hidden></p>
+	<dl class="stats">
+		{
+			stats.map((s) => (
+				<div>
+					<dt>{s.label}</dt>
+					<dd>{s.value}</dd>
+				</div>
+			))
+		}
+	</dl>
+</figure>
+
+<script>
+	import { type ScheduleKind, drawSchedule, simulate, summarize, validate } from "./pipeline";
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".pipeline")) {
+		const cfg = JSON.parse(fig.dataset.config ?? "{}");
+		const state = { kind: cfg.schedules[0] as ScheduleKind, p: cfg.p, m: cfg.m, v: cfg.v };
+		const canvas = fig.querySelector<HTMLElement>(".canvas");
+		const error = fig.querySelector<HTMLElement>(".error");
+		const stats = fig.querySelector<HTMLElement>(".stats");
+		const vKnob = fig.querySelector<HTMLElement>(".v-knob");
+		const mOut = fig.querySelector("output");
+		if (!canvas || !error || !stats) continue;
+
+		const render = () => {
+			vKnob?.toggleAttribute("hidden", state.kind !== "interleaved");
+			if (mOut) mOut.textContent = String(state.m);
+			const err = validate(state);
+			error.hidden = !err;
+			error.textContent = err ?? "";
+			canvas.hidden = stats.hidden = !!err;
+			if (err) return;
+			const r = simulate(state);
+			canvas.innerHTML = drawSchedule(r, { unit: cfg.unit, id: cfg.id });
+			stats.innerHTML = summarize(r)
+				.map((s) => `<div><dt>${s.label}</dt><dd>${s.value}</dd></div>`)
+				.join("");
+		};
+
+		for (const tab of fig.querySelectorAll<HTMLButtonElement>("[role=tab]"))
+			tab.addEventListener("click", () => {
+				state.kind = tab.dataset.kind as ScheduleKind;
+				for (const t of fig.querySelectorAll("[role=tab]"))
+					t.setAttribute("aria-selected", String(t === tab));
+				render();
+			});
+		for (const knob of fig.querySelectorAll<HTMLInputElement | HTMLSelectElement>("[data-knob]"))
+			knob.addEventListener("input", () => {
+				state[knob.dataset.knob as "p" | "m" | "v"] = Number(knob.value);
+				render();
+			});
+
+		// Highlight every block of the hovered microbatch.
+		canvas.addEventListener("pointerover", (e) => {
+			const op = (e.target as Element).closest<SVGGElement>(".op");
+			canvas.classList.toggle("hl", !!op);
+			const keys = new Set(op?.dataset.mb?.split(" "));
+			for (const g of canvas.querySelectorAll<SVGGElement>(".op"))
+				g.classList.toggle("on", !!op && (g.dataset.mb ?? "").split(" ").some((k) => keys.has(k)));
+		});
+		canvas.addEventListener("pointerleave", () => canvas.classList.remove("hl"));
+	}
+</script>
+
+<style>
+	.pipeline {
+		--f0: #9fc8ef;
+		--f1: #5f9fdc;
+		--b0: #a9dba6;
+		--b1: #66b862;
+		--w0: #c8b4ee;
+		--w1: #9d80dd;
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+	}
+	.title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.5rem;
+	}
+	.bar {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		justify-content: space-between;
+		gap: 0.5rem 1rem;
+		margin-bottom: 0.5rem;
+		font-size: 0.78rem;
+	}
+	.tabs {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.25rem;
+	}
+	.tabs button {
+		padding: 0.25rem 0.6rem;
+		border: 1px solid var(--faint);
+		border-radius: 999px;
+		background: var(--bg);
+		color: var(--text);
+		font: inherit;
+		cursor: pointer;
+	}
+	.tabs button:hover {
+		border-color: var(--accent);
+	}
+	.tabs button[aria-selected="true"] {
+		background: var(--accent);
+		border-color: var(--accent);
+		color: var(--bg);
+	}
+	.knobs {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.4rem 1rem;
+		color: var(--muted);
+	}
+	.knobs label {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.35rem;
+		font-family: var(--mono);
+	}
+	.knobs label[hidden] {
+		display: none;
+	}
+	.knobs select {
+		font: inherit;
+		color: var(--text);
+		background: var(--bg);
+		border: 1px solid var(--faint);
+		border-radius: 6px;
+	}
+	.knobs input {
+		width: 7rem;
+		accent-color: var(--accent);
+	}
+	.knobs output {
+		min-width: 1.4rem;
+		color: var(--text);
+	}
+
+	.legend {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.3rem 1rem;
+		margin-bottom: 0.4rem;
+		font-size: 0.72rem;
+		color: var(--muted);
+	}
+	.key {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.3rem;
+	}
+	.sw {
+		width: 0.8rem;
+		height: 0.8rem;
+		border-radius: 2px;
+		border: 1px solid color-mix(in oklch, var(--text) 25%, transparent);
+	}
+	.sw.F.v0 { background: var(--f0); }
+	.sw.F.v1 { background: var(--f1); }
+	.sw.B.v0 { background: var(--b0); }
+	.sw.B.v1 { background: var(--b1); }
+	.sw.W.v0 { background: var(--w0); }
+	.sw.pair {
+		background: linear-gradient(var(--f0) 50%, var(--b0) 50%);
+		border: 1.5px solid var(--text);
+	}
+	.sw.idle {
+		background: repeating-linear-gradient(45deg, var(--surface) 0 3px, var(--faint) 3px 4px);
+	}
+
+	.canvas {
+		overflow-x: auto;
+	}
+	.canvas[hidden] {
+		display: none;
+	}
+	.canvas :global(svg) {
+		display: block;
+		max-width: 100%;
+		height: auto;
+		margin: 0 auto;
+	}
+	.canvas :global(.dev) {
+		font-size: 10.5px;
+		text-anchor: end;
+		fill: var(--muted);
+	}
+	.canvas :global(.idle-bg) {
+		fill: var(--surface);
+	}
+	.canvas :global(.idle-line) {
+		stroke: var(--faint);
+		stroke-width: 1.5;
+	}
+	.canvas :global(.op rect) {
+		stroke: color-mix(in oklch, #1a1a1a 25%, transparent);
+		stroke-width: 0.6;
+		transition: opacity 120ms ease;
+	}
+	.canvas :global(.op text) {
+		font-family: var(--mono);
+		font-size: 9px;
+		text-anchor: middle;
+		fill: #1a1a1a;
+		pointer-events: none;
+	}
+	.canvas :global(.op text.small) {
+		font-size: 7.5px;
+	}
+	.canvas :global(rect.F.v0) { fill: var(--f0); }
+	.canvas :global(rect.F.v1) { fill: var(--f1); }
+	.canvas :global(rect.B.v0) { fill: var(--b0); }
+	.canvas :global(rect.B.v1) { fill: var(--b1); }
+	.canvas :global(rect.W.v0) { fill: var(--w0); }
+	.canvas :global(rect.W.v1) { fill: var(--w1); }
+	/* Chunks 2 and 3 of a deeper interleaving reuse the two shades, darkened. */
+	.canvas :global(rect.F.v2) { fill: var(--f0); }
+	.canvas :global(rect.F.v3) { fill: var(--f1); }
+	.canvas :global(rect.B.v2) { fill: var(--b0); }
+	.canvas :global(rect.B.v3) { fill: var(--b1); }
+	.canvas :global(rect.v2),
+	.canvas :global(rect.v3) { filter: saturate(1.5) brightness(0.8); }
+	.canvas :global(.pair-outline) {
+		fill: none;
+		stroke: var(--text) !important;
+		stroke-width: 1.4 !important;
+	}
+	.canvas.hl :global(.op:not(.on)) {
+		opacity: 0.3;
+	}
+	.canvas :global(.axis) {
+		stroke: var(--muted);
+		stroke-width: 0.8;
+	}
+	.canvas :global(.tick) {
+		font-size: 9px;
+		text-anchor: middle;
+		fill: var(--muted);
+	}
+	.canvas :global(.tick.end) {
+		text-anchor: end;
+	}
+
+	.error {
+		margin: 0.75rem 0;
+		padding: 0.6rem 0.8rem;
+		border-radius: 8px;
+		background: var(--surface);
+		font-size: 0.8rem;
+		color: var(--muted);
+		text-align: center;
+	}
+	.error[hidden] {
+		display: none;
+	}
+	.stats {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.3rem 1.5rem;
+		margin: 0.5rem 0 0;
+		font-size: 0.78rem;
+	}
+	.stats[hidden] {
+		display: none;
+	}
+	.stats :global(div) {
+		display: flex;
+		gap: 0.4rem;
+	}
+	.stats :global(dt) {
+		color: var(--muted);
+	}
+	.stats :global(dd) {
+		margin: 0;
+		font-family: var(--mono);
+		font-weight: 600;
+	}
+</style>

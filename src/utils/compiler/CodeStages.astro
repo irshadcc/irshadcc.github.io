@@ -1,0 +1,270 @@
+---
+// The same program at several stages of compilation, one listing per step: CUDA source, LLVM IR,
+// Machine IR, PTX, or a TableGen file and what it expands into. Lines that belong to one source
+// construct carry the same tag and the same colour at every stage, so the reader can follow, for
+// example, `a * x[i] + y[i]` from an fmul/fadd pair to a single fma.rn.f32. Hover a legend entry
+// to dim every other line. Stage data (code, tags, notes) lives in llvmData.ts.
+// Usage in .mdx:
+//   import { saxpyStages, saxpyTags } from "../../utils/compiler/llvmData";
+//   <CodeStages stages={saxpyStages} tags={saxpyTags} step={0} title="saxpy, from CUDA to PTX" />
+import { Code } from "astro:components";
+import StepControls from "./StepControls.astro";
+import type { CodeStage, StageTag } from "./llvmData";
+import { ptx, tablegen } from "./shikiLangs";
+
+interface Props {
+	stages: CodeStage[];
+	tags?: StageTag[];
+	step?: number;
+	title?: string;
+	/** Tallest the listing gets before it scrolls, in lines. */
+	maxLines?: number;
+}
+
+const { stages, tags = [], step = 0, title, maxLines = 24 } = Astro.props;
+const at = Math.max(0, Math.min(stages.length - 1, step));
+const colour = new Map(tags.map((t, i) => [t.tag, i]));
+const langs = { tablegen, ptx } as const;
+const rows = Math.min(
+	maxLines,
+	Math.max(...stages.map((s) => s.code.trimEnd().split("\n").length)),
+);
+
+// Shiki transformer: give each tagged line the class of its tag's colour.
+const marker = (stage: CodeStage) => {
+	const byLine = new Map(stage.marks);
+	return {
+		line(node: { properties: Record<string, unknown> }, line: number) {
+			const tag = byLine.get(line - 1);
+			const c = tag === undefined ? undefined : colour.get(tag);
+			if (c !== undefined) {
+				const cls = node.properties.class;
+				node.properties.class = `${Array.isArray(cls) ? cls.join(" ") : (cls ?? "")} mk c${c}`;
+				node.properties["data-tag"] = tag;
+			}
+		},
+	};
+};
+---
+
+<figure class="cs" data-step={at} tabindex="-1">
+	{title && <figcaption class="cs-title">{title}</figcaption>}
+	<StepControls labels={stages.map((s) => s.label)} step={at} />
+	<div class="cs-panes" style={`--rows: ${rows}`}>
+		{
+			stages.map((s, i) => (
+				<div class="cs-pane" data-i={i} aria-hidden={i !== at ? "true" : undefined}>
+					<p class="cs-tool">{s.tool}</p>
+					<Code
+						code={s.code.trimEnd()}
+						lang={(langs as Record<string, (typeof langs)[keyof typeof langs]>)[s.lang] ?? (s.lang as "llvm")}
+						themes={{ light: "github-light", dark: "github-dark" }}
+						transformers={[marker(s)]}
+					/>
+				</div>
+			))
+		}
+	</div>
+	<div class="cs-notes" aria-live="polite">
+		{
+			stages.map((s, i) => (
+				<p class="cs-note" data-i={i} hidden={i !== at}>
+					{s.note}
+				</p>
+			))
+		}
+	</div>
+	{
+		tags.length > 0 && (
+			<ul class="cs-legend">
+				{tags.map((t, i) => (
+					<li>
+						<button type="button" class={`c${i}`} data-c={i}>
+							<span class="sw" />
+							{t.label}
+						</button>
+					</li>
+				))}
+			</ul>
+		)
+	}
+</figure>
+
+<script>
+	import { bindStepper } from "./stepper";
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".cs")) {
+		const panes = [...fig.querySelectorAll<HTMLElement>(".cs-pane")];
+		const notes = [...fig.querySelectorAll<HTMLElement>(".cs-note")];
+		bindStepper(fig, panes.length, (i) => {
+			panes.forEach((p, k) => (k === i ? p.removeAttribute("aria-hidden") : p.setAttribute("aria-hidden", "true")));
+			notes.forEach((n, k) => {
+				n.hidden = k !== i;
+			});
+		});
+
+		// Legend: hover (or tap) a tag to dim every line that isn't part of it.
+		let pinned: string | undefined;
+		const focus = (c?: string) => {
+			if (c === undefined) delete fig.dataset.focus;
+			else fig.dataset.focus = c;
+			for (const b of fig.querySelectorAll<HTMLElement>(".cs-legend button")) {
+				b.classList.toggle("on", b.dataset.c === c);
+			}
+		};
+		for (const b of fig.querySelectorAll<HTMLButtonElement>(".cs-legend button")) {
+			b.addEventListener("mouseenter", () => focus(b.dataset.c));
+			b.addEventListener("mouseleave", () => focus(pinned));
+			b.addEventListener("click", () => {
+				pinned = pinned === b.dataset.c ? undefined : b.dataset.c;
+				focus(pinned);
+			});
+		}
+	}
+</script>
+
+<style>
+	.cs {
+		--c0: #2f6fb0;
+		--c1: #b8742a;
+		--c2: #2f8a5b;
+		--c3: #b33b5e;
+		--c4: #7a62b8;
+		--c5: #5f7380;
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+		outline: none;
+	}
+	@media (prefers-color-scheme: dark) {
+		.cs {
+			--c0: #6aa8e6;
+			--c1: #e0a25e;
+			--c2: #5fc08b;
+			--c3: #e2708f;
+			--c4: #a993e6;
+			--c5: #98aab5;
+		}
+	}
+	.cs-title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.3rem;
+	}
+	/* All panes share one grid cell, so the figure is as tall as the longest listing and
+	   doesn't jump while stepping. */
+	.cs-panes {
+		display: grid;
+	}
+	.cs-pane {
+		grid-area: 1 / 1;
+		min-width: 0;
+	}
+	.cs-pane[aria-hidden="true"] {
+		visibility: hidden;
+	}
+	.cs-tool {
+		margin: 0 0 0.2rem;
+		font-family: var(--mono);
+		font-size: 0.7rem;
+		color: var(--muted);
+	}
+	.cs-pane :global(pre.astro-code) {
+		margin: 0;
+		max-height: calc(var(--rows) * 1.5em + 1.4rem);
+		height: calc(var(--rows) * 1.5em + 1.4rem);
+		overflow: auto;
+		font-size: 0.72rem;
+		line-height: 1.5;
+		padding: 0.7rem 0;
+	}
+	.cs-pane :global(pre.astro-code code) {
+		display: block;
+		min-width: max-content;
+	}
+	.cs-pane :global(.line) {
+		display: inline-block;
+		min-width: 100%;
+		padding: 0 0.9rem;
+		transition: opacity 150ms ease;
+	}
+	.cs-pane :global(.line.mk) {
+		background: color-mix(in oklch, var(--mk) 14%, transparent);
+		box-shadow: inset 3px 0 var(--mk);
+	}
+	.cs :global(.c0) {
+		--mk: var(--c0);
+	}
+	.cs :global(.c1) {
+		--mk: var(--c1);
+	}
+	.cs :global(.c2) {
+		--mk: var(--c2);
+	}
+	.cs :global(.c3) {
+		--mk: var(--c3);
+	}
+	.cs :global(.c4) {
+		--mk: var(--c4);
+	}
+	.cs :global(.c5) {
+		--mk: var(--c5);
+	}
+	.cs[data-focus="0"] :global(.line:not(.c0)),
+	.cs[data-focus="1"] :global(.line:not(.c1)),
+	.cs[data-focus="2"] :global(.line:not(.c2)),
+	.cs[data-focus="3"] :global(.line:not(.c3)),
+	.cs[data-focus="4"] :global(.line:not(.c4)),
+	.cs[data-focus="5"] :global(.line:not(.c5)) {
+		opacity: 0.3;
+	}
+	.cs-notes {
+		display: grid;
+		margin-top: 0.45rem;
+	}
+	.cs-note {
+		grid-area: 1 / 1;
+		margin: 0;
+		font-size: 0.8rem;
+		line-height: 1.5;
+		min-height: 3em;
+	}
+	.cs-note[hidden] {
+		display: block;
+		visibility: hidden;
+	}
+	.cs-legend {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.25rem 0.4rem;
+		margin: 0.5rem 0 0;
+		padding: 0;
+		list-style: none;
+	}
+	.cs-legend li {
+		margin: 0;
+	}
+	.cs-legend button {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.35rem;
+		padding: 0.15rem 0.5rem;
+		border: 1px solid var(--faint);
+		border-radius: 999px;
+		background: var(--bg);
+		color: var(--text);
+		font: 0.72rem var(--sans);
+		cursor: pointer;
+	}
+	.cs-legend button:hover,
+	.cs-legend button:global(.on) {
+		border-color: var(--mk);
+		background: color-mix(in oklch, var(--mk) 12%, var(--bg));
+	}
+	.sw {
+		width: 0.7rem;
+		height: 0.7rem;
+		border-radius: 2px;
+		background: var(--mk);
+	}
+</style>

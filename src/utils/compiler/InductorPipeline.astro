@@ -1,0 +1,463 @@
+---
+// Step-through of TorchInductor on the post's running example, relu(x @ w) then softmax and * 2:
+// the FX graph, its lowering to IR, which nodes are realized as buffers, the scheduler's nodes,
+// the two fusion rounds and the generated kernels. One row per FX node; rows keep their place
+// across stages so a node can be followed. Click or hover a row to see its detail (an FX line,
+// an inner_fn, dependencies, fusion scores, generated code). Stages are built in pipeline.ts
+// from the artifacts captured in inductorExample.ts.
+// Usage in .mdx:
+//   <InductorPipeline />
+//   <InductorPipeline step={2} />
+import { STAGE_ROWS, type StageGroup, buildStages } from "./pipeline";
+
+interface Props {
+	step?: number;
+	title?: string;
+}
+
+const { step = 0, title } = Astro.props;
+const stages = buildStages();
+const startAt = Math.min(Math.max(0, step), stages.length - 1);
+
+const ROW = 36;
+const BOX = 26;
+const TOP = 10;
+const X0 = 76;
+const W = 260;
+const VW = X0 + W + 14;
+const VH = TOP * 2 + ROW * STAGE_ROWS;
+const yMid = (r: number) => TOP + r * ROW + ROW / 2;
+
+const arc = (a: number, b: number) => {
+	const span = Math.abs(b - a);
+	const k = 12 + 10 * (span - 1);
+	const y1 = yMid(a) + 3;
+	const y2 = yMid(b) - 3;
+	return `M ${X0} ${y1} C ${X0 - k} ${y1}, ${X0 - k} ${y2}, ${X0 - 2} ${y2}`;
+};
+
+// A group's label goes in an empty row inside it (the rows of inlined nodes), else below.
+const labelRow = (g: StageGroup, used: Set<number>) => {
+	for (let r = g.from; r <= g.to; r++) if (!used.has(r)) return r;
+	return g.to + 1;
+};
+---
+
+<figure class="inductor-pipeline" data-step={startAt}>
+	{title && <figcaption class="title">{title}</figcaption>}
+	<div class="canvas">
+		<svg viewBox={`0 0 ${VW} ${VH}`} role="img" aria-label="TorchInductor stages for the running example">
+			<defs>
+				<marker id="ip-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+					<path d="M0 0 8 4 0 8z" class="arrowhead" />
+				</marker>
+			</defs>
+			{
+				stages.map((s, i) => {
+					const used = new Set(s.nodes.map((n) => n.row));
+					return (
+						<g class="stage" data-i={i} hidden={i !== startAt}>
+							{s.groups.map((g) => (
+								<g class="group">
+									<rect
+										x={X0 - 8}
+										y={TOP + g.from * ROW + 1}
+										width={W + 16}
+										height={(g.to - g.from + 1) * ROW - 2}
+										rx="8"
+									/>
+									<text x={X0 + W / 2} y={yMid(labelRow(g, used)) + 4}>
+										{g.label}
+									</text>
+								</g>
+							))}
+							{s.edges.map(([a, b]) => (
+								<path class="edge" d={arc(a, b)} marker-end="url(#ip-arrow)" />
+							))}
+							{s.nodes.map((n) => (
+								<g class={`node ${n.style}`} data-detail={n.detail} tabindex="0">
+									<rect x={X0} y={yMid(n.row) - BOX / 2} width={W} height={BOX} rx="5" />
+									<text class="label" x={X0 + 10} y={yMid(n.row) + 4}>
+										{n.label}
+									</text>
+									<text class="tag" x={X0 + W - 10} y={yMid(n.row) + 4}>
+										{n.tag}
+									</text>
+								</g>
+							))}
+						</g>
+					);
+				})
+			}
+		</svg>
+	</div>
+
+	<div class="legend">
+		<span class="key extern">extern kernel</span>
+		<span class="key pointwise">Pointwise</span>
+		<span class="key reduction">Reduction</span>
+		<span class="key ghost">inlined</span>
+		<span class="key kernel">generated kernel</span>
+	</div>
+
+	<div class="controls">
+		<div class="buttons">
+			<button type="button" data-act="first" aria-label="First step">
+				<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 3v10M13 3 6 8l7 5z"></path></svg>
+			</button>
+			<button type="button" data-act="prev" aria-label="Previous step">
+				<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M11 3 4 8l7 5z"></path></svg>
+			</button>
+			<button type="button" data-act="play" class="play" aria-label="Play">
+				<svg class="i-play" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5v11L13.5 8z"></path></svg>
+				<svg class="i-pause" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 3h3v10H4zM9 3h3v10H9z"></path></svg>
+			</button>
+			<button type="button" data-act="next" aria-label="Next step">
+				<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 3l7 5-7 5z"></path></svg>
+			</button>
+		</div>
+		<div class="timeline" role="group" aria-label="Stages">
+			{stages.map((s, i) => <button type="button" class="seg" data-i={i} aria-label={s.title} title={s.title} />)}
+		</div>
+		<span class="counter"></span>
+	</div>
+
+	<div class="narration" aria-live="polite">
+		{
+			stages.map((s, i) => (
+				<div class="text" data-i={i} hidden={i !== startAt}>
+					<p class="head">{s.title}</p>
+					<p class="body">{s.body}</p>
+				</div>
+			))
+		}
+	</div>
+	<div class="details">
+		{
+			stages.map((s, i) =>
+				Object.entries(s.details).map(([k, v]) => (
+					<pre data-stage={i} data-key={k} hidden set:text={v} />
+				)),
+			)
+		}
+	</div>
+	<script type="application/json" class="focus" set:html={JSON.stringify(stages.map((s) => s.nodes.find((n) => n.row === s.focus)?.detail ?? s.nodes[0].detail))} />
+</figure>
+
+<script>
+	for (const fig of document.querySelectorAll<HTMLElement>(".inductor-pipeline")) {
+		const stages = [...fig.querySelectorAll<SVGGElement>(".stage")];
+		const texts = [...fig.querySelectorAll<HTMLElement>(".narration .text")];
+		const pres = [...fig.querySelectorAll<HTMLElement>(".details pre")];
+		const segs = [...fig.querySelectorAll<HTMLButtonElement>(".seg")];
+		const counter = fig.querySelector(".counter");
+		const play = fig.querySelector<HTMLButtonElement>("[data-act=play]");
+		const focus: string[] = JSON.parse(fig.querySelector(".focus")?.textContent ?? "[]");
+		const last = stages.length - 1;
+		let at = Number(fig.dataset.step ?? 0);
+		let timer: number | undefined;
+
+		const select = (key: string) => {
+			for (const p of pres) p.hidden = !(Number(p.dataset.stage) === at && p.dataset.key === key);
+			for (const g of stages[at].querySelectorAll<SVGGElement>(".node"))
+				g.classList.toggle("sel", g.dataset.detail === key);
+		};
+		const go = (i: number) => {
+			at = Math.min(Math.max(0, i), last);
+			stages.forEach((g, k) => g.toggleAttribute("hidden", k !== at));
+			texts.forEach((t, k) => {
+				t.hidden = k !== at;
+			});
+			segs.forEach((b, k) => {
+				b.classList.toggle("done", k <= at);
+				b.setAttribute("aria-current", String(k === at));
+			});
+			if (counter) counter.textContent = `${at + 1} / ${last + 1}`;
+			select(focus[at]);
+		};
+		const stop = () => {
+			if (timer !== undefined) clearInterval(timer);
+			timer = undefined;
+			play?.classList.remove("playing");
+			play?.setAttribute("aria-label", "Play");
+		};
+		const start = () => {
+			if (at >= last) go(0);
+			play?.classList.add("playing");
+			play?.setAttribute("aria-label", "Pause");
+			timer = window.setInterval(() => {
+				if (at >= last) stop();
+				else go(at + 1);
+			}, 2500);
+		};
+
+		for (const b of fig.querySelectorAll<HTMLButtonElement>("[data-act]"))
+			b.addEventListener("click", () => {
+				const act = b.dataset.act;
+				if (act === "play") return timer === undefined ? start() : stop();
+				stop();
+				if (act === "first") go(0);
+				if (act === "prev") go(at - 1);
+				if (act === "next") go(at + 1);
+			});
+		for (const b of segs)
+			b.addEventListener("click", () => {
+				stop();
+				go(Number(b.dataset.i));
+			});
+		for (const s of stages)
+			for (const g of s.querySelectorAll<SVGGElement>(".node")) {
+				const pick = () => select(g.dataset.detail ?? "");
+				g.addEventListener("click", pick);
+				g.addEventListener("pointerenter", pick);
+				g.addEventListener("focus", pick);
+			}
+		fig.addEventListener("keydown", (e) => {
+			if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+			e.preventDefault();
+			stop();
+			go(at + (e.key === "ArrowRight" ? 1 : -1));
+		});
+		go(at);
+	}
+</script>
+
+<style>
+	.inductor-pipeline {
+		--red: #8a4fc4;
+		--kern: #2f9e44;
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+	}
+	@media (prefers-color-scheme: dark) {
+		.inductor-pipeline {
+			--red: #b98ae3;
+			--kern: #5cc46c;
+		}
+	}
+	.title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.5rem;
+	}
+	.canvas svg {
+		display: block;
+		width: 100%;
+		max-width: 26rem;
+		height: auto;
+		margin: 0 auto;
+	}
+	.stage[hidden] {
+		display: none;
+	}
+	.arrowhead {
+		fill: var(--muted);
+	}
+	.edge {
+		fill: none;
+		stroke: var(--muted);
+		stroke-width: 1.1;
+	}
+	.group rect {
+		fill: none;
+		stroke: var(--kern);
+		stroke-width: 1.4;
+		stroke-dasharray: 5 3;
+	}
+	.group text {
+		font-family: var(--mono);
+		font-size: 10.5px;
+		text-anchor: middle;
+		fill: var(--kern);
+	}
+	.node {
+		cursor: pointer;
+		outline: none;
+	}
+	.node rect {
+		fill: var(--surface);
+		stroke: var(--faint);
+		stroke-width: 1.2;
+	}
+	.node .label {
+		font-family: var(--mono);
+		font-size: 12px;
+		fill: var(--text);
+	}
+	.node .tag {
+		font-size: 10.5px;
+		text-anchor: end;
+		fill: var(--muted);
+	}
+	.node.extern rect {
+		fill: color-mix(in oklch, var(--muted) 16%, var(--bg));
+		stroke: var(--muted);
+	}
+	.node.pointwise rect {
+		fill: color-mix(in oklch, var(--accent) 14%, var(--bg));
+		stroke: var(--accent);
+	}
+	.node.reduction rect {
+		fill: color-mix(in oklch, var(--red) 14%, var(--bg));
+		stroke: var(--red);
+	}
+	.node.kernel rect {
+		fill: color-mix(in oklch, var(--kern) 14%, var(--bg));
+		stroke: var(--kern);
+	}
+	.node.ghost rect {
+		fill: none;
+		stroke: var(--faint);
+		stroke-dasharray: 3 3;
+	}
+	.node.ghost .label,
+	.node.ghost .tag {
+		fill: var(--muted);
+		opacity: 0.7;
+	}
+	.node.sel rect {
+		stroke-width: 2.4;
+	}
+	.node:focus-visible rect {
+		stroke: var(--text);
+	}
+
+	.legend {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.3rem 0.9rem;
+		margin-top: 0.4rem;
+		font-size: 0.72rem;
+		color: var(--muted);
+	}
+	.key::before {
+		content: "";
+		display: inline-block;
+		width: 0.7rem;
+		height: 0.7rem;
+		margin-right: 0.3rem;
+		vertical-align: -0.1rem;
+		border-radius: 2px;
+		border: 1.2px solid var(--c);
+		background: color-mix(in oklch, var(--c) 14%, var(--bg));
+	}
+	.key.extern {
+		--c: var(--muted);
+	}
+	.key.pointwise {
+		--c: var(--accent);
+	}
+	.key.reduction {
+		--c: var(--red);
+	}
+	.key.kernel {
+		--c: var(--kern);
+	}
+	.key.ghost::before {
+		border: 1.2px dashed var(--faint);
+		background: none;
+	}
+
+	.controls {
+		display: flex;
+		align-items: center;
+		gap: 0.75rem;
+		margin-top: 0.6rem;
+	}
+	.buttons {
+		display: flex;
+		gap: 0.3rem;
+	}
+	.buttons button {
+		display: grid;
+		place-items: center;
+		width: 2rem;
+		height: 2rem;
+		padding: 0;
+		border: 1px solid var(--faint);
+		border-radius: 8px;
+		background: var(--bg);
+		color: var(--text);
+		cursor: pointer;
+		transition: border-color 150ms ease;
+	}
+	.buttons button:hover {
+		border-color: var(--accent);
+	}
+	.buttons svg {
+		width: 0.8rem;
+		height: 0.8rem;
+		fill: currentColor;
+		stroke: currentColor;
+		stroke-width: 1.2;
+		stroke-linejoin: round;
+	}
+	.buttons .play {
+		width: 2.6rem;
+		background: var(--accent);
+		border-color: var(--accent);
+		color: var(--bg);
+	}
+	.play .i-pause,
+	.play.playing .i-play {
+		display: none;
+	}
+	.play.playing .i-pause {
+		display: block;
+	}
+	.timeline {
+		flex: 1;
+		display: flex;
+		gap: 3px;
+	}
+	.seg {
+		flex: 1;
+		height: 0.55rem;
+		padding: 0;
+		border: 0;
+		border-radius: 3px;
+		background: var(--faint);
+		cursor: pointer;
+	}
+	.seg.done {
+		background: var(--accent);
+	}
+	.seg[aria-current="true"] {
+		outline: 2px solid var(--text);
+		outline-offset: 1px;
+	}
+	.counter {
+		font-family: var(--mono);
+		font-size: 0.75rem;
+		color: var(--muted);
+		min-width: 2.6rem;
+		text-align: right;
+	}
+
+	.narration {
+		margin-top: 0.5rem;
+		font-size: 0.8rem;
+		min-height: 4.2rem;
+	}
+	.narration p {
+		margin: 0.15rem 0;
+	}
+	.narration .head {
+		font-weight: 600;
+	}
+	.details pre {
+		margin: 0.4rem 0 0;
+		padding: 0.6rem 0.75rem;
+		max-height: 17rem;
+		overflow: auto;
+		font-family: var(--mono);
+		font-size: 0.72rem;
+		line-height: 1.45;
+		background: var(--surface);
+		border: 1px solid var(--faint);
+		border-radius: 6px;
+		white-space: pre;
+	}
+</style>

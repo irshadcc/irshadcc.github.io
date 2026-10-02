@@ -1,0 +1,456 @@
+---
+title: "ZeRO and FSDP, Stage by Stage"
+description: "Data parallelism keeps a full copy of the model, its gradients and its optimizer state on every GPU. ZeRO removes those copies one at a time: first the optimizer state, then the gradients, then the parameters themselves. This post works out what each stage saves and what it costs to communicate, and builds all three in PyTorch, checked against ordinary training."
+date: 2026-10-02
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import MarginNote from "../../components/MarginNote.astro";
+import ZeroMemory from "../../utils/distributed/ZeroMemory.astro";
+import CollectiveSteps from "../../utils/distributed/CollectiveSteps.astro";
+
+## Background
+
+Data parallelism (DP) is the simplest way to train on many GPUs. Every GPU holds a full copy of
+the model and runs a different slice of the batch. After the backward pass, the GPUs all-reduce
+their gradients, so every copy takes the same optimizer step and the copies stay identical.
+
+That last fact is the waste. Every GPU stores the same parameters, the same summed gradients and
+the same optimizer state, and does the same optimizer update on all of it. With 64 GPUs, there are
+64 copies of everything. **ZeRO** (the Zero Redundancy Optimizer, Rajbhandari et al., 2019) keeps
+data parallelism's simple programming model but removes the copies, in three stages. PyTorch's
+**FSDP** (Fully Sharded Data Parallel) is the third stage, built into PyTorch.
+
+This post works out what each stage saves, shows that the first two cost no extra
+communication at all, and builds all three in a few dozen lines of PyTorch. The collectives
+involved (all-reduce, reduce-scatter and all-gather) are covered in
+[How GPUs Talk](/blog/collective-communication/).
+
+## Where the memory goes
+
+Large models are trained with **mixed precision**: the forward and backward passes use 16-bit
+weights, but the optimizer keeps a 32-bit copy of the weights, so that small updates aren't
+rounded away. With the Adam optimizer, a model with $\Psi$ parameters stores:
+
+| What | Precision | Bytes per parameter |
+| --- | --- | ---: |
+| Parameters | bf16 | 2 |
+| Gradients | bf16 | 2 |
+| Master copy of the parameters | fp32 | 4 |
+| Adam's first moment $m$ | fp32 | 4 |
+| Adam's second moment $v$ | fp32 | 4 |
+| **Total** | | **16** |
+
+The last three rows are the **optimizer state**, $K = 12$ bytes per parameter, and they are three
+quarters of the total. A 7.5B-parameter model needs $16 \times 7.5 = 120$ GB before any
+activations, which is more than an 80 GB GPU has. Data parallelism doesn't help: every GPU needs
+all 120 GB.<Sidenote>Activations, the intermediate values saved for the backward pass, are a
+separate cost that ZeRO doesn't touch. They are handled by activation checkpointing and by
+[sequence parallelism](/blog/tensor-parallelism/).</Sidenote>
+
+Here is the memory per GPU under plain DP and the three ZeRO stages. Change the model size and the
+number of GPUs:
+
+<ZeroMemory billions={7.5} n={64} title="Memory per GPU, without activations" />
+
+With 64 GPUs, the four rows are 120 GB, 31.4 GB, 16.6 GB and 1.9 GB, the numbers from the ZeRO
+paper. The sections below go through them one at a time.
+
+## Stage 1: shard the optimizer state
+
+Adam's update is **elementwise**. The new value of parameter $i$ depends only on its own
+gradient, its own $m_i$ and $v_i$, and its own master weight. So nothing forces one GPU to update
+all of them. Split the parameters into $N$ equal slices, and let rank $r$ keep the optimizer state
+for slice $r$ only, and update only that slice.
+
+Each rank then needs the summed gradient for its own slice, not for all of them. That is a
+**reduce-scatter**, which is half of an all-reduce. After the update, each rank holds new values
+for only its slice, and every rank needs the full parameters for the next forward pass. That is an
+**all-gather**, the other half.
+
+So stage 1 replaces one all-reduce of the gradients with a reduce-scatter of the gradients and
+an all-gather of the parameters:
+
+<CollectiveSteps op="reduce-scatter" n={4} title="Gradients: rank i ends up with the sum of chunk i" />
+
+<CollectiveSteps op="all-gather" n={4} title="Parameters: every rank ends up with every updated chunk" />
+
+An all-reduce *is* a reduce-scatter followed by an all-gather, so the data sent is exactly the same
+as plain DP: $2\Psi$ values per step, or $2\frac{N-1}{N}\Psi$ per GPU with a ring. ZeRO stage 1
+divides the largest part of the memory by $N$ for free:
+
+$$
+M_\text{ZeRO-1} = 2\Psi + 2\Psi + \frac{12\Psi}{N}
+$$
+
+### In code
+
+The simplest version flattens every parameter into one long vector and gives rank $r$ slice $r$ of
+it. That slice, in fp32, is the only thing the optimizer sees:
+
+```python
+def flatten(tensors):
+    return torch.cat([t.reshape(-1) for t in tensors])
+
+
+def unflatten_into(flat, params):
+    offset = 0
+    for p in params:
+        p.data.copy_(flat[offset : offset + p.numel()].view_as(p))
+        offset += p.numel()
+
+
+def all_gather(shard):
+    full = torch.empty(shard.numel() * dist.get_world_size())
+    dist.all_gather_into_tensor(full, shard)
+    return full
+
+
+def reduce_scatter_mean(full):
+    shard = torch.empty(full.numel() // dist.get_world_size())
+    dist.reduce_scatter_tensor(shard, full)
+    return shard / dist.get_world_size()
+
+
+class Zero1:
+    """Each rank keeps Adam's state for a 1/N slice of the flattened parameters."""
+
+    def __init__(self, model):
+        self.params = list(model.parameters())
+        rank, world = dist.get_rank(), dist.get_world_size()
+        flat = flatten(p.detach() for p in self.params)
+        self.shard = nn.Parameter(flat.chunk(world)[rank].clone())  # fp32 "master" slice
+        self.opt = torch.optim.Adam([self.shard], lr=LR)
+
+    def step(self):
+        grad = flatten(p.grad for p in self.params)  # the full gradient, on every rank
+        self.shard.grad = reduce_scatter_mean(grad)  # the sum, but only of my slice
+        self.opt.step()
+        unflatten_into(all_gather(self.shard.detach()), self.params)
+        for p in self.params:
+            p.grad = None
+```
+
+`reduce_scatter_mean` divides by $N$ because each rank's loss is a mean over its own share of
+the batch, so the mean over the whole batch is the mean of the ranks' gradients. The model's own
+parameters are only ever written by `unflatten_into`; the optimizer never sees them.<Sidenote>Every
+tensor here is fp32, to keep the code short. With mixed precision, the model's parameters and
+gradients would be bf16, and `self.shard` would be the fp32 master copy of one slice.</Sidenote>
+This is essentially Megatron-LM's **distributed optimizer**, which shards the optimizer state and
+the fp32 master weights this way, and keeps a full gradient buffer on every rank.
+
+## Stage 2: shard the gradients
+
+After the reduce-scatter, rank $r$ only uses the gradients of its own slice. The full gradient
+buffer is still there, though, because the backward pass wrote every gradient into it before the
+reduce-scatter ran. Stage 2 never builds that full buffer.
+
+The trick is to reduce-scatter while the backward pass is still running. Gradients are produced
+layer by layer, from the last layer to the first. As soon as one layer's gradients are complete,
+reduce-scatter them, keep your own shard and free the rest. At any moment, only the layer in
+flight has full gradients:
+
+$$
+M_\text{ZeRO-2} = 2\Psi + \frac{2\Psi + 12\Psi}{N}
+$$
+
+The communication is the same reduce-scatter as stage 1, just cut into pieces, so it is still
+$2\Psi$ per step. Those pieces even help: each layer's reduce-scatter can run while the backward
+pass computes the next layer, so the communication hides behind compute.
+
+In code, each layer gets its own shard, and a hook on every parameter fires when its gradient has
+been accumulated. When the last gradient of a layer arrives, the layer is reduce-scattered:
+
+```python
+class Zero2:
+    """Also shards the gradients: each layer's are reduce-scattered as soon as they exist."""
+
+    def __init__(self, model):
+        rank, world = dist.get_rank(), dist.get_world_size()
+        self.layers = [list(layer.parameters()) for layer in model]
+        self.shards = []
+        for params in self.layers:
+            flat = flatten(p.detach() for p in params)
+            shard = nn.Parameter(flat.chunk(world)[rank].clone())
+            self.shards.append(shard)
+            pending = [len(params)]
+            for p in params:
+                p.register_post_accumulate_grad_hook(
+                    lambda _, params=params, shard=shard, pending=pending: self.on_grad(params, shard, pending)
+                )
+        self.opt = torch.optim.Adam(self.shards, lr=LR)
+
+    def on_grad(self, params, shard, pending):
+        pending[0] -= 1
+        if pending[0] > 0:
+            return  # the layer's other gradients aren't done yet
+        pending[0] = len(params)
+        shard.grad = reduce_scatter_mean(flatten(p.grad for p in params))
+        for p in params:
+            p.grad = None  # free the full gradients while the backward pass goes on
+
+    def step(self):
+        self.opt.step()
+        self.opt.zero_grad()
+        for params, shard in zip(self.layers, self.shards):
+            unflatten_into(all_gather(shard.detach()), params)
+```
+
+Sharding each layer separately, rather than slicing one flat vector, keeps every collective inside
+one layer's parameters, so a layer can be handled without waiting for any other. Since Adam is
+elementwise, it makes no difference which elements a rank owns, as long as the ranks agree.
+Real implementations group small layers into **buckets** of a few tens of megabytes, because
+many tiny collectives are slow: each one pays the latency $\alpha$.
+
+## Stage 3: shard the parameters
+
+After stage 2, the 16-bit parameters, $2\Psi$, are the only full copy left on every rank. For a
+large model that is still too much: a 70B model needs 140 GB for them alone.
+
+Stage 3 shards those too. Between uses, rank $r$ keeps only its shard of each layer's parameters.
+Right before a layer runs, the ranks **all-gather** its parameters, run the layer, and **free**
+the gathered copy straight away. The backward pass needs the parameters again, so they are
+all-gathered a second time, and then the layer's gradients are reduce-scattered as in stage 2:
+
+| When | Collective | Volume |
+| --- | --- | ---: |
+| Forward, before each layer | All-gather the parameters | $\Psi$ |
+| Backward, before each layer | All-gather the parameters again | $\Psi$ |
+| Backward, after each layer | Reduce-scatter the gradients | $\Psi$ |
+
+That is $3\Psi$ per step, 1.5 times plain DP. In exchange, everything is divided by $N$:
+
+$$
+M_\text{ZeRO-3} = \frac{16\Psi}{N} + \text{the parameters of the layers in flight}
+$$
+
+The second term is what makes this practical. At any moment, a rank only holds the full parameters
+of the one or two layers it is working on, which for a large transformer is a few gigabytes at
+most.
+
+### In code
+
+The all-gather fits into autograd as a function whose gradient is a reduce-scatter, the same
+pairing the [tensor parallelism post](/blog/tensor-parallelism/) uses for sequence parallelism:
+
+```python
+class GatherParams(torch.autograd.Function):
+    """All-gather a layer's parameters; their gradient goes back as a reduce-scatter."""
+
+    @staticmethod
+    def forward(ctx, shard):
+        return all_gather(shard)
+
+    @staticmethod
+    def backward(ctx, grad_full):
+        return reduce_scatter_mean(grad_full)
+```
+
+A layer then holds only its shard as a parameter. It gathers the full weights at the start of its
+forward pass and uses them through views:
+
+```python
+class Zero3Layer(nn.Module):
+    """A Linear + GELU whose parameters exist only as a 1/N shard between uses."""
+
+    def __init__(self, linear):
+        super().__init__()
+        rank, world = dist.get_rank(), dist.get_world_size()
+        self.shape = linear.weight.shape
+        flat = flatten([linear.weight.detach(), linear.bias.detach()])
+        self.shard = nn.Parameter(flat.chunk(world)[rank].clone())
+
+    def run(self, x, shard):
+        w, b = GatherParams.apply(shard).split([self.shape.numel(), self.shape[0]])
+        return F.gelu(F.linear(x, w.view(self.shape), b))
+
+    def forward(self, x):
+        # Don't keep the gathered parameters for the backward pass: recompute `run` instead,
+        # which gathers them again.
+        return checkpoint(self.run, x, self.shard, use_reentrant=False)
+```
+
+The `checkpoint` is what frees the parameters. Without it, autograd would save the gathered
+weight for the backward pass of `F.linear`, and every layer's full parameters would stay alive
+until the backward pass. With it, autograd saves only the layer's input and the shard, and in the
+backward pass it runs `run` again, which calls `GatherParams` again. That is the second
+all-gather. Counting the collectives in one step of a 4-layer model gives exactly 8 all-gathers
+and 4 reduce-scatters.<Sidenote>Checkpointing also recomputes the layer's forward pass, which
+FSDP doesn't need to do. FSDP frees the gathered parameters by resizing their storage to zero
+after the forward pass, and gathers them back into the same storage just before the backward pass
+needs them, so the tensors autograd saved become valid again.</Sidenote>
+
+The optimizer is ordinary Adam over the shards, since the shards *are* the model's parameters now:
+
+```python
+class Zero3:
+    def __init__(self, model):
+        self.opt = torch.optim.Adam(model.parameters(), lr=LR)
+
+    def step(self):
+        self.opt.step()
+        self.opt.zero_grad()
+```
+
+### Checking all three
+
+Every rank builds the same model, reads its own quarter of the batch, and trains for a few steps.
+Plain data parallelism is the baseline:
+
+```python
+import sys
+
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
+
+D, LAYERS, BATCH, STEPS, LR = 64, 4, 32, 5, 1e-2
+
+
+def build_model():
+    torch.manual_seed(0)
+    return nn.Sequential(*[nn.Sequential(nn.Linear(D, D), nn.GELU()) for _ in range(LAYERS)])
+
+
+class DataParallel:
+    """Every rank holds everything, and all-reduces the gradients."""
+
+    def __init__(self, model):
+        self.params = list(model.parameters())
+        self.opt = torch.optim.Adam(self.params, lr=LR)
+
+    def step(self):
+        for p in self.params:
+            dist.all_reduce(p.grad)
+            p.grad /= dist.get_world_size()
+        self.opt.step()
+        self.opt.zero_grad()
+
+
+def main(stage):
+    dist.init_process_group("gloo")
+    rank, world = dist.get_rank(), dist.get_world_size()
+
+    torch.manual_seed(1)
+    x, y = torch.randn(BATCH, D), torch.randn(BATCH, D)
+    x_local, y_local = x.chunk(world)[rank], y.chunk(world)[rank]  # each rank's share
+
+    model = build_model()
+    if stage == 3:
+        model = nn.Sequential(*[Zero3Layer(layer[0]) for layer in model])
+    opt = [DataParallel, Zero1, Zero2, Zero3][stage](model)
+
+    for step in range(STEPS):
+        loss = F.mse_loss(model(x_local), y_local)
+        loss.backward()
+        opt.step()
+        dist.all_reduce(loss)
+        if rank == 0:
+            print(f"step {step}: loss {loss.item() / world:.6f}")
+    dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main(int(sys.argv[1]))
+```
+
+Run it with the stage as an argument, after putting the classes above between `build_model` and
+`main`:
+
+```bash
+torchrun --nproc-per-node 4 zero.py 3
+```
+
+All four stages, on 4 or 8 ranks, print the same losses as a single process training on the
+whole batch, to every printed digit: 0.970874, 0.954123, 0.930318, 0.894015, 0.858355. Sharding
+changes who stores what and who computes which update, not the result.<MarginNote>Each layer's
+parameter count must divide evenly by $N$ here. Real implementations pad the flat buffer.</MarginNote>
+
+## Communication, compared
+
+| | Memory per GPU | Sent per step | Collectives |
+| --- | --- | --- | --- |
+| Data parallel | $16\Psi$ | $2\Psi$ | All-reduce gradients |
+| ZeRO-1 | $4\Psi + 12\Psi/N$ | $2\Psi$ | Reduce-scatter gradients, all-gather parameters |
+| ZeRO-2 | $2\Psi + 14\Psi/N$ | $2\Psi$ | The same, per layer, during the backward pass |
+| ZeRO-3 / FSDP | $16\Psi/N$ | $3\Psi$ | All-gather parameters twice, reduce-scatter gradients, per layer |
+
+The volumes are in parameters, and each one is sent as a 16-bit value. With a ring, each GPU sends
+$\frac{N-1}{N}$ of the volume, which is the "sent per step" column in the figure above. For the
+7.5B model that is about 30 GB per GPU per step for DP and stages 1 and 2, and 44 GB for
+stage 3. Over a 50 GB/s network link, that is 0.6 and 0.9 seconds.
+
+Whether that matters depends on whether it can hide behind the compute. Per GPU, the compute for a
+step is about $6\Psi \times (\text{tokens per GPU})$ FLOPs, which grows with the batch, while the
+communication doesn't. So ZeRO-3 is cheap when each GPU processes many tokens per step, and becomes
+communication-bound when the per-GPU batch is small. That is the opposite of tensor parallelism,
+whose communication grows with the tokens. It is why FSDP is often combined with TP for very large
+models: TP inside a server reduces the parameters each FSDP group has to gather, and FSDP across
+servers removes the copies.
+
+## FSDP in PyTorch
+
+PyTorch's FSDP implements stage 3, with the per-layer units from the code above. In the current
+version, FSDP2, you call `fully_shard` on each layer and then on the whole model:
+
+```python
+from torch.distributed.fsdp import fully_shard
+
+model = build_model()
+for layer in model:
+    fully_shard(layer)  # one all-gather / reduce-scatter unit per layer
+fully_shard(model)      # whatever is left over: embeddings, the final norm
+opt = torch.optim.Adam(model.parameters(), lr=LR)
+```
+
+Every parameter becomes a `DTensor` sharded along its first dimension: with 4 ranks, each rank's
+$64 \times 64$ weight is a $16 \times 64$ local slice. The training loop doesn't change, and on the
+model above it prints the same five losses as the hand-written version.<Sidenote>On a Mac,
+`fully_shard` needs an explicit CPU mesh, `mesh=init_device_mesh("cpu", (world,))`, or it trips
+over the MPS backend.</Sidenote>
+
+What FSDP adds over the code in this post is mostly about overlap and memory:
+
+- **Prefetching.** While layer $i$ computes, FSDP is already all-gathering layer $i + 1$ (or,
+  in the backward pass, layer $i - 1$), so the gathers hide behind the compute.
+- **`reshard_after_forward=False`** keeps each layer's gathered parameters from the forward pass
+  until its backward pass. That skips the second all-gather, bringing the traffic back to $2\Psi$
+  at the cost of holding the full parameters, which is ZeRO-2's trade-off.
+- **Mixed precision.** `MixedPrecisionPolicy(param_dtype=torch.bfloat16,
+  reduce_dtype=torch.float32)` gathers bf16 parameters and reduces gradients in fp32, while the
+  sharded parameters the optimizer sees stay in fp32. These are the master weights.
+- **Hybrid sharding (HSDP).** Pass a 2D device mesh, and FSDP shards within each group of GPUs
+  (typically a server) and replicates across groups. The all-gathers and reduce-scatters stay on
+  NVLink, and only a gradient all-reduce crosses the network.
+
+## Beyond stage 3
+
+Two lines of work push ZeRO further:
+
+- **Offloading.** ZeRO-Offload moves the optimizer state and the update itself to CPU memory,
+  and ZeRO-Infinity extends that to NVMe drives. The GPU then holds little more than the
+  parameters of the layers in flight, at the cost of PCIe bandwidth.
+- **Less communication.** ZeRO++ quantizes the all-gathered weights and the reduce-scattered
+  gradients to fewer bits, and keeps a second copy of the parameters sharded only inside each
+  server, so the backward all-gather stays on NVLink. HSDP does the second part too.
+
+## Summary
+
+- Mixed-precision Adam stores 16 bytes per parameter, and 12 of them are optimizer state, which
+  data parallelism copies onto every GPU.
+- **Stage 1** shards the optimizer state. All-reduce = reduce-scatter + all-gather, so each rank
+  can update just its own slice for no extra communication.
+- **Stage 2** shards the gradients by reduce-scattering each layer as the backward pass produces
+  it. Still no extra communication.
+- **Stage 3** (FSDP) shards the parameters, gathering each layer just before it runs and freeing
+  it right after. That costs one more all-gather, 1.5 times DP's traffic, and divides all
+  16 bytes per parameter by $N$.
+- ZeRO's communication doesn't grow with the batch size, so it hides behind compute as long as
+  each GPU has enough tokens per step.
+
+ZeRO shards the weights across data-parallel replicas and gathers them whenever they are needed.
+Mixture-of-experts models shard their largest weights differently: each expert lives on one GPU,
+and the tokens travel to it instead. That is
+[expert parallelism](/blog/expert-parallelism/).

@@ -4,6 +4,8 @@ import sitemap from "@astrojs/sitemap";
 import { unified } from "@astrojs/markdown-remark";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
+import { ptx, tablegen } from "./src/utils/compiler/shikiLangs";
+import { mlir } from "./src/utils/mlir/shikiMlir";
 
 // https://astro.build/config
 export default defineConfig({
@@ -16,6 +18,9 @@ export default defineConfig({
 		shikiConfig: {
 			themes: { light: "github-light", dark: "github-dark" },
 			wrap: false,
+			// Grammars Shiki doesn't ship, for the LLVM post: ```tablegen and ```ptx, and for the
+			// MLIR post: ```mlir.
+			langs: [tablegen, ptx, mlir],
 		},
 	},
 	vite: {

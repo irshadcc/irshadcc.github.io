@@ -1,0 +1,320 @@
+---
+// Step through how the dispatcher turns a call's tensor arguments into one dispatch key set and
+// then into a slot of the operator's dispatch table. The top row is the 47 functionality bits
+// (highest priority on the left), the bottom row the 16 backend bits. Bits added by a step are
+// outlined, bits removed are dashed. In a lookup step, triangles mark the highest functionality
+// and backend bits, and the panel shows offset + backend index = slot. Scenarios and fallthrough
+// masks come from dispatcherFigures.ts and match key sets observed in PyTorch 2.9.1.
+// Usage in .mdx:
+//   <KeySetSteps />
+//   <KeySetSteps scenario="autocast" step={5} />
+//   <KeySetSteps only="cpu" />
+import { hex, keySetToString } from "./dispatchKeys";
+import { drawBits } from "./dispatcherDraw";
+import {
+	keySetScenarios,
+	lookupMarks,
+	lookupText,
+	scenarioBits,
+} from "./dispatcherFigures";
+
+interface Props {
+	scenario?: string;
+	only?: string;
+	step?: number;
+	title?: string;
+}
+
+const { scenario, only, step = 0, title } = Astro.props;
+const all = keySetScenarios();
+const list = only ? all.filter((s) => s.id === only) : all;
+const sc = list.find((s) => s.id === (only ?? scenario)) ?? list[0];
+const at = Math.max(0, Math.min(step, sc.stages.length - 1));
+const st = sc.stages[at];
+const prev = at > 0 ? sc.stages[at - 1].ks : undefined;
+---
+
+<figure class="kss" data-config={JSON.stringify({ ids: list.map((s) => s.id), id: sc.id, step: at })}>
+	{title && <figcaption class="title">{title}</figcaption>}
+	{
+		list.length > 1 && (
+			<div class="tabs" role="tablist">
+				{list.map((s) => (
+					<button type="button" role="tab" data-id={s.id} aria-selected={s.id === sc.id ? "true" : "false"}>
+						{s.label}
+					</button>
+				))}
+			</div>
+		)
+	}
+	<p class="call">{sc.call}</p>
+	<div class="controls">
+		<button type="button" class="play" aria-label="Play">
+			<svg class="i-play" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5v11L13.5 8z"></path></svg>
+			<svg class="i-pause" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 3h3v10H4zM9 3h3v10H9z"></path></svg>
+		</button>
+		<label>
+			step
+			<input type="range" min="0" max={sc.stages.length - 1} value={at} />
+			<output>{at + 1}/{sc.stages.length}</output>
+		</label>
+	</div>
+	<p class="stage-title">{st.title}</p>
+	<p class="code"><code>{st.code}</code></p>
+	<div class="bits" set:html={drawBits(st.ks, prev, scenarioBits(sc), lookupMarks(st))} />
+	<p class="set"><code>{keySetToString(st.ks)}</code> <span class="hex">{hex(st.ks)}</span></p>
+	<p class="lookup" hidden={!st.lookup}>{lookupText(st)}</p>
+</figure>
+
+<script>
+	import { hex, keySetToString } from "./dispatchKeys";
+	import { drawBits } from "./dispatcherDraw";
+	import { keySetScenarios, lookupMarks, lookupText, scenarioBits } from "./dispatcherFigures";
+
+	const scenarios = keySetScenarios();
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".kss")) {
+		const cfg = JSON.parse(fig.dataset.config ?? "{}");
+		const list = scenarios.filter((s) => cfg.ids.includes(s.id));
+		let sc = list.find((s) => s.id === cfg.id) ?? list[0];
+		const range = fig.querySelector<HTMLInputElement>("input[type=range]");
+		const out = fig.querySelector("output");
+		const play = fig.querySelector<HTMLButtonElement>(".play");
+		const q = (sel: string) => fig.querySelector<HTMLElement>(sel);
+		if (!range) continue;
+		let timer: number | undefined;
+
+		const render = () => {
+			const t = Number(range.value);
+			const st = sc.stages[t];
+			const prev = t > 0 ? sc.stages[t - 1].ks : undefined;
+			if (out) out.textContent = `${t + 1}/${sc.stages.length}`;
+			const callEl = q(".call");
+			if (callEl) callEl.textContent = sc.call;
+			const titleEl = q(".stage-title");
+			if (titleEl) titleEl.textContent = st.title;
+			const code = q(".code code");
+			if (code) code.textContent = st.code;
+			const bits = q(".bits");
+			if (bits)
+				bits.innerHTML = drawBits(st.ks, prev, scenarioBits(sc), lookupMarks(st));
+			const set = q(".set code");
+			if (set) set.textContent = keySetToString(st.ks);
+			const hx = q(".set .hex");
+			if (hx) hx.textContent = hex(st.ks);
+			const lk = q(".lookup");
+			if (lk) {
+				lk.hidden = !st.lookup;
+				lk.textContent = lookupText(st);
+			}
+		};
+		const stop = () => {
+			if (timer !== undefined) clearInterval(timer);
+			timer = undefined;
+			play?.classList.remove("playing");
+			play?.setAttribute("aria-label", "Play");
+		};
+		for (const tab of fig.querySelectorAll<HTMLButtonElement>(".tabs button")) {
+			tab.addEventListener("click", () => {
+				stop();
+				sc = list.find((s) => s.id === tab.dataset.id) ?? sc;
+				for (const b of fig.querySelectorAll(".tabs button")) b.setAttribute("aria-selected", String(b === tab));
+				range.max = String(sc.stages.length - 1);
+				range.value = "0";
+				render();
+			});
+		}
+		range.addEventListener("input", () => {
+			stop();
+			render();
+		});
+		play?.addEventListener("click", () => {
+			if (timer !== undefined) return stop();
+			if (Number(range.value) >= sc.stages.length - 1) range.value = "0";
+			play.classList.add("playing");
+			play.setAttribute("aria-label", "Pause");
+			render();
+			timer = window.setInterval(() => {
+				if (Number(range.value) >= sc.stages.length - 1) return stop();
+				range.value = String(Number(range.value) + 1);
+				render();
+			}, 1500);
+		});
+		render();
+	}
+</script>
+
+<style>
+	.kss {
+		--bit-on: #3b6ea5;
+		--bit-removed: #c0504d;
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+	}
+	@media (prefers-color-scheme: dark) {
+		.kss {
+			--bit-on: #6c9fd6;
+			--bit-removed: #e07a76;
+		}
+	}
+	.title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.5rem;
+	}
+	.tabs {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.35rem;
+		margin-bottom: 0.4rem;
+	}
+	.tabs button {
+		padding: 0.2rem 0.65rem;
+		border: 1px solid var(--faint);
+		border-radius: 999px;
+		background: var(--bg);
+		color: var(--muted);
+		font: inherit;
+		font-size: 0.75rem;
+		cursor: pointer;
+	}
+	.tabs button[aria-selected="true"] {
+		border-color: var(--accent);
+		background: var(--accent-soft);
+		color: var(--text);
+	}
+	.call {
+		margin: 0 0 0.4rem;
+		font-size: 0.78rem;
+		color: var(--muted);
+		text-align: center;
+	}
+	.controls {
+		display: flex;
+		justify-content: center;
+		align-items: center;
+		gap: 0.75rem;
+		margin-bottom: 0.5rem;
+		font-size: 0.78rem;
+		color: var(--muted);
+	}
+	.controls label {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.4rem;
+	}
+	.controls input {
+		width: 12rem;
+		accent-color: var(--accent);
+	}
+	.controls output {
+		min-width: 2.4rem;
+		font-family: var(--mono);
+		color: var(--text);
+	}
+	.play {
+		display: inline-grid;
+		place-items: center;
+		width: 1.9rem;
+		height: 1.9rem;
+		border: 1px solid var(--faint);
+		border-radius: 999px;
+		background: var(--bg);
+		color: var(--text);
+		cursor: pointer;
+	}
+	.play:hover {
+		border-color: var(--accent);
+	}
+	.play svg {
+		width: 0.8rem;
+		height: 0.8rem;
+		fill: currentColor;
+	}
+	.play .i-pause,
+	.play.playing .i-play {
+		display: none;
+	}
+	.play.playing .i-pause {
+		display: block;
+	}
+	.stage-title {
+		margin: 0;
+		font-size: 0.85rem;
+		font-weight: 600;
+		text-align: center;
+	}
+	.code {
+		margin: 0.2rem 0 0.3rem;
+		text-align: center;
+		font-size: 0.72rem;
+		overflow-wrap: anywhere;
+	}
+	.bits :global(svg) {
+		display: block;
+		width: 100%;
+		max-width: 640px;
+		height: auto;
+		margin: 0 auto;
+	}
+	.bits :global(.row-label) {
+		font-size: 9px;
+		fill: var(--muted);
+	}
+	.bits :global(.bit) {
+		stroke-width: 1;
+	}
+	.bits :global(.bit.off) {
+		fill: var(--surface);
+		stroke: var(--faint);
+	}
+	.bits :global(.bit.on) {
+		fill: var(--bit-on);
+		stroke: var(--bit-on);
+	}
+	.bits :global(.bit.added) {
+		stroke: var(--text);
+		stroke-width: 2;
+	}
+	.bits :global(.bit.removed) {
+		stroke: var(--bit-removed);
+		stroke-width: 1.6;
+		stroke-dasharray: 2 1.5;
+	}
+	.bits :global(.bit-name) {
+		font-family: var(--mono);
+		font-size: 8px;
+		fill: var(--muted);
+	}
+	.bits :global(.bit-name.set) {
+		fill: var(--text);
+		font-weight: 600;
+	}
+	.bits :global(.marker) {
+		fill: #d1495b;
+	}
+	.set {
+		margin: 0.2rem 0 0;
+		text-align: center;
+		font-size: 0.74rem;
+		overflow-wrap: anywhere;
+	}
+	.hex {
+		margin-left: 0.4rem;
+		font-family: var(--mono);
+		color: var(--muted);
+	}
+	.lookup {
+		margin: 0.45rem auto 0;
+		max-width: 36rem;
+		padding: 0.45rem 0.7rem;
+		border-left: 3px solid var(--accent);
+		background: var(--accent-soft);
+		font-size: 0.76rem;
+	}
+	.lookup[hidden] {
+		display: none;
+	}
+</style>

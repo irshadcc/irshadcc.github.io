@@ -1,0 +1,255 @@
+---
+// The same stream of requests served with a contiguous KV cache and a paged one, side by side
+// (simulated in kvcache.ts). Each grid is the KV-cache memory, one square per token slot,
+// coloured by the request that owns it; faded squares are reserved but hold no token yet. Scrub
+// or play through the steps.
+// Usage in .mdx:
+//   <PagedKvCache />
+//   <PagedKvCache slots={128} block={8} maxLen={32} />
+import { type KvConfig, drawMemory, simulateKv } from "./kvcache";
+
+interface Props {
+	slots?: number;
+	block?: number;
+	maxLen?: number;
+	step?: number;
+	title?: string;
+}
+
+const { slots = 96, block = 4, maxLen = 32, step = 6, title } = Astro.props;
+const cfg: KvConfig = { slots, block, maxLen };
+const contiguous = simulateKv("contiguous", cfg);
+const paged = simulateKv("paged", cfg);
+const last = Math.max(contiguous.length, paged.length) - 1;
+const at = Math.min(step, last);
+const frameAt = (fr: typeof paged, t: number) => fr[Math.min(t, fr.length - 1)];
+---
+
+<figure class="kv" data-config={JSON.stringify({ ...cfg, last })}>
+	{title && <figcaption class="title">{title}</figcaption>}
+	<div class="controls">
+		<button type="button" class="play" aria-label="Play">
+			<svg class="i-play" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5v11L13.5 8z"></path></svg>
+			<svg class="i-pause" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 3h3v10H4zM9 3h3v10H9z"></path></svg>
+		</button>
+		<label>
+			step
+			<input type="range" min="0" max={last} value={at} />
+			<output>{at}</output>
+		</label>
+	</div>
+	<div class="panels">
+		{
+			(["contiguous", "paged"] as const).map((kind) => {
+				const f = frameAt(kind === "paged" ? paged : contiguous, at);
+				const total = (kind === "paged" ? paged : contiguous).length - 1;
+				return (
+					<div class="panel" data-kind={kind}>
+						<p class="name">
+							{kind === "contiguous" ? `Contiguous: reserve ${maxLen} slots per request` : `Paged: blocks of ${block} slots, on demand`}
+						</p>
+						<div class="grid" set:html={drawMemory(f, kind, cfg)} />
+						<dl class="stats">
+							<div><dt>running</dt><dd data-s="run">{f.running.length}</dd></div>
+							<div><dt>waiting</dt><dd data-s="wait">{f.waiting.length}</dd></div>
+							<div><dt>finished</dt><dd data-s="fin">{f.finished}</dd></div>
+							<div><dt>memory holding tokens</dt><dd data-s="util">{f.allocated ? `${Math.round((100 * f.tokens) / f.allocated)}%` : "—"}</dd></div>
+						</dl>
+						<p class="done">All 10 requests done after <b>{total}</b> steps.</p>
+					</div>
+				);
+			})
+		}
+	</div>
+</figure>
+
+<script>
+	import { type AllocKind, drawMemory, simulateKv } from "./kvcache";
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".kv")) {
+		const cfg = JSON.parse(fig.dataset.config ?? "{}");
+		const frames = {
+			contiguous: simulateKv("contiguous", cfg),
+			paged: simulateKv("paged", cfg),
+		};
+		const range = fig.querySelector<HTMLInputElement>("input[type=range]");
+		const out = fig.querySelector("output");
+		const play = fig.querySelector<HTMLButtonElement>(".play");
+		if (!range) continue;
+		let timer: number | undefined;
+
+		const render = () => {
+			const t = Number(range.value);
+			if (out) out.textContent = String(t);
+			for (const panel of fig.querySelectorAll<HTMLElement>(".panel")) {
+				const kind = panel.dataset.kind as AllocKind;
+				const fr = frames[kind];
+				const f = fr[Math.min(t, fr.length - 1)];
+				const grid = panel.querySelector<HTMLElement>(".grid");
+				if (grid) grid.innerHTML = drawMemory(f, kind, cfg);
+				const set = (k: string, v: string) => {
+					const el = panel.querySelector(`[data-s=${k}]`);
+					if (el) el.textContent = v;
+				};
+				set("run", String(f.running.length));
+				set("wait", String(f.waiting.length));
+				set("fin", String(f.finished));
+				set("util", f.allocated ? `${Math.round((100 * f.tokens) / f.allocated)}%` : "—");
+			}
+		};
+		const stop = () => {
+			if (timer !== undefined) clearInterval(timer);
+			timer = undefined;
+			play?.classList.remove("playing");
+			play?.setAttribute("aria-label", "Play");
+		};
+		range.addEventListener("input", () => {
+			stop();
+			render();
+		});
+		play?.addEventListener("click", () => {
+			if (timer !== undefined) return stop();
+			if (Number(range.value) >= cfg.last) range.value = "0";
+			play.classList.add("playing");
+			play.setAttribute("aria-label", "Pause");
+			timer = window.setInterval(() => {
+				if (Number(range.value) >= cfg.last) return stop();
+				range.value = String(Number(range.value) + 1);
+				render();
+			}, 450);
+		});
+	}
+</script>
+
+<style>
+	.kv {
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+	}
+	.title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.5rem;
+	}
+	.controls {
+		display: flex;
+		justify-content: center;
+		align-items: center;
+		gap: 0.75rem;
+		margin-bottom: 0.6rem;
+		font-size: 0.78rem;
+		color: var(--muted);
+	}
+	.controls label {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.4rem;
+	}
+	.controls input {
+		width: 12rem;
+		accent-color: var(--accent);
+	}
+	.controls output {
+		min-width: 1.6rem;
+		font-family: var(--mono);
+		color: var(--text);
+	}
+	.play {
+		display: inline-grid;
+		place-items: center;
+		width: 1.9rem;
+		height: 1.9rem;
+		border: 1px solid var(--faint);
+		border-radius: 999px;
+		background: var(--bg);
+		color: var(--text);
+		cursor: pointer;
+	}
+	.play:hover {
+		border-color: var(--accent);
+	}
+	.play svg {
+		width: 0.8rem;
+		height: 0.8rem;
+		fill: currentColor;
+	}
+	.play .i-pause,
+	.play.playing .i-play {
+		display: none;
+	}
+	.play.playing .i-pause {
+		display: block;
+	}
+	.panels {
+		display: grid;
+		grid-template-columns: 1fr 1fr;
+		gap: 1rem;
+	}
+	@media (max-width: 640px) {
+		.panels {
+			grid-template-columns: 1fr;
+		}
+	}
+	.panel {
+		min-width: 0;
+	}
+	.name {
+		margin: 0 0 0.4rem;
+		font-size: 0.78rem;
+		font-weight: 600;
+		text-align: center;
+	}
+	.grid :global(svg) {
+		display: block;
+		width: 100%;
+		max-width: 340px;
+		height: auto;
+		margin: 0 auto;
+	}
+	.grid :global(.free) {
+		fill: var(--surface);
+		stroke: var(--faint);
+		stroke-width: 0.8;
+	}
+	.grid :global(.slot rect) {
+		stroke: color-mix(in oklch, #1a1a1a 25%, transparent);
+		stroke-width: 0.6;
+	}
+	.grid :global(.slot.empty rect) {
+		opacity: 0.35;
+	}
+	.grid :global(.slot text) {
+		font-family: var(--mono);
+		font-size: 8px;
+		text-anchor: middle;
+		fill: #1a1a1a;
+		pointer-events: none;
+	}
+	.stats {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.2rem 1rem;
+		margin: 0.5rem 0 0;
+		font-size: 0.74rem;
+	}
+	.stats div {
+		display: flex;
+		gap: 0.35rem;
+	}
+	.stats dt {
+		color: var(--muted);
+	}
+	.stats dd {
+		margin: 0;
+		font-family: var(--mono);
+		font-weight: 600;
+	}
+	.done {
+		margin: 0.3rem 0 0;
+		font-size: 0.72rem;
+		color: var(--muted);
+		text-align: center;
+	}
+</style>

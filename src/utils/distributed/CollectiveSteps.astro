@@ -1,0 +1,704 @@
+---
+// One collective (broadcast, reduce, reduce-scatter, all-gather, all-reduce or all-to-all) run
+// step by step over a group of ranks; the schedules are built in collectives.ts.
+//
+// Each column is a rank and each row a chunk of its M-byte buffer (all-to-all draws a send and a
+// receive buffer). A rank's own data has its colour and letter; a slot holding a sum is striped
+// with the colour of every rank summed into it. Each step draws its messages as arcs, rightward
+// below the buffers and leftward above them, outlines the chunks sent (dashed) and received
+// (solid), and adds the step's cost to a running alpha-beta total.
+//
+// Pass `ranks` to label the columns with global ranks, e.g. one data-parallel group of a
+// LogicalDistributedTopology, and `network` (see network.ts; rank r runs on GPU r) to draw each
+// message by the link it crosses, since a synchronous step takes as long as its slowest message.
+// Usage in .mdx:
+//   <CollectiveSteps op="all-reduce" n={4} />
+//   <CollectiveSteps op="all-reduce" ranks={[0, 4, 8, 12]} network={{ gpusPerServer: 8, serversPerPod: 2, spinesPerPod: 2 }} />
+import katex from "katex";
+import { type CollectiveOp, buildSchedule } from "./collectives";
+import { ClusterNetwork, type HopClass, type NetworkShape } from "./network";
+
+interface Props {
+	op: CollectiveOp;
+	/** Group size, 2 to 8; defaults to the length of `ranks`, else 4. */
+	n?: number;
+	/** Global rank of each group member, used as column labels and to place them on `network`. */
+	ranks?: number[];
+	/** Physical cluster shape; draws each message by the link it crosses. Needs `ranks`. */
+	network?: NetworkShape;
+	/** Step shown first; 0 is the initial state. */
+	step?: number;
+	title?: string;
+}
+
+const { op, ranks, network, step = 0, title } = Astro.props;
+const n = Astro.props.n ?? ranks?.length ?? 4;
+if (ranks && ranks.length !== n)
+	throw new Error(
+		`CollectiveSteps: ranks has ${ranks.length} entries but n = ${n}`,
+	);
+const sched = buildSchedule(op, n);
+const net = network ? new ClusterNetwork(network) : undefined;
+const globalOf = (i: number) => ranks?.[i] ?? i;
+
+// ---- Labels and colours.
+const LETTERS = "abcdefgh";
+const letter = (i: number) => LETTERS[i];
+// Light pastels: the dark labels on them read in both themes.
+const PALETTE = [
+	"#f4a7a3",
+	"#9fc8ef",
+	"#a9dba6",
+	"#f5d38c",
+	"#c8b4ee",
+	"#f3b6d6",
+	"#9fe0d6",
+	"#d9c7a4",
+];
+const colorOf = (i: number) => PALETTE[i];
+const isReduce =
+	op === "reduce" || op === "reduce-scatter" || op === "all-reduce";
+const pieceLabel = (src: number[], dst?: number) => {
+	if (dst !== undefined) return `${letter(src[0])}→${letter(dst)}`;
+	if (src.length === 1) return letter(src[0]);
+	if (src.length === n) return n <= 4 ? src.map(letter).join("+") : "Σ all";
+	return src.length <= 4 ? src.map(letter).join("+") : `Σ ${src.length}`;
+};
+
+const HOP_SHORT: Record<HopClass, string> = {
+	nvlink: "NVLink",
+	tor: "1 sw",
+	spine: "3 sw",
+	core: "5 sw",
+};
+const HOP_LONG: Record<HopClass, string> = {
+	nvlink: "NVLink inside a server",
+	tor: "1 switch (same ToR)",
+	spine: "3 switches (via a spine)",
+	core: "5 switches (via a core)",
+};
+const HOP_RANK: HopClass[] = ["nvlink", "tor", "spine", "core"];
+const hopOf = (a: number, b: number): HopClass | undefined =>
+	net?.route(globalOf(a), globalOf(b)).cls;
+
+// ---- Geometry (px).
+const CW = 50; // cell
+const CH = 20;
+const CG = 3; // between cells of a column
+const COL_GAP = 34;
+const MARGIN = 10;
+const LEFT = 52; // row labels
+const nb = sched.buffers.length;
+const BUF_LABEL = nb > 1 ? 16 : 0;
+const BUF_GAP = nb > 1 ? 14 : 0;
+const HEADER = net ? 34 : 22;
+const stackH = n * (CH + CG) - CG;
+const depth = (d: number) => 12 + 10 * d;
+
+const transfers = sched.steps.flatMap((s) => s.transfers);
+const maxDepth = (right: boolean) =>
+	Math.max(
+		0,
+		...transfers
+			.filter((t) => t.to > t.from === right)
+			.map((t) => depth(Math.abs(t.to - t.from)) + (net ? 12 : 0)),
+	);
+const upH = maxDepth(false);
+const downH = maxDepth(true);
+
+const colX = (i: number) => MARGIN + LEFT + i * (CW + COL_GAP);
+const headerY = MARGIN + upH; // top of the column headers; leftward arcs rise from here
+const bufY = (b: number) =>
+	headerY + HEADER + b * (BUF_LABEL + stackH + BUF_GAP) + BUF_LABEL;
+const cellY = (b: number, c: number) => bufY(b) + c * (CH + CG);
+const bottom = bufY(nb - 1) + stackH; // rightward arcs hang from here
+const W = colX(n - 1) + CW + MARGIN;
+const H = bottom + 4 + downH + MARGIN;
+
+const arcPath = (from: number, to: number) => {
+	const right = to > from;
+	const x1 = colX(from) + CW / 2 + (right ? 6 : -6);
+	const x2 = colX(to) + CW / 2 + (right ? -6 : 6);
+	const y = right ? bottom + 4 : headerY - 2;
+	const h = depth(Math.abs(to - from)) * (right ? 1 : -1);
+	// A cubic with both handles at the full depth peaks at 3/4 of it.
+	return {
+		d: `M${x1},${y} C${x1},${y + (h * 4) / 3} ${x2},${y + (h * 4) / 3} ${x2},${y}`,
+		lx: (x1 + x2) / 2,
+		ly: y + h + (right ? -3 : 9),
+	};
+};
+
+// ---- Per-step text: what happens, its cost and the running alpha-beta total.
+const gcd = (a: number, b: number): number => (b ? gcd(b, a % b) : a);
+const ofM = (chunks: number) => {
+	if (chunks === 0) return "0";
+	const g = gcd(chunks, n);
+	const p = chunks / g;
+	const q = n / g;
+	if (q === 1) return p === 1 ? "M" : `${p}M`;
+	return `${p}/${q}·M`;
+};
+let total = 0;
+const texts = sched.steps.map((s, i) => {
+	total += s.chunks;
+	if (i === 0)
+		return { head: "Start", body: s.text, cost: "Nothing sent yet." };
+	const slow = s.transfers
+		.map((t) => hopOf(t.from, t.to))
+		.filter((h): h is HopClass => h !== undefined)
+		.sort((a, b) => HOP_RANK.indexOf(b) - HOP_RANK.indexOf(a))[0];
+	const body = `${s.text}${slow ? ` Slowest link this step: ${HOP_LONG[slow]}.` : ""}`;
+	const sent = `This step: each sender sends ${ofM(s.chunks)}${isReduce ? " and adds what it receives" : ""}.`;
+	const elapsed = `Total so far: ${i === 1 ? "" : i}α + ${ofM(total)}β`;
+	return {
+		head:
+			s.phase === "tree" || s.phase === "pairwise"
+				? `Step ${i}`
+				: `Step ${i} · ${s.phase}`,
+		body,
+		cost: `${sent} ${elapsed}`,
+	};
+});
+
+const OP_NAMES: Record<CollectiveOp, string> = {
+	broadcast: "Binomial-tree broadcast",
+	reduce: "Binomial-tree reduce",
+	"reduce-scatter": "Ring reduce-scatter",
+	"all-gather": "Ring all-gather",
+	"all-reduce": "Ring all-reduce",
+	"all-to-all": "Pairwise all-to-all",
+};
+const costHtml = katex.renderToString(`T = ${sched.cost}`, {
+	throwOnError: true,
+});
+const startAt = Math.min(Math.max(0, step), sched.steps.length - 1);
+const hash = [...JSON.stringify(Astro.props)]
+	.reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7)
+	.toString(36);
+const arrowId = `cs-arrow-${hash}`;
+const rowLabel = (b: number, c: number) =>
+	nb > 1 ? `${b === 0 ? "→" : "←"} ${letter(c)}` : `chunk ${c}`;
+---
+
+<figure class="collective" data-step={startAt}>
+	{title && <figcaption class="title">{title}</figcaption>}
+	<div class="legend">
+		{
+			Array.from({ length: n }, (_, i) => (
+				<span class="key">
+					<i class="sw" style={`background: ${colorOf(i)}`} />
+					{letter(i)} = rank {globalOf(i)}'s data
+				</span>
+			))
+		}
+		{
+			net && (
+				<>
+					<span class="key">
+						<i class="link nvlink" />
+						NVLink
+					</span>
+					<span class="key">
+						<i class="link fabric" />
+						network (switches crossed)
+					</span>
+				</>
+			)
+		}
+	</div>
+
+	<div class="canvas">
+		<svg
+			viewBox={`0 0 ${W} ${H}`}
+			width={W}
+			height={H}
+			style={`min-width: ${Math.round(W * 0.7)}px`}
+			role="img"
+			aria-label={`${OP_NAMES[op]} over ${n} ranks, ${sched.steps.length - 1} steps`}
+		>
+			<defs>
+				<marker id={arrowId} viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+					<path class="arrowhead" d="M0,0.5 L8,4 L0,7.5 z" />
+				</marker>
+			</defs>
+
+			<!-- Column headers and row labels, the same for every step. -->
+			{
+				Array.from({ length: n }, (_, i) => (
+					<g class="col-head">
+						<text class="who" x={colX(i) + CW / 2} y={headerY + 14}>
+							<tspan class="letter">{letter(i)}</tspan> · rank {globalOf(i)}
+						</text>
+						{net && (
+							<text class="host" x={colX(i) + CW / 2} y={headerY + 27}>
+								host {net.place(globalOf(i)).server}
+							</text>
+						)}
+					</g>
+				))
+			}
+			{
+				sched.buffers.map((name, b) => (
+					<>
+						{name && (
+							<text class="buf-name" x={MARGIN} y={bufY(b) - 5}>
+								{name === "send" ? "send buffer (chunk for →)" : "receive buffer (chunk from ←)"}
+							</text>
+						)}
+						{Array.from({ length: n }, (_, c) => (
+							<text class="row-label" x={MARGIN + LEFT - 8} y={cellY(b, c) + CH / 2 + 3.5}>
+								{rowLabel(b, c)}
+							</text>
+						))}
+					</>
+				))
+			}
+
+			<!-- One group per step: the buffers after it and the messages that produced them. -->
+			{
+				sched.steps.map((s, si) => {
+					const prev = si > 0 ? sched.steps[si - 1].state : undefined;
+					const sentCells = new Set(s.transfers.flatMap((t) => t.moves.map((m) => `${t.from}:${m.fromBuf}:${m.fromChunk}`)));
+					const recvCells = new Set(s.transfers.flatMap((t) => t.moves.map((m) => `${t.to}:${m.toBuf}:${m.toChunk}`)));
+					return (
+						<g class="step" data-i={si} {...{ hidden: si !== startAt }}>
+							{s.state.map((bufs, r) =>
+								bufs.map((buf, b) =>
+									buf.map((p, c) => {
+										const x = colX(r);
+										const y = cellY(b, c);
+										const key = `${r}:${b}:${c}`;
+										const cls = [
+											"cell",
+											p ? "" : "empty",
+											isReduce && p && p.src.length === n ? "complete" : "",
+											sentCells.has(key) ? "sent" : "",
+											recvCells.has(key) ? "recv" : "",
+										]
+											.filter(Boolean)
+											.join(" ");
+										const tip = p
+											? `Rank ${globalOf(r)}, ${rowLabel(b, c)}: ${p.dst !== undefined ? `${letter(p.src[0])}'s data for ${letter(p.dst)}` : p.src.length > 1 ? `sum of ${p.src.map(letter).join(", ")}` : `${letter(p.src[0])}'s data`}`
+											: `Rank ${globalOf(r)}, ${rowLabel(b, c)}: empty`;
+										return (
+											<g class={cls}>
+												<title>{tip}</title>
+												{p &&
+													p.src.map((src, k) => (
+														<rect
+															x={x + (k * CW) / p.src.length}
+															y={y}
+															width={CW / p.src.length}
+															height={CH}
+															style={`fill: ${colorOf(src)}`}
+														/>
+													))}
+												<rect class="outline" x={x} y={y} width={CW} height={CH} rx="2" />
+												{p && (
+													<text x={x + CW / 2} y={y + CH / 2 + 3.5}>
+														{pieceLabel(p.src, p.dst)}
+													</text>
+												)}
+											</g>
+										);
+									}),
+								),
+							)}
+							{prev &&
+								s.transfers.map((t) => {
+									const a = arcPath(t.from, t.to);
+									const hop = hopOf(t.from, t.to);
+									return (
+										<g class={`msg${hop ? ` ${hop === "nvlink" ? "nvlink" : "fabric"}` : ""}`}>
+											<path d={a.d} marker-end={`url(#${arrowId})`} />
+											{hop && (
+												<text x={a.lx} y={a.ly}>
+													{HOP_SHORT[hop]}
+												</text>
+											)}
+										</g>
+									);
+								})}
+						</g>
+					);
+				})
+			}
+		</svg>
+	</div>
+
+	<div class="controls">
+		<div class="buttons">
+			<button type="button" data-act="first" aria-label="First step">
+				<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 3v10M13 3 6 8l7 5z" /></svg>
+			</button>
+			<button type="button" data-act="prev" aria-label="Previous step">
+				<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M11 3 4 8l7 5z" /></svg>
+			</button>
+			<button type="button" data-act="play" class="play" aria-label="Play">
+				<svg class="i-play" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5v11L13.5 8z" /></svg>
+				<svg class="i-pause" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 3h3v10H4zM9 3h3v10H9z" /></svg>
+			</button>
+			<button type="button" data-act="next" aria-label="Next step">
+				<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 3l7 5-7 5z" /></svg>
+			</button>
+		</div>
+		<div class="timeline" role="group" aria-label="Steps">
+			{
+				sched.steps.map((s, i) => (
+					<button type="button" class="seg" data-i={i} data-phase={s.phase} aria-label={texts[i].head} title={texts[i].head} />
+				))
+			}
+		</div>
+		<span class="counter"></span>
+	</div>
+
+	<div class="narration" aria-live="polite">
+		<p class="head"></p>
+		<p class="body"></p>
+		<p class="cost"></p>
+	</div>
+	<div class="store" hidden>
+		{
+			texts.map((t) => (
+				<span data-head={t.head} data-cost={t.cost}>
+					{t.body}
+				</span>
+			))
+		}
+	</div>
+	<p class="formula">
+		<span>{OP_NAMES[op]}, N = {n}:</span>
+		<Fragment set:html={costHtml} />
+	</p>
+</figure>
+
+<script>
+	for (const fig of document.querySelectorAll<HTMLElement>(".collective")) {
+		const steps = [...fig.querySelectorAll<SVGGElement>(".step")];
+		const segs = [...fig.querySelectorAll<HTMLButtonElement>(".seg")];
+		const store = [...fig.querySelectorAll<HTMLElement>(".store span")];
+		const head = fig.querySelector(".narration .head");
+		const body = fig.querySelector(".narration .body");
+		const cost = fig.querySelector(".narration .cost");
+		const counter = fig.querySelector(".counter");
+		const play = fig.querySelector<HTMLButtonElement>("[data-act=play]");
+		const last = steps.length - 1;
+		let at = Number(fig.dataset.step ?? 0);
+		let timer: number | undefined;
+
+		const go = (i: number) => {
+			at = Math.min(Math.max(0, i), last);
+			steps.forEach((g, k) => g.toggleAttribute("hidden", k !== at));
+			segs.forEach((b, k) => {
+				b.classList.toggle("done", k <= at);
+				b.setAttribute("aria-current", String(k === at));
+			});
+			const s = store[at];
+			if (head) head.textContent = s?.dataset.head ?? "";
+			if (body) body.textContent = s?.textContent ?? "";
+			if (cost) cost.textContent = s?.dataset.cost ?? "";
+			if (counter) counter.textContent = `${at} / ${last}`;
+		};
+		const stop = () => {
+			if (timer !== undefined) clearInterval(timer);
+			timer = undefined;
+			play?.classList.remove("playing");
+			play?.setAttribute("aria-label", "Play");
+		};
+		const start = () => {
+			if (at >= last) go(0);
+			play?.classList.add("playing");
+			play?.setAttribute("aria-label", "Pause");
+			timer = window.setInterval(() => {
+				if (at >= last) stop();
+				else go(at + 1);
+			}, 1500);
+		};
+
+		fig.querySelectorAll<HTMLButtonElement>("[data-act]").forEach((b) =>
+			b.addEventListener("click", () => {
+				const act = b.dataset.act;
+				if (act === "play") return timer === undefined ? start() : stop();
+				stop();
+				if (act === "first") go(0);
+				if (act === "prev") go(at - 1);
+				if (act === "next") go(at + 1);
+			}),
+		);
+		for (const b of segs)
+			b.addEventListener("click", () => {
+				stop();
+				go(Number(b.dataset.i));
+			});
+		fig.addEventListener("keydown", (e) => {
+			if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+			e.preventDefault();
+			stop();
+			go(at + (e.key === "ArrowRight" ? 1 : -1));
+		});
+		go(at);
+	}
+</script>
+
+<style>
+	.collective {
+		--nvlink: #2f9e44;
+		--fabric: #e8590c;
+		--rs: #a86ad8;
+		--ag: #1f9bb0;
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+	}
+	@media (prefers-color-scheme: dark) {
+		.collective {
+			--nvlink: #5cc46c;
+			--fabric: #ff8a4c;
+			--rs: #b98ae3;
+			--ag: #3dbcd0;
+		}
+	}
+	.title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.5rem;
+	}
+	.legend {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.3rem 1rem;
+		margin-bottom: 0.4rem;
+		font-size: 0.72rem;
+		color: var(--muted);
+	}
+	.key {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.35rem;
+	}
+	.sw {
+		width: 0.8rem;
+		height: 0.8rem;
+		border-radius: 2px;
+		border: 1px solid color-mix(in oklch, var(--text) 25%, transparent);
+	}
+	.link {
+		width: 1.3rem;
+		height: 0;
+		border-top: 2px solid var(--nvlink);
+	}
+	.link.fabric {
+		border-top: 2px dashed var(--fabric);
+	}
+	.canvas {
+		overflow-x: auto;
+	}
+	svg {
+		display: block;
+		max-width: 100%;
+		height: auto;
+		margin: 0 auto;
+	}
+
+	/* SVG elements ignore the hidden attribute without this. */
+	.step[hidden] {
+		display: none;
+	}
+	.col-head text {
+		text-anchor: middle;
+		fill: var(--text);
+	}
+	.who {
+		font-size: 10.5px;
+	}
+	.letter {
+		font-weight: 700;
+	}
+	.host {
+		font-size: 9px;
+		fill: var(--muted) !important;
+	}
+	.buf-name {
+		font-size: 10px;
+		font-weight: 600;
+		fill: var(--muted);
+	}
+	.row-label {
+		font-size: 9.5px;
+		text-anchor: end;
+		fill: var(--muted);
+	}
+
+	.cell .outline {
+		fill: none;
+		stroke: color-mix(in oklch, var(--text) 30%, transparent);
+		stroke-width: 0.8;
+	}
+	.cell.empty .outline {
+		fill: var(--surface);
+		stroke-dasharray: 3 2;
+	}
+	.cell text {
+		font-family: var(--mono);
+		font-size: 9px;
+		text-anchor: middle;
+		fill: #1a1a1a;
+		pointer-events: none;
+	}
+	.cell.complete .outline {
+		stroke: #1a1a1a;
+		stroke-width: 1.4;
+	}
+	@media (prefers-color-scheme: dark) {
+		.cell.complete .outline {
+			stroke: var(--text);
+		}
+	}
+	.cell.complete text {
+		font-weight: 700;
+	}
+	.cell.sent .outline {
+		stroke: var(--accent);
+		stroke-width: 2;
+		stroke-dasharray: 4 2;
+	}
+	.cell.recv .outline {
+		stroke: var(--accent);
+		stroke-width: 2.4;
+		stroke-dasharray: none;
+	}
+
+	.msg path {
+		fill: none;
+		stroke: color-mix(in oklch, var(--text) 70%, transparent);
+		stroke-width: 1.6;
+	}
+	.arrowhead {
+		fill: color-mix(in oklch, var(--text) 70%, transparent);
+	}
+	.msg.nvlink path {
+		stroke: var(--nvlink);
+	}
+	.msg.fabric path {
+		stroke: var(--fabric);
+		stroke-dasharray: 5 3;
+	}
+	.msg text {
+		font-size: 9px;
+		text-anchor: middle;
+		fill: var(--text);
+		paint-order: stroke;
+		stroke: var(--bg);
+		stroke-width: 3px;
+	}
+
+	.controls {
+		display: flex;
+		align-items: center;
+		gap: 0.75rem;
+		margin-top: 0.5rem;
+	}
+	.buttons {
+		display: flex;
+		gap: 0.3rem;
+	}
+	.buttons button {
+		display: grid;
+		place-items: center;
+		width: 2rem;
+		height: 2rem;
+		padding: 0;
+		border: 1px solid var(--faint);
+		border-radius: 8px;
+		background: var(--bg);
+		color: var(--text);
+		cursor: pointer;
+		transition: border-color 150ms ease;
+	}
+	.buttons button:hover {
+		border-color: var(--accent);
+	}
+	.buttons svg {
+		width: 0.8rem;
+		height: 0.8rem;
+		fill: currentColor;
+		stroke: currentColor;
+		stroke-width: 1.2;
+		stroke-linejoin: round;
+	}
+	.buttons .play {
+		width: 2.6rem;
+		background: var(--accent);
+		border-color: var(--accent);
+		color: var(--bg);
+	}
+	.play .i-pause,
+	.play.playing .i-play {
+		display: none;
+	}
+	.play.playing .i-pause {
+		display: block;
+	}
+	.timeline {
+		flex: 1;
+		display: flex;
+		gap: 3px;
+	}
+	.seg {
+		flex: 1;
+		height: 0.55rem;
+		padding: 0;
+		border: 0;
+		border-radius: 3px;
+		background: var(--faint);
+		cursor: pointer;
+	}
+	.seg.done {
+		background: var(--accent);
+	}
+	.seg.done[data-phase="reduce-scatter"] {
+		background: var(--rs);
+	}
+	.seg.done[data-phase="all-gather"] {
+		background: var(--ag);
+	}
+	.seg[aria-current="true"] {
+		outline: 2px solid var(--text);
+		outline-offset: 1px;
+	}
+	.counter {
+		font-family: var(--mono);
+		font-size: 0.75rem;
+		color: var(--muted);
+		min-width: 3.2rem;
+		text-align: right;
+	}
+
+	.narration {
+		margin-top: 0.5rem;
+		font-size: 0.8rem;
+		min-height: 4.6rem;
+	}
+	.narration p {
+		margin: 0.15rem 0;
+	}
+	.narration .head {
+		font-weight: 600;
+	}
+	.narration .cost {
+		font-family: var(--mono);
+		font-size: 0.74rem;
+		color: var(--muted);
+	}
+	.formula {
+		margin: 0.4rem 0 0;
+		font-size: 0.8rem;
+		text-align: center;
+		color: var(--muted);
+	}
+	.formula span {
+		margin-right: 0.4rem;
+	}
+</style>

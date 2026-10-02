@@ -1,0 +1,775 @@
+---
+title: "The PyTorch Dispatcher"
+description: "Every operation on a tensor goes through PyTorch's dispatcher, which picks the kernel to run from the tensors' devices, layouts and the thread's modes. This post follows torch.add through the dispatcher's code: how each operator's dispatch table is built from kernel registrations, how a call's dispatch key set is computed from its arguments, and how that key set becomes an index into the table."
+date: 2025-07-01
+updated: 2026-10-02
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import MarginNote from "../../components/MarginNote.astro";
+import KeySetSteps from "../../utils/dispatcher/KeySetSteps.astro";
+import DispatchTable from "../../utils/dispatcher/DispatchTable.astro";
+
+## Background
+
+When you call `torch.add(x, w)`, something has to decide which of several dozen implementations
+of `add` should run. A CPU tensor needs the CPU kernel and a CUDA tensor the CUDA kernel. If
+either input might need a gradient, the autograd kernel must run first to record the operation
+for the backward pass. Inside `torch.autocast` the inputs may need casting to a lower precision,
+under `torch.vmap` the batch dimension must be handled, and a tensor subclass with
+`__torch_dispatch__` wants Python to see the call. The component that makes this decision, for
+every operator call, is the **dispatcher**.
+
+It matters for two reasons. First, it runs on every operator call, so it has to be cheap: a few
+bit operations, one array read and an indirect call. Second, almost every PyTorch feature that
+"wraps" operators (autograd, autocast, `vmap`, functionalisation, tracing, Python subclasses) is
+a kernel registered at some **dispatch key** and layered by the dispatcher. Knowing how it works
+explains error messages like *"Could not run 'aten::foo' with arguments from the 'CUDA'
+backend"*, why `torch.no_grad()` still enters the autograd kernel while `torch.inference_mode()`
+skips it, and what you are doing when you register a custom operator or a new backend.
+
+This post reads the dispatcher's code, pinned to PyTorch v2.9.1<Sidenote>Tag `v2.9.1`, commit
+[`d38164a5`](https://github.com/pytorch/pytorch/tree/d38164a545b4a4e4e0cf73ce67173f70574890b6).
+The dispatcher files are identical in the commit the 2.9.1 wheels were built from (`5811a8d7`).
+Every key set, slot number and table entry below was also checked against a real PyTorch 2.9.1
+install; the notes say how.</Sidenote>, in five parts:
+
+1. **Dispatch keys**: what a key is, and how a tensor carries a set of them in 64 bits.
+2. **The operator table**: the per-operator array of kernels the dispatcher indexes into.
+3. **Initialising the table**: how kernel registrations fill that array, including alias keys,
+   backend fallbacks and fallthroughs.
+4. **Computing the dispatch key**: from a call's arguments and thread-local state to one slot.
+5. **Inside `Dispatcher::call`**: the hot path, redispatch, and the full trace of `torch.add`.
+
+## The running example
+
+We follow one call through the whole post: adding a tensor that does not require a gradient to
+one that does, then backpropagating.
+
+```python
+import torch
+
+x = torch.tensor([1, 2], requires_grad=False, dtype=torch.float32)
+w = torch.tensor([3, 4], requires_grad=True, dtype=torch.float32)
+
+result_tensor = torch.add(x, w)     # tensor([4., 6.], grad_fn=<AddBackward0>)
+sum_tensor = result_tensor.sum()
+sum_tensor.backward()
+print(x.grad)                       # None
+print(w.grad)                       # tensor([1., 1.])
+```
+
+`torch.add` goes through a few layers of generated code before it reaches the dispatcher. Each
+row of this table is a real function in the PyTorch 2.9.1 binaries:<Sidenote>The symbol names
+were checked with `nm` on `libtorch_python.dylib` and `libtorch_cpu.dylib` from the 2.9.1
+macOS wheel.</Sidenote>
+
+| Frame | Generated from | What it does |
+| --- | --- | --- |
+| `torch::autograd::THPVariable_add` | `tools/autograd/gen_python_functions.py` | Parses the Python arguments, releases the GIL |
+| `at::add(self, other, alpha)` | `torchgen/gen.py` (`Functions.h`) | The public C++ API; one line |
+| `at::_ops::add_Tensor::call` | `torchgen/gen.py` (`Operators.cpp`) | Finds the operator once, then calls the dispatcher |
+| `c10::Dispatcher::call` | hand-written | Computes the dispatch key set, looks up and calls the kernel |
+| `VariableType::add_Tensor` | `tools/autograd/gen_variable_type.py` | The autograd kernel: records `AddBackward0`, redispatches |
+| `wrapper_CPU_add_Tensor` | `torchgen` (`RegisterCPU_0.cpp`) | The CPU kernel that does the arithmetic |
+
+The dispatcher is the fourth row, and it runs twice: once to pick the autograd kernel and once,
+as a **redispatch**, to pick the CPU kernel. The rest of the post explains how it chooses.
+
+## Dispatch keys
+
+A **dispatch key** names one kind of handler that an operator can have: a backend (`CPU`,
+`CUDA`), a tensor layout (`SparseCPU`), or a piece of functionality layered on top
+(`AutogradCPU`, `AutocastCPU`, `Python`, `FuncTorchBatched`). Keys are ordered by priority, and
+the dispatcher always runs the handler for the highest-priority key that applies to a call. That
+handler usually does its part of the work and calls the operator again with its own key removed,
+so the call peels down through the layers until it reaches a backend.
+
+### Functionality bits and backend bits
+
+The keys live in two enums in
+[`c10/core/DispatchKey.h`](https://github.com/pytorch/pytorch/blob/d38164a545b4a4e4e0cf73ce67173f70574890b6/c10/core/DispatchKey.h#L65):
+
+- **`BackendComponent`** lists the 16 backends that can customise functionality: `CPU`,
+  `CUDA`, `HIP`, `XLA`, `MPS`, `IPU`, `XPU`, `HPU`, `VE`, `Lazy`, `MTIA`, `MAIA`,
+  `PrivateUse1`–`3` and `Meta`.
+- **`DispatchKey`** starts with 47 **functionality keys** (plus `Undefined = 0`), in
+  increasing priority: `Dense`, `FPGA`, …, `BackendSelect`, `Python`, …, `ADInplaceOrView`,
+  `AutogradOther`, `AutogradFunctionality`, …, `AutocastCPU`, …, `PythonDispatcher`.
+
+Six of the functionality keys are **per-backend**: `Dense`, `Quantized`, `Sparse`, `SparseCsr`,
+`NestedTensor` and `AutogradFunctionality`. Each combines with a backend to make a **runtime
+key**: `Dense` + `CPU` is the key `CPU`, `Sparse` + `CUDA` is `SparseCUDA`, and
+`AutogradFunctionality` + `CPU` is `AutogradCPU`. The enum spells all 6 × 16 of these out after
+the functionality keys. The other 41 functionality keys, such as `BackendSelect` or `AutocastCPU`,
+are runtime keys on their own.
+
+A **`DispatchKeySet`** is a set of keys packed into one `uint64_t`. The low 16 bits are the
+backends (bit $b$ for the backend with enum value $b + 1$), and functionality key $f$ is bit
+$15 + f$, so the functionality bits run from 16 (`Dense`) to 62 (`PythonDispatcher`). A runtime
+key like `AutogradCPU` sets two bits: its functionality bit and its backend bit.
+
+Why not one bit per key? Because 16 backends times 6 per-backend functionalities is already 96
+keys, more than 64 bits can hold. Splitting a key into a functionality part and a backend part
+makes the cross product cost $16 + 6$ bits instead of $96$.<Sidenote>`DispatchKey.h` has a
+`static_assert` that the backends plus the functionality keys fit in 64 bits, and another that
+there are at most 16 backends ("Note [No More Than 16 Backends]"), because the backend mask is a
+`uint16_t`.</Sidenote>
+
+### Where a tensor's key set comes from
+
+Every `TensorImpl` stores a `key_set_`. Its constructor in
+[`c10/core/TensorImpl.cpp`](https://github.com/pytorch/pytorch/blob/d38164a545b4a4e4e0cf73ce67173f70574890b6/c10/core/TensorImpl.cpp#L148)
+starts from the backend key (`CPU` for our tensors) and adds the keys of the layers above it:
+
+```cpp
+auto k = key_set.highestBackendKey();
+key_set = key_set | getAutocastRelatedKeySetFromBackend(k);   // AutocastCPU
+key_set = key_set - c10::python_ks;                           // added later, if ever
+if (inference_mode) {
+  key_set_ = key_set - c10::autograd_dispatch_keyset_with_ADInplaceOrView;
+} else {
+  // TODO: Ideally we only add AutogradBackend key when the tensor requires grad.
+  key_set_ = key_set | getAutogradRelatedKeySetFromBackend(k); // ADInplaceOrView, AutogradCPU
+}
+```
+
+So `x` gets `DispatchKeySet(CPU, ADInplaceOrView, AutogradCPU, AutocastCPU)`. Note the TODO:
+`x` does not require a gradient, but it still carries `AutogradCPU`. `requires_grad` is a flag on
+the autograd metadata, not a dispatch key, so `x` and `w` have identical key sets.
+
+Check the bits by hand. `CPU` is backend bit 0 plus `Dense` ($f = 1$, bit 16); `ADInplaceOrView`
+is $f = 20$ (bit 35); `AutogradCPU` is `AutogradFunctionality` ($f = 22$, bit 37) plus the `CPU`
+bit again; `AutocastCPU` is $f = 25$ (bit 40). So
+
+$$
+2^{40} + 2^{37} + 2^{35} + 2^{16} + 2^{0} = \texttt{0x12800010001},
+$$
+
+which is exactly what `torch._C._dispatch_keys(x).raw_repr()` returns.
+
+## The operator table
+
+The dispatcher, a process-wide singleton, keeps one entry per operator overload. From
+[`Dispatcher.h`](https://github.com/pytorch/pytorch/blob/d38164a545b4a4e4e0cf73ce67173f70574890b6/aten/src/ATen/core/dispatch/Dispatcher.h#L399):
+
+```cpp
+std::list<OperatorDef> operators_;   // OperatorDef wraps an impl::OperatorEntry
+LeftRight<ska::flat_hash_map<OperatorName, OperatorHandle>> operatorLookupTable_;
+std::array<impl::AnnotatedKernel, num_runtime_entries> backendFallbackKernels_;
+```
+
+An **`OperatorHandle`** is a pointer to one `OperatorDef`. The lookup table maps an
+`OperatorName` such as `aten::add.Tensor` to its handle; it is a `LeftRight` structure so that
+readers never take a lock while registrations write.<MarginNote>`operators_` is a `std::list` so
+that handles, which point into it, stay valid as operators are added.</MarginNote>
+
+Each **`OperatorEntry`**
+([`OperatorEntry.h`](https://github.com/pytorch/pytorch/blob/d38164a545b4a4e4e0cf73ce67173f70574890b6/aten/src/ATen/core/dispatch/OperatorEntry.h#L238))
+holds the operator's schema and two views of its kernels:
+
+```cpp
+std::array<KernelFunction, c10::num_runtime_entries> dispatchTable_;  // what calls read
+DispatchKeyExtractor dispatchKeyExtractor_;                            // how to read the args
+ska::flat_hash_map<DispatchKey, std::list<AnnotatedKernel>> kernels_;  // what was registered
+```
+
+- **`kernels_`** records every registration, keyed by the key it was registered at, which may
+  be an alias key. Each list is ordered newest first, so re-registering a kernel (say, re-running
+  a notebook cell) overrides the old one without losing it.
+- **`dispatchTable_`** is the **computed table**: one `KernelFunction` per runtime key, ready to
+  call. A call reads only this array, which is small enough to stay in cache. The comment in the
+  header puts it this way: `kernels_` "is a larger data structure and accessed quite
+  infrequently while dispatchTable is accessed often and should be kept small".
+
+A **`KernelFunction`** holds up to three function pointers: a **boxed** one, which takes the
+arguments as a stack of `IValue`s and works for any operator, and **unboxed** ones (with and
+without `SymInt`s), which take the C++ arguments directly. A call uses the unboxed pointer when
+there is one.
+
+### Slots and offsets
+
+The table has `num_runtime_entries` slots: one per functionality key, plus 15 extra for each
+per-backend functionality, so $48 + 6 \times 15 = 138$. A per-backend functionality takes 16
+consecutive slots, one per backend, in backend order. `initializeFunctionalityOffsetsAndMasks()`
+in
+[`DispatchKeySet.cpp`](https://github.com/pytorch/pytorch/blob/d38164a545b4a4e4e0cf73ce67173f70574890b6/c10/core/DispatchKeySet.cpp#L262)
+walks the functionality keys in order and records where each one's slots start (its
+**offset**) and whether the backend bits matter (its **mask**):
+
+```cpp
+offsets_and_masks[0] = FunctionalityOffsetAndMask(0, 0);       // Undefined
+for (const auto functionality_idx : c10::irange(1, num_functionality_keys)) {
+  auto prev_offset_and_mask = offsets_and_masks[functionality_idx - 1];
+  auto k = static_cast<DispatchKey>(functionality_idx);
+  auto next_offset = prev_offset_and_mask.offset +
+      (prev_offset_and_mask.mask == 0 ? 1 : num_backends);
+  auto next_mask = isPerBackendFunctionalityKey(k) ? full_backend_mask : 0;
+  offsets_and_masks[functionality_idx] = FunctionalityOffsetAndMask(next_offset, next_mask);
+}
+```
+
+The result, for a selection of keys:
+
+| $f$ | Functionality | Bit | Offset | Mask | Slots |
+| --: | --- | --: | --: | --: | --- |
+| 0 | `Undefined` | – | 0 | `0` | 0 |
+| 1 | `Dense` | 16 | 1 | `0xffff` | 1–16 (`CPU` = 1, `CUDA` = 2, …, `Meta` = 16) |
+| 5 | `Quantized` | 20 | 20 | `0xffff` | 20–35 |
+| 8 | `Sparse` | 23 | 38 | `0xffff` | 38–53 |
+| 11 | `BackendSelect` | 26 | 86 | `0` | 86 |
+| 20 | `ADInplaceOrView` | 35 | 95 | `0` | 95 |
+| 21 | `AutogradOther` | 36 | 96 | `0` | 96 |
+| 22 | `AutogradFunctionality` | 37 | 97 | `0xffff` | 97–112 (`AutogradCPU` = 97) |
+| 25 | `AutocastCPU` | 40 | 115 | `0` | 115 |
+| 47 | `PythonDispatcher` | 62 | 137 | `0` | 137 |
+
+The figure in the next section draws all 138 slots, one row per functionality.
+
+## Initialising the table
+
+Nothing in the table is written by hand. It is computed from **registrations**: a schema from a
+`def`, kernels from `impl`s, and process-wide **backend fallbacks**. All of them happen while the
+shared libraries load.
+
+### TORCH_LIBRARY and static initialisers
+
+Operators are defined in a `TORCH_LIBRARY` block and implemented in `TORCH_LIBRARY_IMPL` blocks.
+`aten::add.Tensor` is defined in the generated `RegisterSchema.cpp`, and the CPU kernel comes
+from the generated `RegisterCPU_0.cpp`, which contains (abridged):
+
+```cpp
+TORCH_LIBRARY_IMPL(aten, CPU, m) {
+  m.impl("add.Tensor", TORCH_FN(wrapper_CPU_add_Tensor));
+  // ... one line per operator with a CPU kernel
+}
+```
+
+The macro, in
+[`torch/library.h`](https://github.com/pytorch/pytorch/blob/d38164a545b4a4e4e0cf73ce67173f70574890b6/torch/library.h#L1070),
+declares a function holding the block's body and a static object whose constructor calls it:
+
+```cpp
+#define _TORCH_LIBRARY_IMPL(ns, k, m, uid)                                \
+  static void C10_CONCATENATE(                                            \
+      TORCH_LIBRARY_IMPL_init_##ns##_##k##_, uid)(torch::Library&);       \
+  static const torch::detail::TorchLibraryInit C10_CONCATENATE(           \
+      TORCH_LIBRARY_IMPL_static_init_##ns##_##k##_, uid)(                 \
+      torch::Library::IMPL,                                               \
+      &C10_CONCATENATE(TORCH_LIBRARY_IMPL_init_##ns##_##k##_, uid),       \
+      #ns,                                                                \
+      std::make_optional(c10::DispatchKey::k),                            \
+      __FILE__,                                                           \
+      __LINE__);                                                          \
+  void C10_CONCATENATE(                                                   \
+      TORCH_LIBRARY_IMPL_init_##ns##_##k##_, uid)(torch::Library & m)
+```
+
+`TorchLibraryInit`'s constructor builds a `Library(kind, ns, key, file, line)` and calls the
+function with it. Because the object is a namespace-scope static, this runs as a **static
+initialiser** when `libtorch_cpu` is loaded, before `import torch` returns.<Sidenote>`uid` is
+`C10_UID`, i.e. `__COUNTER__`, so one file can hold several blocks for the same key. On mobile,
+with `TORCH_LIBRARY_THREAD_UNSAFE_LAZY_INIT`, `TorchLibraryInit` instead queues itself and runs
+later.</Sidenote> C++ does not order static initialisers across files, so a kernel can be
+registered before its schema. The dispatcher allows that: `impl` creates the operator entry if it
+does not exist yet, and `def` fills in the schema later.
+
+### def: registering a schema
+
+`m.def(...)` reaches `Library::_def`, which calls `Dispatcher::registerDef`:
+
+```cpp
+RegistrationHandleRAII Dispatcher::registerDef(FunctionSchema schema, std::string debug,
+                                               std::vector<at::Tag> tags) {
+  std::lock_guard<std::mutex> lock(guard_->mutex);
+  OperatorName op_name = schema.operator_name();
+  auto op = findOrRegisterName_(op_name);                 // create the OperatorEntry if new
+  TORCH_CHECK(op.operatorDef_->def_count == 0, "Tried to register an operator (", schema,
+              ") with the same name and overload name multiple times. ...");
+  op.operatorDef_->op.registerSchema(std::move(schema), std::move(debug), std::move(tags));
+  listeners_->callOnOperatorRegistered(op);
+  ++op.operatorDef_->def_count;
+  ++op.operatorDef_->def_and_impl_count;
+  cond_var_.notify_all();
+  return RegistrationHandleRAII(/* deregisterDef_ on destruction */);
+}
+```
+
+`registerSchema` hands the schema to the operator's **`DispatchKeyExtractor`**, which records
+which arguments can carry dispatch keys: those of type `Tensor`, `Tensor?`, `Tensor[]` or
+`Tensor?[]`. For `add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1)` that is arguments 0
+and 1, stored as a bitset counted from the end of the argument list, so a boxed call can find them
+on the stack without scanning it. The table itself does not change.
+
+### impl: registering a kernel
+
+`m.impl(...)` reaches `Library::_impl`, then `Dispatcher::registerImpl`:
+
+```cpp
+RegistrationHandleRAII Dispatcher::registerImpl(OperatorName op_name,
+    std::optional<DispatchKey> dispatch_key, KernelFunction kernel,
+    std::optional<impl::CppSignature> cpp_signature,
+    std::unique_ptr<FunctionSchema> inferred_function_schema, std::string debug) {
+  std::lock_guard<std::mutex> lock(guard_->mutex);
+  auto op = findOrRegisterName_(op_name);
+  auto handle = op.operatorDef_->op.registerKernel(*this, dispatch_key, std::move(kernel),
+      std::move(cpp_signature), std::move(inferred_function_schema), std::move(debug));
+  ++op.operatorDef_->def_and_impl_count;
+  cond_var_.notify_all();
+  return RegistrationHandleRAII(/* deregisterImpl_ on destruction */);
+}
+```
+
+[`OperatorEntry::registerKernel`](https://github.com/pytorch/pytorch/blob/d38164a545b4a4e4e0cf73ce67173f70574890b6/aten/src/ATen/core/dispatch/OperatorEntry.cpp#L166)
+checks that the kernel's C++ signature matches earlier kernels and the schema, pushes the kernel
+onto the front of `kernels_[dispatch_key]` (warning if one was already there), and then brings the
+table up to date:
+
+```cpp
+auto& k = dispatch_key.has_value() ? kernels_[*dispatch_key]
+                                   : kernels_[DispatchKey::CompositeImplicitAutograd];
+k.emplace_front(std::move(kernel), std::move(inferred_function_schema), std::move(debug));
+if (dispatch_key.has_value()) {
+  updateDispatchTable_(dispatcher, *dispatch_key);
+} else {
+  updateDispatchTableFull_(dispatcher);
+}
+```
+
+A kernel registered with no key (a "catch-all") is filed under `CompositeImplicitAutograd`.
+
+### Alias keys
+
+`updateDispatchTable_` recomputes every slot that a registration can affect. For a runtime key
+like `CPU` that is just its own slot, plus the matching autograd slot (`AutogradCPU`), whose
+entry can depend on whether a backend kernel exists. But a kernel can also be registered at an
+**alias key**, which is not a slot at all: it stands for a set of runtime keys, given by
+`getRuntimeDispatchKeySet`
+([`DispatchKeySet.cpp`](https://github.com/pytorch/pytorch/blob/d38164a545b4a4e4e0cf73ce67173f70574890b6/c10/core/DispatchKeySet.cpp#L64)):
+
+| Alias key | Runtime keys it fills | Typical use |
+| --- | --- | --- |
+| `Autograd` | `AutogradOther`, `AutogradNestedTensor`, every `Autograd<Backend>` | The generated `VariableType` kernels |
+| `CompositeExplicitAutograd` | every backend key (`Dense`, `Sparse`, `Quantized`, … × all backends) | One kernel that works on any backend, with its own derivative formula |
+| `CompositeExplicitAutogradNonFunctional` | the same, minus `Sparse`, `XLA` and `Lazy` | Like the above, for decompositions that mutate |
+| `CompositeImplicitAutograd` | the backend keys and the autograd keys, plus `NestedTensor`, `Functionalize` | A decomposition into other ops; autograd comes for free |
+
+```cpp
+void OperatorEntry::updateDispatchTable_(const c10::Dispatcher& dispatcher,
+                                         DispatchKey dispatch_key) {
+  if (dispatch_key == DispatchKey::Undefined) {
+    updateDispatchTableEntry_(dispatcher, dispatch_key);
+    return;
+  }
+  for (auto k : c10::getRuntimeDispatchKeySet(dispatch_key)) {
+    updateDispatchTableEntry_(dispatcher, k);
+  }
+  // Composite* registrations also fill the Undefined slot (calls with no tensor arguments)
+  if (dispatch_key == DispatchKey::CompositeImplicitAutograd
+   || dispatch_key == DispatchKey::CompositeExplicitAutograd
+   || dispatch_key == DispatchKey::CompositeExplicitAutogradNonFunctional) {
+    updateDispatchTableEntry_(dispatcher, DispatchKey::Undefined);
+  }
+  if (c10::isBackendDispatchKey(dispatch_key)) {
+    DispatchKey autograd_key = getAutogradKeyFromBackend(toBackendComponent(dispatch_key));
+    updateDispatchTableEntry_(dispatcher, autograd_key);
+  }
+}
+```
+
+### Computing one slot
+
+`updateDispatchTableEntry_` sets one slot to `computeDispatchTableEntry(key)` and tells the key
+extractor whether the result is a fallthrough (more on that below).
+[`computeDispatchTableEntryWithDebug`](https://github.com/pytorch/pytorch/blob/d38164a545b4a4e4e0cf73ce67173f70574890b6/aten/src/ATen/core/dispatch/OperatorEntry.cpp#L362)
+decides what goes in a slot, trying these in order and taking the first that exists:
+
+1. A kernel registered **directly** at this key ("kernel").
+2. A kernel from an alias key whose set contains this key:
+   1. `CompositeExplicitAutogradNonFunctional` ("default backend kernel"),
+   2. `CompositeExplicitAutograd` ("default backend kernel"),
+   3. `CompositeImplicitAutogradNestedTensor`, then `CompositeImplicitAutograd` ("math
+      kernel"). For an autograd key, only if there is no kernel for the matching backend key and
+      no `CompositeExplicitAutograd` kernel: a backend kernel without a derivative must not be
+      hidden behind a decomposition's autograd.
+   4. `Autograd` ("autograd kernel"),
+   5. `FuncTorchBatchedDecomposition` ("batched kernel").
+3. The **backend fallback** for this key, if one is registered.
+4. Nothing: the slot is "missing", and reaching it raises the "Could not run" error.
+
+So a direct registration always beats an alias, and among aliases the more specific one wins.
+The labels in quotes are what `torch._C._dispatch_dump_table` prints for each slot.
+
+### Backend fallbacks and fallthroughs
+
+A **backend fallback** is a single boxed kernel that serves a key for *every* operator, such as
+the one implementing the `Python` key for `__torch_dispatch__`, or the `Conjugate` key that
+materialises lazy conjugation. It is registered with `m.fallback(...)` in a `TORCH_LIBRARY_IMPL(_,
+Key, m)` block, the `_` meaning "all namespaces", and stored in the dispatcher's
+`backendFallbackKernels_` array, indexed by slot like the per-operator tables.
+`Dispatcher::registerFallback` stores it and then calls `updateFallback` on every existing
+operator, and the `OperatorEntry` constructor copies the fallbacks that already exist into a new
+operator's table:
+
+```cpp
+for (const auto dispatch_ix : c10::irange(dispatcher.backendFallbackKernels_.size())) {
+  const auto& bfk = dispatcher.backendFallbackKernels_[dispatch_ix];
+  if (bfk.kernel.isValid()) {
+    dispatchTable_[dispatch_ix] = bfk.kernel;
+    if (bfk.kernel.isFallthrough()) {
+      dispatchKeyExtractor_.setOperatorHasFallthroughForKey(dispatch_table_index_to_key[dispatch_ix], true);
+    }
+  } else {
+    dispatchTable_[dispatch_ix] = missingKernel().kernel;
+  }
+}
+```
+
+A **fallthrough** kernel means "this key has nothing to do here; go to the next key". Several
+keys that every tensor carries are fallthroughs for most operators:
+
+```cpp
+TORCH_LIBRARY_IMPL(_, BackendSelect, m) {
+  m.fallback(torch::CppFunction::makeFallthrough());
+}
+TORCH_LIBRARY_IMPL(_, ADInplaceOrView, m) {   // VariableFallbackKernel.cpp
+  m.fallback(torch::CppFunction::makeFallthrough());
+}
+```
+
+A fallthrough is never actually called. Instead, whenever a slot's entry becomes or stops being a
+fallthrough,
+[`setOperatorHasFallthroughForKey`](https://github.com/pytorch/pytorch/blob/d38164a545b4a4e4e0cf73ce67173f70574890b6/aten/src/ATen/core/dispatch/DispatchKeyExtractor.cpp#L8)
+removes or adds that key's functionality bit in the operator's `nonFallthroughKeys_` set. The
+dispatcher ANDs every call's key set with this mask, so fallthrough keys are skipped at no cost
+per call.<Sidenote>Removing a per-backend key such as `AutogradCPU` would clear the whole
+`AutogradFunctionality` bit, for every backend. So the extractor also keeps one mask per backend
+(`nonFallthroughKeysPerBackend_`), and sets `requiresBitsetPerBackend_` when they differ; calls
+then pick the mask of their highest backend. For `aten::add` all 16 are equal and the fast path
+is used.</Sidenote>
+
+### aten::add.Tensor's table
+
+Putting it together, the figure builds `aten::add.Tensor`'s table from its real registrations,
+one group at a time. Step through it and watch which slots each registration fills.
+
+<DispatchTable title="The dispatch table of aten::add.Tensor, built up from its registrations" />
+
+Things to look at:
+
+- **Step 0.** A new `OperatorEntry` already has 39 filled slots: the backend fallbacks. The
+  autograd slots start out holding the generic autograd fallback (amber), and
+  `BackendSelect`, `ADInplaceOrView` and the `Autocast` keys hold fallthroughs.
+- **Step 2.** One registration at `CompositeExplicitAutogradNonFunctional` fills 48 slots: the
+  `Undefined` slot and every backend slot in that alias's set. `XLA`, `Lazy` and the `Sparse`
+  row stay empty, because that alias leaves them out.
+- **Step 3.** Registering at `CPU` replaces slot 1 with `wrapper_CPU_add_Tensor`, because a
+  direct kernel beats an alias.
+- **Step 5.** The generated `VariableType` kernel is registered once, at the `Autograd` alias,
+  and fills 18 slots, replacing the autograd fallback everywhere.
+- **Step 7.** `torch/_meta_registrations.py` registers a second `Meta` kernel from Python during
+  `import torch`. `kernels_[Meta]` keeps both, and the slot points at the newer one.
+
+<DispatchTable
+	step={7}
+	highlight={["AutogradCPU", "CPU"]}
+	title="The final table. Our call reads slot 97 (AutogradCPU), then slot 1 (CPU), outlined in red"
+/>
+
+The final table is independent of the order of the registrations, which is just as well, since
+static initialisers have no defined order: each slot depends only on the newest kernel per key
+and on the fallbacks.<Sidenote>Verification: the figure's data are the registrations printed by
+`torch._C._dispatch_dump("aten::add.Tensor")` and the fallbacks of a freshly defined operator,
+from the PyTorch 2.9.1 macOS wheel. `dispatchKeys.ts` reimplements
+`computeDispatchTableEntryWithDebug` and the alias key sets, and its result matches
+`torch._C._dispatch_dump_table` in all 138 slots (source and registration site) for both
+`aten::add.Tensor` and `aten::mm`. This build has no CUDA kernels, which is why `CUDA` (slot 2)
+holds the default backend kernel rather than a CUDA kernel.</Sidenote> You can print this table
+yourself:
+
+```python
+print(torch._C._dispatch_dump("aten::add.Tensor"))        # registrations: kernels_
+print(torch._C._dispatch_dump_table("aten::add.Tensor"))  # computed: dispatchTable_
+```
+
+## Computing the dispatch key
+
+At call time the dispatcher has the table and the arguments. It must reduce the arguments to one
+slot. It does that in four steps, all inside
+[`DispatchKeyExtractor::getDispatchKeySetUnboxed`](https://github.com/pytorch/pytorch/blob/d38164a545b4a4e4e0cf73ce67173f70574890b6/aten/src/ATen/core/dispatch/DispatchKeyExtractor.h#L185)
+and `getDispatchTableIndexForDispatchKeySet`.
+
+### Step 1: union the arguments' key sets
+
+```cpp
+template <class... Args>
+DispatchKeySet getDispatchKeySetUnboxed(const Args&... args) const {
+  auto ks = detail::multi_dispatch_key_set(args...);
+  // Keys that are fallthrough should be skipped
+  if (requiresBitsetPerBackend_) {
+    c10::impl::LocalDispatchKeySet tls = c10::impl::tls_local_dispatch_key_set();
+    auto backend_idx = ((ks | tls.included_) - tls.excluded_).getBackendIndex();
+    return impl::computeDispatchKeySet(ks, nonFallthroughKeysPerBackend_[backend_idx]);
+  } else {
+    return impl::computeDispatchKeySet(ks, nonFallthroughKeys_);
+  }
+}
+```
+
+`multi_dispatch_key_set` visits every argument at compile-time-known positions and ORs in the
+key set of each `Tensor`, `optional<Tensor>`, tensor list and `Generator`; scalars and other
+types are ignored. This is **multiple dispatch**: the kernel is chosen from all tensor
+arguments, not just `self`. For `torch.add(x, w)` both sets are the same, so the union is
+`0x12800010001`.
+
+### Step 2: apply thread-local state
+
+```cpp
+inline DispatchKeySet computeDispatchKeySet(DispatchKeySet ks, DispatchKeySet key_mask) {
+  c10::impl::LocalDispatchKeySet local = c10::impl::tls_local_dispatch_key_set();
+  return (((ks | local.included_) - local.excluded_) & key_mask);
+}
+```
+
+Each thread has an **included** set, keys added to every call, and an **excluded** set, keys
+removed from every call (exclusion wins). This is how modes work without touching tensors:
+
+| State | Included | Excluded |
+| --- | --- | --- |
+| Default | `BackendSelect`, `ADInplaceOrView` | all 10 `Autocast*` keys |
+| `torch.autocast("cpu")` | same | `AutocastCPU` removed from the excluded set |
+| `torch.inference_mode()` | `BackendSelect` | `Autocast*` and the autograd keys |
+| `AutoDispatchBelowAutograd` guard | unchanged | adds the autograd keys |
+
+Every tensor carries `AutocastCPU`, but it is excluded by default, so autocast costs nothing
+until you turn it on. The values in the table are what
+`torch._C._dispatch_tls_local_include_set()` and `_exclude_set()` print.<Sidenote>The defaults
+are stored XORed: the thread-local `PODLocalDispatchKeySet` holds `included ^
+default_included_set`. C++ zero-initialises `thread_local` PODs for free, so a zero raw value
+must mean "the defaults" ("Note [TLS Initialization]").</Sidenote> `torch.no_grad()` is not in
+the table: it sets `GradMode`, not a dispatch key. Under `no_grad` the autograd kernel still runs;
+it just sees that no graph is needed. `inference_mode` excludes the autograd keys, and tensors
+created inside it lack them, so the autograd kernel is skipped entirely.
+
+`-` on key sets only removes functionality bits, never backend bits ("Note [Removing keys from
+DispatchKeySet Only Affects Functionality Keys]"), since a backend bit may be shared by several
+runtime keys in the set.
+
+### Step 3: mask out fallthrough keys
+
+`& key_mask` applies the operator's `nonFallthroughKeys_`. For `aten::add.Tensor` the masked-out
+keys are `BackendSelect`, `Named`, `ADInplaceOrView`, `FuncTorchVmapMode`, `VmapMode` and six of
+the `Autocast` keys. So the included `BackendSelect` and `ADInplaceOrView` disappear again, and
+the result is `DispatchKeySet(CPU, AutogradCPU)` = `0x2000010001`.
+
+### Step 4: from key set to slot
+
+Only the highest-priority key matters, and finding it is a count-leading-zeros:
+
+```cpp
+int getDispatchTableIndexForDispatchKeySet() const {
+  auto functionality_idx = DispatchKeySet(repr_ >> num_backends).indexOfHighestBit();
+  auto offset_and_mask = offsetsAndMasks()[functionality_idx];
+  // Mask the functionality bits out first, then right-shift by 1.
+  auto backend_idx = DispatchKeySet((repr_ & offset_and_mask.mask) >> 1).indexOfHighestBit();
+  return offset_and_mask.offset + backend_idx;
+}
+```
+
+where `indexOfHighestBit()` is `64 - countLeadingZeros(repr_)`, one more than the position of
+the highest set bit.
+
+Work it through for `0x2000010001`. Shifting right by 16 leaves `0x200001`, whose highest bit is
+bit 21, so `functionality_idx` $= 22$: `AutogradFunctionality`. Its offset is 97 and its mask is
+`0xffff`. The backend bits are `0x1`; shifted right by one that is `0`, whose `indexOfHighestBit`
+is 0, so `backend_idx` $= 0$, the index of `CPU`. The slot is $97 + 0 = 97$: `AutogradCPU`.
+For a functionality that is not per-backend, the mask is 0 and the backend term vanishes.
+
+The `>> 1` is what turns a highest backend *bit* into a zero-based backend index: `CPU` alone is
+`0b1` → 0, `CUDA` is `0b10` → 1. If a CPU tensor meets a CUDA tensor, both bits are set and the
+higher one, `CUDA`, wins. That is why adding a 0-dim CPU tensor to a CUDA tensor runs the CUDA
+kernel.
+
+The figure runs these steps for four calls. Step through each and watch the bits.
+
+<KeySetSteps title="From tensor arguments to a dispatch table slot" />
+
+- **`torch.add(x, w)`.** The last two steps are the two lookups of our call: slot 97, the
+  autograd kernel, and after the redispatch (next section), slot 1.
+- **CUDA + CPU scalar.** Both backend bits are set; `CUDA` is higher, so the lookups land on
+  `AutogradCUDA` (98) and `CUDA` (2).
+- **`mm` under autocast.** `AutocastCPU` (bit 40) is no longer excluded, and `aten::mm` has a
+  real `AutocastCPU` kernel, so it is the highest key: slot 115, before autograd. (For `add`,
+  `AutocastCPU` is a fallthrough, because autocast leaves addition alone.)
+- **`inference_mode`.** Inference tensors have no autograd keys, so the first lookup is already
+  the CPU kernel.
+
+<MarginNote>Verification: the final key sets in the figure are the ones PyTorch 2.9.1 passes to a
+kernel registered with `torch.library.Library.impl(..., with_keyset=True)` in that slot:
+`0x2000010001` for `add`, `0x12000010001` for `mm` under autocast and `0x10001` in inference
+mode. The CUDA case was not run on a GPU; its key sets were built and checked with
+`torch._C.DispatchKeySet` on CPU.</MarginNote>
+
+## Inside Dispatcher::call
+
+### Finding the operator once
+
+`at::_ops::add_Tensor::call` is generated by `torchgen/gen.py`, from this template:
+
+```cpp
+static C10_NOINLINE c10::TypedOperatorHandle<add_Tensor::schema> create_add_Tensor_typed_handle() {
+  return c10::Dispatcher::singleton()
+      .findSchemaOrThrow(add_Tensor::name, add_Tensor::overload_name)   // "aten::add", "Tensor"
+      .typed<add_Tensor::schema>();
+}
+
+// aten::add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor
+at::Tensor add_Tensor::call(const at::Tensor & self, const at::Tensor & other, const at::Scalar & alpha) {
+    static auto op = create_add_Tensor_typed_handle();
+    return op.call(self, other, alpha);
+}
+```
+
+The hash-map lookup by name happens once per process, the first time `add` is called, and the
+handle is cached in a function-local `static`. `typed<FuncType>()` checks that the C++ signature
+the caller uses matches the one the kernels were registered with, so a mismatch is caught at the
+first call instead of corrupting the stack.
+
+### The hot path
+
+[`Dispatcher::call`](https://github.com/pytorch/pytorch/blob/d38164a545b4a4e4e0cf73ce67173f70574890b6/aten/src/ATen/core/dispatch/Dispatcher.h#L775),
+with the Facebook-only USDT probes removed:
+
+```cpp
+template <class Return, class... Args>
+C10_ALWAYS_INLINE_UNLESS_MOBILE Return Dispatcher::call(
+    const TypedOperatorHandle<Return(Args...)>& op, Args... args) const {
+  auto dispatchKeySet = op.operatorDef_->op.dispatchKeyExtractor()
+                            .template getDispatchKeySetUnboxed<Args...>(args...);
+#if defined(HAS_TORCH_SHOW_DISPATCH_TRACE) || !defined(NDEBUG)
+  DispatchTraceNestingGuard debug_guard;
+  if (show_dispatch_trace()) {
+    detail::_print_dispatch_trace("[call]", toString(op.operator_name()), dispatchKeySet);
+  }
+#endif
+  const KernelFunction& kernel = op.operatorDef_->op.lookup(dispatchKeySet);
+#ifndef PYTORCH_DISABLE_PER_OP_PROFILING
+  auto step_callbacks = at::getStepCallbacksUnlessEmpty(at::RecordScope::FUNCTION);
+  if (C10_UNLIKELY(step_callbacks.has_value() && op.operatorDef_->op.isObserved())) {
+    return callWithDispatchKeySlowPath<Return, Args...>(
+        op, *step_callbacks, dispatchKeySet, kernel, std::forward<Args>(args)...);
+  }
+#endif
+  return kernel.template call<Return, Args...>(op, dispatchKeySet, std::forward<Args>(args)...);
+}
+```
+
+Three things happen:
+
+1. **Compute the key set**, as in the previous section.
+2. **Look up the kernel.** `OperatorEntry::lookup` is the table read, with a check:
+
+   ```cpp
+   const KernelFunction& lookup(DispatchKeySet ks) const {
+     const auto idx = ks.getDispatchTableIndexForDispatchKeySet();
+     if (C10_UNLIKELY(idx == -1)) {
+       reportError(ks.highestPriorityTypeId());
+     }
+     const auto& kernel = dispatchTable_[idx];
+     if (C10_UNLIKELY(!kernel.isValidUnboxed())) {
+       if (!kernel.isValid()) {
+         reportError(ks.highestPriorityTypeId());
+       }
+     }
+     return kernel;
+   }
+   ```
+
+   A "missing" slot holds an invalid `KernelFunction`, and `reportError` raises *"Could not run
+   'aten::add.Tensor' with arguments from the '...' backend"*, followed by the list of keys that
+   do have kernels and the whole computed table.
+3. **Call the kernel**, unless a profiler is active (`RecordFunction` callbacks), in which case
+   the slow path records the op first. `KernelFunction::call` uses the unboxed function pointer
+   when there is one, and otherwise boxes the arguments onto a stack and calls the boxed kernel,
+   which is how a single boxed fallback (such as `Python`) serves every operator.
+
+The key set is passed into the kernel. Kernels whose first parameter is a `DispatchKeySet`
+receive it; for the others, the wrapper drops it.<Sidenote>`TORCH_SHOW_DISPATCH_TRACE=1` prints
+a `[call]` or `[redispatch]` line with the key set for every dispatch, but only in builds with
+`HAS_TORCH_SHOW_DISPATCH_TRACE` or without `NDEBUG`. In the 2.9.1 release wheel it prints
+nothing.</Sidenote>
+
+### Redispatch: peeling off a layer
+
+The autograd kernel `VariableType::add_Tensor(DispatchKeySet ks, ...)` sets up `AddBackward0`,
+then calls the operator again for the layers below it. It does not go through `at::add`, which
+would recompute the key set from TLS and land on `AutogradCPU` again. The generator,
+[`gen_variable_type.py`](https://github.com/pytorch/pytorch/blob/d38164a545b4a4e4e0cf73ce67173f70574890b6/tools/autograd/gen_variable_type.py#L1547),
+emits a **redispatch** with the key set it was given, masked:
+
+```python
+dispatch_key_set = "ks & c10::after_autograd_keyset"
+```
+
+`after_autograd_keyset` is `DispatchKeySet(FULL_AFTER, AutogradOther)`: every functionality bit
+below `AutogradOther`, all backend bits, and `PythonDispatcher`. For our call,
+`0x2000010001 & 0x4000000fffffffff` = `0x10001` = `DispatchKeySet(CPU)`, slot 1.
+`Dispatcher::redispatch` skips the key extraction and profiling and only does the lookup and
+call:
+
+```cpp
+template <class Return, class... Args>
+inline Return Dispatcher::redispatch(const TypedOperatorHandle<Return(Args...)>& op,
+    DispatchKeySet currentDispatchKeySet, Args... args) const {
+  const KernelFunction& kernel = op.operatorDef_->op.lookup(currentDispatchKeySet);
+  return kernel.template call<Return, Args...>(op, currentDispatchKeySet, std::forward<Args>(args)...);
+}
+```
+
+The generated kernel also holds an `at::AutoDispatchBelowADInplaceOrView` guard during the
+redispatch, which excludes the autograd and `ADInplaceOrView` keys in TLS. That matters for any
+*new* operator calls the CPU kernel makes: they start from `Dispatcher::call` again, read TLS, and
+must not re-enter autograd.
+
+### The whole trace of torch.add(x, w)
+
+| # | Function | Key set | Slot | Kernel |
+| --: | --- | --- | --: | --- |
+| 1 | `Dispatcher::call` | `CPU, AutogradCPU` (`0x2000010001`) | 97 | `VariableType::add_Tensor` (autograd kernel) |
+| 2 | `Dispatcher::redispatch` | `CPU` (`0x10001`) | 1 | `wrapper_CPU_add_Tensor` (kernel) |
+
+Two lookups, each a shift, two count-leading-zeros, an add and an array read. Everything that
+might have made this expensive (alias resolution, precedence between composite kernels,
+fallbacks, fallthroughs) was resolved when the table was built.
+
+## Summary
+
+- A **dispatch key** names one layer of an operator's behaviour. A tensor's keys live in a
+  64-bit `DispatchKeySet`: 16 backend bits and 47 priority-ordered functionality bits. Runtime keys
+  like `AutogradCPU` are a functionality bit plus a backend bit.
+- Each operator has a **dispatch table** of 138 kernels, one slot per runtime key. It is computed
+  at load time from the operator's registrations (direct kernels beat alias kernels, which beat
+  backend fallbacks) and recomputed whenever a registration changes.
+- A call's key set is the **union of its tensor arguments' key sets**, plus the thread's included
+  keys, minus its excluded keys, masked by the operator's non-fallthrough keys. Modes like
+  autocast and inference mode work by changing the thread-local sets.
+- The **slot** is the offset of the highest functionality bit plus, for per-backend
+  functionalities, the index of the highest backend bit. For `torch.add(x, w)` that is slot 97
+  (`AutogradCPU`), and after the autograd kernel's redispatch, slot 1 (`CPU`).
+- Inspect all of this from Python with `torch._C._dispatch_keys(t)`,
+  `torch._C._dispatch_dump(op)` and `torch._C._dispatch_dump_table(op)`.
+
+## References
+
+1. PyTorch source at v2.9.1:
+   [`c10/core/DispatchKey.h`](https://github.com/pytorch/pytorch/blob/d38164a545b4a4e4e0cf73ce67173f70574890b6/c10/core/DispatchKey.h),
+   [`c10/core/DispatchKeySet.h`](https://github.com/pytorch/pytorch/blob/d38164a545b4a4e4e0cf73ce67173f70574890b6/c10/core/DispatchKeySet.h),
+   [`aten/src/ATen/core/dispatch/Dispatcher.h`](https://github.com/pytorch/pytorch/blob/d38164a545b4a4e4e0cf73ce67173f70574890b6/aten/src/ATen/core/dispatch/Dispatcher.h),
+   [`Dispatcher.cpp`](https://github.com/pytorch/pytorch/blob/d38164a545b4a4e4e0cf73ce67173f70574890b6/aten/src/ATen/core/dispatch/Dispatcher.cpp),
+   [`OperatorEntry.cpp`](https://github.com/pytorch/pytorch/blob/d38164a545b4a4e4e0cf73ce67173f70574890b6/aten/src/ATen/core/dispatch/OperatorEntry.cpp),
+   [`DispatchKeyExtractor.h`](https://github.com/pytorch/pytorch/blob/d38164a545b4a4e4e0cf73ce67173f70574890b6/aten/src/ATen/core/dispatch/DispatchKeyExtractor.h),
+   [`aten/src/ATen/core/library.cpp`](https://github.com/pytorch/pytorch/blob/d38164a545b4a4e4e0cf73ce67173f70574890b6/aten/src/ATen/core/library.cpp).
+2. [PyTorch dispatcher walkthrough](https://github.com/pytorch/pytorch/wiki/PyTorch-dispatcher-walkthrough), PyTorch GitHub wiki.
+3. Edward Z. Yang, [Let's talk about the PyTorch dispatcher](https://blog.ezyang.com/2020/09/lets-talk-about-the-pytorch-dispatcher/), ezyang's blog, September 2020.
+4. [pytorch/pytorch#68743](https://github.com/pytorch/pytorch/pull/68743), a closed PR with a
+   Python model of the DispatchKeySet representation, linked from `DispatchKeySet.h`.

@@ -1,0 +1,196 @@
+---
+// LLVM's three-phase design: many front ends produce LLVM IR, one optimizer improves it, and many
+// back ends turn it into code for a target. The path a CUDA kernel takes (Clang, the optimizer,
+// the NVPTX back end, PTX, then NVIDIA's ptxas) is highlighted. Static; no props needed.
+// Usage in .mdx:
+//   <LlvmOverview />
+interface Props {
+	title?: string;
+}
+
+const { title } = Astro.props;
+const W = 720;
+const ROW = 46;
+const TOP = 34;
+const H = TOP + 5 * ROW + 8;
+const BOX_H = 34;
+const fronts = [
+	["Clang", "C, C++, CUDA"],
+	["rustc", "Rust"],
+	["swiftc", "Swift"],
+	["Flang", "Fortran"],
+	["Triton", "Python, via MLIR"],
+];
+const backs = [
+	["X86", "x86-64 machine code"],
+	["AArch64", "Arm64 machine code"],
+	["RISCV", "RISC-V machine code"],
+	["AMDGPU", "AMD GPU code object"],
+	["NVPTX", "PTX → ptxas → SASS"],
+];
+const hotFront = 0;
+const hotBack = 4;
+const col = {
+	fe: [8, 132],
+	ir: [178, 82],
+	opt: [298, 112],
+	be: [456, 92],
+	out: [580, 132],
+};
+const rowY = (i: number) => TOP + i * ROW + (ROW - BOX_H) / 2;
+const mid = TOP + (5 * ROW) / 2;
+const curve = (x1: number, y1: number, x2: number, y2: number) =>
+	`M${x1},${y1} C${(x1 + x2) / 2},${y1} ${(x1 + x2) / 2},${y2} ${x2},${y2}`;
+---
+
+<figure class="ov">
+	{title && <figcaption class="ov-title">{title}</figcaption>}
+	<svg viewBox={`0 0 ${W} ${H}`} role="img" aria-label="Front ends produce LLVM IR, the optimizer transforms it, and back ends such as NVPTX generate code">
+		<defs>
+			<marker id="ov-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+				<path d="M0,0 L8,4 L0,8 z" class="ov-head"></path>
+			</marker>
+			<marker id="ov-arrow-hot" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+				<path d="M0,0 L8,4 L0,8 z" class="ov-head hot"></path>
+			</marker>
+		</defs>
+
+		<text class="ov-col" x={col.fe[0] + col.fe[1] / 2} y="16">Front ends</text>
+		<text class="ov-col" x={col.ir[0] + (col.opt[0] + col.opt[1] - col.ir[0]) / 2} y="16">Middle end</text>
+		<text class="ov-col" x={col.be[0] + col.be[1] / 2} y="16">Back ends (llc)</text>
+		<text class="ov-col" x={col.out[0] + col.out[1] / 2} y="16">Output</text>
+
+		{
+			fronts.map((_, i) => (
+				<path
+					class:list={["ov-edge", { hot: i === hotFront }]}
+					d={curve(col.fe[0] + col.fe[1], rowY(i) + BOX_H / 2, col.ir[0] - 2, mid)}
+					marker-end={`url(#ov-arrow${i === hotFront ? "-hot" : ""})`}
+				/>
+			))
+		}
+		<path class="ov-edge hot" d={`M${col.ir[0] + col.ir[1]},${mid} H${col.opt[0] - 2}`} marker-end="url(#ov-arrow-hot)"></path>
+		{
+			backs.map((_, i) => (
+				<>
+					<path
+						class:list={["ov-edge", { hot: i === hotBack }]}
+						d={curve(col.opt[0] + col.opt[1], mid, col.be[0] - 2, rowY(i) + BOX_H / 2)}
+						marker-end={`url(#ov-arrow${i === hotBack ? "-hot" : ""})`}
+					/>
+					<path
+						class:list={["ov-edge", { hot: i === hotBack }]}
+						d={`M${col.be[0] + col.be[1]},${rowY(i) + BOX_H / 2} H${col.out[0] - 2}`}
+						marker-end={`url(#ov-arrow${i === hotBack ? "-hot" : ""})`}
+					/>
+				</>
+			))
+		}
+
+		{
+			fronts.map(([name, lang], i) => (
+				<g class:list={["ov-box", { hot: i === hotFront }]} transform={`translate(${col.fe[0]},${rowY(i)})`}>
+					<rect width={col.fe[1]} height={BOX_H} rx="6" />
+					<text class="name" x={col.fe[1] / 2} y="14">{name}</text>
+					<text class="sub" x={col.fe[1] / 2} y="27">{lang}</text>
+				</g>
+			))
+		}
+		<g class="ov-box hot ir" transform={`translate(${col.ir[0]},${mid - 34})`}>
+			<rect width={col.ir[1]} height="68" rx="6"></rect>
+			<text class="name" x={col.ir[1] / 2} y="30">LLVM IR</text>
+			<text class="sub" x={col.ir[1] / 2} y="46">one language</text>
+		</g>
+		<g class="ov-box hot ir" transform={`translate(${col.opt[0]},${mid - 38})`}>
+			<rect width={col.opt[1]} height="76" rx="6"></rect>
+			<text class="name" x={col.opt[1] / 2} y="21">Optimizer</text>
+			<text class="sub" x={col.opt[1] / 2} y="38">opt: IR → IR</text>
+			<text class="sub" x={col.opt[1] / 2} y="54">mostly target-</text>
+			<text class="sub" x={col.opt[1] / 2} y="66">independent passes</text>
+		</g>
+		{
+			backs.map(([name], i) => (
+				<g class:list={["ov-box", { hot: i === hotBack }]} transform={`translate(${col.be[0]},${rowY(i)})`}>
+					<rect width={col.be[1]} height={BOX_H} rx="6" />
+					<text class="name" x={col.be[1] / 2} y="21">{name}</text>
+				</g>
+			))
+		}
+		{
+			backs.map(([, out], i) => (
+				<text class:list={["ov-out", { hot: i === hotBack }]} x={col.out[0] + 4} y={rowY(i) + BOX_H / 2 + 4}>{out}</text>
+			))
+		}
+	</svg>
+</figure>
+
+<style>
+	.ov {
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+	}
+	.ov-title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.3rem;
+	}
+	.ov svg {
+		display: block;
+		width: 100%;
+		height: auto;
+	}
+	.ov-col {
+		font-size: 11px;
+		font-weight: 600;
+		fill: var(--muted);
+		text-anchor: middle;
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+	}
+	.ov-edge {
+		fill: none;
+		stroke: var(--faint);
+		stroke-width: 1.3;
+	}
+	.ov-edge.hot {
+		stroke: var(--accent);
+		stroke-width: 2;
+	}
+	.ov-head {
+		fill: var(--faint);
+	}
+	.ov-head.hot {
+		fill: var(--accent);
+	}
+	.ov-box rect {
+		fill: var(--surface);
+		stroke: var(--faint);
+		stroke-width: 1.2;
+	}
+	.ov-box.hot rect {
+		fill: var(--accent-soft);
+		stroke: var(--accent);
+		stroke-width: 1.6;
+	}
+	.ov-box text {
+		text-anchor: middle;
+		fill: var(--text);
+	}
+	.ov-box .name {
+		font-size: 12px;
+		font-weight: 600;
+	}
+	.ov-box .sub {
+		font-size: 9.5px;
+		fill: var(--muted);
+	}
+	.ov-out {
+		font-size: 11px;
+		fill: var(--muted);
+	}
+	.ov-out.hot {
+		fill: var(--accent);
+		font-weight: 600;
+	}
+</style>

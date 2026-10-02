@@ -1,0 +1,236 @@
+---
+// Which slice of each activation every rank holds as one transformer block runs under tensor
+// parallelism, with tabs for plain TP and TP with sequence parallelism (drawn in
+// tensorParallel.ts). Each cell is one activation, sequence across and hidden size down. The
+// columns between cells are the collectives. A readout gives the activation memory per rank
+// from Korthikanti et al. (2022).
+// Usage in .mdx:
+//   <TpBlock />
+//   <TpBlock n={8} sp />
+import katex from "katex";
+import { RANK_COLORS, activationUnits, drawBlock } from "./tensorParallel";
+
+interface Props {
+	/** Ranks: 2, 4 or 8. */
+	n?: number;
+	/** Start on the sequence-parallel tab. */
+	sp?: boolean;
+	title?: string;
+}
+
+const { n = 4, sp = false, title } = Astro.props;
+const hash = [...JSON.stringify(Astro.props)]
+	.reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7)
+	.toString(36);
+const id = `tpb-${hash}`;
+const fmt = (v: number) => String(Math.round(v * 100) / 100);
+const readout = (spOn: boolean, t: number) =>
+	katex.renderToString(
+		spOn
+			? `\\tfrac{34}{t}\\,sbh = ${fmt(activationUnits(true, t))}\\,sbh`
+			: `\\left(10 + \\tfrac{24}{t}\\right) sbh = ${fmt(activationUnits(false, t))}\\,sbh`,
+	);
+const readouts = Object.fromEntries(
+	[2, 4, 8].flatMap((t) => [false, true].map((s) => [`${s ? "sp" : "tp"}-${t}`, readout(s, t)])),
+);
+---
+
+<figure class="tp-block" data-config={JSON.stringify({ n, sp, id, readouts })}>
+	{title && <figcaption class="title">{title}</figcaption>}
+	<div class="bar">
+		<div class="tabs" role="tablist">
+			<button type="button" role="tab" data-sp="0" aria-selected={sp ? "false" : "true"}>Tensor parallel</button>
+			<button type="button" role="tab" data-sp="1" aria-selected={sp ? "true" : "false"}>+ sequence parallel</button>
+		</div>
+		<label class="knob">
+			t
+			<select>
+				{[2, 4, 8].map((k) => <option value={k} selected={k === n}>{k}</option>)}
+			</select>
+		</label>
+	</div>
+	<div class="legend">
+		<span class="key"><i class="sw rep"></i>whole tensor, same on every rank</span>
+		<span class="key"><i class="sw" style={`background: linear-gradient(90deg, ${RANK_COLORS[0]} 50%, ${RANK_COLORS[1]} 50%)`}></i>slice of the sequence</span>
+		<span class="key"><i class="sw" style={`background: linear-gradient(${RANK_COLORS[0]} 50%, ${RANK_COLORS[1]} 50%)`}></i>slice of the hidden features</span>
+		<span class="key"><i class="sw comm"></i>collective</span>
+	</div>
+	<div class="canvas" set:html={drawBlock(sp, n, id)} />
+	<p class="readout">
+		Activations each rank stores per layer (no attention scores):
+		<span class="math" set:html={readouts[`${sp ? "sp" : "tp"}-${n}`]} />
+	</p>
+</figure>
+
+<script>
+	import { drawBlock } from "./tensorParallel";
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".tp-block")) {
+		const cfg = JSON.parse(fig.dataset.config ?? "{}");
+		const state = { sp: cfg.sp as boolean, n: cfg.n as number };
+		const canvas = fig.querySelector<HTMLElement>(".canvas");
+		const math = fig.querySelector<HTMLElement>(".readout .math");
+		if (!canvas || !math) continue;
+		const render = () => {
+			canvas.innerHTML = drawBlock(state.sp, state.n, cfg.id);
+			math.innerHTML = cfg.readouts[`${state.sp ? "sp" : "tp"}-${state.n}`];
+		};
+		for (const tab of fig.querySelectorAll<HTMLButtonElement>("[role=tab]"))
+			tab.addEventListener("click", () => {
+				state.sp = tab.dataset.sp === "1";
+				for (const t of fig.querySelectorAll("[role=tab]")) t.setAttribute("aria-selected", String(t === tab));
+				render();
+			});
+		fig.querySelector("select")?.addEventListener("input", (e) => {
+			state.n = Number((e.target as HTMLSelectElement).value);
+			render();
+		});
+	}
+</script>
+
+<style>
+	.tp-block {
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+	}
+	.title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.5rem;
+	}
+	.bar {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		justify-content: space-between;
+		gap: 0.5rem 1rem;
+		margin-bottom: 0.5rem;
+		font-size: 0.78rem;
+	}
+	.tabs {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.25rem;
+	}
+	.tabs button {
+		padding: 0.25rem 0.6rem;
+		border: 1px solid var(--faint);
+		border-radius: 999px;
+		background: var(--bg);
+		color: var(--text);
+		font: inherit;
+		cursor: pointer;
+	}
+	.tabs button:hover {
+		border-color: var(--accent);
+	}
+	.tabs button[aria-selected="true"] {
+		background: var(--accent);
+		border-color: var(--accent);
+		color: var(--bg);
+	}
+	.knob {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.35rem;
+		font-family: var(--mono);
+		color: var(--muted);
+	}
+	.knob select {
+		font: inherit;
+		color: var(--text);
+		background: var(--bg);
+		border: 1px solid var(--faint);
+		border-radius: 6px;
+	}
+	.legend {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.3rem 1rem;
+		margin-bottom: 0.4rem;
+		font-size: 0.72rem;
+		color: var(--muted);
+	}
+	.key {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.3rem;
+	}
+	.sw {
+		width: 0.8rem;
+		height: 0.8rem;
+		border-radius: 2px;
+		border: 1px solid color-mix(in oklch, var(--text) 25%, transparent);
+	}
+	.sw.rep {
+		background: color-mix(in oklch, var(--muted) 30%, transparent);
+	}
+	.sw.comm {
+		background: color-mix(in oklch, var(--accent) 22%, transparent);
+	}
+	.canvas {
+		overflow-x: auto;
+	}
+	.canvas :global(svg) {
+		display: block;
+		max-width: 100%;
+		height: auto;
+		margin: 0 auto;
+	}
+	.canvas :global(.rank) {
+		font-size: 10px;
+		text-anchor: end;
+		fill: var(--muted);
+	}
+	.canvas :global(.stage) {
+		font-size: 9px;
+		text-anchor: middle;
+		fill: var(--muted);
+	}
+	.canvas :global(.frame) {
+		fill: var(--bg);
+	}
+	.canvas :global(.rep) {
+		fill: color-mix(in oklch, var(--muted) 30%, transparent);
+	}
+	.canvas :global(.frame-line) {
+		fill: none;
+		stroke: var(--muted);
+		stroke-width: 0.8;
+	}
+	.canvas :global(.part) {
+		opacity: 0.55;
+	}
+	.canvas :global(.sigma) {
+		font-size: 8.5px;
+		text-anchor: middle;
+		fill: #1a1a1a;
+	}
+	.canvas :global(.comm-bar) {
+		fill: color-mix(in oklch, var(--accent) 10%, transparent);
+		stroke: color-mix(in oklch, var(--accent) 35%, transparent);
+		stroke-dasharray: 3 2;
+	}
+	.canvas :global(.comm-col.real .comm-bar) {
+		fill: color-mix(in oklch, var(--accent) 22%, transparent);
+		stroke-dasharray: none;
+	}
+	.canvas :global(.comm-label) {
+		font-family: var(--mono);
+		font-size: 10px;
+		font-weight: 600;
+		text-anchor: middle;
+		fill: var(--accent);
+	}
+	.readout {
+		margin: 0.5rem 0 0;
+		font-size: 0.8rem;
+		text-align: center;
+		color: var(--muted);
+	}
+	.readout .math {
+		color: var(--text);
+	}
+</style>

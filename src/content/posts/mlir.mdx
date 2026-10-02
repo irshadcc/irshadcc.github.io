@@ -1,0 +1,507 @@
+---
+title: "MLIR, One Lowering at a Time"
+description: "MLIR is the compiler infrastructure under Triton, the CuTe DSL, IREE and much of today's ML compiler stack. This post reads its IR from the ground up, operations, regions, blocks and dialects, and then follows a matrix multiply from linalg on tensors down to LLVM and runs it, with tiling and vectorization through the transform dialect along the way. Every snippet is real mlir-opt output."
+date: 2026-10-02
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import MarginNote from "../../components/MarginNote.astro";
+import LoweringExplorer from "../../utils/mlir/LoweringExplorer.astro";
+
+## Background
+
+A compiler for machine learning has to cross a wide gap. At the top is a graph of tensor operations:
+a matrix multiply, a softmax, a convolution. At the bottom are loops, loads, stores and vector
+instructions for one particular chip. LLVM IR is excellent at the bottom, but it has no notion of a
+tensor or a matrix multiply, and by the time a program is in LLVM IR, the information a compiler
+needs to tile or fuse it is gone.
+
+So for years every ML framework built its own IRs for the levels in between: TensorFlow graphs and
+XLA's HLO, TVM's Relay and TIR, and many more, each with its own parser, printer, pass manager and
+bugs. **MLIR** (Multi-Level Intermediate Representation; Lattner et al., 2020) started at Google
+as an answer to that duplication. It is not one IR but a framework for building IRs. You define
+**dialects**, sets of operations and types at whatever level of abstraction you need, and MLIR
+supplies everything around them: the textual format, verification, the pass manager, pattern
+rewriting and conversion to LLVM. Different dialects can be mixed in one program, so a compiler can
+lower step by step, one dialect at a time, instead of in one big jump.
+
+Today most new ML compilers are built on it. Triton lowers through its own `tt` and `ttg` dialects,
+the [CuTe DSL](/blog/cute-dsl/) traces Python into MLIR, and IREE, torch-mlir, StableHLO, Mojo, the
+Flang Fortran compiler and the CIRCT hardware tools all use it. This post reads MLIR from the
+ground up and then follows one matrix multiply all the way down to machine code.
+
+**Following along.** Every snippet here was run with MLIR from LLVM 23.1. On a Mac,
+`brew install llvm` installs `mlir-opt`, `mlir-runner` and `mlir-translate` under
+`$(brew --prefix llvm)/bin`; most Linux distributions package them as `mlir-*-tools`. The passes
+and syntax used here are stable, except where a note says otherwise.<Sidenote>`mlir-runner` used
+to be called `mlir-cpu-runner`, and `bufferization.to_buffer` used to be
+`bufferization.to_memref`. Both were renamed in 2025.</Sidenote>
+
+## A first program
+
+Here is a function that sums the integers from 1 to $n$, and a `main` that calls it:
+
+```mlir
+// Sum of 1..n, with a loop that carries the running total.
+func.func @sum(%n: index) -> index {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %np1 = arith.addi %n, %c1 : index
+  %total = scf.for %i = %c1 to %np1 step %c1 iter_args(%acc = %c0) -> (index) {
+    %next = arith.addi %acc, %i : index
+    scf.yield %next : index
+  }
+  return %total : index
+}
+
+func.func @main() -> i32 {
+  %c100 = arith.constant 100 : index
+  %s = call @sum(%c100) : (index) -> index
+  %r = arith.index_cast %s : index to i32
+  return %r : i32
+}
+```
+
+Lowered to the LLVM dialect and run, it prints `5050`:
+
+```bash
+mlir-opt sum.mlir --convert-scf-to-cf --convert-to-llvm --reconcile-unrealized-casts -o sum.llvm.mlir
+mlir-runner sum.llvm.mlir -e main -entry-point-result=i32
+```
+
+Even this small program uses three dialects. `func` provides functions, calls and `return`.
+`arith` provides constants and integer and floating-point arithmetic. `scf` (structured control
+flow) provides the `for` loop. Every name with a dot in it is an **operation** from some dialect,
+and there is nothing else: there are no built-in instructions, only operations.
+
+## The structure of the IR
+
+### Operations
+
+That sameness is easiest to see in the **generic form**, which `mlir-opt` prints with
+`--mlir-print-op-generic`. Here is `@sum` again:
+
+```mlir
+"func.func"() <{function_type = (index) -> index, sym_name = "sum"}> ({
+^bb0(%arg0: index):
+  %3 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %4 = "arith.constant"() <{value = 1 : index}> : () -> index
+  %5 = "arith.addi"(%arg0, %4) <{overflowFlags = #arith.overflow<none>}> : (index, index) -> index
+  %6 = "scf.for"(%4, %5, %4, %3) ({
+  ^bb0(%arg1: index, %arg2: index):
+    %7 = "arith.addi"(%arg2, %arg1) <{overflowFlags = #arith.overflow<none>}> : (index, index) -> index
+    "scf.yield"(%7) : (index) -> ()
+  }) : (index, index, index, index) -> index
+  "func.return"(%6) : (index) -> ()
+}) : () -> ()
+```
+
+Every line has the same shape. An operation has:
+
+- a **name**, `dialect.op`;
+- **operands**, the values it uses, and **results**, the values it defines, each with a **type**;
+- **properties** and **attributes**: compile-time constants such as `value = 0`, a function's name
+  and type, or the overflow flags on an add;
+- **regions**: nested code. `func.func` has one, the function body, and `scf.for` has one, the
+  loop body;
+- a **location**, for error messages, hidden by default.
+
+The friendlier syntax of the first listing is a custom format each operation can declare, but it
+always means exactly this. Even the function is just an operation, `func.func`, whose region is its
+body, and the whole file is one `builtin.module` operation holding the functions in its region.
+
+### Values, blocks and regions
+
+Values are in **SSA form**: each one is defined once, by an operation result or a block argument,
+and its definition comes before its uses. A **region** holds a list of **blocks**, and a block
+holds a list of operations. Instead of LLVM's `phi` nodes, blocks take **arguments**.
+
+The loop shows how this works. `scf.for`'s operands are the lower bound, upper bound, step and the
+initial value of every loop-carried variable. Its body is a block whose arguments are the induction
+variable `%arg1` and the running total `%arg2`. The body ends with `scf.yield`, which passes the
+next total back to the loop. When the loop finishes, the last yielded value becomes the result of
+`scf.for` itself. Structured control flow keeps the loop's whole shape inside one operation, which
+is what makes it easy to analyse and transform.
+
+Lower it with `--convert-scf-to-cf`, and the structure disappears into a control-flow graph of
+plain blocks and branches:
+
+```mlir
+func.func @sum(%arg0: index) -> index {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %0 = arith.addi %arg0, %c1 : index
+  cf.br ^bb1(%c1, %c0 : index, index)
+^bb1(%1: index, %2: index):  // 2 preds: ^bb0, ^bb2
+  %3 = arith.cmpi slt, %1, %0 : index
+  cf.cond_br %3, ^bb2, ^bb3
+^bb2:  // pred: ^bb1
+  %4 = arith.addi %2, %1 : index
+  %5 = arith.addi %1, %c1 : index
+  cf.br ^bb1(%5, %4 : index, index)
+^bb3:  // pred: ^bb1
+  return %2 : index
+}
+```
+
+The loop header `^bb1` takes the induction variable and the total as block arguments, and each
+branch into it passes values for them. Translated to LLVM IR with `mlir-translate --mlir-to-llvmir`,
+those block arguments become exactly the `phi` nodes LLVM expects:
+
+```llvm
+3:                                                ; preds = %7, %1
+  %4 = phi i64 [ %9, %7 ], [ 1, %1 ]
+  %5 = phi i64 [ %8, %7 ], [ 0, %1 ]
+  %6 = icmp slt i64 %4, %2
+  br i1 %6, label %7, label %10
+```
+
+### Types and attributes
+
+Types are also defined by dialects. `index` (a machine-sized integer for indices and sizes), the
+integers `i1` to `i64`, the floats, and the shaped types `tensor`, `memref` and `vector` are
+built in. Dialects add their own: the LLVM dialect has `!llvm.ptr` and `!llvm.struct`, and Triton
+or the CuTe DSL have types for layouts. Attributes work the same way, so `#arith.overflow<none>` is
+an attribute of the `arith` dialect.
+
+Because all of this is open, passes can't know every operation. Instead they work through
+**traits** and **interfaces** that operations declare. A trait such as `Pure` tells a pass the
+operation has no side effects, so dead-code elimination can delete it. An interface such as
+`LoopLikeOpInterface` lets a pass hoist loop-invariant code out of any loop, whatever its dialect.
+That is how one pass manager serves a hundred dialects.
+
+## The dialects of a lowering
+
+Dialects sit at different levels. The ones this post uses, from the top down:
+
+| Dialect | Level | What it holds |
+| --- | --- | --- |
+| `linalg` | Tensor algebra | Named ops like `linalg.matmul` and `linalg.fill`, plus `linalg.generic` for any loop nest over arrays |
+| `tensor` | Values | Immutable tensors: `tensor.empty`, slicing with `extract_slice` and `insert_slice` |
+| `bufferization` | Bridge | Converting between tensors and buffers |
+| `memref` | Memory | Buffers with a shape and a layout: `alloc`, `load`, `store`, views |
+| `vector` | SIMD | Fixed-size vectors: `transfer_read`, `contract`, reductions |
+| `scf` | Structured control | `for`, `while`, `if`, with their bodies as regions |
+| `cf` | Unstructured control | Branches between blocks |
+| `arith` | Scalars | Integer and floating-point arithmetic and comparisons |
+| `func` | Functions | `func`, `call`, `return` |
+| `llvm` | Target | A mirror of LLVM IR, ready for translation |
+
+Others cover GPUs (`gpu`, and `nvvm` and `rocdl` for NVIDIA and AMD), affine loop nests (`affine`),
+async execution, sparse tensors and more. A compiler like Triton or IREE adds its own dialects at
+the top and reuses these below.
+
+## Following a matrix multiply down
+
+Now a real lowering. The function multiplies a $4 \times 8$ matrix by an $8 \times 4$ one, written
+at the level of tensors:
+
+```mlir
+func.func @matmul(%A: tensor<4x8xf32>, %B: tensor<8x4xf32>) -> tensor<4x4xf32> {
+  %zero = arith.constant 0.0 : f32
+  %empty = tensor.empty() : tensor<4x4xf32>
+  %C = linalg.fill ins(%zero : f32) outs(%empty : tensor<4x4xf32>) -> tensor<4x4xf32>
+  %D = linalg.matmul ins(%A, %B : tensor<4x8xf32>, tensor<8x4xf32>)
+                     outs(%C : tensor<4x4xf32>) -> tensor<4x4xf32>
+  return %D : tensor<4x4xf32>
+}
+```
+
+Tensors here are **values**, not memory: `linalg.fill` doesn't write into `%empty`, it returns a new
+tensor, and `linalg.matmul` returns another. `tensor.empty` only says "a tensor of this shape";
+its contents don't matter, because `linalg.fill` overwrites them. The `outs` operand gives the
+initial value to accumulate into, which is why the zeros come first.
+
+A `main` function builds two inputs, $A_{ik} = i + k$ and $B_{kj} = k - j$, calls `@matmul` and
+prints the result with `printMemrefF32`, a function from MLIR's runtime library. The inputs come
+from `tensor.generate`, which builds a tensor from a region that computes each element from its
+indices:
+
+```mlir
+// An 8 x 8 tensor with element (i, j) = i + sign * j.
+func.func @iota(%sign: f32) -> tensor<8x8xf32> {
+  %t = tensor.generate {
+  ^bb0(%i: index, %j: index):
+    %fi = arith.index_cast %i : index to i32
+    %fj = arith.index_cast %j : index to i32
+    %a = arith.sitofp %fi : i32 to f32
+    %b = arith.sitofp %fj : i32 to f32
+    %sb = arith.mulf %sign, %b : f32
+    %v = arith.addf %a, %sb : f32
+    tensor.yield %v : f32
+  } : tensor<8x8xf32>
+  return %t : tensor<8x8xf32>
+}
+
+func.func @main() {
+  %p1 = arith.constant 1.0 : f32
+  %m1 = arith.constant -1.0 : f32
+  %ta = call @iota(%p1) : (f32) -> tensor<8x8xf32>
+  %tb = call @iota(%m1) : (f32) -> tensor<8x8xf32>
+  %a = tensor.extract_slice %ta[0, 0] [4, 8] [1, 1] : tensor<8x8xf32> to tensor<4x8xf32>
+  %b = tensor.extract_slice %tb[0, 0] [8, 4] [1, 1] : tensor<8x8xf32> to tensor<8x4xf32>
+  %c = call @matmul(%a, %b) : (tensor<4x8xf32>, tensor<8x4xf32>) -> tensor<4x4xf32>
+  %buf = bufferization.to_buffer %c : tensor<4x4xf32> to memref<4x4xf32>
+  %cast = memref.cast %buf : memref<4x4xf32> to memref<*xf32>
+  call @printMemrefF32(%cast) : (memref<*xf32>) -> ()
+  return
+}
+
+func.func private @printMemrefF32(memref<*xf32>)
+```
+
+One command lowers the whole file to the LLVM dialect, and `mlir-runner` compiles and runs it:
+
+```bash
+mlir-opt matmul.mlir \
+  --one-shot-bufferize="bufferize-function-boundaries function-boundary-type-conversion=identity-layout-map" \
+  --convert-linalg-to-loops \
+  --convert-scf-to-cf \
+  --expand-strided-metadata \
+  --lower-affine \
+  --convert-to-llvm \
+  --reconcile-unrealized-casts \
+  -o matmul.llvm.mlir
+mlir-runner matmul.llvm.mlir -e main -entry-point-result=void \
+  -shared-libs=$LIB/libmlir_runner_utils.dylib,$LIB/libmlir_c_runner_utils.dylib
+```
+
+```
+[[140,   112,   84,   56],
+ [168,   132,   96,   60],
+ [196,   152,   108,   64],
+ [224,   172,   120,   68]]
+```
+
+That matches NumPy's `A @ B`. Here `$LIB` is the `lib` directory of the LLVM installation, which
+holds the runtime library (`.so` on Linux). Step through what each pass did to `@matmul`. Operation
+names are coloured by dialect, and the bar under the code counts the operations of each dialect;
+hover a dialect in it to pick out its operations:
+
+<LoweringExplorer stage="linalg on tensors" title="@matmul at each step of the lowering" />
+
+### Bufferization
+
+The first pass, `--one-shot-bufferize`, turns tensors (values) into **memrefs** (buffers). Each
+tensor value needs memory, and the pass decides which values can share it. `linalg.fill` and
+`linalg.matmul` can both write into the same buffer, because the tensor they replace is never used
+again, so there is only one `memref.alloc`. Deciding when an update can happen in place, rather
+than in a copy, is the hard part, and "one-shot" refers to doing that analysis for the whole
+function at once. The linalg operations survive unchanged, now on memrefs:
+
+```mlir
+%alloc = memref.alloc() {alignment = 64 : i64} : memref<4x4xf32>
+linalg.fill ins(%cst : f32) outs(%alloc : memref<4x4xf32>)
+linalg.matmul ins(%arg0, %arg1 : memref<4x8xf32>, memref<8x4xf32>) outs(%alloc : memref<4x4xf32>)
+```
+
+The `function-boundary-type-conversion` option asks for plain row-major memrefs on the function's
+arguments. Without it, the pass assumes the caller might pass any strided view, and the argument
+types become `memref<4x8xf32, strided<[?, ?], offset: ?>>`.
+
+### Loops, then branches
+
+`--convert-linalg-to-loops` expands each linalg operation into the loop nest it stands for: two
+loops for the fill and three for the matmul, made of `scf.for`, `memref.load`, `arith.mulf`,
+`arith.addf` and `memref.store`. `--convert-scf-to-cf` then flattens the loops into blocks and
+branches, as with `@sum`. Notice how the operation count grows at each step, from 6 operations
+with linalg to 40 with branches: each step trades meaning for detail.
+
+### Into the LLVM dialect
+
+The last group of passes rewrites every remaining operation into the `llvm` dialect.
+`--convert-to-llvm` is a driver that collects the conversion patterns of every dialect that
+implements its interface: arith to LLVM arithmetic, cf to LLVM branches, func to LLVM functions,
+memref to pointer arithmetic. `--expand-strided-metadata` and `--lower-affine` first simplify how
+memref addresses are computed, so that the memref conversion has less to do, and
+`--reconcile-unrealized-casts` removes the temporary casts the conversions left at dialect
+boundaries.
+
+The biggest change is to the memrefs. A memref becomes a **descriptor**, a struct with an
+allocated pointer, an aligned pointer, an offset, and the sizes and strides of each dimension:
+
+```mlir
+!llvm.struct<(ptr, ptr, i64, array<2 x i64>, array<2 x i64>)>
+```
+
+At a function boundary, each descriptor is passed as its seven fields, which is why the LLVM
+version of `@matmul` takes 14 arguments for its two inputs. A `memref.load %A[%i, %k]` becomes
+a multiply-add of the indices with the strides, a `getelementptr` and a `llvm.load`. From here,
+`mlir-translate --mlir-to-llvmir` produces ordinary LLVM IR, and `mlir-runner` hands it to LLVM's
+JIT.
+
+## Rewriting: canonicalization
+
+Lowering is one kind of transformation; cleanup is the other. The `--canonicalize` pass applies
+every **folder** and **canonicalization pattern** that the operations in a program declare, over
+and over, until nothing changes. It also deletes operations that are `Pure` and unused. Given
+
+```mlir
+func.func @f(%x: i32) -> i32 {
+  %c0 = arith.constant 0 : i32
+  %c2 = arith.constant 2 : i32
+  %c3 = arith.constant 3 : i32
+  %a = arith.addi %x, %c0 : i32     // x + 0
+  %b = arith.muli %c2, %c3 : i32    // 2 * 3
+  %c = arith.muli %a, %b : i32
+  %d = arith.subi %x, %x : i32      // never used
+  return %c : i32
+}
+```
+
+`mlir-opt --canonicalize` produces
+
+```mlir
+func.func @f(%arg0: i32) -> i32 {
+  %c6_i32 = arith.constant 6 : i32
+  %0 = arith.muli %arg0, %c6_i32 : i32
+  return %0 : i32
+}
+```
+
+`arith.addi` knows that adding zero returns its other operand, `arith.muli` folds two constants
+into one, and `%d` is pure and unused, so it is erased. No pass here knows anything about
+arithmetic. Each operation carries its own simplifications, and the pass just runs them. The same
+mechanism, a **greedy pattern rewrite driver**, applies any set of patterns, and the **dialect
+conversion** framework behind the lowering passes extends it with a notion of which operations are
+*legal* in the target, and a **type converter** that turns, for example, a memref type into its
+descriptor struct.
+
+## Scheduling with the transform dialect
+
+Lowering `linalg.matmul` straight to loops gives the textbook triple loop, which is slow on any
+real machine. A fast kernel needs tiling, vectorization and more, and where to apply them depends
+on the hardware. In MLIR, those decisions can be written as IR too, in the **transform dialect**: a
+small program whose operations act on the payload program's operations. Here is one that tiles the
+matmul into $2 \times 2$ blocks of output:
+
+```mlir
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%root: !transform.any_op {transform.readonly}) {
+    %mm = transform.structured.match ops{["linalg.matmul"]} in %root
+      : (!transform.any_op) -> !transform.any_op
+    %tiled, %loops:2 = transform.structured.tile_using_for %mm tile_sizes [2, 2]
+      : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
+    transform.yield
+  }
+}
+```
+
+`%mm` is a **handle**: not a value of the payload program, but a reference to the operations that
+`structured.match` found in it. `tile_using_for` tiles them and returns handles to the tiled matmul
+and the two new loops, which a longer script could transform further. The script lives in its own
+file and is run by the interpreter pass:
+
+```bash
+mlir-opt matmul.mlir \
+  --transform-preload-library="transform-library-paths=tile.mlir" \
+  --transform-interpreter --canonicalize
+```
+
+The result is still on tensors. Each iteration slices out a $2 \times 8$ block of $A$, an
+$8 \times 2$ block of $B$ and a $2 \times 2$ block of the output, multiplies them with a smaller
+`linalg.matmul`, and inserts the result back:
+
+```mlir
+%2 = scf.for %arg2 = %c0 to %c4 step %c2 iter_args(%arg3 = %1) -> (tensor<4x4xf32>) {
+  %3 = scf.for %arg4 = %c0 to %c4 step %c2 iter_args(%arg5 = %arg3) -> (tensor<4x4xf32>) {
+    %extracted_slice = tensor.extract_slice %arg0[%arg2, 0] [2, 8] [1, 1] : tensor<4x8xf32> to tensor<2x8xf32>
+    %extracted_slice_0 = tensor.extract_slice %arg1[0, %arg4] [8, 2] [1, 1] : tensor<8x4xf32> to tensor<8x2xf32>
+    %extracted_slice_1 = tensor.extract_slice %arg5[%arg2, %arg4] [2, 2] [1, 1] : tensor<4x4xf32> to tensor<2x2xf32>
+    %4 = linalg.matmul ins(%extracted_slice, %extracted_slice_0 : tensor<2x8xf32>, tensor<8x2xf32>) outs(%extracted_slice_1 : tensor<2x2xf32>) -> tensor<2x2xf32>
+    %inserted_slice = tensor.insert_slice %4 into %arg5[%arg2, %arg4] [2, 2] [1, 1] : tensor<2x2xf32> into tensor<4x4xf32>
+    scf.yield %inserted_slice : tensor<4x4xf32>
+  }
+  scf.yield %3 : tensor<4x4xf32>
+}
+```
+
+The output tensor is carried through both loops as an `iter_args` value, updated one tile at a
+time. Bufferization later turns every `insert_slice` into a write into the same buffer, so no
+copies remain. Adding `transform.structured.vectorize %tiled` to the script turns each tile's
+matmul into operations on vectors: `vector.transfer_read`s of the two input tiles, broadcast and
+transposed so that both are `vector<2x2x8xf32>`, a read of the output tile, an elementwise `arith.mulf`, a
+`vector.multi_reduction` that sums over the 8 values of $k$, and a `vector.transfer_write`. Both variants
+are in the figure above, under "or, from the tensors". Both lower to LLVM with the same pipeline
+(plus `--convert-vector-to-scf` and `--convert-vector-to-llvm` for the vector version) and print
+the same result.<Sidenote>The vector version also needs patterns that lower
+`vector.multi_reduction`, applied in the script with `transform.apply_patterns`. Their names are
+the least stable part of this post. In LLVM 23 they are
+`transform.apply_patterns.vector.reorder_multi_reduction_dims`, `multi_reduction_flattening` and
+`multi_reduction_unrolling`, which replaced a single `lower_multi_reduction` in earlier
+versions.</Sidenote>
+
+This separates *what* to compute from *how*, much as Halide and TVM do with their schedules: the
+payload says matmul, and the script, written once per target, says how to tile it. And since the
+script is IR, the same tools parse, verify and print it.
+
+## Defining a dialect
+
+New dialects are usually defined in **ODS** (Operation Definition Specification), a TableGen
+format from which MLIR generates the C++ classes, parser, printer and verifier. For experiments,
+there is also **IRDL**, which defines a dialect in MLIR itself and loads it at run time, with no
+compiling. Here is a dialect with one operation that takes two `f32` operands and returns an
+`f32`:
+
+```mlir
+irdl.dialect @toy {
+  irdl.operation @scale {
+    %f32 = irdl.is f32
+    irdl.operands(input: %f32, factor: %f32)
+    irdl.results(output: %f32)
+  }
+}
+```
+
+With `mlir-opt --irdl-file=toy.irdl.mlir`, programs can use `"toy.scale"(%x, %k) : (f32, f32) -> f32`
+in generic form, and the verifier enforces the definition. Give it `i32` operands, and it reports
+
+```
+error: expected 'f32' but got 'i32'
+  %y = "toy.scale"(%x, %k) : (i32, i32) -> i32
+       ^
+```
+
+Without the definition, `mlir-opt` rejects the operation outright, since its dialect isn't
+registered. To *lower* a new dialect you still need code: conversion patterns that rewrite
+`toy.scale` into, say, `arith.mulf`, written in C++ or Python, or in MLIR's own pattern languages,
+PDL and PDLL. MLIR's
+[Toy tutorial](https://mlir.llvm.org/docs/Tutorials/Toy/) walks through all of it, from ODS to
+lowering to LLVM.
+
+## How ML compilers use it
+
+With these pieces, the architecture of an MLIR-based compiler is a stack of dialects with
+lowerings between them:
+
+- **Triton** parses a Python kernel into its `tt` dialect, which works on blocks of values much
+  like `tensor`. The `ttg` (TritonGPU) dialect then attaches a **layout** to each block, which
+  says how its elements are spread over threads, warps and registers. Most of Triton's
+  optimizations, such as choosing layouts for tensor cores and pipelining loads, are passes on
+  `ttg`, before it lowers to the LLVM dialect, NVVM and PTX.
+- **The CuTe DSL** traces a Python function into MLIR operations from its `cute` dialect, whose
+  types are the layouts and tensors from the [CuTe tour](/blog/cute-dsl/), plus
+  `cute_nvgpu` for the hardware-specific copy and MMA atoms. From there it lowers through the
+  standard dialects to NVVM and PTX.
+- **torch-mlir** brings PyTorch programs into MLIR, through its own `torch` dialect and on into
+  `linalg` on tensors, TOSA or StableHLO. **IREE** compiles models from there: it tiles, fuses,
+  vectorizes and distributes `linalg` operations, with the same kind of machinery as above, for
+  CPUs, GPUs and accelerators.
+
+In each case, the parts that are specific to a domain are a few dialects and passes. The rest
+(parsing, printing, verification, pass management, pattern rewriting and the path to LLVM) is
+shared, which is the bet MLIR made.
+
+## Summary
+
+- **Everything is an operation.** Instructions, loops and functions are all operations with
+  operands, results, attributes and regions, and the generic form prints any of them the same way.
+- **SSA with regions and block arguments.** Regions nest code inside operations like `scf.for` or
+  `func.func`, and block arguments replace `phi` nodes.
+- **Dialects are levels of abstraction.** A program lowers step by step, from `linalg` on tensors
+  through buffers, loops and branches to the `llvm` dialect, and the dialects in between can be
+  mixed freely.
+- **Passes work through traits, interfaces and patterns**, so generic passes like
+  canonicalization serve any dialect, and lowerings are sets of conversion patterns.
+- **Transformations can be IR too.** The transform dialect writes tiling and vectorization
+  decisions as a script that is kept apart from the program it transforms.

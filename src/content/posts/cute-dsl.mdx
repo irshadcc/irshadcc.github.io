@@ -1,0 +1,709 @@
+---
+title: "A Tour of the CuTe DSL"
+description: "The CuTe DSL lets you write CUDA kernels in Python, using the same layout algebra as CUTLASS's C++ CuTe. This post walks through its main functions: building and querying layouts, composition, division and products, tensors, thread-value layouts, and copy and MMA atoms, with a picture for every one."
+date: 2026-10-02
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import MarginNote from "../../components/MarginNote.astro";
+import LayoutGrid from "../../utils/matrix/LayoutGrid.astro";
+import Matrix2D from "../../utils/matrix/Matrix2D.astro";
+import { cuteDslFigures as F } from "../../utils/matrix/cuteDslFigures";
+
+## Background
+
+CUTLASS has long had **CuTe**, a C++ library for describing how data is laid out and how threads
+divide it up. With CUTLASS 4, NVIDIA added the **CuTe DSL**: the same ideas, written in Python.
+You write a kernel as a Python function, and the DSL traces it into MLIR and compiles it to GPU
+code just in time. There is no C++ and no separate build step, and the kernel can still reach
+tensor cores, TMA and the other hardware features of Hopper and Blackwell.
+
+At the heart of both is the **layout**: a function from coordinates to memory offsets. Almost
+everything else in the DSL builds new layouts out of old ones, or applies them to data. This post
+tours the main functions in `cutlass.cute`, roughly in the order you meet them when writing a
+kernel, and draws each one.
+
+The code comes from, or closely follows, NVIDIA's own CuTe DSL notebooks and examples in the
+[CUTLASS repository](https://github.com/NVIDIA/cutlass/tree/main/examples/python/CuTeDSL).<Sidenote>Every
+layout printed or drawn here was computed with `pycute`, CUTLASS's pure-Python version of the
+layout algebra. I checked it against the outputs recorded in NVIDIA's `cute_layout_algebra`
+notebook, which it matches exactly.</Sidenote> My earlier post,
+[Working Backwards Through CuTe Layout Composition](/blog/cute-layout-composition/), goes deeper on
+one operation.
+
+**Reading the figures.** Each grid draws a layout with rows for mode 0 and columns for mode 1.
+The headers give each row's and column's coordinate, nested where the mode is. The big number in
+a cell is whatever that figure is about, usually the cell's memory offset. The small grey label
+underneath groups cells, and cells with the same label share a colour.
+
+## A first kernel
+
+A CuTe DSL program has two halves, marked by two decorators:
+
+- **`@cute.kernel`** marks device code: the function every GPU thread runs.
+- **`@cute.jit`** marks host code: a function that sets up and launches kernels.
+
+Here is the simplest possible elementwise add, from NVIDIA's tutorial:
+
+```python
+import torch
+import cutlass
+import cutlass.cute as cute
+from cutlass.cute.runtime import from_dlpack
+
+@cute.kernel
+def add_kernel(gA: cute.Tensor, gB: cute.Tensor, gC: cute.Tensor):
+    tidx, _, _ = cute.arch.thread_idx()   # thread within the block
+    bidx, _, _ = cute.arch.block_idx()    # block within the grid
+    bdim, _, _ = cute.arch.block_dim()    # threads per block
+    thread_idx = bidx * bdim + tidx
+
+    m, n = gA.shape
+    mi, ni = thread_idx // n, thread_idx % n
+    gC[mi, ni] = gA[mi, ni] + gB[mi, ni]
+
+@cute.jit
+def add(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
+    m, n = mA.shape
+    add_kernel(mA, mB, mC).launch(grid=((m * n) // 256, 1, 1), block=(256, 1, 1))
+
+a = torch.randn(16384, 8192, device="cuda", dtype=torch.float16)
+b = torch.randn_like(a)
+c = torch.zeros_like(a)
+a_, b_, c_ = (from_dlpack(t, assumed_align=16) for t in (a, b, c))
+
+add_ = cute.compile(add, a_, b_, c_)   # trace and compile once
+add_(a_, b_, c_)                       # run
+torch.testing.assert_close(c, a + b)
+```
+
+- **`cute.arch.thread_idx()`, `block_idx()` and `block_dim()`** return CUDA's `threadIdx`,
+  `blockIdx` and `blockDim` as `(x, y, z)` tuples.
+- **`kernel(...).launch(grid=, block=)`** launches a kernel from host code.
+- **`from_dlpack`** wraps a PyTorch (or any DLPack) tensor as a `cute.Tensor` without copying it.
+  `assumed_align=16` promises 16-byte alignment, which later allows vectorized loads.
+- **`cute.compile`** traces and compiles a `@cute.jit` function for the given argument types, and
+  returns a callable you can run repeatedly. Calling the `@cute.jit` function directly also works;
+  it compiles on first use and caches the result.
+
+## Tracing: static and dynamic values
+
+A `@cute.jit` function runs **once**, in Python, to build the kernel. Every value in it is
+either **static**, a plain Python value known while tracing, or **dynamic**, a value that only
+exists when the GPU runs. That split decides how loops, branches and printing behave.
+
+| Construct | Static (trace time, in Python) | Dynamic (run time, on the GPU) |
+| --- | --- | --- |
+| Integer | Python `int`, `cutlass.Constexpr` parameter | `cutlass.Int32` |
+| Loop | `cutlass.range_constexpr(n)`: fully unrolled while tracing | `cutlass.range(n)`: a real GPU loop, optionally `unroll=k` |
+| Branch | `if cutlass.const_expr(cond):` only the taken side is compiled | plain `if` on a dynamic value: both sides are compiled |
+| Printing | `print(x)`: prints once, while tracing | `cute.printf("{}", x)`: prints from every thread that runs it |
+
+Layouts can mix the two. A static layout is fully known while tracing, so the compiler can fold
+all its arithmetic into constants; a dynamic one is evaluated at run time. `print` shows dynamic
+values as `?`. From NVIDIA's layout notebook:
+
+```python
+@cute.jit
+def show():
+    A = cute.make_layout((6, 2), stride=(cutlass.Int32(8), 2))   # one dynamic stride
+    print(A)                        # (6,2):(?,2)    -- while tracing
+    cute.printf("{}", A)            # (6,2):(8,2)    -- on the GPU
+```
+
+## Layouts
+
+### `make_layout` and `make_ordered_layout`
+
+A layout is a **shape** and a **stride**, written `shape:stride`. It maps a coordinate to an
+offset by multiplying each coordinate by its stride and adding up the results. If you leave out
+the stride, `make_layout` uses compact **column-major** strides, where the leftmost mode varies
+fastest:
+
+```python
+cute.make_layout((4, 8))                         # (4,8):(1,4)   column-major
+cute.make_layout((4, 8), stride=(8, 1))          # (4,8):(8,1)   row-major
+cute.make_ordered_layout((4, 8), order=(1, 0))   # (4,8):(8,1)   the same, by mode order
+```
+
+`make_ordered_layout` builds compact strides in the order you give, listing modes from
+fastest-varying to slowest. Here are the two, with each cell showing its offset:
+
+<LayoutGrid name="column-major" shape={[4, 8]} stride={[1, 4]} />
+
+<LayoutGrid name="row-major" shape={[4, 8]} stride={[8, 1]} />
+
+### Hierarchical layouts
+
+A mode can itself be a layout, which is what makes CuTe different from ordinary strided arrays.
+Here is a 4×8 matrix stored as 2×2 blocks, each block contiguous in memory and the blocks
+arranged column-major:
+
+```python
+cute.make_layout(((2, 2), (2, 4)), stride=((1, 4), (2, 8)))
+```
+
+The row mode `(2,2):(1,4)` says "row within a block, then which block row". The column mode
+`(2,4):(2,8)` says the same for columns. The figure labels each 2×2 block:
+
+<Matrix2D name="blocked storage" {...F.hier} />
+
+You still index it as a 4×8 matrix with `(row, col)`. The nesting only changes where each element
+lives.
+
+### Querying a layout
+
+| Function | Returns | For `(4,8):(1,4)` |
+| --- | --- | --- |
+| `cute.size(L)` | Number of coordinates | 32 |
+| `cute.cosize(L)` | Size of the memory it spans: largest offset + 1 | 32 |
+| `cute.rank(L)` | Number of top-level modes | 2 |
+| `cute.depth(L)` | Nesting depth | 1 |
+| `cute.shape(L)`, `L.stride` | The shape and stride tuples | `(4,8)`, `(1,4)` |
+| `L((1, 2))` or `cute.crd2idx((1, 2), L)` | Offset of a coordinate | 9 |
+| `L(9)` | Offset of a 1-D index, split column-major over the shape | 9 |
+| `cute.size(L, mode=[0])` | Size of one mode | 4 |
+
+**`crd2idx`** is the layout applied to one coordinate: row 1, column 2 of the column-major layout
+is $1 \cdot 1 + 2 \cdot 4 = 9$.
+
+<Matrix2D name="L, with coordinate (1,2) marked" {...F.crd2idx} />
+
+**`size` and `cosize`** differ as soon as a layout has gaps. `(4,8):(2,8)` still has 32
+coordinates, but its largest offset is 62, so it spans 63 elements of memory. Drawing the memory
+those 63 elements occupy, in rows of 8, shows the gaps:
+
+<LayoutGrid name="L" shape={[4, 8]} stride={[2, 8]} />
+
+<Matrix2D name="memory in rows of 8, marked by whether L touches it" {...F.cosize} />
+
+### `coalesce`
+
+`coalesce` simplifies a layout without changing what it computes: it flattens nesting and merges
+neighbouring modes whenever one continues where the previous one stopped:
+
+```python
+L = cute.make_layout((2, (1, 6)), stride=(1, (6, 2)))
+cute.coalesce(L)                          # 12:1
+cute.coalesce(L, target_profile=(1, 1))   # (2,6):(1,2)   coalesce each mode separately
+```
+
+The size-1 mode disappears, and `2:1` followed by `6:2` is just `12:1`. With
+`target_profile=(1, 1)` each mode is simplified on its own, so the rank stays 2. The two grids
+below are the same function, before and after:
+
+<Matrix2D name="before" {...F.coalesce_before} />
+
+<LayoutGrid name="after, by mode" shape={[2, 6]} stride={[1, 2]} />
+
+## Layout algebra
+
+These functions build new layouts from old ones. They are how a kernel describes tiling and how
+work is split between threads, without writing any index arithmetic.
+
+### `composition`
+
+`cute.composition(A, B)` returns $R = A \circ B$, defined by $R(c) = A(B(c))$. $B$ picks out
+coordinates, and $A$ turns them into offsets. The result has $B$'s shape, so composition is the
+standard way to **reshape** or **reorder** a layout. From NVIDIA's notebook:
+
+```python
+A = cute.make_layout((6, 2), stride=(8, 2))
+B = cute.make_layout((4, 3), stride=(3, 1))
+R = cute.composition(A, B)            # ((2,2),3):((24,2),8)
+```
+
+<LayoutGrid name="A" shape={[6, 2]} stride={[8, 2]} />
+
+<LayoutGrid name="B" shape={[4, 3]} stride={[3, 1]} />
+
+<Matrix2D name="R = A ∘ B" {...F.composed} />
+
+Check one entry: $B(1, 0) = 3$, the 1-D index of row 3, column 0 of $A$, so $A$ gives
+$3 \cdot 8 = 24$. That is $R(1, 0)$. CuTe expressed the result with a nested row mode
+`(2,2):(24,2)`, because the rows of $B$ step through $A$'s rows in a pattern a single stride
+can't describe.
+
+Instead of a layout, you can also pass a **tiler**, a tuple with one entry per mode, and each mode
+is composed separately. Here mode 0 is composed with `4:2` (every other row) and mode 1 with `4:1`
+(the first four columns):
+
+```python
+M = cute.make_layout((8, 8))                                   # (8,8):(1,8)
+cute.composition(M, (cute.make_layout(4, stride=2), cute.make_layout(4)))   # (4,4):(2,8)
+```
+
+<Matrix2D name="M, with the selected cells" {...F.compose_tiler_src} />
+
+<Matrix2D name="composition(M, (4:2, 4:1))" {...F.compose_tiler_res} />
+
+A tuple entry can also be a plain number, as in `cute.composition(A, (3, 8))`, which means
+`3:1` and `8:1`, or `None` to leave that mode alone.
+
+### `complement`
+
+`cute.complement(A, n)` returns the layout that fills in the gaps of $A$ up to size $n$: placed
+after $A$, the pair covers $0, 1, \dots, n-1$ exactly once.
+
+```python
+A = cute.make_layout(4, stride=2)   # offsets 0, 2, 4, 6
+cute.complement(A, 24)              # (2,3):(1,8)
+```
+
+The figure draws the pair `(A, complement)` as one layout: rows are $A$'s four offsets, columns
+are the complement's six repeats. Every offset from 0 to 23 appears once:
+
+<Matrix2D name="(A, complement(A, 24))" {...F.complement} />
+
+You rarely call it directly, but it is the building block of division and products.
+
+### Division: splitting into tiles
+
+`cute.logical_divide(A, tiler)` splits a layout into tiles. The result has two modes: the
+elements **within** a tile, and the tiles themselves. Formally it is
+$A \circ (\text{tiler}, \text{complement}(\text{tiler}))$. Like composition, the tiler can be a
+tuple with one entry per mode.
+
+Take an 8×8 column-major matrix and divide it into 2×4 tiles:
+
+```python
+M = cute.make_layout((8, 8))            # (8,8):(1,8)
+cute.logical_divide(M, (2, 4))          # ((2,4),(4,2)):((1,2),(8,32))
+cute.zipped_divide(M, (2, 4))           # ((2,4),(4,2)):((1,8),(2,32))
+cute.tiled_divide(M, (2, 4))            # ((2,4),4,2):((1,8),2,32)
+cute.flat_divide(M, (2, 4))             # (2,4,4,2):(1,8,2,32)
+```
+
+The figure shows the matrix with each element coloured by its tile, and the number in each cell
+is the element's position **inside** its tile:
+
+<Matrix2D name="M, coloured by (2,4) tile" {...F.divide} />
+
+The flavours of divide hold the same elements but group the modes differently:
+
+| Function | Result shape | Typical use |
+| --- | --- | --- |
+| `logical_divide` | `((TileM,RestM),(TileN,RestN))` | Keeps each original mode together |
+| `zipped_divide` | `((TileM,TileN),(RestM,RestN))` | Mode 0 is one tile, mode 1 picks the tile |
+| `tiled_divide` | `((TileM,TileN),RestM,RestN)` | The same, with the tile index unpacked |
+| `flat_divide` | `(TileM,TileN,RestM,RestN)` | Everything flattened |
+
+**`logical_divide`** keeps rows as rows and columns as columns. Here the tiler is contiguous, so
+drawn as a matrix it puts every element exactly where it was in `M`. What changes is the
+grouping, visible in the headers: each row index is now a (row in tile, which tile row) pair, and
+likewise for columns. With a strided tiler such as `2:4`, the same function would gather rows 0
+and 4 into one tile, and the picture would be reordered.
+
+<Matrix2D name="logical_divide(M, (2,4))" {...F.logical_divide} />
+
+**`zipped_divide`** is the one kernels use most, because its result is a 2-D layout: **(element
+in tile, which tile)**. Drawn as a matrix, every column is one complete tile:
+
+<Matrix2D name="zipped_divide(M, (2,4))" {...F.zipped} />
+
+`tiled_divide` and `flat_divide` hold exactly the same offsets as `zipped_divide`, only with the
+tile and rest modes unpacked into rank 3 and rank 4, so the zipped figure stands in for both.
+
+### `local_tile`
+
+`gA[(None, t)]` on a zipped tensor is tile `t`, where `None` keeps a whole mode, like `:` in
+NumPy. **`cute.local_tile(tensor, tiler, coord)`** does exactly this, `zipped_divide` and then
+slice, and is how a thread block picks out its own tile. Taking tile coordinate `(1, 1)`, the
+second tile down and second across:
+
+```python
+cute.local_tile(M, tiler=(2, 4), coord=(1, 1))   # (2,4):(1,8), starting at offset 34
+```
+
+<Matrix2D name="M, with tile (1,1) marked" {...F.local_tile_src} />
+
+<Matrix2D name="local_tile(M, (2,4), (1,1))" {...F.local_tile_res} />
+
+The result is a 2×4 tensor whose layout is the tile's shape `(2,4):(1,8)`; the pointer moves to
+offset 34, where the tile starts.
+
+### `local_partition`
+
+`local_tile` gives each **block** a contiguous tile. **`cute.local_partition(tensor, thr_layout,
+index)`** does the opposite slice: it divides the tensor into tiles shaped like the thread layout,
+then gives thread `index` the element at **its position inside every tile**. With a 2×4 thread
+layout of 8 threads over the 8×8 matrix:
+
+```python
+thr_layout = cute.make_layout((2, 4))           # 8 threads, column-major
+cute.local_partition(M, thr_layout, index=5)    # thread 5's elements: (4,2) of them
+```
+
+<Matrix2D name="M, coloured by thread" {...F.local_partition} />
+
+Each colour is one thread. Thread 5 sits at coordinate `(1, 2)` of the thread layout, so it owns
+every odd row and every column $\equiv 2 \pmod 4$: one element from each of the 8 tiles, labelled
+`v0`–`v7`. Neighbouring threads own neighbouring elements, which is what you want for coalesced
+memory access.
+
+### Products: repeating a tile
+
+Products go the other way: they take a tile and repeat it. `cute.logical_product(A, B)` returns
+`(A, B*)`, where `B*` is $B$ rescaled so that each repeat lands on a fresh copy of $A$. The
+other products regroup the same result. Repeating a 2×2 tile `(2,2):(1,2)` in a 2×3 pattern:
+
+```python
+tile = cute.make_layout((2, 2))              # (2,2):(1,2)
+reps = cute.make_layout((2, 3))              # (2,3):(1,2)
+cute.logical_product(tile, reps)             # ((2,2),(2,3)):((1,2),(4,8))
+cute.zipped_product(tile, reps)              # ((2,2),(2,3)):((1,2),(4,8))
+cute.blocked_product(tile, reps)             # ((2,2),(2,3)):((1,4),(2,8))
+cute.raked_product(tile, reps)               # ((2,2),(3,2)):((4,1),(8,2))
+```
+
+**`logical_product`**: mode 0 is the tile, mode 1 is which copy. Drawn as a matrix, every column
+is one copy of the tile, the mirror image of `zipped_divide`. `zipped_product` gives the same
+layout here, because the repeat pattern is a single layout rather than a tuple of per-mode
+layouts; `tiled_product` and `flat_product` unpack the copy mode into rank 3 and 4.
+
+<Matrix2D name="logical_product(tile, reps)" {...F.logical_product} />
+
+**`blocked_product` and `raked_product`** regroup that result into a rank-2 layout shaped like
+the full repeated tile, 4×6 here. The colours mark the six copies of the tile:
+
+<Matrix2D name="blocked_product(tile, reps)" {...F.blocked} />
+
+<Matrix2D name="raked_product(tile, reps)" {...F.raked} />
+
+A **blocked** product keeps each copy together as a contiguous block. A **raked** product
+interleaves the copies, so neighbouring elements belong to different copies. That is the pattern
+you want when assigning elements to threads: spread across threads, each thread's elements are a
+fixed distance apart, and neighbouring threads touch neighbouring memory.
+
+### `right_inverse` and `left_inverse`
+
+A layout maps coordinates to offsets; an inverse maps offsets back. **`cute.right_inverse(L)`**
+returns $R$ with $L(R(k)) = k$: for each offset, which coordinate (as a 1-D index) lands there.
+For the row-major 2×4 layout `(2,4):(4,1)`, which stores coordinate $i$ at offset
+$4 \cdot (i \bmod 2) + \lfloor i/2 \rfloor$:
+
+```python
+L = cute.make_layout((2, 4), stride=(4, 1))
+cute.right_inverse(L)        # (4,2):(2,1)
+```
+
+| Offset $k$ | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| $R(k)$, the 1-D coordinate stored there | 0 | 2 | 4 | 6 | 1 | 3 | 5 | 7 |
+| $L(R(k))$ | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+
+<LayoutGrid name="L, offset of each coordinate" shape={[2, 4]} stride={[4, 1]} />
+
+**`cute.left_inverse(L)`** works for layouts with gaps: it only promises to undo $L$ on the
+offsets $L$ actually produces. For `4:2`, which produces offsets 0, 2, 4 and 6:
+
+```python
+cute.left_inverse(cute.make_layout(4, stride=2))   # (2,4):(4,1)
+```
+
+| Coordinate $i$ | 0 | 1 | 2 | 3 |
+| --- | ---: | ---: | ---: | ---: |
+| $L(i)$ | 0 | 2 | 4 | 6 |
+| $L^{-1}(L(i))$ | 0 | 1 | 2 | 3 |
+
+`make_layout_tv`, below, is built on `right_inverse`: it describes which thread owns each element,
+then inverts that to get which element each thread owns.
+
+### `recast_layout`
+
+`cute.recast_layout(new_bits, old_bits, layout)` reinterprets a layout for a different element
+size. Going from bytes to 16-bit elements (`recast_layout(16, 8, L)`), the contiguous mode
+shrinks by 2 and the other strides are halved, because two bytes now make one element:
+
+```python
+L_bytes = cute.make_layout((2, 8), stride=(8, 1))   # 2 rows of 8 bytes
+cute.recast_layout(16, 8, L_bytes)                  # (2,4):(4,1): 2 rows of 4 fp16
+```
+
+<Matrix2D name="bytes" {...F.recast_bytes} />
+
+<Matrix2D name="fp16 elements" {...F.recast_elems} />
+
+The labels show which element each byte belongs to. Kernels use this to describe a copy in bytes,
+for example "16 bytes per thread", and then convert it to whatever element type they run on.
+
+## Tensors
+
+A **tensor** is a layout paired with a pointer: `cute.make_tensor(ptr, layout)`. Indexing a tensor
+evaluates its layout and reads memory at the resulting offset, and every layout function above
+also works on tensors, transforming the layout and keeping the pointer.
+
+- **`from_dlpack(t)`** wraps an existing PyTorch tensor. Its layout comes from the tensor's
+  shape and strides; a row-major 16384×8192 matrix becomes `(16384,8192):(8192,1)`.
+- **Slicing** with `None` keeps a mode: `gA[(None, (mi, ni))]` returns a smaller tensor.
+- **`t.load()`** reads a whole tensor into registers as one vector value, which the compiler can
+  turn into vectorized loads. **`t.store(v)`** (or `t[None] = v`) writes one back.
+- **`cute.make_rmem_tensor(layout_or_shape, dtype)`** allocates a tensor in registers. Kernels
+  use it for accumulators and per-element predicates.
+
+### `make_identity_tensor` and `elem_less`
+
+**`cute.make_identity_tensor(shape)`** is a tensor whose value at each coordinate is the
+coordinate itself:
+
+<Matrix2D name="identity tensor of shape (4,6)" {...F.identity} />
+
+Its use is bounds checking. Divide and slice it exactly like the data tensor, and each thread
+learns which coordinates it is about to touch. **`cute.elem_less(coord, shape)`** then tells it
+whether a coordinate is inside the real tensor. Here a 6×7 tensor is covered by 4×4 tiles, so
+the four tiles reach coordinates up to (7, 7); the identity tensor marks the ones a predicate
+must mask out:
+
+```python
+idC = cute.make_identity_tensor(mC.shape)            # coordinates, not data
+cC  = cute.zipped_divide(idC, tiler=(4, 4))          # tiled exactly like the data
+pred[i] = cute.elem_less(thrCrd[i], mC.shape)        # False for masked cells
+```
+
+<Matrix2D name="identity coordinates under 2×2 tiles of 4×4" {...F.predicate} />
+
+### Vectorized slices
+
+With tensors in hand, the elementwise kernel can load 8 `fp16` values (16 bytes) per thread
+instead of one, by dividing the tensor into `(1, 8)` tiles:
+
+```python
+@cute.jit
+def add_vec(mA, mB, mC):
+    gA = cute.zipped_divide(mA, (1, 8))   # ((1,8),(16384,1024)): (element, which vector)
+    gB = cute.zipped_divide(mB, (1, 8))
+    gC = cute.zipped_divide(mC, (1, 8))
+    add_vec_kernel(gA, gB, gC).launch(
+        grid=(cute.size(gC, mode=[1]) // 256, 1, 1), block=(256, 1, 1))
+
+@cute.kernel
+def add_vec_kernel(gA, gB, gC):
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+    bdim, _, _ = cute.arch.block_dim()
+    thread_idx = bidx * bdim + tidx
+    m, n = gA.shape[1]                    # the grid of vectors
+    mi, ni = thread_idx // n, thread_idx % n
+    gC[(None, (mi, ni))] = gA[(None, (mi, ni))].load() + gB[(None, (mi, ni))].load()
+```
+
+The same pattern on a small 4×8 row-major tensor with `(1, 4)` vectors: `zipped_divide` gives
+`((1,4),(4,2))`, and thread `t` takes vector `(t // 2, t % 2)`. Each colour is one thread's
+vector, and the numbers are the value indices inside it:
+
+<Matrix2D name="A, one (1,4) vector per thread" {...F.vector} />
+
+## Thread-value layouts
+
+The vectorized kernel still works out its coordinates by hand. CuTe's answer is the
+**thread-value (TV) layout**: a layout that maps **(thread index, value index)** to a coordinate
+in a tile. `cute.make_layout_tv(thr_layout, val_layout)` builds one from two pieces: how threads
+are arranged over the tile, and how each thread's values are arranged. It returns the tile shape
+(the tiler) and the TV layout. Internally it is a raked product of the two, then a right inverse.
+
+The example from the function's docstring arranges 6 threads in a 2×3 grid, each owning a 2×2
+block of values:
+
+```python
+thr = cute.make_layout((2, 3), stride=(3, 1))   # 6 threads, row-major
+val = cute.make_layout((2, 2), stride=(2, 1))   # 4 values per thread, row-major
+tiler, tv = cute.make_layout_tv(thr, val)
+# tiler = (4,6),  tv = ((3,2),(2,2)):((8,2),(4,1))
+```
+
+Here is the 4×6 tile, coloured by the thread that owns each element and labelled with its value
+index:
+
+<Matrix2D name="(4,6) tile" {...F.tv} />
+
+Thread 0 owns the top-left 2×2 block, thread 1 the next one to the right, and so on. To use it, a
+kernel composes a tile of the data with the TV layout, then slices out its own thread:
+
+```python
+tile   = gA[((None, None), bidx)]           # this block's tile:   (M, N) -> address
+tidfrg = cute.composition(tile, tv)         # (thread, value) -> address
+mine   = tidfrg[(tidx, None)]               # this thread's values: (value) -> address
+frag   = mine.load()                        # into registers
+```
+
+Composition does the work: `tile` maps tile coordinates to addresses, `tv` maps (thread, value)
+to tile coordinates, so `tile ∘ tv` maps (thread, value) straight to addresses. Slicing
+`tidfrg[(4, None)]` leaves thread 4's four values:
+
+<Matrix2D name="(4,6) tile, thread 4 marked" {...F.tv_thread4} />
+
+| Value | V0 | V1 | V2 | V3 |
+| --- | :-: | :-: | :-: | :-: |
+| Tile coordinate | (2, 2) | (2, 3) | (3, 2) | (3, 3) |
+
+Loading that slice, or allocating a matching register tensor with `make_rmem_tensor`, gives the
+thread its four values as a small **fragment** it can compute on.
+
+### The full elementwise kernel
+
+NVIDIA's final elementwise-add kernel puts it all together. The host side builds the TV layout
+and splits the tensors into tiles; the kernel slices its tile, composes, and slices its thread:
+
+```python
+@cute.jit
+def elementwise_add(mA, mB, mC):
+    dtype = mA.element_type
+    thr_layout = cute.make_ordered_layout((4, 64), order=(1, 0))  # 256 threads
+    val_layout = cute.make_ordered_layout((16, 16), order=(1, 0)) # 16 rows x 16 bytes
+    val_layout = cute.recast_layout(dtype.width, 8, val_layout)   # bytes -> elements
+    tiler_mn, tv_layout = cute.make_layout_tv(thr_layout, val_layout)
+
+    gA = cute.zipped_divide(mA, tiler_mn)   # ((TileM,TileN),(RestM,RestN))
+    gB = cute.zipped_divide(mB, tiler_mn)
+    gC = cute.zipped_divide(mC, tiler_mn)
+    elementwise_add_kernel(gA, gB, gC, tv_layout).launch(
+        grid=[cute.size(gC, mode=[1]), 1, 1],
+        block=[cute.size(tv_layout, mode=[0]), 1, 1])
+
+@cute.kernel
+def elementwise_add_kernel(gA, gB, gC, tv_layout):
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+    blk = ((None, None), bidx)
+    thrA = cute.composition(gA[blk], tv_layout)[(tidx, None)]
+    thrB = cute.composition(gB[blk], tv_layout)[(tidx, None)]
+    thrC = cute.composition(gC[blk], tv_layout)[(tidx, None)]
+    thrC[None] = thrA.load() + thrB.load()
+```
+
+For `fp16`, `recast_layout(16, 8, ...)` turns the 16-byte rows of the value layout into 8-element
+rows, so the value layout becomes `(16,8):(8,1)`. The result:
+
+- The tile is **64×512** elements, and each block of **256 threads** handles one tile.
+- Each thread owns **128 values**: 8 contiguous elements (16 bytes, one vectorized load) in each
+  of 16 rows. Thread 0 takes row 0, columns 0–7; thread 1 takes columns 8–15; 64 threads cover a
+  full row of 512, and thread 64 starts again at row 16.
+- For a 16384×8192 tensor, `zipped_divide` gives `((64,512),(256,16))`, so the grid has
+  $256 \times 16 = 4096$ blocks.
+
+That tile is too big to draw, but it is the 4×6 figure above scaled up. Neighbouring threads read
+neighbouring 16-byte chunks, so every load is coalesced, and nothing in the kernel computes an
+index by hand. Changing the tile shape or the data type only changes the two layouts on the host.
+
+## Copy and MMA atoms
+
+Real kernels move data between memory spaces with special instructions and multiply with tensor
+cores. CuTe wraps each of these as an **atom**, and tiles atoms across threads with the same
+TV-layout ideas. The Ampere SGEMM example in CUTLASS uses all the pieces. The figures in this
+section are scaled-down versions of its layouts.
+
+### `make_copy_atom`, `make_tiled_copy_tv` and `copy`
+
+A copy atom names one hardware copy instruction. A tiled copy spreads it over threads:
+
+```python
+atom = cute.make_copy_atom(
+    cute.nvgpu.cpasync.CopyG2SOp(),            # asynchronous global -> shared copy (cp.async)
+    cutlass.Float32, num_bits_per_copy=128)    # 4 floats per instruction
+tiled_copy = cute.make_tiled_copy_tv(atom, thr_layout, val_layout)
+
+thr_copy = tiled_copy.get_slice(tidx)          # this thread's share of the copy
+tAgA = thr_copy.partition_S(gA)                # source:      (CPY, CPY_M, CPY_K, k)
+tAsA = thr_copy.partition_D(sA)                # destination: (CPY, CPY_M, CPY_K, PIPE)
+cute.copy(tiled_copy, tAgA[None, None, None, k], tAsA[None, None, None, stage], pred=tApA)
+```
+
+`make_tiled_copy_tv` calls `make_layout_tv` on the thread and value layouts, so a copy partition
+is drawn exactly like a TV layout. For a column-major A tile, SGEMM gives each thread 4
+consecutive elements along M (one 128-bit `cp.async`), and lays the threads out along M first.
+With 8 threads, `thr_layout = (2,4):(1,2)` and `val_layout = (4,1)`, the tile is 8×4:
+
+<Matrix2D name="A tile, coloured by copying thread" {...F.copy} />
+
+`partition_S` and `partition_D` apply this split to the source and destination tensors, so each
+thread gets exactly the elements it moves: thread 0 copies column 0, rows 0–3. `cute.copy` then
+issues the instructions, and the optional `pred` tensor (built from an identity tensor, as above)
+masks out-of-bounds elements.
+
+### `make_tiled_mma`, partitions and `gemm`
+
+An MMA atom names one multiply instruction, from a scalar fused multiply-add (`MmaUniversalOp`)
+to warp-group and `tcgen05` tensor-core instructions. A tiled MMA spreads it over threads:
+
+```python
+tiled_mma = cute.make_tiled_mma(
+    cute.nvgpu.MmaUniversalOp(cutlass.Float32), atoms_layout,
+    permutation_mnk=(perm_M, perm_N, None))
+thr_mma = tiled_mma.get_slice(tidx)
+tCsA = thr_mma.partition_A(sA)                 # this thread's slice of A in shared memory
+tCsB = thr_mma.partition_B(sB)
+tCgC = thr_mma.partition_C(gC)
+tCrA = tiled_mma.make_fragment_A(tCsA[None, None, None, 0])   # register copies
+tCrB = tiled_mma.make_fragment_B(tCsB[None, None, None, 0])
+tCrC = tiled_mma.make_fragment_C(tCgC)
+tCrC.fill(0.0)
+cute.gemm(tiled_mma, tCrC, tCrA[None, None, k], tCrB[None, None, k], tCrC)   # C += A * B
+```
+
+`MmaUniversalOp` multiplies one element, so `atoms_layout` is simply a grid of threads over C.
+SGEMM also passes a **permutation** so that each thread owns 4 consecutive rows and columns
+instead of every 16th one; the code's own comment shows the row owners going
+`0 0 0 0 1 1 1 1 ...` rather than `0 1 2 ... 15 0 1 ...`. With a 2×2 grid of threads and runs of
+2 instead of 4, `partition_C` splits an 8×8 tile of C like this:
+
+<Matrix2D name="C tile, coloured by thread (partition_C)" {...F.mma_c} />
+
+Each thread computes the C elements of its colour. To do that, `cute.gemm` needs the matching
+rows of A and columns of B, which `partition_A` and `partition_B` select. Threads 0 and 1 share
+the same C rows, so they read the same rows of A:
+
+<Matrix2D name="A tile, coloured by the threads that read it (partition_A)" {...F.mma_a} />
+
+### `local_tile` with a projection
+
+The same example picks each thread block's tiles of A, B and C from one 3-D tiler with
+`local_tile` and a **projection**, which drops the mode a matrix doesn't have:
+
+```python
+cta_tiler = (bM, bN, bK)
+gA = cute.local_tile(mA, tiler=cta_tiler, coord=(bidx, bidy, None), proj=(1, None, 1))  # (bM, bK, k)
+gB = cute.local_tile(mB, tiler=cta_tiler, coord=(bidx, bidy, None), proj=(None, 1, 1))  # (bN, bK, k)
+gC = cute.local_tile(mC, tiler=cta_tiler, coord=(bidx, bidy, None), proj=(1, 1, None))  # (bM, bN)
+```
+
+A is M×K, so it uses the M and K entries of the tiler and ignores N; `None` in the coordinate
+keeps every tile along K, which becomes the main loop. Each one is the `local_tile` picture from
+earlier, applied to a different pair of modes.
+
+## Function reference
+
+| Group | Functions |
+| --- | --- |
+| Compilation | `@cute.jit`, `@cute.kernel`, `.launch(grid=, block=)`, `cute.compile`, `cutlass.Constexpr` |
+| Thread indices | `cute.arch.thread_idx`, `block_idx`, `block_dim` |
+| Control flow | `cutlass.range`, `cutlass.range_constexpr`, `cutlass.const_expr` |
+| Building layouts | `make_layout`, `make_ordered_layout`, `make_identity_layout`, `recast_layout` |
+| Querying | `size`, `cosize`, `rank`, `depth`, `shape`, `crd2idx`, `select`, `get` |
+| Simplifying | `coalesce` |
+| Algebra | `composition`, `complement`, `right_inverse`, `left_inverse` |
+| Division | `logical_divide`, `zipped_divide`, `tiled_divide`, `flat_divide`, `local_tile`, `local_partition` |
+| Products | `logical_product`, `zipped_product`, `tiled_product`, `flat_product`, `blocked_product`, `raked_product` |
+| Thread-value | `make_layout_tv` |
+| Tensors | `make_tensor`, `from_dlpack`, `make_rmem_tensor`, `make_identity_tensor`, `.load()`, `.store()`, `elem_less`, `where`, `full_like` |
+| Atoms | `make_copy_atom`, `make_tiled_copy_tv`, `copy`, `make_mma_atom`, `make_tiled_mma`, `gemm` |
+| Debugging | `print`, `cute.printf`, `cute.print_tensor` |
+
+## Summary
+
+- A CuTe DSL program is ordinary Python, traced once into a compiled kernel. Values are either
+  static (known while tracing, folded away) or dynamic (computed on the GPU), and the loop and
+  branch helpers let you choose which.
+- Everything is built on **layouts**, functions from coordinates to offsets, which can be nested
+  to describe tiles within tiles.
+- **Composition** reshapes, **division** splits into tiles, and **products** repeat a tile. Each
+  produces a new layout, so no index arithmetic is written by hand.
+- A **TV layout** maps (thread, value) to coordinates. Composing it with a tile of data gives each
+  thread its own view, and the same idea drives tiled copies and tiled MMAs.
+
+## References
+
+- [CUTLASS CuTe DSL examples and notebooks](https://github.com/NVIDIA/cutlass/tree/main/examples/python/CuTeDSL),
+  in particular `cute/notebooks/cute_layout_algebra.ipynb`, `cute/notebooks/elementwise_add.ipynb`,
+  `notebooks/1_dsl_features/` and `cute/ampere/kernel/dense_gemm/sgemm.py`.
+- [CuTe C++ layout documentation](https://github.com/NVIDIA/cutlass/blob/main/media/docs/cpp/cute/01_layout.md)
+  and [layout algebra](https://github.com/NVIDIA/cutlass/blob/main/media/docs/cpp/cute/02_layout_algebra.md).

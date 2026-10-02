@@ -1,0 +1,368 @@
+---
+title: "The KV Cache, from First Principles to PagedAttention"
+description: "A language model generates one token at a time, and without a cache it would redo all its earlier work for every new token. This post derives the KV cache from causal attention, works out how much memory it takes for real models, and then follows vLLM's PagedAttention, which manages that memory in fixed-size blocks like an operating system manages pages, with a simulator and working code."
+date: 2026-10-02
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import MarginNote from "../../components/MarginNote.astro";
+import PagedKvCache from "../../utils/inference/PagedKvCache.astro";
+
+## Background
+
+A language model generates text one token at a time. To produce token $t + 1$, it runs a forward
+pass over the sequence so far and samples from the output at the last position. Then it appends
+the new token and does it again.
+
+Run naively, that is enormously wasteful: every step processes the whole sequence, almost all of
+which the previous step already processed. The **KV cache** removes the waste by saving the one
+part of the computation that later tokens need. It is the reason generation is fast, and also the
+reason serving is hard: the cache grows with every token of every request, and on a busy server
+it, not the model's weights, fills the GPU's memory.
+
+This post derives the KV cache, sizes it for real models, and then looks at **PagedAttention**
+(Kwon et al., 2023), the memory manager behind vLLM, which made it possible to fit several times
+as many requests on a GPU.
+
+## Why keys and values can be cached
+
+Inside an attention layer, token $i$ computes a query $q_i$, a key $k_i$ and a value $v_i$ from its
+own hidden state. Its output is a weighted average of the values of every token it may see. In a
+decoder, that is itself and every token before it:
+
+$$
+o_i = \sum_{j \le i} \frac{\exp(q_i \cdot k_j / \sqrt{d})}{\sum_{j' \le i} \exp(q_i \cdot k_{j'} / \sqrt{d})}\, v_j
+$$
+
+Two facts make caching possible:
+
+- **Causality.** Token $j$'s hidden states never depend on any token after it. So once
+  $k_j$ and $v_j$ are computed, they never change, however many tokens follow.
+- **Only the last position matters.** To generate the next token we only need the output at the
+  last position, so only the new token needs a query.
+
+So at each step, the only new work is the new token's own forward pass. Its query attends over
+the keys and values of every earlier token, and those can be read from memory instead of
+recomputed. Everything else about the earlier tokens (their queries, attention outputs and MLP
+activations) is never needed again.
+
+Generation therefore has two phases:
+
+- **Prefill.** The whole prompt goes through the model in one forward pass, as in training, and
+  every layer's keys and values for every prompt token are written to the cache.
+- **Decode.** One token at a time: compute its query, key and value, append the key and value to
+  the cache, and attend over everything cached.
+
+### In code
+
+Here is a small decoder layer whose attention takes an optional cache. It handles prefill and
+decode with the same code: the `t` new tokens are appended to whatever is cached, and the mask
+lets new token $i$ see every cached token plus the new ones up to itself:
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+VOCAB, D, HEADS, LAYERS = 64, 32, 4, 2
+D_HEAD = D // HEADS
+
+
+class Layer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.ln1, self.ln2 = nn.LayerNorm(D), nn.LayerNorm(D)
+        self.qkv, self.o = nn.Linear(D, 3 * D), nn.Linear(D, D)
+        self.mlp = nn.Sequential(nn.Linear(D, 4 * D), nn.GELU(), nn.Linear(4 * D, D))
+
+    def forward(self, x, cache=None):
+        b, t, _ = x.shape
+        heads = lambda z: z.view(b, -1, HEADS, D_HEAD).transpose(1, 2)  # (b, heads, t, d)
+        q, k, v = (heads(z) for z in self.qkv(self.ln1(x)).chunk(3, dim=-1))
+        if cache is not None:
+            if "k" in cache:  # prepend the keys and values of every earlier token
+                k = torch.cat([cache["k"], k], dim=2)
+                v = torch.cat([cache["v"], v], dim=2)
+            cache["k"], cache["v"] = k, v
+        total = k.shape[2]
+        # The t new tokens sit at the end: token i may see every key up to position total - t + i.
+        mask = torch.ones(t, total, dtype=torch.bool).tril(diagonal=total - t)
+        a = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        x = x + self.o(a.transpose(1, 2).reshape(b, t, D))
+        return x + self.mlp(self.ln2(x))
+
+
+class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embed = nn.Embedding(VOCAB, D)
+        self.pos = nn.Embedding(256, D)
+        self.layers = nn.ModuleList(Layer() for _ in range(LAYERS))
+        self.head = nn.Linear(D, VOCAB)
+
+    def forward(self, tokens, start=0, caches=None):
+        positions = torch.arange(start, start + tokens.shape[1])
+        x = self.embed(tokens) + self.pos(positions)
+        for i, layer in enumerate(self.layers):
+            x = layer(x, None if caches is None else caches[i])
+        return self.head(x)
+```
+
+Generation without a cache runs the whole sequence every step. With one, it runs the prompt once
+and then a single token per step:
+
+```python
+@torch.no_grad()
+def generate_no_cache(model, prompt, n):
+    tokens = prompt
+    for _ in range(n):
+        logits = model(tokens)  # the whole sequence, every step
+        tokens = torch.cat([tokens, logits[:, -1:].argmax(-1)], dim=1)
+    return tokens
+
+
+@torch.no_grad()
+def generate_cached(model, prompt, n):
+    caches = [{} for _ in model.layers]
+    logits = model(prompt, caches=caches)  # prefill: the whole prompt at once
+    tokens = prompt
+    for _ in range(n):
+        next_token = logits[:, -1:].argmax(-1)
+        tokens = torch.cat([tokens, next_token], dim=1)
+        logits = model(next_token, start=tokens.shape[1] - 1, caches=caches)  # decode: one token
+    return tokens
+
+
+torch.manual_seed(0)
+model = Model().eval()
+prompt = torch.randint(VOCAB, (2, 5))
+print(torch.equal(generate_no_cache(model, prompt, 20), generate_cached(model, prompt, 20)))
+```
+
+This prints `True`: greedy decoding picks exactly the same 20 tokens either way.
+
+The saving is large. With $P$ weights, a forward pass costs about $2P$ FLOPs per token it processes.
+Without a cache, step $s$ of generating $n$ tokens after a prompt of length $p$ processes $p + s$
+tokens, so the total is about $2P \cdot n(p + n/2)$. With a cache it is $2P(p + n)$: the prompt
+once, then one token per step. For a 1000-token prompt and 1000 generated tokens, that is 750 times
+less work in the weights. The attention itself still reads every cached token at every step, but
+that is a small cost next to the weights until contexts get very long.
+
+## How big is the cache?
+
+Every layer stores a key and a value for every token, and each has one vector of length $d$ per
+key/value head. So per token,
+
+$$
+\text{KV bytes per token} = 2 \times \text{layers} \times \text{KV heads} \times d \times \text{bytes per value}
+$$
+
+| Model | Layers | KV heads × $d$ | Per token (bf16) | One 8K-token sequence |
+| --- | ---: | ---: | ---: | ---: |
+| Llama 2 7B (multi-head) | 32 | 32 × 128 | 512 KiB | 4 GiB |
+| Llama 3 8B (grouped-query) | 32 | 8 × 128 | 128 KiB | 1 GiB |
+| Llama 3 70B (grouped-query) | 80 | 8 × 128 | 320 KiB | 2.5 GiB |
+| DeepSeek-V3 (latent attention) | 61 | 576 (latent) | 68.6 KiB | 549 MiB |
+
+Llama 3 8B's weights take 16 GB in bf16. On an 80 GB GPU that leaves 64 GB for the cache, which is
+about 490,000 tokens: 60 sequences of 8K tokens. Everything a serving system does to raise
+throughput, it does by fitting more sequences into that space.
+
+The table also shows how architectures have shrunk the cache:
+
+- **Multi-query and grouped-query attention** (MQA, GQA) let several query heads share one key
+  and value head. Llama 3 uses 8 KV heads for its 32 (8B) or 64 (70B) query heads, a 4 to 8 times
+  smaller cache than Llama 2's one KV head per query head.
+- **Multi-head latent attention** (MLA, from DeepSeek-V2) caches one compressed 512-dimensional
+  latent vector per token and layer, plus a 64-dimensional key for the rotary position embedding,
+  and reconstructs every head's keys and values from the latent.
+- **Quantizing the cache** to 8 bits halves it again, and several engines support it.
+
+### Decoding is memory-bound
+
+The cache also sets the speed of decoding. Each decode step reads every weight once for the whole
+batch, and reads every cached key and value of every sequence once. It does only about two FLOPs
+per weight per sequence, so the GPU spends the step waiting on memory, not computing. For Llama 3
+8B on an H100 (3.35 TB/s), reading the 16 GB of weights takes at least 4.8 ms per step. A batch of
+60 sequences with 8K tokens each adds 60 GiB of cache to read, another 19 ms. At long contexts,
+the cache reads dominate, and unlike the weights, they don't amortize over the batch: each
+sequence's cache is read only for that sequence.
+
+## Managing the memory
+
+A serving engine handles many requests at once, each with its own cache, and none of them knows
+in advance how long its output will be. Before PagedAttention, the usual approach was to give
+each request a **contiguous** buffer big enough for the longest sequence it could reach, reserved
+when the request started. That wastes memory three ways:
+
+- **Reserved but unused.** A request reserves room for its maximum length but usually stops
+  well short of it. Even if it does reach it, the slots sit empty for most of the request's life,
+  since they fill one token per step.
+- **Internal fragmentation.** The reservation is fixed, but the real length varies.
+- **External fragmentation.** Requests of different sizes come and go, leaving holes between the
+  reservations that are too small for a new request.
+
+The vLLM paper measured existing systems storing actual tokens in only 20.4% to 38.2% of their
+KV-cache memory.
+
+### PagedAttention
+
+PagedAttention borrows the operating system's answer to the same problem: **paging**. The cache
+memory is cut into fixed-size **blocks**, each holding the keys and values of $B$ tokens
+($B = 16$ by default in vLLM). A request's cache doesn't have to be contiguous. Each request keeps
+a **block table**, a list of the physical blocks that hold its tokens, in order, just as a
+process's page table maps its virtual pages to physical frames. A new block is allocated only when
+the last one fills up.
+
+Only a request's last block can be partly empty, so the waste is less than $B$ slots per request.
+Any free block can go to any request, so there is no external fragmentation. And memory is taken as
+the request grows, not reserved up front, so a request holds only what it has used.
+
+The figure below runs the same stream of 10 requests through both allocators, in a cache of 96
+token slots. Each request's prompt is stored when it is admitted, and every step adds one token
+to each running request. The contiguous allocator reserves 32 slots per request, enough for the
+longest. The paged one uses blocks of 4. Faded squares are reserved but hold no token yet.
+
+<PagedKvCache step={10} title="10 requests through a 96-slot KV cache" />
+
+Play it, or drag the slider. The contiguous cache never runs more than 3 requests at once, because
+3 reservations fill it, and on average only 37% of its slots hold a token. The paged cache runs up
+to 6 at once, and keeps 88% of its slots in use. It finishes all 10 requests in 30 steps instead of
+48. Decoding is memory-bound, so a step with 6 sequences takes barely longer than a step with 3,
+and running twice as many at once is close to twice the throughput. The vLLM paper reports 2 to 4
+times the throughput of the systems it compared against, at the same latency.
+
+### The block manager
+
+Here is a small paged cache. One pool of blocks holds the keys and values of every sequence, a
+free list tracks the unused blocks, and every sequence has a block table:
+
+```python
+BLOCK = 4
+
+
+class PagedKVCache:
+    """K and V for many sequences, stored in fixed-size blocks drawn from one pool."""
+
+    def __init__(self, num_blocks):
+        self.k = torch.zeros(num_blocks, BLOCK, HEADS, D_HEAD)
+        self.v = torch.zeros(num_blocks, BLOCK, HEADS, D_HEAD)
+        self.free = list(range(num_blocks))
+        self.refs = [0] * num_blocks
+        self.tables = {}  # sequence id -> list of block numbers
+        self.lengths = {}  # sequence id -> tokens stored
+
+    def append(self, seq, k, v):
+        """Store one token's keys and values, each (HEADS, D_HEAD)."""
+        table = self.tables.setdefault(seq, [])
+        n = self.lengths.get(seq, 0)
+        if n % BLOCK == 0:  # the last block is full (or there is none): take a new one
+            table.append(self.allocate())
+        elif self.refs[table[-1]] > 1:  # the last block is shared: copy it before writing
+            table[-1] = self.copy_on_write(table[-1])
+        block, slot = table[-1], n % BLOCK
+        self.k[block, slot], self.v[block, slot] = k, v
+        self.lengths[seq] = n + 1
+
+    def allocate(self):
+        block = self.free.pop()
+        self.refs[block] = 1
+        return block
+
+    def attend(self, seq, q):
+        """Attention of one query, (HEADS, D_HEAD), over every token stored for seq."""
+        table, n = self.tables[seq], self.lengths[seq]
+        k = self.k[table].flatten(0, 1)[:n]  # gather the blocks: (n, HEADS, D_HEAD)
+        v = self.v[table].flatten(0, 1)[:n]
+        scores = torch.einsum("hd,nhd->hn", q, k) / D_HEAD**0.5
+        return torch.einsum("hn,nhd->hd", scores.softmax(dim=-1), v)
+```
+
+`attend` gathers a sequence's blocks through its block table and runs ordinary attention over
+them. This copies the blocks, which is fine for checking the idea. The point of the PagedAttention
+*kernel* is to avoid that copy: each thread block of the kernel looks up the physical block
+numbers itself and reads the keys and values straight from the pool. FlashAttention and
+FlashInfer accept a block table too, so prefill and decode kernels can read a paged cache
+directly.
+
+To check it, three sequences grow in an interleaved order, so their blocks end up mixed together in
+the pool, and each one's attention is compared with ordinary attention over the same keys and
+values stored contiguously. The largest difference is $3 \times 10^{-7}$.
+
+### Sharing blocks
+
+Paging has a second benefit: blocks can be shared. When a request asks for several samples of the
+same prompt (parallel sampling, or beam search), all of them start with the same prompt tokens.
+With a block table, they can point at the same physical blocks, with a **reference count** on each
+block so that it is freed only when the last user leaves:
+
+```python
+    def fork(self, parent, child):
+        """A new sequence that shares the parent's tokens so far, without copying them."""
+        self.tables[child] = list(self.tables[parent])
+        self.lengths[child] = self.lengths[parent]
+        for block in self.tables[child]:
+            self.refs[block] += 1
+
+    def copy_on_write(self, block):
+        new = self.allocate()
+        self.k[new], self.v[new] = self.k[block], self.v[block]
+        self.refs[block] -= 1
+        return new
+
+    def free_sequence(self, seq):
+        for block in self.tables.pop(seq):
+            self.refs[block] -= 1
+            if self.refs[block] == 0:
+                self.free.append(block)
+        del self.lengths[seq]
+```
+
+The samples diverge as soon as they generate different tokens. Full blocks are never written
+again, so they can stay shared forever. Only the partly filled last block needs care. The first
+sample to write into it gets a private copy, **copy-on-write**, again exactly as an operating
+system handles a forked process's pages. In the check, sequence 3 forks from sequence 0 after 14
+tokens, and then both grow:
+
+```
+block tables: {0: [63, 60, 57, 55], 1: [62, 59], 2: [61, 58], 3: [63, 60, 57, 56, 54]}
+```
+
+The first three blocks are shared. Block 56 was sequence 0's half-full last block. Sequence 0 wrote
+first, so it got the copy (block 55), and sequence 3 kept the original. Altogether, 49 tokens
+across four sequences are stored in 10 blocks, 40 slots.
+
+**Prefix caching** takes sharing across requests. Many requests begin the same way: a long system
+prompt, a few-shot template, or the earlier turns of a chat. vLLM names every full block by a hash
+of its tokens and of all the tokens before it, and when a new request's prompt produces a block
+with the same hash, it reuses the cached block instead of recomputing it. SGLang's RadixAttention
+does the same with a radix tree over token sequences. Either way, a shared prefix is prefilled
+once, not once per request.
+
+## Running out of memory
+
+Allocating on demand has a catch: a request may need a new block when none are free. The engine
+then **preempts** a request, usually the most recently started. vLLM's default is to free its
+blocks and later recompute its cache from the prompt and the tokens generated so far, which costs
+one prefill. The alternative is to swap the blocks to CPU memory and back. In the figure's trace
+memory never runs out, but a larger stream of requests would trigger it.
+
+This is also why paging pairs naturally with **continuous batching** (from Orca, Yu et al., 2022).
+Instead of running a fixed batch until every sequence in it finishes, the engine re-forms the batch
+at every step: finished requests leave at once and waiting ones join as soon as there are blocks
+for them. Paging makes "is there room?" a question of counting free blocks, which is what lets the
+scheduler make that decision every step.
+
+## Summary
+
+- **Causal attention makes keys and values reusable.** A token's keys and values never change
+  once computed, so generation computes them once, caches them, and runs only the new token
+  through the model at each step: one prefill, then one token per decode step.
+- **The cache is big.** It costs $2 \times \text{layers} \times \text{KV heads} \times d$ values per
+  token: 128 KiB for Llama 3 8B in bf16, or a gigabyte per 8K-token sequence. GQA, MLA and
+  quantization shrink it, and at long contexts reading it dominates the decode step.
+- **Contiguous allocation wastes most of it**, on reservations for tokens that don't exist yet
+  and on fragments.
+- **PagedAttention stores the cache in fixed-size blocks** through a per-request block table. Only
+  the last block of each request is partly empty, blocks are taken as needed, and blocks can be
+  shared, with copy-on-write, across samples and across requests with the same prefix.

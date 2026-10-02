@@ -1,0 +1,52 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import InductorPipeline from "../../utils/compiler/InductorPipeline.astro";
+import KernelBlocks from "../../utils/compiler/KernelBlocks.astro";
+---
+
+<Layout title="TorchInductor demo">
+	<h1>TorchInductor demo</h1>
+	<p>
+		Figures from <code>pipeline.ts</code> (with data captured in <code>inductorExample.ts</code>) and
+		<code>kernelBlocks.ts</code>.
+	</p>
+
+	<h2>InductorPipeline, from the start</h2>
+	<InductorPipeline title="relu(x @ w), softmax, * 2" />
+
+	<h2>InductorPipeline, starting at the realize stage</h2>
+	<InductorPipeline step={2} />
+
+	<h2>KernelBlocks, persistent reduction</h2>
+	<KernelBlocks
+		rows={8}
+		cols={32}
+		blocks={[
+			[1, 32],
+			[2, 32],
+			[8, 32],
+		]}
+		blockNames={["XBLOCK", "R0_BLOCK"]}
+		rowVar="x0"
+		colVar="r0_1"
+		pointers={[{ name: "in_out_ptr0", strides: [32, 1] }]}
+		wrap={32}
+	/>
+
+	<h2>KernelBlocks, 2D tiles with masked lanes</h2>
+	<KernelBlocks
+		rows={6}
+		cols={8}
+		blocks={[
+			[4, 4],
+			[1, 8],
+			[2, 4],
+		]}
+		rowVar="y0"
+		colVar="x1"
+		pointers={[
+			{ name: "in_ptr0", strides: [8, 1] },
+			{ name: "in_ptr1", strides: [1, 6] },
+		]}
+	/>
+</Layout>

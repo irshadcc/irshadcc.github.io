@@ -1,0 +1,20 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import AttentionTiles from "../../utils/gpu/AttentionTiles.astro";
+import OnlineSoftmax from "../../utils/gpu/OnlineSoftmax.astro";
+import PagedKvCache from "../../utils/inference/PagedKvCache.astro";
+---
+
+<Layout title="Attention and KV cache demo">
+	<h1>Attention and KV cache demo</h1>
+	<p>Figures from <code>kvcache.ts</code> and <code>flash.ts</code>.</p>
+
+	<h2>PagedKvCache</h2>
+	<PagedKvCache step={10} />
+
+	<h2>OnlineSoftmax</h2>
+	<OnlineSoftmax step={2} />
+
+	<h2>AttentionTiles, causal</h2>
+	<AttentionTiles tiles={8} causal />
+</Layout>

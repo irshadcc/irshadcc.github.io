@@ -1,0 +1,22 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import TpBlock from "../../utils/distributed/TpBlock.astro";
+import TpMatmul from "../../utils/distributed/TpMatmul.astro";
+---
+
+<Layout title="Tensor parallelism demo">
+	<h1>Tensor parallelism demo</h1>
+	<p>Figures from <code>tensorParallel.ts</code>. Hover a rank to highlight what it holds.</p>
+
+	<h2>TpMatmul, all modes</h2>
+	<TpMatmul modes={["column", "row", "mlp"]} n={4} />
+
+	<h2>TpMatmul, 8 ranks</h2>
+	<TpMatmul modes={["row"]} n={8} />
+
+	<h2>TpBlock</h2>
+	<TpBlock n={4} />
+
+	<h2>TpBlock, sequence parallel, 8 ranks</h2>
+	<TpBlock n={8} sp />
+</Layout>

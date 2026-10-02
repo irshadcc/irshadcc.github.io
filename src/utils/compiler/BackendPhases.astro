@@ -1,0 +1,168 @@
+---
+// The passes `llc -O2` really runs for an NVPTX kernel, grouped into the phases of LLVM's code
+// generator: late IR passes, instruction selection, Machine IR optimizations in SSA form,
+// leaving SSA (where other targets allocate registers), late machine passes, and printing.
+// Pick a phase to list its passes; NVPTX's own passes are highlighted, and analysis passes
+// (which compute information but change nothing) are hidden unless asked for.
+// Data: llcPasses / llcPhases in llvmData.ts, from `llc -debug-pass=Structure`.
+// Usage in .mdx:
+//   <BackendPhases phase="isel" />
+import { llcPasses, llcPhases } from "./llvmData";
+
+interface Props {
+	/** Phase shown first: ir, isel, mssa, ra, late or emit. */
+	phase?: string;
+	title?: string;
+}
+
+const { phase = "ir", title } = Astro.props;
+const groups = llcPhases.map((p) => ({
+	...p,
+	passes: llcPasses.filter((q) => q.phase === p.id),
+}));
+const transforms = llcPasses.filter((p) => !p.analysis).length;
+const nvptx = llcPasses.filter((p) => p.nvptx).length;
+---
+
+<figure class="bp">
+	{title && <figcaption class="bp-title">{title}</figcaption>}
+	<div class="bp-phases" role="tablist">
+		{
+			groups.map((g, i) => (
+				<button type="button" role="tab" class="bp-phase" data-phase={g.id} aria-selected={String(g.id === phase)}>
+					<span class="bp-ir">{g.ir}</span>
+					<span class="bp-name">
+						{i + 1}. {g.label}
+					</span>
+					<span class="bp-count">{((n) => `${n} ${n === 1 ? "pass" : "passes"}`)(g.passes.filter((p) => !p.analysis).length)}</span>
+				</button>
+			))
+		}
+	</div>
+	{
+		groups.map((g) => (
+			<ol class="bp-list" data-phase={g.id} hidden={g.id !== phase} role="tabpanel">
+				{g.passes.map((p) => (
+					<li class:list={{ analysis: p.analysis, nvptx: p.nvptx }}>{p.name}</li>
+				))}
+			</ol>
+		))
+	}
+	<p class="bp-foot">
+		<label><input type="checkbox" class="bp-toggle" /> show analysis passes</label>
+		<span>
+			{transforms} transform passes in all, <b class="bp-nv">{nvptx}</b> of them NVPTX's own · from <code>llc -O2 -debug-pass=Structure</code>
+		</span>
+	</p>
+</figure>
+
+<script>
+	for (const fig of document.querySelectorAll<HTMLElement>(".bp")) {
+		const tabs = [...fig.querySelectorAll<HTMLButtonElement>(".bp-phase")];
+		const lists = [...fig.querySelectorAll<HTMLElement>(".bp-list")];
+		for (const t of tabs) {
+			t.addEventListener("click", () => {
+				for (const u of tabs) u.setAttribute("aria-selected", String(u === t));
+				for (const l of lists) l.hidden = l.dataset.phase !== t.dataset.phase;
+			});
+		}
+		fig.querySelector<HTMLInputElement>(".bp-toggle")?.addEventListener("change", (e) => {
+			fig.classList.toggle("all", (e.target as HTMLInputElement).checked);
+		});
+	}
+</script>
+
+<style>
+	.bp {
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+	}
+	.bp-title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.4rem;
+	}
+	.bp-phases {
+		display: grid;
+		grid-template-columns: repeat(6, minmax(0, 1fr));
+		gap: 4px;
+	}
+	@media (max-width: 640px) {
+		.bp-phases {
+			grid-template-columns: repeat(2, minmax(0, 1fr));
+		}
+	}
+	.bp-phase {
+		display: flex;
+		flex-direction: column;
+		gap: 0.15rem;
+		padding: 0.4rem 0.45rem 0.45rem;
+		border: 1px solid var(--faint);
+		border-radius: 6px;
+		background: var(--surface);
+		color: var(--text);
+		text-align: left;
+		cursor: pointer;
+		position: relative;
+	}
+	.bp-phase:hover {
+		border-color: var(--accent);
+	}
+	.bp-phase[aria-selected="true"] {
+		background: var(--accent-soft);
+		border-color: var(--accent);
+		box-shadow: inset 0 -3px var(--accent);
+	}
+	.bp-ir {
+		font-family: var(--mono);
+		font-size: 0.62rem;
+		color: var(--muted);
+	}
+	.bp-name {
+		font-size: 0.74rem;
+		font-weight: 600;
+		line-height: 1.25;
+	}
+	.bp-count {
+		font-size: 0.68rem;
+		color: var(--muted);
+	}
+	.bp-list {
+		columns: 2 15rem;
+		column-gap: 1.5rem;
+		margin: 0.6rem 0 0;
+		padding: 0.6rem 0.8rem 0.6rem 2rem;
+		border: 1px solid var(--faint);
+		border-radius: 6px;
+		font-size: 0.74rem;
+		line-height: 1.55;
+	}
+	.bp-list li {
+		break-inside: avoid;
+	}
+	.bp-list li.nvptx {
+		color: var(--accent);
+		font-weight: 600;
+	}
+	.bp-list li.analysis {
+		display: none;
+		color: var(--muted);
+		font-style: italic;
+	}
+	.bp:global(.all) .bp-list li.analysis {
+		display: list-item;
+	}
+	.bp-foot {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: space-between;
+		gap: 0.3rem 1rem;
+		margin: 0.4rem 0 0;
+		font-size: 0.72rem;
+		color: var(--muted);
+	}
+	.bp-nv {
+		color: var(--accent);
+	}
+</style>

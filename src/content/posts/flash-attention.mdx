@@ -1,0 +1,377 @@
+---
+title: "FlashAttention, from Online Softmax to a CuTe DSL Kernel"
+description: "FlashAttention computes exact attention without ever writing the N×N score matrix to memory. This post derives the online softmax that makes that possible, builds the tiled algorithm in a few lines of PyTorch, and then reads NVIDIA's FlashAttention-2 kernel written in the CuTe DSL to see how each step maps onto tiles, tensor cores and registers."
+date: 2026-10-02
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import MarginNote from "../../components/MarginNote.astro";
+import OnlineSoftmax from "../../utils/gpu/OnlineSoftmax.astro";
+import AttentionTiles from "../../utils/gpu/AttentionTiles.astro";
+
+## Background
+
+Attention for one head, with $N$ queries and keys of dimension $d$, is three steps:
+
+$$
+S = \frac{QK^\top}{\sqrt d}, \qquad P = \text{softmax}(S), \qquad O = PV
+$$
+
+Written that way, it produces two $N \times N$ matrices, $S$ and $P$. For $N = 8192$ in 16-bit
+precision, each is 128 MiB per head, against 2 MiB for each of $Q$, $K$, $V$ and $O$. A
+straightforward implementation runs three kernels, a matrix multiply, a softmax and another
+matrix multiply, and so writes $S$ to the GPU's main memory (HBM), reads it back, writes $P$ and
+reads it back again. The arithmetic is cheap next to that traffic, so attention ends up
+memory-bound, and its memory footprint grows with $N^2$.
+
+**FlashAttention** (Dao et al., 2022) computes exactly the same $O$ without ever materializing
+$S$ or $P$ in HBM. It cuts the computation into tiles small enough for on-chip memory and fuses all
+three steps into one kernel. The one hard part is the softmax, whose normalization needs a whole
+row of $S$ at once. This post derives the trick that removes that need, builds the algorithm in
+PyTorch, and then reads the FlashAttention-2 kernel that ships with CUTLASS, written in the
+[CuTe DSL](/blog/cute-dsl/).
+
+## Online softmax
+
+For one row of scores $s_1, \ldots, s_N$ and values $v_1, \ldots, v_N$, the output is
+
+$$
+o = \frac{\sum_j e^{s_j - m}\, v_j}{\sum_j e^{s_j - m}}, \qquad m = \max_j s_j
+$$
+
+Subtracting the maximum $m$ doesn't change the result, since it cancels between the numerator and
+denominator, but it keeps every exponent at most zero, so nothing overflows. That is the problem:
+$m$ is a maximum over the whole row, and we want to process the row a block at a time.
+
+The fix is to keep a **running** maximum and correct for it later. Suppose that after some blocks we
+have
+
+$$
+m = \max_{j \text{ so far}} s_j, \qquad \ell = \sum_{j \text{ so far}} e^{s_j - m}, \qquad a = \sum_{j \text{ so far}} e^{s_j - m}\, v_j
+$$
+
+and a new block of scores arrives. Its maximum might be larger, so the new running maximum is
+$m' = \max(m, \max_{j \in \text{block}} s_j)$. Every term already summed into $\ell$ and $a$ used
+$m$ where it should now use $m'$, and
+
+$$
+e^{s_j - m'} = e^{s_j - m} \cdot e^{m - m'}
+$$
+
+So multiplying the old sums by one number, $\alpha = e^{m - m'}$, fixes all of them at once:
+
+$$
+\ell' = \alpha\,\ell + \sum_{j \in \text{block}} e^{s_j - m'}, \qquad a' = \alpha\, a + \sum_{j \in \text{block}} e^{s_j - m'}\, v_j
+$$
+
+After the last block, $o = a / \ell$ exactly. This is **online softmax** (Milakov and Gimelshein,
+2018). Step through it on a row of 12 scores, in blocks of 4:
+
+<OnlineSoftmax step={2} title="One query row, 12 keys, blocks of 4" />
+
+Block 1 sets $m = 2$. Block 2 contains a 3, so $m$ rises, and every weight from block 1 shrinks by
+$e^{2-3} \approx 0.37$: the dashed outlines are their old heights. Block 3 raises $m$ again, to 3.5.
+After the last block, $a / \ell = 2.290$, the same as the softmax over all 12 scores at once.
+Before the end, $a / \ell$ is the correct softmax output over the keys seen so far, just not over
+all of them.
+
+## The tiled algorithm
+
+Now apply this to whole matrices. Cut $Q$ into tiles of $B_r$ rows and $K$ and $V$ into tiles of
+$B_c$ rows. For each query tile:
+
+1. Load $Q_i$ into on-chip memory, and start every row with $m = -\infty$, $\ell = 0$ and an
+   accumulator $A = 0$ of shape $B_r \times d$.
+2. For each key/value tile $j$: compute the $B_r \times B_c$ score tile $S_{ij} = Q_i K_j^\top /
+   \sqrt d$, update the running maximum and sum of every row, rescale $A$, and add $P_{ij} V_j$.
+3. Divide each row of $A$ by its $\ell$, and write it out as $O_i$.
+
+Only a $B_r \times B_c$ tile of scores ever exists, and it lives in registers. In PyTorch, for one
+head:
+
+```python
+import math
+
+import torch
+import torch.nn.functional as F
+
+
+def flash_attention(q, k, v, block_q=16, block_k=16, causal=False):
+    """Attention for one head, q: (N, d), k and v: (M, d), one (block_q x block_k) tile at a time."""
+    n, d = q.shape
+    out = torch.empty_like(q)
+    lse = torch.empty(n, dtype=q.dtype)
+    scale = 1 / math.sqrt(d)
+    for i in range(0, n, block_q):
+        qi = q[i : i + block_q] * scale
+        rows = torch.arange(i, i + qi.shape[0])
+        m = torch.full((qi.shape[0],), -math.inf)  # running max of each row
+        l = torch.zeros(qi.shape[0])  # running sum of exp(s - m)
+        acc = torch.zeros(qi.shape[0], d)  # running sum of exp(s - m) * v
+        end = min(i + block_q, k.shape[0]) if causal else k.shape[0]
+        for j in range(0, end, block_k):
+            s = qi @ k[j : j + block_k].T  # (block_q, block_k) scores: the only N x N piece
+            if causal:
+                cols = torch.arange(j, j + s.shape[1])
+                s = s.masked_fill(cols[None, :] > rows[:, None], -math.inf)
+            m_new = torch.maximum(m, s.max(dim=1).values)
+            p = torch.exp(s - m_new[:, None])
+            alpha = torch.exp(m - m_new)  # rescales everything summed so far
+            l = alpha * l + p.sum(dim=1)
+            acc = alpha[:, None] * acc + p @ v[j : j + block_k]
+            m = m_new
+        out[i : i + block_q] = acc / l[:, None]
+        lse[i : i + block_q] = m + torch.log(l)  # kept for the backward pass
+    return out, lse
+```
+
+Checked against PyTorch's `scaled_dot_product_attention` in float64, on 100 queries of dimension
+64, the largest difference is $6 \times 10^{-16}$ with or without the causal mask, and `lse`
+matches the row-wise log-sum-exp of the full score matrix to the same precision.
+
+Two details are worth noticing. With a causal mask, query tile $i$ stops at the diagonal: the key
+tiles after it would be entirely masked, so they are never loaded or computed. And the function
+also returns $\text{LSE} = m + \log \ell$, the log of each row's softmax denominator. That is all
+the backward pass needs to rebuild any tile of $P$ as $e^{S - \text{LSE}}$, so it recomputes $S$
+tile by tile instead of storing it: one extra matrix multiply, instead of $N^2$ memory.
+
+### Who does what
+
+On the GPU, each query tile goes to one thread block, and every thread block runs the inner loop
+over the key/value tiles on its own:
+
+<AttentionTiles tiles={8} title="The score matrix in tiles: one row of tiles per thread block" />
+
+A thread block never needs another's results, because each row of the softmax depends only on its
+own row of scores. That is the improvement FlashAttention-2 (Dao, 2023) made over the original:
+the original put the loop over key/value tiles on the outside, so the partial results of each
+query tile were written to HBM and read back for every key tile. FlashAttention-2 puts the query
+tiles on the outside, as here, so each thread block keeps its running $m$, $\ell$ and $A$ in
+registers from start to finish. It also parallelizes over the sequence, not only over batch and
+heads, and divides by $\ell$ once at the end instead of after every tile.
+
+With the causal tab, 36 of the 64 tiles are computed, a little over half. The 8 diagonal tiles
+are the only ones that need masking at all, which is why kernels handle them in a separate code
+path.
+
+### What it saves
+
+The $N \times N$ matrices never reach HBM. $Q$ and $O$ cross it once each, and $K$ and $V$ are
+read once per query tile, $N / B_r$ times. Many of those reads hit in the L2 cache, because the
+thread blocks working on the same head run at about the same time. The FlashAttention paper puts
+the HBM traffic at $\Theta(N^2 d^2 / M)$ for on-chip memory of size $M$, against
+$\Theta(Nd + N^2)$ for standard attention, and the memory footprint drops from $O(N^2)$ to $O(N)$:
+just the output and the LSE.
+
+## The kernel in the CuTe DSL
+
+CUTLASS ships a FlashAttention-2 forward kernel for Ampere GPUs written in the CuTe DSL, in
+`examples/python/CuTeDSL/cute/ampere/kernel/attention/flash_attention_v2.py`. It is about
+1,300 lines including the test harness, and checks its output against PyTorch's
+`scaled_dot_product_attention`. Every step of the PyTorch function above is in it. The excerpts
+below are lightly abridged; my [tour of the CuTe DSL](/blog/cute-dsl/) covers the layout, copy and
+MMA functions they use.
+
+### The grid
+
+Each thread block handles one query tile of one head of one sequence, just as in the figure:
+
+```python
+# grid_dim: (m_block, batch_size, num_head)
+grid_dim = (
+    cute.ceil_div(mQ.shape[1], self._m_block_size),
+    cute.size(mQ.shape[0]),
+    cute.size(mQ.shape[2]),
+)
+```
+
+The tensors are laid out `(batch, seqlen, num_head, head_dim)`. In the kernel, each thread block
+picks out its tiles with `local_tile`. Leaving the key tile's coordinate as `None` keeps all of
+them, as an extra mode to loop over:
+
+```python
+m_block, batch_size, num_head = cute.arch.block_idx()
+
+# (m_block_size, head_dim)
+gQ = cute.local_tile(
+    mQ[batch_size, None, num_head, None],
+    (self._m_block_size, self._head_dim_padded),
+    (m_block, 0),
+)
+# (n_block_size, head_dim, n_block)
+gK = cute.local_tile(
+    mK[batch_size, None, num_head, None],
+    (self._n_block_size, self._head_dim_padded),
+    (None, 0),
+)
+```
+
+With a causal mask, the loop stops at the diagonal, like `end` in the PyTorch version:
+
+```python
+n_block_max = cute.ceil_div(mK.shape[1], self._n_block_size)
+if self._is_causal:
+    n_block_max = min(
+        cute.ceil_div((m_block + 1) * self._m_block_size, self._n_block_size),
+        n_block_max,
+    )
+```
+
+### The two matrix multiplies
+
+$S = QK^\top$ and $AV$ run on tensor cores, through a tiled MMA built from Ampere's
+$16 \times 8 \times 16$ half-precision instruction, with the warps stacked along the rows of the
+query tile, so each warp owns its own rows of $S$ and of the output:
+
+```python
+tiled_mma = cute.make_tiled_mma(
+    warp.MmaF16BF16Op(self._dtype, cutlass.Float32, (16, 8, 16)),
+    (self._num_threads // 32, 1, 1),
+    permutation_mnk=(self._num_threads // 32 * 16, 16, 16),
+)
+```
+
+Q, K and V tiles are copied from global to shared memory with `cp.async`, and from shared memory
+into registers with `ldmatrix`. The kernel overlaps the two: it starts loading the V tile before
+computing $S$, and the next K tile before computing $AV$, so the loads hide behind the math. V is
+read through a transposed view of shared memory, made with `cute.composition`, because the second
+multiply needs it as $V^\top$:
+
+```python
+sVt = cute.composition(
+    sV,
+    cute.make_layout(
+        (self._head_dim_padded, self._n_block_size),
+        stride=(self._n_block_size, 1),
+    ),
+)
+```
+
+The score tile is accumulated in fp32 registers, `acc_S`, one $k$-slice of the head dimension at a
+time:
+
+```python
+for k in cutlass.range_constexpr(cute.size(smem_copy_params.tSsQ.shape[2])):
+    ...  # load the next k-slice of Q and K from shared memory into registers
+    cute.gemm(
+        mma_params.tiled_mma,
+        acc_S,
+        mma_params.tSrQ[None, None, k],
+        mma_params.tSrK[None, None, k],
+        acc_S,
+    )
+```
+
+### The online softmax, in registers
+
+This is the PyTorch inner loop, row by row. Each thread holds a few rows of the score tile, but
+only some of each row's columns: in the MMA's accumulator layout, one row is spread over the 4
+threads of a **quad**. So the row maximum takes a local reduction and then two butterfly shuffles
+within the quad (`_threadquad_reduce_max`, built on `cute.arch.shuffle_sync_bfly`):
+
+```python
+for r in cutlass.range_constexpr(cute.size(softmax_params.row_max)):
+    acc_S_row = acc_S_mn[r, None].load()
+    row_max_cur_row = acc_S_row.reduce(cute.ReductionOp.MAX, -cutlass.Float32.inf, 0)
+    row_max_cur_row = self._threadquad_reduce_max(row_max_cur_row)
+    if cutlass.const_expr(not is_first_n_block):
+        row_max_prev_row = row_max_prev[r]
+        row_max_cur_row = cute.arch.fmax(row_max_prev_row, row_max_cur_row)
+
+    # compute exp(x - max) using exp2(x * log_2(e) - max * log_2(e))
+    acc_S_row_exp = cute.math.exp2(
+        acc_S_row * softmax_params.softmax_scale_log2
+        - row_max_cur_row * softmax_params.softmax_scale_log2,
+        fastmath=True,
+    )
+    acc_S_row_sum = acc_S_row_exp.reduce(cute.ReductionOp.ADD, cutlass.Float32.zero, 0)
+    if cutlass.const_expr(not is_first_n_block):
+        prev_minus_cur_exp = cute.math.exp2(
+            row_max_prev_row * softmax_params.softmax_scale_log2
+            - row_max_cur_row * softmax_params.softmax_scale_log2,
+            fastmath=True,
+        )
+        acc_S_row_sum = acc_S_row_sum + softmax_params.row_sum[r] * prev_minus_cur_exp
+        acc_O_mn[r, None] = acc_O_mn[r, None].load() * prev_minus_cur_exp
+    softmax_params.row_max[r] = row_max_cur_row
+    softmax_params.row_sum[r] = acc_S_row_sum
+    acc_S_mn[r, None] = acc_S_row_exp
+```
+
+Line by line, against the PyTorch version:
+
+- `row_max_cur_row` is `m_new`, the larger of the old running maximum and this tile's.
+- `acc_S_row_exp` is `p`. The GPU's fast exponential is base 2, so the kernel folds
+  $\log_2 e$ into the scale once, on the host (`softmax_scale_log2`), and computes
+  $2^{s \log_2 e - m \log_2 e} = e^{s - m}$ with a single multiply-add and `exp2` per score.
+- `prev_minus_cur_exp` is `alpha`. It rescales the running sum and the accumulator `acc_O`,
+  which is $A$.
+- `is_first_n_block` is a compile-time constant, so the first tile's code has no rescaling at all.
+  The masking code lives in a separate, also compile-time, variant used only for the diagonal
+  tiles.
+
+The row's local sum is left unreduced across the quad until the end. Each thread keeps a partial
+$\ell$ over its own columns, which is enough, since the rescaling factor is the same for all of
+them.
+
+Then comes a detail the PyTorch version hides: the probabilities `acc_S` are converted to 16 bits
+and fed straight into the second multiply, as its A operand, without leaving registers. The MMA's
+accumulator layout and its A-operand layout are different arrangements of the same tile, so the
+kernel builds a new view of the same registers with `cute.logical_divide` and `cute.make_layout`,
+regrouping `(4, MMA_M, MMA_N)` into `((4, 2), MMA_M, MMA_N / 2)`. No data moves. It is the layout
+algebra doing the work a shuffle would otherwise have to.
+
+### The epilogue
+
+After the last tile, each row is divided by its sum, after finishing the quad reduction that was
+skipped inside the loop:
+
+```python
+for r in cutlass.range_constexpr(cute.size(row_sum)):
+    row_sum[r] = self._threadquad_reduce_sum(row_sum[r])
+    # if row_sum is zero or nan, set acc_O_mn_row to 1.0
+    acc_O_mn_row_is_zero_or_nan = row_sum[r] == 0.0 or row_sum[r] != row_sum[r]
+    scale = 1.0 if acc_O_mn_row_is_zero_or_nan else cute.arch.rcp_approx(row_sum[r])
+    acc_O_mn[r, None] = acc_O_mn[r, None].load() * scale
+```
+
+The output is converted to 16 bits, staged through shared memory (reusing Q's buffer, which is no
+longer needed), and stored to global memory with wide, vectorized copies. This example skips the
+LSE, so it is forward-only; the training kernels in the flash-attention repository write it out
+too.
+
+## Newer GPUs
+
+The algorithm hasn't changed since FlashAttention-2, but each GPU generation has moved the
+bottleneck:
+
+- **FlashAttention-3** (Shah et al., 2024) targets Hopper. It loads tiles with the TMA engine and
+  multiplies with asynchronous warpgroup MMAs, and uses **warp specialization**: some warps only
+  load data while others compute. Two warpgroups take turns ("ping-pong"), so one's softmax runs
+  while the other's matrix multiplies do. It also adds FP8.
+- **FlashAttention-4** targets Blackwell, and is written in the CuTe DSL (in `flash_attn/cute` in
+  the flash-attention repository). On Blackwell, the tensor cores are so fast that the
+  exponentials in the softmax become a bottleneck. FA4 computes some of them with a polynomial on
+  the ordinary floating-point units instead of the special-function unit (the `ex2_emu` options),
+  and lets the running maximum lag behind (`rescale_threshold`), skipping the rescale of $A$ unless
+  the maximum has grown enough to risk overflow.
+
+The online softmax, the tiling and the LSE are the same in all of them.
+
+## Summary
+
+- **Online softmax** processes a row of scores block by block, keeping a running maximum $m$, sum
+  $\ell$ and weighted sum $a$. When $m$ grows, one factor $e^{m - m'}$ corrects everything summed
+  so far, and $a / \ell$ is exact at the end.
+- **FlashAttention** applies it to tiles: each thread block owns a tile of queries and loops over
+  tiles of keys and values, so the $N \times N$ scores exist only one small tile at a time, in
+  registers. A causal mask lets it skip nearly half the tiles.
+- It returns the **log-sum-exp** of each row, so the backward pass can recompute $P$ tile by tile
+  instead of storing it.
+- In the CuTe DSL kernel, the two matrix multiplies are tiled MMAs on tensor cores, loads overlap
+  compute through `cp.async`, row reductions are quad shuffles, and the probabilities move from the
+  first multiply to the second through a layout change alone.
+
+FlashAttention is also what serving engines use for both prefill and decode. Reading the keys and
+values from a paged cache, through a block table, is the subject of
+[the KV cache post](/blog/kv-cache-and-paged-attention/).
