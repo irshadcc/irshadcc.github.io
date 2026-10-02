@@ -1,0 +1,357 @@
+---
+title: "A/B Testing: Power, p-Values, and Experimentation at Scale"
+description: "How randomized product experiments establish causality, how power and p-values answer different questions, and how layers and deterministic bucketing let many tests run safely at once."
+date: 2026-10-02
+tags: [Machine learning]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import PowerExplorer from "../../utils/experimentation/PowerExplorer.astro";
+import ExperimentLayers from "../../utils/experimentation/ExperimentLayers.astro";
+
+## Background
+
+A product metric rises after a new ranking model ships. The model may have caused the rise, but
+the calendar, a marketing campaign, or a different mix of users may have caused it too. A
+before-and-after comparison cannot separate those explanations because time changed along with
+the product.
+
+An **A/B test**, or **online controlled experiment**, solves this by randomly assigning units to
+a **control**, which receives the current experience, or a **treatment**, which receives the
+change. Both groups run at the same time. Randomization makes their expected composition equal,
+so a systematic difference in outcomes can be attributed to the treatment. This is why controlled
+experiments are useful for model launches as well as button colours: they measure causal impact,
+not merely offline model quality.
+
+This post follows Ron Kohavi, Diane Tang, and Ya Xu's *Trustworthy Online Controlled Experiments*.<Sidenote>The author's name is Ron Kohavi; the book is sometimes found through the misspelling “Kahavi.”</Sidenote>
+We will design one experiment, distinguish statistical power from the p-value, compare testing
+methods, and then build up the layers and buckets that let a platform run many experiments at
+once.
+
+## From a product question to an experiment
+
+Suppose a checkout team believes a shorter form will increase completed purchases. A useful
+experiment specification fixes six choices *before* looking at results:
+
+| choice | example |
+| --- | --- |
+| Hypothesis | A shorter form increases checkout conversion |
+| Randomization unit | Signed-in user |
+| Control | Existing form |
+| Treatment | Short form |
+| Primary metric | Purchases / eligible users over 14 days |
+| Guardrails | Refund rate, page latency, support contacts |
+
+The **randomization unit** is the object assigned once to a variant. User-level assignment keeps
+a returning user in one experience. Session-level assignment gives more independent-looking
+observations, but the same person can see both forms; that can cause learning or confusion and
+violates the assumption that units do not affect one another. For a collaborative feature, even
+user assignment can be wrong: everyone in a company or conversation may need the same variant,
+so the tenant or group becomes the unit.
+
+The **analysis unit** is the object over which the metric is computed. If assignment is by user,
+an analysis that treats every page view as independent invents precision: page views from one
+person are correlated. Aggregate to the user or use a variance estimator that respects the
+clusters.
+
+The **overall evaluation criterion** (OEC) is the small set of metrics used to decide whether the
+change is good. The primary metric should capture the intended value; guardrails catch damage
+elsewhere. A ranking change may improve clicks while making pages slower. Declaring hundreds of
+metrics to be independent reasons to ship all but guarantees chance “wins.”
+
+### The estimand and estimator
+
+Let $Y_i(1)$ be user $i$'s outcome under treatment and $Y_i(0)$ the outcome under control. The
+individual treatment effect $Y_i(1)-Y_i(0)$ cannot be observed: each user sees only one variant.
+The target is therefore the **average treatment effect**
+
+$$
+\tau = \mathbb E[Y(1)-Y(0)].
+$$
+
+With random assignment, the difference in sample means is an unbiased estimator:
+
+$$
+\widehat\tau = \overline Y_T-\overline Y_C.
+$$
+
+Randomization does the causal work. The statistical test then asks whether the observed
+difference is distinguishable from sampling noise.
+
+## What a p-value says
+
+Start with a **null hypothesis** $H_0$: the treatment effect is zero. The alternative $H_1$ says
+it is not zero. For two conversion rates, a large-sample test statistic is
+
+$$
+z = \frac{\widehat p_T-\widehat p_C}
+{\sqrt{\widehat p(1-\widehat p)(1/n_T+1/n_C)}},
+$$
+
+where $\widehat p$ pools successes across both arms. Under $H_0$ and the test assumptions, $z$
+is approximately standard normal.
+
+The **p-value** is the probability, *assuming the null hypothesis and the model are true*, of a
+test statistic at least as extreme as the observed one. For a two-sided z-test,
+
+$$
+p\text{-value}=2\left[1-\Phi(|z|)\right].
+$$
+
+It is not the probability that the null hypothesis is true. It is not the probability that the
+result happened “by chance.” It does not measure the size or business value of the effect. A tiny
+effect can have a tiny p-value with enough traffic; a valuable effect can miss significance in a
+small experiment.
+
+### A worked result
+
+Take 10,000 users in each arm. Control has 1,000 purchases and treatment has 1,050:
+
+$$
+\widehat p_C=0.100,\qquad
+\widehat p_T=0.105,\qquad
+\widehat\tau=0.005.
+$$
+
+The pooled rate is $2{,}050/20{,}000=0.1025$, giving
+
+$$
+\operatorname{SE}_{H_0}
+=\sqrt{0.1025(1-0.1025)(1/10{,}000+1/10{,}000)}
+=0.004289.
+$$
+
+Therefore $z=0.005/0.004289=1.166$ and the two-sided p-value is $0.244$. At a preselected
+significance level $\alpha=0.05$, we do not reject $H_0$.
+
+“Not statistically significant” does not mean “no effect.” A 95% confidence interval using the
+unpooled standard error is $[-0.34, 1.34]$ percentage points. The data are compatible with a
+small loss, no effect, or a useful gain. The experiment is inconclusive at the precision the team
+asked for.
+
+The **significance level** $\alpha$ limits the long-run probability of a **Type I error**: rejecting
+a true null hypothesis. If thousands of valid A/A tests compare identical variants at
+$\alpha=0.05$, about 5% will be significant. This statement concerns the testing procedure over
+repetitions, not the truth of one result.
+
+## Statistical power
+
+An experiment can control false positives and still miss real improvements. A **Type II error**
+occurs when the test fails to reject $H_0$ even though a specified effect exists. If its
+probability is $\beta$, then **statistical power** is
+
+$$
+\text{power}=1-\beta
+=\Pr(\text{reject }H_0\mid\text{specified effect is real}).
+$$
+
+Power is a property of a test design at a particular true effect, not a label attached to the
+observed p-value. Teams commonly plan for 80% or 90% power at a **minimum detectable effect**
+(MDE): the smallest effect worth reliably detecting. An MDE is a product choice before it becomes
+a statistical input.
+
+For two equally sized groups with baseline rate $p_0$, target rate $p_1$, two-sided $\alpha$, and
+target power $1-\beta$, the normal approximation gives the per-arm sample size
+
+$$
+n \approx
+\frac{\left[
+z_{1-\alpha/2}\sqrt{2\bar p(1-\bar p)}+
+z_{1-\beta}\sqrt{p_0(1-p_0)+p_1(1-p_1)}
+\right]^2}{(p_1-p_0)^2},
+\qquad \bar p=\frac{p_0+p_1}{2}.
+$$
+
+For $p_0=10\%$, an absolute MDE of one percentage point, $\alpha=5\%$, and 80% power,
+$z_{0.975}=1.960$ and $z_{0.8}=0.842$. Substitution gives 14,751 users per arm, or 29,502 total.
+This is a planning approximation; very rare events and small samples need exact or simulation-based
+calculations.
+
+<PowerExplorer baseline={0.1} lift={0.01} alpha={0.05} targetPower={0.8} />
+
+The curve explains why the worked experiment was inconclusive. With 10,000 users per arm, it had
+only 63.6% power to detect a true move from 10% to 11%. Repeating that design when the effect is
+exactly one point would fail to reach significance about 36.4% of the time.
+
+| users per arm | power for 10% → 11% |
+| ---: | ---: |
+| 1,000 | 11.3% |
+| 5,000 | 37.1% |
+| 10,000 | 63.6% |
+| 15,000 | 80.7% |
+| 30,000 | 97.9% |
+
+Four levers increase power:
+
+- **More units.** Standard error falls roughly as $1/\sqrt n$, so halving the MDE usually needs
+  about four times the traffic.
+- **A larger true effect.** Its signal sits farther from the null distribution.
+- **Less variance.** Better metrics, stratification, or CUPED can remove predictable noise.
+- **A larger $\alpha$.** This makes rejection easier but permits more false positives; it is a
+  trade, not free power.
+
+Unequal allocation also costs power for a fixed total sample. A 50/50 split minimizes the variance
+when observations cost the same. Teams sometimes begin at 1% treatment to limit blast radius,
+then ramp toward 50% after safety metrics look healthy.
+
+### Power is not the positive predictive value
+
+Even 80% power and 5% significance do not imply that 80% or 95% of significant results are true.
+That probability also depends on how many tested ideas truly work. If only 10 of 100 ideas have
+the planned effect, an illustrative batch expects 8 true positives and $0.05\times90=4.5$ false
+positives. Only about $8/(8+4.5)=64\%$ of significant results would be true in that simplified
+model. Better hypotheses, lower $\alpha$, replication, and multiple-testing control all matter.
+
+## Different ways to run a test
+
+“A/B testing” names a family of designs and analyses. The right choice depends on whether the goal
+is inference, safe rollout, or reward during the experiment.
+
+### Fixed-horizon frequentist A/B
+
+Choose the MDE, $\alpha$, power, sample size, metric, and duration in advance. Analyze once at the
+end with a z-test, t-test, bootstrap, or randomization test appropriate to the metric. This is the
+default because its error rates are straightforward when the assumptions hold.
+
+Do not check an ordinary p-value each hour and stop at the first value below 0.05. Every extra look
+is another chance for noise to cross the boundary, inflating the false-positive rate. Also run for
+at least a full business cycle when day-of-week effects matter; reaching the sample size on Friday
+does not make a Monday-only sample representative.
+
+### Sequential tests
+
+A **sequential test** allows planned interim looks while preserving an error guarantee. Group
+sequential designs spend the Type I error across checkpoints; always-valid p-values and confidence
+sequences remain valid under continuous monitoring. Sequential methods can stop early for a clear
+win, harm, or futility, but their stopping rule and estimator must match. Ordinary fixed-horizon
+thresholds do not become sequential merely because a dashboard updates continuously.
+
+### A/B/n and factorial tests
+
+An **A/B/n test** compares several treatments with one control. It explores more alternatives but
+creates more opportunities for a false winner, so use a family-wise procedure such as Holm's method
+or control the false discovery rate when that matches the decision problem.
+
+A **factorial design** independently randomizes two or more factors, such as button text and button
+colour. A $2\times2$ design estimates both main effects and their interaction. It is more efficient
+than isolated tests when factors do not interact, and it reveals when the combination behaves
+differently from the sum of its parts.
+
+### Cluster and switchback experiments
+
+User randomization fails when one user's treatment changes another user's outcome. Marketplaces
+have shared inventory; social products have networks; delivery algorithms affect a common pool of
+drivers. A **cluster-randomized test** assigns whole stores, regions, teams, or network clusters.
+A **switchback test** alternates control and treatment for the whole market across time blocks.
+Both usually have fewer effective independent units than a user test, so power calculations must
+include within-cluster or within-period correlation.
+
+### Bayesian experiments
+
+A Bayesian analysis combines a prior with the likelihood to produce a posterior distribution for
+the effect. It can answer questions such as $\Pr(\tau>0\mid\text{data})$ or the probability that
+the gain exceeds a business threshold. Those are not p-values. Bayesian designs make assumptions
+through the prior and decision rule, and repeated monitoring is safe only relative to a specified
+Bayesian stopping and loss framework.
+
+### Multi-armed bandits
+
+A **multi-armed bandit** adapts traffic toward variants that currently appear better, reducing
+lost reward during allocation. That is an optimization goal. A balanced randomized test is usually
+better for precise causal estimates, guardrail measurement, and learning about segments. Adaptive
+allocation also complicates conventional estimators. Use bandits for persistent choices with
+rapid feedback; use experiments when learning the treatment effect is the primary goal.
+
+## Control, experiments, layers, and buckets
+
+At platform scale, assignment must be stable, reproducible, and able to support concurrent tests.
+The useful hierarchy is:
+
+- A **variant** is one experience, usually control or treatment.
+- An **experiment** owns a population slice and divides it among variants.
+- A **layer** is a namespace of mutually exclusive experiments. One unit can enter at most one
+  experiment in a layer.
+- A **bucket** is a small allocation slot. An experiment reserves a set of buckets and maps those
+  buckets to variants.
+
+<ExperimentLayers users={12} buckets={16} />
+
+A service can compute
+
+$$
+b=\operatorname{hash}(\text{unit ID},\text{layer ID},\text{salt})\bmod B,
+$$
+
+where $B$ is the bucket count. The hash must be deterministic and close to uniform. Adding the
+layer ID re-randomizes the same user independently in each layer. Adding an experiment-specific
+salt can independently split the users reserved for that experiment into variants.
+
+Suppose a layer has 10,000 buckets. Checkout experiment E1 reserves buckets 0–999: 0–499 are
+control and 500–999 treatment, so it receives 10% of eligible traffic in a 50/50 split. Search
+experiment E2 can reserve 1,000–2,999 in the same layer without overlap. A ranking experiment in a
+different layer may use all 10,000 buckets, allowing E1 and the ranking test to run concurrently.
+
+Layers increase throughput, but only when cross-layer interactions are unlikely. A button-colour
+test and a ranking-model test may safely overlap. Two tests that both change checkout should share
+a layer and be mutually exclusive, or use an explicit factorial design. Hidden interactions make
+each experiment's effect depend on the other experiment's assignment.
+
+Do not bucket by `hash(user_id) % 100` and then change the modulus or boundaries casually. That can
+reshuffle existing users between variants and produce carryover. Production systems use stable
+hashes, many fine-grained buckets, versioned configuration, eligibility filters applied consistently,
+and logged assignment exposure so the analysis can reconstruct what a user actually received.
+
+### Triggering and exposure
+
+Assignment is not the same as exposure. A user may be assigned to the checkout experiment but never
+open checkout. **Triggered analysis** includes a unit once it reaches the point where treatment
+could affect it, improving sensitivity by excluding unaffected traffic. The trigger must be defined
+before assignment can influence it; filtering on a post-treatment action can bias the groups.
+
+Analyze by the original assignment—**intention to treat**—when delivery is imperfect. Comparing
+only users who successfully received treatment can destroy randomization because delivery failure
+may correlate with device, geography, or outcome.
+
+## Trust checks before reading impact
+
+A polished p-value cannot repair a broken experiment. Check trustworthiness first.
+
+1. **Run an A/A test.** Send both arms the same experience. Significant metrics should occur at
+   their advertised rate, and confidence intervals should have their advertised coverage.
+2. **Check sample ratio mismatch (SRM).** If a 50/50 experiment has a highly implausible assignment
+   count, investigate missing logs, eligibility differences, bad hashing, or crashes before reading
+   treatment effects.
+3. **Check invariant metrics.** Assignment should not change pre-experiment attributes such as
+   historical activity or country mix.
+4. **Verify exposure and telemetry.** The variant served, assignment ID, randomization unit, trigger,
+   and metric events must join without treatment-dependent loss.
+5. **Inspect novelty and carryover.** Users may explore a new interface briefly, while cached state
+   or learned behaviour can survive reassignment.
+6. **Treat guardrails as decisions.** A primary-metric win does not excuse a material regression in
+   latency, errors, safety, or long-term retention.
+
+Kohavi, Tang, and Xu emphasize this distinction: calculating numbers is easy; obtaining numbers
+that deserve trust requires engineering and diagnostic checks around the statistical test.
+
+## Summary
+
+- Random assignment makes control and treatment comparable in expectation, turning a product
+  comparison into an estimate of causal effect.
+- A p-value asks how surprising the observed statistic would be under the null; it is not the
+  probability that the null is true or a measure of effect size.
+- Power is the chance that a design detects a specified real effect. Choose the MDE, $\alpha$,
+  target power, and sample size before reading the data.
+- Fixed-horizon, sequential, factorial, cluster, Bayesian, and bandit methods answer different
+  operational questions; their stopping and analysis rules are not interchangeable.
+- Stable hashing assigns units to buckets. Mutually exclusive experiments share a layer, while
+  separate layers let compatible experiments reuse traffic.
+- Validate assignment, exposure, metric logging, and SRM before interpreting any impact estimate.
+
+## References
+
+1. Ron Kohavi, Diane Tang, and Ya Xu, [*Trustworthy Online Controlled Experiments: A Practical
+   Guide to A/B Testing*](https://www.cambridge.org/core/books/trustworthy-online-controlled-experiments/BFFD7CC0B7325B5DCEEFFB1DD9401F7E), Cambridge University Press, 2020.
+2. Ron Kohavi et al., [“Controlled experiments on the web: survey and practical guide”](https://link.springer.com/article/10.1007/s10618-008-0114-1), *Data Mining and Knowledge Discovery*, 2009.
+3. Diane Tang et al., [“Overlapping Experiment Infrastructure: More, Better, Faster Experimentation”](https://research.google.com/pubs/archive/36500.pdf), *KDD*, 2010.
+4. Somit Gupta et al., [“The Anatomy of a Large-Scale Experimentation Platform”](https://www.microsoft.com/en-us/research/publication/the-anatomy-of-a-large-scale-experimentation-platform/), *ICSA*, 2018.
+5. NIST/SEMATECH, [“Critical values and p-values”](https://www.itl.nist.gov/div898/handbook/prc/section1/prc131.htm), *e-Handbook of Statistical Methods*.

@@ -2,6 +2,7 @@
 title: "FlashAttention, from Online Softmax to a CuTe DSL Kernel"
 description: "FlashAttention computes exact attention without ever writing the N×N score matrix to memory. This post derives the online softmax that makes that possible, builds the tiled algorithm in a few lines of PyTorch, and then reads NVIDIA's FlashAttention-2 kernel written in the CuTe DSL to see how each step maps onto tiles, tensor cores and registers."
 date: 2026-10-02
+tags: [CUDA, Draft]
 ---
 
 import Sidenote from "../../components/Sidenote.astro";

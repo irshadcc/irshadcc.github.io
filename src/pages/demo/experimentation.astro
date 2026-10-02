@@ -1,0 +1,21 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import ExperimentLayers from "../../utils/experimentation/ExperimentLayers.astro";
+import PowerExplorer from "../../utils/experimentation/PowerExplorer.astro";
+---
+
+<Layout title="Experimentation components">
+	<main>
+		<h1>Experimentation components</h1>
+		<PowerExplorer baseline={0.1} lift={0.01} alpha={0.05} targetPower={0.8} />
+		<ExperimentLayers users={12} buckets={16} />
+	</main>
+</Layout>
+
+<style>
+	main {
+		max-width: 900px;
+		margin: 3rem auto;
+		padding: 0 1rem;
+	}
+</style>

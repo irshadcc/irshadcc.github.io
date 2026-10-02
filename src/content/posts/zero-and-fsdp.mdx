@@ -2,6 +2,7 @@
 title: "ZeRO and FSDP, Stage by Stage"
 description: "Data parallelism keeps a full copy of the model, its gradients and its optimizer state on every GPU. ZeRO removes those copies one at a time: first the optimizer state, then the gradients, then the parameters themselves. This post works out what each stage saves and what it costs to communicate, and builds all three in PyTorch, checked against ordinary training."
 date: 2026-10-02
+tags: [Distributed training, Draft]
 ---
 
 import Sidenote from "../../components/Sidenote.astro";

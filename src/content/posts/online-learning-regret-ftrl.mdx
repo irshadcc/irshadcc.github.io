@@ -1,0 +1,459 @@
+---
+title: "Online Learning, Regret, and FTRL"
+description: "A worked introduction to sequential prediction, regret, and the FTRL-Proximal algorithm behind Google's large-scale click-through-rate models."
+date: 2026-10-02
+tags: [Machine learning, Optimization]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import LineChart from "../../utils/charts/LineChart.astro";
+import BoxDiagram from "../../utils/payments/BoxDiagram.astro";
+import { onlineRoundEdges, onlineRoundNodes } from "../../utils/ml/onlineLearningFigures";
+
+## Background
+
+A batch model collects a dataset, trains, and then serves a fixed set of parameters. That split is
+awkward for a search-ad system. Impressions arrive continuously, a click changes what the system
+knows, and yesterday's traffic need not look like today's. Rebuilding a model from all historical
+data after every event would be far too expensive.
+
+**Online learning** processes examples one at a time: predict with the current model, observe the
+outcome, suffer a loss, and update the model. It matters wherever feedback is a stream---ads,
+recommendations, spam filtering, pricing, and monitoring. It also gives us a way to reason about
+changing or even adversarial data without assuming that examples are independent and identically
+distributed (IID).
+
+This post first defines the online protocol and loss, then builds **regret** as its measure of
+performance. From there we derive Follow the Regularized Leader (FTRL), prove a basic regret
+bound, and finally derive the sparse, per-coordinate FTRL-Proximal update in Google's
+*Ad Click Prediction: a View from the Trenches*. A five-impression example checks every state
+update.
+
+## The online-learning protocol
+
+At round $t=1,2,\ldots,T$, a learner goes through four ordered steps:
+
+1. observe a context $x_t$ and choose parameters $w_t$;
+2. make a prediction, such as $p_t=\sigma(w_t^\top x_t)$;
+3. observe the outcome $y_t$ and incur loss $\ell_t(w_t)$;
+4. use that loss to construct $w_{t+1}$.
+
+Here $\sigma(a)=1/(1+e^{-a})$ is the **sigmoid** function. The subscript matters: $w_t$ must be
+chosen before $y_t$ is known. Otherwise the learner could simply copy the answer.
+
+<BoxDiagram
+  nodes={onlineRoundNodes}
+  edges={onlineRoundEdges}
+  selected="predict"
+  title="One round of online learning (click a box)"
+/>
+
+“Online” describes the order of information, not necessarily the deployment architecture. A
+system may update after every example, after a small mini-batch, or by replaying a stored stream.
+The mathematical distinction from ordinary empirical risk minimization is that each prediction is
+evaluated using only the past.
+
+### Loss turns a mistake into a number
+
+A **loss function** says how costly a prediction is. For a binary label $y_t\in\{0,1\}$ and a
+predicted probability $p_t$, logistic loss is
+
+$$
+\ell_t(p_t)
+=-y_t\log p_t-(1-y_t)\log(1-p_t).
+$$
+
+It is zero only in the limit of a perfectly confident, correct prediction. Confident mistakes are
+expensive: predicting $p=0.9$ when $y=0$ costs $-\log(0.1)=2.303$, while predicting $p=0.6$
+costs $-\log(0.4)=0.916$.
+
+For logistic regression, let $a_t=w^\top x_t$ and $p_t=\sigma(a_t)$. Differentiate in two
+steps:
+
+$$
+\frac{\partial \ell_t}{\partial p_t}
+=-\frac{y_t}{p_t}+\frac{1-y_t}{1-p_t},
+\qquad
+\frac{\partial p_t}{\partial a_t}=p_t(1-p_t).
+$$
+
+Multiplying and simplifying gives
+
+$$
+\frac{\partial \ell_t}{\partial a_t}=p_t-y_t,
+\qquad
+g_t=\nabla_w\ell_t(w_t)=(p_t-y_t)x_t.
+$$
+
+This compact gradient is important in a sparse system. If only 20 coordinates of $x_t$ are
+non-zero, only those 20 coordinates have non-zero gradients.
+
+## Regret: compare decisions, not datasets
+
+Cumulative loss alone lacks a reference point. A loss of 1,000 may be excellent on a difficult
+stream and terrible on an easy one. **Regret** compares the learner with a fixed decision $u$
+chosen with hindsight:
+
+$$
+\operatorname{Regret}_T(u)
+=\sum_{t=1}^{T}\ell_t(w_t)-\sum_{t=1}^{T}\ell_t(u).
+$$
+
+The usual **external regret** uses the best fixed comparator in a set $\mathcal W$:
+
+$$
+R_T
+=\sum_{t=1}^{T}\ell_t(w_t)
+-\min_{u\in\mathcal W}\sum_{t=1}^{T}\ell_t(u).
+$$
+
+“Fixed” is essential. The comparator may be selected after seeing the whole sequence, but it must
+use the same $u$ on every round. Comparing with a clairvoyant action that changes after seeing
+each $y_t$ would ask an online learner to beat an impossible opponent.
+
+An algorithm is **no-regret** when $R_T/T\to0$. Its total excess loss can grow, but slower than
+the number of rounds, so the excess per prediction vanishes.<Sidenote>A regret guarantee is not a
+claim that the loss itself vanishes. Noise may force both the learner and the comparator to make
+mistakes.</Sidenote>
+
+### A five-round calculation
+
+Suppose the labels are $[1,1,0,1,0]$ and an online learner predicts
+$[0.50,0.75,0.75,0.50,0.60]$.
+
+| round $t$ | label $y_t$ | prediction $p_t$ | log loss |
+| ---: | ---: | ---: | ---: |
+| 1 | 1 | 0.50 | 0.6931 |
+| 2 | 1 | 0.75 | 0.2877 |
+| 3 | 0 | 0.75 | 1.3863 |
+| 4 | 1 | 0.50 | 0.6931 |
+| 5 | 0 | 0.60 | 0.9163 |
+| **learner total** | | | **3.9766** |
+
+Restrict the comparator to one constant probability $q$. Its cumulative loss is
+
+$$
+L(q)=-3\log q-2\log(1-q).
+$$
+
+Set its derivative $-3/q+2/(1-q)$ to zero. The best constant is $q^*=3/5=0.6$, the empirical
+click rate. It loses
+
+$$
+L(0.6)=-3\log(0.6)-2\log(0.4)=3.3651.
+$$
+
+Therefore $R_5=3.9766-3.3651=0.6115$, or $0.1223$ per round. Regret can be negative on a finite
+sequence: an adaptive learner can outperform every *fixed* comparator.
+
+## From Follow the Leader to FTRL
+
+The most direct idea is **Follow the Leader** (FTL): on each round, choose the parameter that
+would have performed best on all previous rounds,
+
+$$
+w_{t+1}=\arg\min_w\sum_{s=1}^{t}\ell_s(w).
+$$
+
+FTL can be unstable. When two decisions have nearly equal historical loss, one new observation
+can move the minimizer a long way. The learner then chases the newest winner. **Regularization**
+adds a preference for controlled solutions:
+
+$$
+w_{t+1}
+=\arg\min_w\left[
+\sum_{s=1}^{t}\ell_s(w)+R(w)
+\right].
+$$
+
+This is **Follow the Regularized Leader**. A strongly convex $R$ gives the objective curvature,
+so a small change in accumulated loss causes a small change in the minimizer.
+
+In large models, repeatedly minimizing every original loss is still costly. For a convex loss,
+the tangent at $w_t$ is a global lower bound:
+
+$$
+\ell_t(w)\geq \ell_t(w_t)+g_t^\top(w-w_t),
+\qquad g_t=\nabla\ell_t(w_t).
+$$
+
+Terms independent of $w$ do not affect the minimizer. Replacing past losses with their linear
+parts gives the linearized FTRL update
+
+$$
+w_{t+1}=\arg\min_w\left[g_{1:t}^\top w+R(w)\right],
+\qquad g_{1:t}=\sum_{s=1}^{t}g_s.
+$$
+
+The entire past is compressed into the gradient sum.
+
+### A basic regret bound, step by step
+
+Take $R(w)=\lVert w\rVert_2^2/(2\eta)$. Differentiating the FTRL objective gives
+
+$$
+g_{1:t}+\frac{1}{\eta}w_{t+1}=0
+\quad\Longrightarrow\quad
+w_{t+1}=-\eta g_{1:t}.
+$$
+
+Since $w_t=-\eta g_{1:t-1}$, we also have the familiar gradient update
+$w_{t+1}=w_t-\eta g_t$. FTRL and online gradient descent coincide in this particular case.
+
+Convexity gives $\ell_t(w_t)-\ell_t(u)\leq g_t^\top(w_t-u)$. Substitute
+$g_t=(w_t-w_{t+1})/\eta$ and use
+
+$$
+2(a-b)^\top(a-c)
+=\lVert a-c\rVert^2-\lVert b-c\rVert^2+\lVert a-b\rVert^2.
+$$
+
+Then each round satisfies
+
+$$
+g_t^\top(w_t-u)
+=\frac{\lVert w_t-u\rVert^2-\lVert w_{t+1}-u\rVert^2}{2\eta}
++\frac{\eta}{2}\lVert g_t\rVert^2.
+$$
+
+Sum over $t$. The squared-distance terms telescope. With $w_1=0$, dropping the final
+non-positive term gives
+
+$$
+\operatorname{Regret}_T(u)
+\leq \frac{\lVert u\rVert^2}{2\eta}
++\frac{\eta}{2}\sum_{t=1}^{T}\lVert g_t\rVert^2.
+$$
+
+If $\lVert u\rVert\leq D$ and $\lVert g_t\rVert\leq G$, choose
+$\eta=D/(G\sqrt T)$. Both terms balance, producing
+
+$$
+\operatorname{Regret}_T(u)\leq DG\sqrt T,
+\qquad
+\frac{\operatorname{Regret}_T(u)}{T}\leq\frac{DG}{\sqrt T}.
+$$
+
+This is a no-regret guarantee. It holds for every sequence satisfying the gradient bound; no
+probability model for the data was needed.
+
+## FTRL-Proximal for click prediction
+
+Google's paper considers logistic regression with billions of sparse examples and an enormous
+feature vocabulary. Two properties matter at that scale:
+
+- frequent features should earn smaller learning rates than rare features;
+- unhelpful features should have weights exactly equal to zero, saving memory and prediction work.
+
+FTRL-Proximal combines a per-coordinate quadratic stabilizer with $L_1$ and $L_2$
+regularization. In the paper's notation, after observing gradient $g_t$, it chooses
+
+$$
+w_{t+1}=\arg\min_w\left[
+g_{1:t}^\top w
++\frac12\sum_{s=1}^{t}\sum_i\sigma_{s,i}(w_i-w_{s,i})^2
++\lambda_1\lVert w\rVert_1
++\frac{\lambda_2}{2}\lVert w\rVert_2^2
+\right].
+$$
+
+The word **proximal** refers to the terms centred at old iterates $w_s$: moving away from a past
+solution has a quadratic cost. The curvature increment is chosen as
+
+$$
+\sigma_{t,i}
+=\frac{\sqrt{n_{t,i}+g_{t,i}^2}-\sqrt{n_{t,i}}}{\alpha},
+\qquad
+n_{t,i}=\sum_{s=1}^{t-1}g_{s,i}^2.
+$$
+
+Thus the accumulated curvature telescopes:
+
+$$
+\sum_{s=1}^{t}\sigma_{s,i}
+=\frac{\sqrt{\sum_{s=1}^{t}g_{s,i}^2}}{\alpha}.
+$$
+
+The implementation adds $\beta/\alpha$ to this curvature. The effective coordinate learning
+rate is therefore
+
+$$
+\eta_{t,i}
+=\frac{\alpha}{\beta+\sqrt{\sum_{s=1}^{t}g_{s,i}^2}}.
+$$
+
+A coordinate with many large gradients accumulates a large denominator and takes cautious
+steps. A rare coordinate retains a larger step. This is the per-coordinate adaptation familiar
+from AdaGrad, embedded inside FTRL.
+
+### Deriving the closed-form weight
+
+Because every term is separable by coordinate, solve for one $w_i$. Expand the proximal sum:
+
+$$
+\frac12\sum_s\sigma_{s,i}(w_i-w_{s,i})^2
+=\frac12\left(\sum_s\sigma_{s,i}\right)w_i^2
+-\left(\sum_s\sigma_{s,i}w_{s,i}\right)w_i+C,
+$$
+
+where $C$ does not depend on $w_i$. Define
+
+$$
+z_{t,i}=\sum_{s=1}^{t}g_{s,i}-\sum_{s=1}^{t}\sigma_{s,i}w_{s,i},
+\qquad
+A_{t,i}=\lambda_2+\frac{\beta+\sqrt{\sum_{s=1}^{t}g_{s,i}^2}}{\alpha}.
+$$
+
+The one-coordinate objective is now only
+
+$$
+\phi_i(w_i)=z_{t,i}w_i+\lambda_1|w_i|+\frac12A_{t,i}w_i^2+C.
+$$
+
+There are three cases.
+
+1. If $w_i>0$, then $\partial|w_i|=1$. Setting the derivative to zero gives
+   $w_i=-(z_{t,i}+\lambda_1)/A_{t,i}$, valid when $z_{t,i}<-\lambda_1$.
+2. If $w_i<0$, then $\partial|w_i|=-1$. This gives
+   $w_i=-(z_{t,i}-\lambda_1)/A_{t,i}$, valid when $z_{t,i}>\lambda_1$.
+3. At $w_i=0$, the subgradient of $|w_i|$ is the interval $[-1,1]$. Zero is optimal when
+   $0\in z_{t,i}+\lambda_1[-1,1]$, or $|z_{t,i}|\leq\lambda_1$.
+
+Combining the cases yields the paper's lazy weight formula:
+
+$$
+w_{t+1,i}=
+\begin{cases}
+0, & |z_{t,i}|\leq\lambda_1,\\[4pt]
+-\dfrac{z_{t,i}-\operatorname{sign}(z_{t,i})\lambda_1}
+{(\beta+\sqrt{n_{t+1,i}})/\alpha+\lambda_2},
+& |z_{t,i}|>\lambda_1.
+\end{cases}
+$$
+
+<LineChart
+  x={() => Array.from({ length: 161 }, (_, i) => -4 + i * 0.05)}
+  series={[{
+    name: "weight w(z)",
+    fn: (z) => Math.abs(z) <= 1 ? 0 : -(z - Math.sign(z)) / 2,
+  }]}
+  title="L1 creates a dead zone (λ₁ = 1, denominator = 2)"
+  xLabel="accumulator z"
+  yLabel="weight w"
+  height={280}
+/>
+
+The flat middle is why FTRL produces exact sparsity. Small, inconsistent gradients can cancel
+inside $[-\lambda_1,\lambda_1]$ without allocating a non-zero weight. Once the evidence crosses
+the threshold, the weight grows linearly after subtracting the threshold.
+
+### Deriving the state updates
+
+Recomputing the sums in $z_{t,i}$ would defeat online learning. Take the difference between two
+successive accumulators:
+
+$$
+z_{t,i}-z_{t-1,i}=g_{t,i}-\sigma_{t,i}w_{t,i}.
+$$
+
+So each active coordinate needs only two stored values:
+
+$$
+\begin{aligned}
+\sigma_{t,i}
+&=\frac{\sqrt{n_i+g_{t,i}^2}-\sqrt{n_i}}{\alpha},\\
+z_i&\leftarrow z_i+g_{t,i}-\sigma_{t,i}w_{t,i},\\
+n_i&\leftarrow n_i+g_{t,i}^2.
+\end{aligned}
+$$
+
+At prediction time, compute $w_i$ from $z_i$ and $n_i$ only for coordinates present in $x_t$.
+This **lazy regularization** is crucial: the system does not sweep over billions of absent
+features after every impression.
+
+## A complete five-impression update
+
+Use one feature with value $x_t=1$ on every round and labels $[1,0,1,1,0]$. Choose illustrative
+hyperparameters $\alpha=1$, $\beta=1$, $\lambda_1=0.5$, and $\lambda_2=0.1$, starting from
+$z=n=0$. These values are chosen to make the threshold visible; they are not Google's production
+settings.
+
+The gradient is $g_t=p_t-y_t$. Each row first derives $w_t$ from the old state, predicts, and
+then updates $z$ and $n$.
+
+| $t$ | $y_t$ | $w_t$ | $p_t$ | $g_t$ | $\sigma_t$ | new $z$ | new $n$ |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 | 0.000000 | 0.500000 | -0.500000 | 0.500000 | -0.500000 | 0.250000 |
+| 2 | 0 | 0.000000 | 0.500000 | 0.500000 | 0.207107 | 0.000000 | 0.500000 |
+| 3 | 1 | 0.000000 | 0.500000 | -0.500000 | 0.158919 | -0.500000 | 0.750000 |
+| 4 | 1 | 0.000000 | 0.500000 | -0.500000 | 0.133975 | -1.000000 | 1.000000 |
+| 5 | 0 | 0.238095 | 0.559244 | 0.559244 | 0.145755 | -0.475459 | 1.312754 |
+
+Check round 1. The initial logit is zero, so $p_1=\sigma(0)=0.5$ and
+$g_1=0.5-1=-0.5$. Then
+
+$$
+\sigma_1=\sqrt{0+(-0.5)^2}-\sqrt0=0.5,
+\quad
+z\leftarrow0-0.5-0.5(0)=-0.5,
+\quad
+n\leftarrow0.25.
+$$
+
+Because $|z|=\lambda_1$, the next weight remains exactly zero. The opposite gradient on round 2
+returns $z$ to zero. This is the sparsity mechanism doing useful work: contradictory evidence
+does not make the parameter jitter around zero.
+
+After round 4, $z=-1$ crosses the threshold. The round-5 weight is
+
+$$
+w_5
+=-\frac{-1-(-1)(0.5)}{(1+\sqrt1)/1+0.1}
+=\frac{0.5}{2.1}
+=0.238095.
+$$
+
+Check the prediction: $\sigma(0.238095)=0.559244$. The non-click gives
+$g_5=0.559244$, pulling the accumulator back to $-0.475459$; because that is inside the dead
+zone, the following weight becomes zero again.
+
+## What the Google paper adds in practice
+
+The derivation explains the optimizer, but the “trenches” paper is valuable because it connects
+the optimizer to system constraints. Its deployed click-through-rate (CTR) models made billions
+of predictions per day from extremely sparse inputs. FTRL-Proximal offered strong online accuracy
+and sparsity, while per-coordinate rates handled features observed at very different frequencies.
+
+The paper also reports engineering ideas around the algorithm: hashing feature identifiers,
+probabilistic storage to save memory, training several models in one pass, evaluating performance
+on slices, estimating prediction uncertainty, and calibrating probabilities. These are not part
+of the FTRL derivation, but they are part of making an online learner useful. A small optimizer
+improvement can be irrelevant if model state no longer fits in memory or serving cannot reproduce
+the training features.
+
+Three cautions keep the method in perspective:
+
+- Low regret is relative to a comparator class. A linear model cannot regret its way into learning
+  interactions that its features do not express.
+- $L_1$ sparsity depends on feature scaling and $\lambda_1$. A zero weight means the accumulated
+  evidence has not crossed the optimizer's threshold, not that the feature is universally useless.
+- Online updates react quickly to drift, but they also react to corrupted labels and pipeline
+  bugs. Monitoring, replay, and rollback remain necessary.
+
+## Summary
+
+- Online learning predicts first, observes the outcome second, and updates without retraining from
+  scratch.
+- Regret compares cumulative learner loss with the best fixed decision in hindsight; sublinear
+  regret makes the average gap vanish.
+- Quadratic FTRL recovers online gradient descent and gives an $O(\sqrt T)$ regret bound under
+  bounded comparators and gradients.
+- FTRL-Proximal combines adaptive coordinate-wise curvature, $L_1$ sparsity, and $L_2$ shrinkage.
+- Expanding its one-coordinate objective produces a soft-thresholded closed form, while the
+  $z_i,n_i$ state makes sparse updates lazy and cheap.
+
+## References
+
+1. H. Brendan McMahan et al., [*Ad Click Prediction: a View from the Trenches*](https://static.googleusercontent.com/media/research.google.com/en/us/pubs/archive/41159.pdf), KDD 2013.
+2. H. Brendan McMahan, [*Follow-the-Regularized-Leader and Mirror Descent: Equivalence Theorems and $L_1$ Regularization*](https://proceedings.mlr.press/v15/mcmahan11b.html), AISTATS 2011.
+3. H. Brendan McMahan, [*A Survey of Algorithms and Analysis for Adaptive Online Learning*](https://jmlr.org/papers/v18/14-428.html), JMLR 2017.

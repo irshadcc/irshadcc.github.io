@@ -2,6 +2,7 @@
 title: "Tensor Parallelism, One Matrix at a Time"
 description: "Tensor parallelism splits every weight matrix of a transformer across GPUs. This post derives Megatron-LM's column- and row-parallel layers from a single matrix multiply, builds a tensor-parallel transformer block in about a hundred lines of PyTorch, works out what its all-reduces cost, and adds sequence parallelism to cut the activation memory."
 date: 2026-10-02
+tags: [Distributed training, Draft]
 ---
 
 import Sidenote from "../../components/Sidenote.astro";

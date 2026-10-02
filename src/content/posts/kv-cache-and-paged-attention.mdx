@@ -2,6 +2,7 @@
 title: "The KV Cache, from First Principles to PagedAttention"
 description: "A language model generates one token at a time, and without a cache it would redo all its earlier work for every new token. This post derives the KV cache from causal attention, works out how much memory it takes for real models, and then follows vLLM's PagedAttention, which manages that memory in fixed-size blocks like an operating system manages pages, with a simulator and working code."
 date: 2026-10-02
+tags: [Inference, Draft]
 ---
 
 import Sidenote from "../../components/Sidenote.astro";

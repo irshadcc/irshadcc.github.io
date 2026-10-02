@@ -2,6 +2,7 @@
 title: "Expert Parallelism and the All-to-All"
 description: "A mixture-of-experts layer sends every token to a few of many expert networks. Expert parallelism puts those experts on different GPUs and moves the tokens to them with two all-to-alls. This post builds an expert-parallel MoE layer in PyTorch, shows why the busiest GPU sets the pace, and works out what the all-to-alls cost on a model the size of DeepSeek-V3."
 date: 2026-10-02
+tags: [Distributed training, Draft]
 ---
 
 import Sidenote from "../../components/Sidenote.astro";

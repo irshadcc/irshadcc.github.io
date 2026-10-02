@@ -1,0 +1,12 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import PreferenceAlgorithms from "../../utils/rl/PreferenceAlgorithms.astro";
+import RlhfTrainingLoop from "../../utils/rl/RlhfTrainingLoop.astro";
+---
+<Layout title="Preference algorithms demo">
+	<main>
+		<h1>Preference optimization algorithms</h1>
+		<RlhfTrainingLoop />
+		<PreferenceAlgorithms initial="rlhf" />
+	</main>
+</Layout>

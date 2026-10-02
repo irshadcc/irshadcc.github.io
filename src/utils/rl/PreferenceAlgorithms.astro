@@ -1,0 +1,68 @@
+---
+// Interactive comparison of preference-optimization training graphs.
+// Usage in .mdx:
+//   <PreferenceAlgorithms initial="rlhf" />
+import {
+	type PreferenceMethod,
+	preferenceMethods,
+} from "./preferenceAlgorithms";
+
+interface Props {
+	initial?: PreferenceMethod;
+}
+const { initial = "rlhf" } = Astro.props;
+const start = preferenceMethods.some((m) => m.id === initial)
+	? initial
+	: "rlhf";
+---
+
+<figure class="pa" data-active={start}>
+	<div class="tabs" role="tablist" aria-label="Preference optimization method">
+		{preferenceMethods.map((m) => <button type="button" role="tab" data-method={m.id} aria-selected={m.id === start}>{m.label}</button>)}
+	</div>
+	{preferenceMethods.map((m) => (
+		<section class="panel" data-panel={m.id} hidden={m.id !== start}>
+			<header><strong>{m.label}</strong><span>{m.subtitle}</span></header>
+			<div class="flow">
+				<div class="endpoint"><small>INPUT</small>{m.input}</div>
+				{m.nodes.map((n, i) => (<><span class="arrow" aria-hidden="true">→</span><div class:list={["node", n.kind]}><strong>{n.label}</strong><small>{n.note}</small>{m.loopFrom === i && <span class="loop">↺ repeat</span>}</div></>))}
+				<span class="arrow" aria-hidden="true">→</span><div class="endpoint"><small>RESULT</small>{m.output}</div>
+			</div>
+			<p>{m.takeaway}</p>
+		</section>
+	))}
+	<figcaption>Follow the arrows to compare what data and auxiliary models each method needs. Select a method above.</figcaption>
+</figure>
+
+<script>
+	document.querySelectorAll<HTMLElement>(".pa").forEach((root) => {
+		root.querySelectorAll<HTMLButtonElement>("button[data-method]").forEach((button) => {
+			button.addEventListener("click", () => {
+				const id = button.dataset.method;
+				root.querySelectorAll<HTMLButtonElement>("button[data-method]").forEach((b) => b.setAttribute("aria-selected", String(b === button)));
+				root.querySelectorAll<HTMLElement>("[data-panel]").forEach((p) => { p.hidden = p.dataset.panel !== id; });
+			});
+		});
+	});
+</script>
+
+<style>
+	.pa { margin: 1.5rem 0 2rem; padding: 1rem; border: 1px solid var(--faint); border-radius: .7rem; background: var(--surface); }
+	.tabs { display: flex; flex-wrap: wrap; gap: .4rem; margin-bottom: 1rem; }
+	button { border: 1px solid var(--faint); border-radius: 999px; padding: .35rem .7rem; color: var(--muted); background: transparent; cursor: pointer; font: inherit; }
+	button[aria-selected="true"] { color: var(--surface); border-color: var(--accent); background: var(--accent); }
+	header { display: flex; gap: .5rem 1rem; align-items: baseline; flex-wrap: wrap; margin-bottom: .9rem; }
+	header span, .panel > p, figcaption { color: var(--muted); }
+	.flow { display: flex; align-items: stretch; gap: .35rem; overflow-x: auto; padding: .3rem 0 .7rem; }
+	.node, .endpoint { min-width: 8.2rem; padding: .65rem; border: 1px solid var(--faint); border-radius: .45rem; background: color-mix(in srgb, var(--surface) 88%, var(--accent)); position: relative; }
+	.node.score { background: color-mix(in srgb, var(--surface) 84%, #e5a13a); }
+	.node.data { background: color-mix(in srgb, var(--surface) 84%, #55a879); }
+	.node small, .endpoint small { display: block; margin-top: .25rem; color: var(--muted); line-height: 1.25; }
+	.endpoint { min-width: 7.3rem; border-style: dashed; }
+	.endpoint > small { margin: 0 0 .25rem; font-size: .65rem; letter-spacing: .08em; }
+	.arrow { align-self: center; color: var(--accent); font-size: 1.2rem; }
+	.loop { position: absolute; right: .3rem; top: -.65rem; padding: .05rem .3rem; border-radius: .3rem; color: var(--accent); background: var(--surface); font-size: .65rem; }
+	.panel > p { margin: .3rem 0 0; }
+	figcaption { margin-top: .7rem; font-size: .85rem; }
+	.panel[hidden] { display: none; }
+</style>

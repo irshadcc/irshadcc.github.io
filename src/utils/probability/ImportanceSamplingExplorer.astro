@@ -1,0 +1,185 @@
+---
+// Interactive comparison of direct Monte Carlo and importance sampling for a Gaussian tail.
+// The target is N(0,1), the proposal is N(mu,1), and the event is X > threshold.
+// Usage in .mdx:
+//   <ImportanceSamplingExplorer threshold={3} initialMean={3} />
+interface Props {
+	threshold?: number;
+	initialMean?: number;
+}
+
+const { threshold = 3, initialMean = 3 } = Astro.props;
+---
+
+<figure
+	class="importance-explorer"
+	data-threshold={threshold}
+	data-initial-mean={initialMean}
+>
+	<div class="controls">
+		<label>
+			Proposal mean <span class="mu-value"></span>
+			<input class="mu" type="range" min="0" max="4.5" step="0.1" value={initialMean} />
+		</label>
+		<button class="reset" type="button">Reset</button>
+	</div>
+	<svg viewBox="0 0 720 350" role="img" aria-label="Target and proposal densities with importance weights">
+		<title>Target and proposal densities with importance weights</title>
+		<g class="density-panel">
+			<line class="axis" x1="54" y1="212" x2="690" y2="212" />
+			<path class="tail" />
+			<path class="target" />
+			<path class="proposal" />
+			<line class="threshold" y1="34" y2="216" />
+			<text class="threshold-label" y="26" text-anchor="middle"></text>
+			<text x="62" y="48" class="target-label">target p(x)</text>
+			<text x="62" y="68" class="proposal-label">proposal q(x)</text>
+			<g class="ticks"></g>
+		</g>
+		<g class="weight-panel">
+			<text x="54" y="255" class="panel-title">Weights in the event region</text>
+			<g class="weight-bars"></g>
+		</g>
+	</svg>
+	<div class="metrics" aria-live="polite">
+		<div><span>True probability</span><strong class="probability"></strong></div>
+		<div><span>Proposal hits event</span><strong class="hit-rate"></strong></div>
+		<div><span>Variance reduction</span><strong class="reduction"></strong></div>
+	</div>
+	<figcaption>
+		Move the proposal toward the rare event. More proposal samples land to the right of the
+		threshold, but each is corrected by the displayed ratio <em>p(x)/q(x)</em>.
+	</figcaption>
+</figure>
+
+<script>
+	import {
+		importanceWeight,
+		normalCdf,
+		normalPdf,
+		normalTail,
+		varianceReduction,
+	} from "./importanceSampling";
+
+	const NS = "http://www.w3.org/2000/svg";
+	const fmt = (value: number, digits = 3) => value.toLocaleString(undefined, { maximumSignificantDigits: digits });
+
+	function attach(figure: HTMLElement) {
+		const threshold = Number(figure.dataset.threshold);
+		const initialMean = Number(figure.dataset.initialMean);
+		const slider = figure.querySelector<HTMLInputElement>(".mu")!;
+		const svg = figure.querySelector("svg")!;
+		const xMin = -4;
+		const xMax = 6;
+		const left = 54;
+		const right = 690;
+		const baseline = 212;
+		const top = 34;
+		const sx = (x: number) => left + ((x - xMin) / (xMax - xMin)) * (right - left);
+		const sy = (y: number) => baseline - (y / 0.44) * (baseline - top);
+		const path = (fn: (x: number) => number, start = xMin) => {
+			const points = Array.from({ length: 241 }, (_, i) => start + (i / 240) * (xMax - start));
+			return points.map((x, i) => `${i ? "L" : "M"}${sx(x).toFixed(1)},${sy(fn(x)).toFixed(1)}`).join(" ");
+		};
+
+		const ticks = figure.querySelector<SVGGElement>(".ticks")!;
+		for (let x = -4; x <= 6; x += 2) {
+			const text = document.createElementNS(NS, "text");
+			text.setAttribute("x", String(sx(x)));
+			text.setAttribute("y", "230");
+			text.setAttribute("text-anchor", "middle");
+			text.textContent = String(x);
+			ticks.append(text);
+		}
+
+		const thresholdLine = figure.querySelector<SVGLineElement>(".threshold")!;
+		thresholdLine.setAttribute("x1", String(sx(threshold)));
+		thresholdLine.setAttribute("x2", String(sx(threshold)));
+		const thresholdLabel = figure.querySelector<SVGTextElement>(".threshold-label")!;
+		thresholdLabel.setAttribute("x", String(sx(threshold)));
+		thresholdLabel.textContent = `event: x > ${threshold}`;
+		figure.querySelector<SVGPathElement>(".target")!.setAttribute("d", path((x) => normalPdf(x)));
+		const tailPath = path((x) => normalPdf(x), threshold);
+		figure.querySelector<SVGPathElement>(".tail")!.setAttribute(
+			"d",
+			`${tailPath} L${sx(xMax)},${baseline} L${sx(threshold)},${baseline} Z`,
+		);
+
+		function update() {
+			const mean = Number(slider.value);
+			figure.querySelector(".mu-value")!.textContent = `μ = ${mean.toFixed(1)}`;
+			figure.querySelector<SVGPathElement>(".proposal")!.setAttribute("d", path((x) => normalPdf(x, mean)));
+			figure.querySelector<HTMLElement>(".probability")!.textContent = `${(100 * normalTail(threshold)).toFixed(4)}%`;
+			figure.querySelector<HTMLElement>(".hit-rate")!.textContent = `${(100 * (1 - normalCdf(threshold - mean))).toFixed(1)}%`;
+			const reduction = varianceReduction(threshold, mean);
+			figure.querySelector<HTMLElement>(".reduction")!.textContent = `${fmt(reduction)}×`;
+
+			const bars = figure.querySelector<SVGGElement>(".weight-bars")!;
+			bars.replaceChildren();
+			const examples = [threshold, threshold + 0.5, threshold + 1, threshold + 1.5].map((x) => ({
+				x,
+				weight: importanceWeight(x, mean),
+			}));
+			const maxWeight = Math.max(...examples.map(({ weight }) => weight));
+			examples.forEach(({ x, weight }, i) => {
+				const group = document.createElementNS(NS, "g");
+				const bar = document.createElementNS(NS, "rect");
+				const label = document.createElementNS(NS, "text");
+				const value = document.createElementNS(NS, "text");
+				const bx = 58 + i * 156;
+				const height = 58 * (weight / maxWeight);
+				bar.setAttribute("x", String(bx));
+				bar.setAttribute("y", String(326 - height));
+				bar.setAttribute("width", "104");
+				bar.setAttribute("height", String(height));
+				bar.setAttribute("rx", "3");
+				label.setAttribute("x", String(bx + 52));
+				label.setAttribute("y", "344");
+				label.setAttribute("text-anchor", "middle");
+				label.textContent = `x = ${x.toFixed(1)}`;
+				value.setAttribute("x", String(bx + 52));
+				value.setAttribute("y", String(Math.max(266, 320 - height)));
+				value.setAttribute("text-anchor", "middle");
+				value.textContent = `w = ${fmt(weight)}`;
+				group.append(bar, label, value);
+				bars.append(group);
+			});
+		}
+
+		slider.addEventListener("input", update);
+		figure.querySelector<HTMLButtonElement>(".reset")!.addEventListener("click", () => {
+			slider.value = String(initialMean);
+			update();
+		});
+		update();
+	}
+
+	document.querySelectorAll<HTMLElement>(".importance-explorer").forEach(attach);
+</script>
+
+<style>
+	.importance-explorer { margin: 2rem 0; }
+	.controls { display: flex; align-items: end; gap: 1rem; margin-bottom: .4rem; }
+	.controls label { flex: 1; color: var(--muted); font-size: .9rem; }
+	.controls input { display: block; width: 100%; accent-color: var(--accent); }
+	.controls button { border: 1px solid var(--faint); border-radius: 4px; padding: .35rem .7rem; color: var(--text); background: var(--surface); }
+	svg { display: block; width: 100%; height: auto; font: 12px var(--sans); }
+	.axis { stroke: var(--faint); }
+	.target, .proposal { fill: none; stroke-width: 2.5; }
+	.target { stroke: var(--text); }
+	.proposal { stroke: var(--accent); }
+	.tail { fill: color-mix(in srgb, var(--accent) 22%, transparent); }
+	.threshold { stroke: var(--muted); stroke-dasharray: 4 4; }
+	.threshold-label, .panel-title { fill: var(--text); font-weight: 600; }
+	.target-label, .ticks text { fill: var(--text); }
+	.proposal-label { fill: var(--accent); }
+	.weight-bars rect { fill: color-mix(in srgb, var(--accent) 55%, var(--surface)); }
+	.weight-bars text { fill: var(--muted); }
+	.metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: .6rem; margin-top: .25rem; }
+	.metrics div { padding: .65rem .75rem; border: 1px solid var(--faint); border-radius: 5px; background: var(--surface); }
+	.metrics span, .metrics strong { display: block; }
+	.metrics span { color: var(--muted); font-size: .78rem; }
+	.metrics strong { margin-top: .15rem; color: var(--text); font-size: 1.05rem; }
+	figcaption { margin-top: .65rem; color: var(--muted); font-size: .9rem; }
+	@media (max-width: 560px) { .metrics { grid-template-columns: 1fr; } }
+</style>

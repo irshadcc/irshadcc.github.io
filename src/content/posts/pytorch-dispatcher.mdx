@@ -3,6 +3,7 @@ title: "The PyTorch Dispatcher"
 description: "Every operation on a tensor goes through PyTorch's dispatcher, which picks the kernel to run from the tensors' devices, layouts and the thread's modes. This post follows torch.add through the dispatcher's code: how each operator's dispatch table is built from kernel registrations, how a call's dispatch key set is computed from its arguments, and how that key set becomes an index into the table."
 date: 2025-07-01
 updated: 2026-10-02
+tags: [DL Frameworks]
 ---
 
 import Sidenote from "../../components/Sidenote.astro";

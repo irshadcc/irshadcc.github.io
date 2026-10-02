@@ -2,6 +2,7 @@
 title: "Pipeline Parallelism, from GPipe to DualPipe"
 description: "Pipeline parallelism splits a model's layers across GPUs and streams microbatches through them. This post builds a working pipeline in about a hundred lines of PyTorch, then walks through the schedules that shrink its idle time: GPipe, 1F1B, Megatron-LM's virtual pipeline (interleaved 1F1B), zero-bubble pipelines and DeepSeek's DualPipe, with a simulator to compare them."
 date: 2026-10-02
+tags: [Distributed training, Draft]
 ---
 
 import Sidenote from "../../components/Sidenote.astro";

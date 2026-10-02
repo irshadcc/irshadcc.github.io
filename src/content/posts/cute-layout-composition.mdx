@@ -2,6 +2,7 @@
 title: "Working Backwards Through CuTe Layout Composition"
 description: "Composition is how CuTe builds new layouts out of old ones. This post runs it in reverse: given a layout A and the result R of composing it, we derive the layout B that makes A ∘ B = R, working out its strides and shape by hand and checking the answer with pycute."
 date: 2026-09-27
+tags: [CUDA]
 ---
 
 import Sidenote from "../../components/Sidenote.astro";
@@ -187,7 +188,7 @@ CuTe agrees: composing $A$ with our derived $B$ gives back $R$.
 
 ## Appendix
 
-### Proof of $x = (x \bmod n) + n \left\lfloor \frac{x}{n} \right\rfloor$
+### Division algorithm
 
 By the division algorithm, write $x = r + nq$ with $q \in \mathbb{Z}$ and $0 \le r < n$. The
 quotient and remainder are unique, so
