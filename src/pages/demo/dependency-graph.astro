@@ -1,0 +1,144 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import DependencyGraph from "../../utils/graph/DependencyGraph.astro";
+import {
+	buildEdges,
+	buildNodes,
+	codeEdges,
+	codeNodes,
+} from "../../utils/graph/graphFigures";
+---
+
+<Layout title="Dependency graph demo">
+	<h1>Dependency graph demo</h1>
+	<p>
+		<code>DependencyGraph</code> from <code>src/utils/graph</code>: cards, bare icons, skeleton placeholders and
+		junctions, laid out with dagre and joined by right-angled wires. Hover a node to trace its connections;
+		click one to make it the active node.
+	</p>
+
+	<h2>Code context graph: theme="dark", directed, active="compose"</h2>
+	<DependencyGraph
+		nodes={codeNodes}
+		edges={codeEdges}
+		theme="dark"
+		directed
+		active="compose"
+		title="What composeMiddleware touches"
+	/>
+
+	<h2>Same graph: theme="light", directed, active="components"</h2>
+	<DependencyGraph nodes={codeNodes} edges={codeEdges} theme="light" directed active="components" />
+
+	<h2>Same graph: no theme (follows the site), undirected, nothing active</h2>
+	<DependencyGraph nodes={codeNodes} edges={codeEdges} />
+
+	<h2>Top to bottom: a build pipeline, directed except the wires into the junction</h2>
+	<DependencyGraph
+		nodes={buildNodes}
+		edges={buildEdges}
+		rankdir="TB"
+		ranksep={44}
+		directed
+		title="Building the bundle"
+	/>
+
+	<h2>Listening for events: an inspector driven by the graph</h2>
+	<p>
+		The panel below is not part of <code>DependencyGraph</code>. A page script listens for the figure's
+		<code>depg:hover</code> and <code>depg:active</code> events and redraws the panel from the same node and edge
+		data the graph was built from.
+	</p>
+	<DependencyGraph id="deps-events" nodes={codeNodes} edges={codeEdges} directed active="compose" />
+	<div class="inspector" id="deps-inspector" aria-live="polite">
+		<p class="inspector-mode"></p>
+		<p class="inspector-title"></p>
+		<p class="inspector-sub"></p>
+		<p><span class="inspector-k">depends on</span> <span class="inspector-in"></span></p>
+		<p><span class="inspector-k">used by</span> <span class="inspector-out"></span></p>
+		<p class="inspector-log"></p>
+	</div>
+</Layout>
+
+<script>
+	import { codeEdges, codeNodes } from "../../utils/graph/graphFigures";
+
+	const fig = document.getElementById("deps-events");
+	const panel = document.getElementById("deps-inspector");
+	const byId = new Map(codeNodes.map((n) => [n.id, n]));
+	const name = (id: string) => byId.get(id)?.title ?? id;
+	const field = (cls: string) => panel?.querySelector<HTMLElement>(`.inspector-${cls}`);
+
+	let active = fig?.dataset.active ?? "";
+	const log: string[] = [];
+
+	// Redraw the panel for one node: the hovered one if any, else the active one.
+	function render(id: string, mode: string) {
+		const n = byId.get(id);
+		const set = (cls: string, text: string) => {
+			const el = field(cls);
+			if (el) el.textContent = text;
+		};
+		set("mode", n ? mode : "nothing selected");
+		set("title", n ? name(id) : "Hover or click a node");
+		set("sub", n?.subtitle ?? "");
+		const list = (ids: string[]) => ids.map(name).join(", ") || "—";
+		set("in", n ? list(codeEdges.filter((e) => e.to === id).map((e) => e.from)) : "—");
+		set("out", n ? list(codeEdges.filter((e) => e.from === id).map((e) => e.to)) : "—");
+		set("log", log.slice(-4).join("  ·  "));
+	}
+
+	fig?.addEventListener("depg:hover", (e) => {
+		const id = (e as CustomEvent<string>).detail;
+		log.push(`hover ${id || "(left)"}`);
+		render(id || active, id ? "hovered" : "active");
+	});
+	fig?.addEventListener("depg:active", (e) => {
+		active = (e as CustomEvent<string>).detail;
+		log.push(`active ${active || "(cleared)"}`);
+		render(active, "active");
+	});
+	render(active, "active");
+</script>
+
+<style>
+	.inspector {
+		max-width: 26rem;
+		margin: -0.5rem auto 2rem;
+		padding: 0.75rem 1rem;
+		border: 1px solid var(--faint);
+		border-radius: 8px;
+		background: var(--surface);
+		font-family: var(--sans);
+		font-size: 0.85rem;
+		color: var(--muted);
+	}
+	.inspector p {
+		margin: 0.15rem 0;
+	}
+	.inspector-mode {
+		font-size: 0.7rem;
+		text-transform: uppercase;
+		letter-spacing: 0.06em;
+		color: var(--accent);
+	}
+	.inspector-title {
+		font-family: var(--mono);
+		font-size: 0.95rem;
+		color: var(--text);
+	}
+	.inspector-sub,
+	.inspector-log {
+		font-family: var(--mono);
+		font-size: 0.75rem;
+	}
+	.inspector-log {
+		margin-top: 0.5rem !important;
+		color: var(--faint);
+	}
+	.inspector-k {
+		display: inline-block;
+		width: 6.5rem;
+		color: var(--text);
+	}
+</style>

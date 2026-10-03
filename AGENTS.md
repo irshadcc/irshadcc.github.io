@@ -116,6 +116,7 @@ has a demo page under `src/pages/demo/`, listed at `/demo`.
 | `PipelineSchedule` | `src/utils/distributed/PipelineSchedule.astro` | Pipeline-parallel schedules as timelines |
 | `SequenceSteps` | `src/utils/payments/SequenceSteps.astro` | Step-through sequence diagram (participants, messages, replies, lost messages) |
 | `BoxDiagram` | `src/utils/payments/BoxDiagram.astro` | Clickable boxes-and-arrows diagram on a grid: architectures, state machines, deployments |
+| `DependencyGraph` | `src/utils/graph/DependencyGraph.astro` | Code or build dependency graph laid out by dagre: icon cards, bare icons, placeholders, junctions, right-angled (optionally directed) wires, clickable active node, dark/light theme |
 | `ShardRouting` | `src/utils/payments/ShardRouting.astro` | Keys placed on shards by range, hash mod N or bucket directory, with keys moved when a shard is added |
 
 ### Building a new component

@@ -1,0 +1,437 @@
+---
+// A dependency graph in the style of a code-search "context" view: cards with an icon, a
+// monospace title and a muted subtitle, bare icons, faded skeleton placeholders and small
+// junction squares, joined by thin right-angled wires. dagre places the nodes; the wires are
+// routed in dependencyGraph.ts. Hover or focus a node to preview its wires and neighbours and,
+// if it has a note, read it under the figure; click it (or press Enter) to make it the active
+// node, which stays highlighted until another is chosen. `active` sets the node active on load.
+// `directed` draws arrowheads on every edge; an edge's own `directed` overrides it. `theme`
+// ("dark" or "light") fixes the palette on a panel of its own whatever the site theme; without it the figure follows the site's colours.
+// `wide` (on by default) lets the figure use the margin-note column on wide screens. The drawing
+// scales down to 75% at most and then scrolls sideways, so its text stays readable.
+//
+// Events, for other scripts on the page to react to (they bubble; `id` names the figure):
+//   depg:hover   detail: the hovered or focused node id, or "" when the pointer leaves
+//   depg:active  detail: the new active node id, or "" when it is cleared
+// Astro props are build-time only, so a callback prop could not reach the browser; listen instead:
+//   document.getElementById("deps")?.addEventListener("depg:hover", (e) => show(e.detail));
+// Usage in .mdx:
+//   import DependencyGraph from "../../utils/graph/DependencyGraph.astro";
+//   import { codeNodes, codeEdges } from "../../utils/graph/graphFigures";
+//   <DependencyGraph nodes={codeNodes} edges={codeEdges} theme="dark" active="compose" directed
+//     title="What composeMiddleware touches" />
+import {
+	type GraphEdge,
+	type GraphIcon,
+	type GraphNode,
+	type GraphOptions,
+	type PlacedNode,
+	layoutGraph,
+	validateGraph,
+} from "./dependencyGraph";
+
+interface Props extends GraphOptions {
+	nodes: GraphNode[];
+	edges: GraphEdge[];
+	title?: string;
+	/** Fixed palette; omit to follow the site's light/dark theme. */
+	theme?: "dark" | "light";
+	/** Text shown under the figure when no node with a note is hovered. */
+	hint?: string;
+	/** On wide screens, extend into the margin-note column. */
+	wide?: boolean;
+	/** Id of the node that is active on load. */
+	active?: string;
+	/** HTML id of the figure, so a page script can listen for its events. */
+	id?: string;
+}
+
+const {
+	nodes,
+	edges,
+	title,
+	theme,
+	wide = true,
+	active = "",
+	id,
+	hint = "Hover a node to trace its connections; click one to make it active.",
+	...opts
+} = Astro.props;
+const err = validateGraph(nodes, edges);
+if (err) throw new Error(`DependencyGraph: ${err}`);
+const activeNode = nodes.find((n) => n.id === active);
+if (
+	active &&
+	(!activeNode ||
+		activeNode.kind === "placeholder" ||
+		activeNode.kind === "junction")
+)
+	throw new Error(
+		`DependencyGraph: active "${active}" is not a card or icon node`,
+	);
+const g = layoutGraph(nodes, edges, opts);
+
+const esc = (s: string) =>
+	s
+		.replace(/&/g, "&amp;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;")
+		.replace(/"/g, "&quot;");
+
+/** An icon of size s with its top-left corner at (x, y). */
+function icon(ic: GraphIcon, x: number, y: number, s: number): string {
+	const cx = x + s / 2;
+	const cy = y + s / 2;
+	if (typeof ic === "object") {
+		const fs = (ic.text.length > 2 ? 0.36 : 0.46) * s;
+		const fill = ic.outline ? "none" : (ic.bg ?? "var(--dg-muted)");
+		const stroke = ic.outline ? (ic.bg ?? "var(--dg-muted)") : "none";
+		const fg = ic.fg ?? (ic.outline ? (ic.bg ?? "var(--dg-text)") : "#fff");
+		return `<rect x="${x}" y="${y}" width="${s}" height="${s}" rx="3" fill="${fill}" stroke="${stroke}" stroke-width="1.4"/><text x="${x + s - 2}" y="${y + s - 3}" text-anchor="end" font-size="${fs.toFixed(1)}" font-weight="700" fill="${fg}">${esc(ic.text)}</text>`;
+	}
+	switch (ic) {
+		case "fn":
+			return `<rect class="ic-fn" x="${x + 1}" y="${y + 1}" width="${s - 2}" height="${s - 2}" rx="4"/><text class="ic-fn-t" x="${cx}" y="${cy + s * 0.17}" text-anchor="middle" font-size="${(s * 0.42).toFixed(1)}">Fn</text>`;
+		case "folder": {
+			const t = y + s * 0.22;
+			const b = y + s * 0.82;
+			return `<path class="ic-solid" d="M${x + 1},${t + 2} q0,-2 2,-2 h${s * 0.3} l${s * 0.1},${s * 0.1} h${s * 0.5} q2,0 2,2 V${b - 2} q0,2 -2,2 H${x + 3} q-2,0 -2,-2 Z"/>`;
+		}
+		case "file":
+			return `<path class="ic-line" d="M${x + s * 0.2},${y + 1.5} h${s * 0.4} l${s * 0.2},${s * 0.2} V${y + s - 1.5} H${x + s * 0.2} Z M${x + s * 0.6},${y + 1.5} v${s * 0.2} h${s * 0.2}"/>`;
+		case "commit":
+			return `<line class="ic-line" x1="${cx}" y1="${y}" x2="${cx}" y2="${y + s}"/><circle class="ic-solid" cx="${cx}" cy="${cy}" r="${s * 0.16}"/>`;
+		case "sparkle": {
+			const r = s / 2;
+			const k = r * 0.18;
+			return `<path class="ic-spark" d="M${cx},${cy - r} Q${cx + k},${cy - k} ${cx + r},${cy} Q${cx + k},${cy + k} ${cx},${cy + r} Q${cx - k},${cy + k} ${cx - r},${cy} Q${cx - k},${cy - k} ${cx},${cy - r} Z"/>`;
+		}
+		case "hexagon": {
+			const r = s * 0.44;
+			const hex = [...Array(6)].map((_, i) => {
+				const a = Math.PI / 6 + (i * Math.PI) / 3;
+				return [cx + r * Math.cos(a), cy + r * Math.sin(a)];
+			});
+			const tri = [hex[1], hex[3], hex[5]];
+			const poly = (p: number[][]) =>
+				p.map((q) => q.map((v) => v.toFixed(1)).join(",")).join(" ");
+			return `<polygon class="ic-hex" points="${poly(hex)}"/><polygon class="ic-hex" points="${poly(tri)}"/>${hex.map(([px, py]) => `<circle class="ic-hex-d" cx="${px.toFixed(1)}" cy="${py.toFixed(1)}" r="${(s * 0.07).toFixed(1)}"/>`).join("")}`;
+		}
+		default:
+			return `<circle class="ic-dot" cx="${cx}" cy="${cy}" r="${s * 0.36}"/>`;
+	}
+}
+
+function node(n: PlacedNode): string {
+	const attrs = `class="dg-node k-${n.kind}" data-id="${esc(n.id)}"${n.kind === "placeholder" || n.kind === "junction" ? "" : ' tabindex="0"'}`;
+	const label = n.title
+		? `<title>${esc(n.title)}${n.subtitle ? ` — ${esc(n.subtitle)}` : ""}</title>`
+		: "";
+	if (n.kind === "junction")
+		return `<g ${attrs}><rect class="dg-junction" x="${n.x}" y="${n.y}" width="${n.w}" height="${n.h}"/></g>`;
+	if (n.kind === "icon")
+		return `<g ${attrs}>${label}<rect class="dg-hit" x="${n.x}" y="${n.y}" width="${n.w}" height="${n.h}"/>${icon(n.icon as GraphIcon, n.x + 3, n.y + 3, n.w - 6)}</g>`;
+	const box = `<rect class="dg-box" x="${n.x}" y="${n.y}" width="${n.w}" height="${n.h}" rx="6"/>`;
+	if (n.kind === "placeholder") {
+		const cy = n.y + n.h / 2;
+		return `<g ${attrs}>${box}<circle class="dg-skel" cx="${n.x + 26}" cy="${cy}" r="11"/><rect class="dg-skel" x="${n.x + 48}" y="${cy - 7}" width="${n.w - 66}" height="5" rx="2.5"/><rect class="dg-skel" x="${n.x + 48}" y="${cy + 3}" width="${(n.w - 66) * 0.55}" height="5" rx="2.5"/></g>`;
+	}
+	const ix = n.x + 14;
+	const tx = n.icon ? ix + 22 + 12 : ix;
+	const ty = n.subtitle ? n.y + 24 : n.y + n.h / 2 + 4.5;
+	// Built in pieces: Astro's compiler fails to parse a <text> template nested in this one.
+	const ic = n.icon ? icon(n.icon, ix, n.y + (n.h - 22) / 2, 22) : "";
+	const head = `<text class="dg-t" x="${tx}" y="${ty}">${esc(n.title ?? "")}</text>`;
+	const sub = n.subtitle
+		? `<text class="dg-s" x="${tx}" y="${ty + 19}">${esc(n.subtitle)}</text>`
+		: "";
+	return `<g ${attrs}>${label}${box}${ic}${head}${sub}</g>`;
+}
+
+function edge(e: (typeof g.edges)[number]): string {
+	const head = e.arrow
+		? `<polygon class="dg-arrow" points="${e.arrow.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ")}"/>`
+		: "";
+	return `<g class="dg-edge" data-from="${esc(e.from)}" data-to="${esc(e.to)}"><path d="${e.d}"/>${head}</g>`;
+}
+
+const svg = `<svg viewBox="0 0 ${g.width} ${g.height}" width="${g.width}" height="${g.height}" style="min-width:${Math.round(g.width * 0.75)}px" role="img" aria-label="${esc(title ?? "Dependency graph")}"><g class="dg-edges">${g.edges.map(edge).join("")}</g>${g.nodes.map(node).join("")}</svg>`;
+const noted = nodes.filter((n) => n.note);
+---
+
+<figure class:list={["depg", theme && `depg-${theme}`, { "depg-wide": wide }]} id={id} data-active={active}>
+	{title && <figcaption class="depg-title">{title}</figcaption>}
+	<div class="depg-canvas" set:html={svg} />
+	{
+		noted.length > 0 && (
+			<div class="depg-notes">
+				<p class="depg-note" data-id="">
+					{hint}
+				</p>
+				{noted.map((n) => (
+					<p class="depg-note" data-id={n.id} hidden>
+						<strong>{n.title ?? n.id}.</strong> <span set:html={n.note} />
+					</p>
+				))}
+			</div>
+		)
+	}
+</figure>
+
+<script>
+	for (const fig of document.querySelectorAll<HTMLElement>(".depg")) {
+		const nodes = [...fig.querySelectorAll<SVGGElement>(".dg-node")];
+		const edges = [...fig.querySelectorAll<SVGGElement>(".dg-edge")];
+		const notes = [...fig.querySelectorAll<HTMLElement>(".depg-note")];
+		const canvas = fig.querySelector<HTMLElement>(".depg-canvas");
+		let active = fig.dataset.active ?? "";
+		/** Highlight node id (a hover preview, or the active node when nothing is hovered). */
+		const show = (id: string) => {
+			const near = new Set([id]);
+			for (const e of edges) {
+				const out = !!id && e.dataset.from === id;
+				const inc = !!id && e.dataset.to === id;
+				e.classList.toggle("lit", out || inc);
+				if (out || inc) near.add(e.dataset.from ?? "").add(e.dataset.to ?? "");
+			}
+			canvas?.classList.toggle("focused", !!id);
+			for (const n of nodes) {
+				n.classList.toggle("near", !!id && near.has(n.dataset.id ?? ""));
+				n.classList.toggle("active", !!active && n.dataset.id === active);
+			}
+			const hasNote = notes.some((p) => p.dataset.id === id);
+			for (const p of notes) p.hidden = p.dataset.id !== (hasNote ? id : "");
+		};
+		let hovered = "";
+		/** Preview id ("" = back to the active node) and tell listeners, once per change. */
+		const hover = (id: string) => {
+			show(id || active);
+			if (id === hovered) return;
+			hovered = id;
+			fig.dispatchEvent(new CustomEvent("depg:hover", { detail: id, bubbles: true }));
+		};
+		const activate = (id: string) => {
+			active = active === id ? "" : id;
+			for (const n of nodes) n.setAttribute("aria-pressed", String(n.dataset.id === active));
+			show(active);
+			fig.dispatchEvent(new CustomEvent("depg:active", { detail: active, bubbles: true }));
+		};
+		for (const n of nodes) {
+			if (n.classList.contains("k-junction") || n.classList.contains("k-placeholder")) continue;
+			const id = n.dataset.id ?? "";
+			n.setAttribute("role", "button");
+			n.setAttribute("aria-pressed", String(id === active));
+			n.addEventListener("mouseenter", () => hover(id));
+			n.addEventListener("focus", () => hover(id));
+			n.addEventListener("mouseleave", () => hover(""));
+			n.addEventListener("blur", () => hover(""));
+			n.addEventListener("click", () => activate(id));
+			n.addEventListener("keydown", (e) => {
+				if (e.key === "Enter" || e.key === " ") {
+					e.preventDefault();
+					activate(id);
+				}
+			});
+		}
+		show(active);
+	}
+</script>
+
+<style>
+	.depg {
+		--dg-bg: transparent;
+		--dg-card: var(--bg);
+		--dg-line: color-mix(in oklch, var(--muted) 55%, var(--bg));
+		--dg-border: var(--faint);
+		--dg-text: var(--text);
+		--dg-muted: var(--muted);
+		--dg-skel: var(--faint);
+		--dg-lit: var(--accent);
+		--dg-fn: #7c5cd6;
+		--dg-spark: #4a7fe0;
+		--dg-hex: #b04fc4;
+		margin: 1.75rem 0;
+	}
+	@media (prefers-color-scheme: dark) {
+		.depg {
+			--dg-fn: #9d86f0;
+			--dg-spark: #6d9cf5;
+			--dg-hex: #d083e0;
+		}
+	}
+	/* Fixed palettes, the same in either site theme. */
+	.depg-dark {
+		--dg-bg: #08080a;
+		--dg-card: #0e0f11;
+		--dg-line: #3a3b40;
+		--dg-border: #2b2c31;
+		--dg-text: #ecebe8;
+		--dg-muted: #8e8e8a;
+		--dg-skel: #2a2b2f;
+		--dg-lit: #8dbbe3;
+		--dg-fn: #9d86f0;
+		--dg-spark: #6d9cf5;
+		--dg-hex: #d083e0;
+	}
+	.depg-light {
+		--dg-bg: #f4f3ee;
+		--dg-card: #ffffff;
+		--dg-line: #c4c1b8;
+		--dg-border: #dad7cd;
+		--dg-text: #1c1c1a;
+		--dg-muted: #6a6a64;
+		--dg-skel: #e6e3da;
+		--dg-lit: #1f4f78;
+		--dg-fn: #7c5cd6;
+		--dg-spark: #4a7fe0;
+		--dg-hex: #b04fc4;
+	}
+	@media (min-width: 1081px) {
+		.depg-wide {
+			width: calc(100% + var(--gap) + var(--note));
+		}
+	}
+	.depg-title {
+		font-family: var(--sans);
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.4rem;
+	}
+	.depg-canvas {
+		overflow-x: auto;
+		background: var(--dg-bg);
+		border-radius: 8px;
+	}
+	.depg-dark .depg-canvas,
+	.depg-light .depg-canvas {
+		padding: 1rem 0.5rem;
+	}
+	.depg-canvas :global(svg) {
+		display: block;
+		max-width: 100%;
+		height: auto;
+		margin: 0 auto;
+		font-family: var(--mono);
+	}
+	.depg-canvas :global(.dg-edge path) {
+		fill: none;
+		stroke: var(--dg-line);
+		stroke-width: 1.1;
+		transition:
+			stroke 0.15s,
+			opacity 0.15s;
+	}
+	.depg-canvas :global(.dg-box) {
+		fill: var(--dg-card);
+		stroke: var(--dg-border);
+		stroke-width: 1.1;
+	}
+	.depg-canvas :global(.dg-hit) {
+		fill: transparent;
+	}
+	.depg-canvas :global(.dg-junction) {
+		fill: var(--dg-line);
+	}
+	.depg-canvas :global(.dg-skel) {
+		fill: var(--dg-skel);
+	}
+	.depg-canvas :global(.k-placeholder) {
+		opacity: 0.75;
+	}
+	.depg-canvas :global(.dg-t) {
+		font-size: 13px;
+		fill: var(--dg-text);
+	}
+	.depg-canvas :global(.dg-s) {
+		font-size: 11px;
+		fill: var(--dg-muted);
+	}
+	.depg-canvas :global(.dg-arrow) {
+		fill: var(--dg-line);
+	}
+	.depg-canvas :global(.dg-node[tabindex]) {
+		cursor: pointer;
+		outline: none;
+	}
+	.depg-canvas :global(.ic-fn) {
+		fill: none;
+		stroke: var(--dg-fn);
+		stroke-width: 1.3;
+	}
+	.depg-canvas :global(.ic-fn-t) {
+		fill: var(--dg-fn);
+	}
+	.depg-canvas :global(.ic-solid) {
+		fill: var(--dg-muted);
+	}
+	.depg-canvas :global(.ic-line) {
+		fill: none;
+		stroke: var(--dg-muted);
+		stroke-width: 1.4;
+	}
+	.depg-canvas :global(.ic-spark) {
+		fill: var(--dg-spark);
+	}
+	.depg-canvas :global(.ic-hex) {
+		fill: none;
+		stroke: var(--dg-hex);
+		stroke-width: 1.3;
+	}
+	.depg-canvas :global(.ic-hex-d) {
+		fill: var(--dg-hex);
+	}
+	.depg-canvas :global(.ic-dot) {
+		fill: var(--dg-skel);
+	}
+	.depg-canvas :global(.dg-node) {
+		transition: opacity 0.15s;
+	}
+	.depg-canvas:global(.focused) :global(.dg-node:not(.near)),
+	.depg-canvas:global(.focused) :global(.dg-edge:not(.lit)) {
+		opacity: 0.35;
+	}
+	.depg-canvas :global(.dg-edge.lit path) {
+		stroke: var(--dg-lit);
+		stroke-width: 1.6;
+	}
+	.depg-canvas :global(.dg-edge.lit .dg-arrow) {
+		fill: var(--dg-lit);
+	}
+	.depg-canvas :global(.dg-edge) {
+		transition: opacity 0.15s;
+	}
+	.depg-canvas :global(.near .dg-box) {
+		stroke: var(--dg-lit);
+	}
+	.depg-canvas :global(.active .dg-box) {
+		stroke: var(--dg-lit);
+		stroke-width: 2;
+		fill: color-mix(in oklch, var(--dg-lit) 10%, var(--dg-card));
+	}
+	.depg-canvas :global(.active.k-icon .dg-hit) {
+		fill: none;
+		stroke: var(--dg-lit);
+		stroke-width: 1.5;
+		rx: 6px;
+	}
+	.depg-canvas :global(.dg-node[tabindex]:focus-visible .dg-box),
+	.depg-canvas :global(.dg-node[tabindex]:focus-visible .dg-hit) {
+		stroke: var(--dg-lit);
+		stroke-dasharray: 3 2;
+	}
+	.depg-notes {
+		min-height: 2.6em;
+		margin-top: 0.5rem;
+		font-family: var(--sans);
+		font-size: 0.85rem;
+		color: var(--muted);
+		text-align: center;
+	}
+	.depg-note {
+		margin: 0;
+	}
+	.depg-note[hidden] {
+		display: none;
+	}
+</style>
