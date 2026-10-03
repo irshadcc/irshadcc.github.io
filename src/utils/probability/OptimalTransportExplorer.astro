@@ -1,0 +1,137 @@
+---
+// Interactive 2x2 optimal-transport plan and a step-through Sinkhorn trace.
+// Usage in .mdx:
+//   <OptimalTransportExplorer />
+import { sinkhornTrace } from "./optimalTransport";
+
+const trace = sinkhornTrace(8);
+---
+
+<figure class="ot-explorer" data-trace={JSON.stringify(trace)}>
+	<div class="exact-panel">
+		<div class="controls">
+			<label>
+				Mass sent from source 0 to target 0: <strong class="x-value">0.00</strong>
+				<input class="plan-slider" type="range" min="0" max="0.25" step="0.01" value="0" />
+			</label>
+		</div>
+		<div class="transport-map" aria-label="Two by two transport plan">
+			<div class="source labels"><span>source 0<br /><b>0.50</b></span><span>source 1<br /><b>0.50</b></span></div>
+			<svg viewBox="0 0 400 180" role="img" aria-label="Flows from two source piles to two target piles">
+				<title>Flows in the selected transport plan</title>
+				<g class="flows"></g>
+				<circle cx="25" cy="40" r="8" /><circle cx="25" cy="140" r="8" />
+				<circle cx="375" cy="40" r="8" /><circle cx="375" cy="140" r="8" />
+			</svg>
+			<div class="target labels"><span>target 0<br /><b>0.25</b></span><span>target 1<br /><b>0.75</b></span></div>
+		</div>
+		<div class="matrix-wrap">
+			<table aria-label="Selected coupling matrix">
+				<thead><tr><th></th><th>target 0</th><th>target 1</th><th>row sum</th></tr></thead>
+				<tbody><tr><th>source 0</th><td></td><td></td><td>0.50</td></tr><tr><th>source 1</th><td></td><td></td><td>0.50</td></tr></tbody>
+				<tfoot><tr><th>column sum</th><td>0.25</td><td>0.75</td><td>1.00</td></tr></tfoot>
+			</table>
+			<div class="cost-card"><span>transport cost</span><strong class="plan-cost"></strong></div>
+		</div>
+	</div>
+
+	<div class="sinkhorn-panel">
+		<div class="step-heading"><strong>Sinkhorn scaling</strong><span>iteration <b class="iteration">1</b> of 8</span></div>
+		<div class="sinkhorn-grid">
+			<table aria-label="Sinkhorn coupling matrix">
+				<tbody><tr><td></td><td></td></tr><tr><td></td><td></td></tr></tbody>
+			</table>
+			<div class="marginals">
+				<div><span>row sums</span><strong class="row-sums"></strong><small>goal: 0.50, 0.50</small></div>
+				<div><span>column sums</span><strong class="column-sums"></strong><small>goal: 0.25, 0.75</small></div>
+			</div>
+		</div>
+		<div class="step-controls"><button class="previous" type="button">← Previous</button><button class="next" type="button">Next →</button></div>
+	</div>
+	<figcaption>
+		Top: move the slider through every feasible exact coupling. Bottom: step through alternating
+		row and column rescaling with ε = 1; the marginals converge while entropy keeps every cell positive.
+	</figcaption>
+</figure>
+
+<script>
+	const NS = "http://www.w3.org/2000/svg";
+	const fmt = (value: number, digits = 3) => value.toFixed(digits);
+
+	function attach(figure: HTMLElement) {
+		const slider = figure.querySelector<HTMLInputElement>(".plan-slider")!;
+		const planCells = [...figure.querySelectorAll<HTMLTableCellElement>(".exact-panel tbody td:not(:last-child)")];
+		const flows = figure.querySelector<SVGGElement>(".flows")!;
+		const endpoints = [[[25, 40], [375, 40]], [[25, 40], [375, 140]], [[25, 140], [375, 40]], [[25, 140], [375, 140]]];
+		function updatePlan() {
+			const x = Number(slider.value);
+			const values = [x, 0.5 - x, 0.25 - x, 0.25 + x];
+			figure.querySelector(".x-value")!.textContent = x.toFixed(2);
+			planCells.forEach((cell, i) => { cell.textContent = values[i].toFixed(2); });
+			figure.querySelector(".plan-cost")!.textContent = (2.75 - 4 * x).toFixed(2);
+			flows.replaceChildren();
+			values.forEach((mass, i) => {
+				if (mass <= 0) return;
+				const [[x1, y1], [x2, y2]] = endpoints[i];
+				const line = document.createElementNS(NS, "line");
+				line.setAttribute("x1", String(x1)); line.setAttribute("y1", String(y1));
+				line.setAttribute("x2", String(x2)); line.setAttribute("y2", String(y2));
+				line.setAttribute("stroke-width", String(2 + mass * 22));
+				const label = document.createElementNS(NS, "text");
+				label.setAttribute("x", "200"); label.setAttribute("y", String((y1 + y2) / 2 - 5 + (i % 2 ? 10 : -2)));
+				label.textContent = mass.toFixed(2);
+				flows.append(line, label);
+			});
+		}
+
+		const trace = JSON.parse(figure.dataset.trace!) as { iteration: number; plan: number[][]; rowSums: number[]; columnSums: number[] }[];
+		let index = 0;
+		const sinkhornCells = [...figure.querySelectorAll<HTMLTableCellElement>(".sinkhorn-panel td")];
+		function updateStep() {
+			const state = trace[index];
+			figure.querySelector(".iteration")!.textContent = String(state.iteration);
+			sinkhornCells.forEach((cell, i) => { cell.textContent = fmt(state.plan.flat()[i]); });
+			figure.querySelector(".row-sums")!.textContent = state.rowSums.map((x) => fmt(x)).join(", ");
+			figure.querySelector(".column-sums")!.textContent = state.columnSums.map((x) => fmt(x)).join(", ");
+			figure.querySelector<HTMLButtonElement>(".previous")!.disabled = index === 0;
+			figure.querySelector<HTMLButtonElement>(".next")!.disabled = index === trace.length - 1;
+		}
+		slider.addEventListener("input", updatePlan);
+		figure.querySelector(".previous")!.addEventListener("click", () => { index = Math.max(0, index - 1); updateStep(); });
+		figure.querySelector(".next")!.addEventListener("click", () => { index = Math.min(trace.length - 1, index + 1); updateStep(); });
+		updatePlan(); updateStep();
+	}
+	document.querySelectorAll<HTMLElement>(".ot-explorer").forEach(attach);
+</script>
+
+<style>
+	.ot-explorer { margin: 2rem 0; }
+	.exact-panel, .sinkhorn-panel { border: 1px solid var(--faint); border-radius: 7px; padding: 1rem; background: var(--surface); }
+	.sinkhorn-panel { margin-top: .75rem; }
+	.controls label { color: var(--muted); font-size: .9rem; }
+	.controls input { display: block; width: 100%; margin-top: .35rem; accent-color: var(--accent); }
+	.transport-map { display: grid; grid-template-columns: 86px 1fr 86px; align-items: center; margin: .5rem 0; }
+	.labels { display: flex; height: 180px; flex-direction: column; justify-content: space-around; color: var(--muted); font-size: .78rem; }
+	.target { text-align: right; }
+	svg { width: 100%; height: auto; }
+	svg circle { fill: var(--accent); }
+	.flows line { stroke: color-mix(in srgb, var(--accent) 60%, var(--faint)); opacity: .8; }
+	.flows text { fill: var(--text); font: 12px var(--sans); text-anchor: middle; paint-order: stroke; stroke: var(--surface); stroke-width: 4px; }
+	.matrix-wrap, .sinkhorn-grid { display: grid; grid-template-columns: minmax(260px, 1fr) 150px; gap: 1rem; align-items: stretch; }
+	table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+	th, td { padding: .35rem .5rem; border: 1px solid var(--faint); text-align: right; }
+	th { color: var(--muted); font-size: .76rem; font-weight: 500; }
+	.cost-card, .marginals > div { display: flex; flex-direction: column; justify-content: center; padding: .7rem; border: 1px solid var(--faint); border-radius: 5px; }
+	.cost-card span, .marginals span, .marginals small { color: var(--muted); font-size: .75rem; }
+	.cost-card strong { color: var(--accent); font-size: 1.5rem; }
+	.step-heading, .step-controls { display: flex; justify-content: space-between; align-items: center; margin-bottom: .65rem; }
+	.step-heading span { color: var(--muted); font-size: .82rem; }
+	.sinkhorn-panel td { height: 2.2rem; text-align: center; }
+	.marginals { display: grid; gap: .45rem; }
+	.marginals strong { font-size: .84rem; font-variant-numeric: tabular-nums; }
+	.step-controls { justify-content: flex-end; gap: .5rem; margin: .75rem 0 0; }
+	button { border: 1px solid var(--faint); border-radius: 4px; padding: .35rem .7rem; color: var(--text); background: var(--surface); }
+	button:disabled { opacity: .4; }
+	figcaption { margin-top: .65rem; color: var(--muted); font-size: .9rem; }
+	@media (max-width: 600px) { .matrix-wrap, .sinkhorn-grid { grid-template-columns: 1fr; } .transport-map { grid-template-columns: 66px 1fr 66px; } }
+</style>

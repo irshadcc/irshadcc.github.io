@@ -1,0 +1,421 @@
+---
+title: "Tensor Layouts as Integer Set Relations"
+description: "CuTe and Triton describe tensor layouts with different algebra. Integer set relations give a compiler one language for both, including strides, swizzles, composition, inverse and complement."
+date: 2026-10-03
+tags: [Draft, Compilers]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import BoxDiagram from "../../utils/payments/BoxDiagram.astro";
+import LayoutGrid from "../../utils/matrix/LayoutGrid.astro";
+import Matrix2D from "../../utils/matrix/Matrix2D.astro";
+import { CuteLayout } from "../../utils/matrix/CuteLayout";
+import {
+  complementValues,
+  cuteLayoutValues,
+  cutePipelineEdges,
+  cutePipelineNodes,
+  frameworkEdges,
+  frameworkNodes,
+  linearLayoutValues,
+  linearPipelineEdges,
+  linearPipelineNodes,
+  swizzleBits,
+  swizzleValues,
+} from "../../utils/matrix/integerSetRelationsFigures";
+
+## Background
+
+A tensor layout answers a small question with large consequences: given a logical coordinate,
+which integer identifies its storage location or hardware resource? GPU compilers ask this while
+assigning matrix tiles to threads, arranging shared memory, and preparing operands for tensor-core
+instructions. A wrong answer corrupts data; an awkward answer creates bank conflicts or scattered
+memory accesses.
+
+Two important layout systems speak different mathematical languages. NVIDIA's **CuTe layout** is
+a shape-and-stride map, extended with hierarchical modes and bit-level swizzles. A **Triton linear
+layout** is a linear transformation over the two-element field $\mathbb{F}_2$, specified by where
+it sends basis vectors. Separate representations make it hard for a compiler to compare layouts or
+reuse the same correctness machinery across them.
+
+The paper [*Modeling Layout Abstractions Using Integer Set
+Relations*](https://arxiv.org/abs/2511.10374) proposes a common language: an **integer set
+relation** is a set of input-output pairs of integer tuples, described by constraints. This post
+first builds that language from a tiny example, then encodes ordinary CuTe layouts, swizzles, and
+Triton linear layouts. Finally, it shows what relation algebra buys us for composition, inverse,
+and complement---and what the paper does not yet establish. If CuTe's basic notation is new, the
+[CuTe DSL tour](/blog/cute-dsl/) introduces shapes, strides, and composition in more detail.
+
+<BoxDiagram
+  nodes={frameworkNodes}
+  edges={frameworkEdges}
+  title="Two layout algebras, one relation representation"
+  grid={{ cellW: 142, cellH: 48, gapX: 42, gapY: 28 }}
+/>
+
+## Relations: maps written as constraints
+
+An **integer set** collects integer points. For example, a $3\times4$ coordinate domain is
+
+$$
+C = \{[r,c] : 0 \le r < 3 \land 0 \le c < 4\}.
+$$
+
+An **integer set relation** connects points from one set to points in another. The row-major
+mapping from those coordinates to offsets is
+
+$$
+R = \{[r,c] \to [i] : i=4r+c \land 0\le r<3 \land 0\le c<4\}.
+$$
+
+Read one entry literally: $[1,2]\to[6]$ belongs to $R$ because $6=4\cdot1+2$. The relation is
+written symbolically, but for this bounded example it denotes exactly twelve pairs. This is the
+same mapping drawn as a layout:
+
+<LayoutGrid name="row-major" shape={[3, 4]} stride={[4, 1]} />
+
+A relation need not be a function. It may map one input to several outputs, omit inputs, or have
+several inputs reach the same output. That generality is useful: **domain** and **range** expose
+which coordinates and indices are legal, while inverse, composition, intersection, subtraction,
+and emptiness tests become operations on one mathematical object.<Sidenote>The paper uses the
+Integer Set Library (ISL), whose maps are relations between tuples of integers bounded by affine or
+quasi-affine constraints. “ISL space” has a narrower API meaning; the paper's coordinate and index
+spaces are technically integer sets.</Sidenote>
+
+### Affine versus quasi-affine
+
+The expression $4r+c$ is **affine**: variables are multiplied only by constants and then added.
+Layout conversion also needs integer division and remainder. ISL admits these **quasi-affine**
+expressions, including $\lfloor c/4\rfloor$ and $c\bmod4$. This matters because converting one
+linear counter into a multidimensional coordinate is exactly a mixed-radix decomposition.
+
+For shape $(4,2,2)$,
+
+$$
+c_0=c\bmod4,\qquad
+c_1=\left\lfloor\frac{c}{4}\right\rfloor\bmod2,\qquad
+c_2=\left\lfloor\frac{c}{8}\right\rfloor.
+$$
+
+The floor and modulo operations are not incidental notation. They are the bridge from a flat
+coordinate to CuTe's modes.
+
+## A CuTe layout becomes two relations
+
+A CuTe layout $H=s:d$ pairs shape $s=(s_0,\ldots,s_{n-1})$ with strides
+$d=(d_0,\ldots,d_{n-1})$. The paper splits its meaning into two relations:
+
+1. the **coordinate mapping** $M_C^H$ converts an integral coordinate $c$ into its natural
+   coordinate $(c_0,\ldots,c_{n-1})$ in CuTe's colexicographic order;
+2. the **index mapping** $M_I^H$ takes the dot product with the strides.
+
+<BoxDiagram
+  nodes={cutePipelineNodes}
+  edges={cutePipelineEdges}
+  title="A CuTe layout is coordinate conversion followed by a stride dot product"
+  grid={{ cellW: 154, cellH: 52, gapX: 84 }}
+/>
+
+Their composition is the complete layout mapping:
+
+$$
+M_L^H=M_I^H\circ M_C^H.
+$$
+
+Consider the paper's running layout
+
+$$
+H=(4,2,2):(2,1,8).
+$$
+
+It has $4\cdot2\cdot2=16$ coordinates. The coordinate relation is
+
+$$
+M_C^H=
+\left\{[c]\to
+\left[c\bmod4,
+\left\lfloor\frac c4\right\rfloor\bmod2,
+\left\lfloor\frac c8\right\rfloor\right]
+:0\le c<16\right\},
+$$
+
+and the index relation is
+
+$$
+M_I^H=
+\{[c_0,c_1,c_2]\to[2c_0+c_1+8c_2]
+:0\le c_0<4\land0\le c_1,c_2<2\}.
+$$
+
+The figure groups the last two modes into its columns, but each header retains the nested
+coordinate. Every cell is generated by the stride dot product.
+
+<Matrix2D
+  name="H"
+  layout={new CuteLayout([4, [2, 2]], [2, [1, 8]])}
+  data={cuteLayoutValues}
+/>
+
+Check one entry, $c=13$. Mixed-radix decomposition gives
+
+$$
+(c_0,c_1,c_2)=(13\bmod4,\lfloor13/4\rfloor\bmod2,\lfloor13/8\rfloor)=(1,1,1).
+$$
+
+The stride dot product then gives $2\cdot1+1\cdot1+8\cdot1=11$. The cell in row $1$ and column
+$(1,1)$ therefore contains $11$.
+
+### Why the split is useful
+
+$M_C^H$ depends only on shape. It looks like repeatedly tiling a one-dimensional loop by
+$s_0,s_1,\ldots$. $M_I^H$ looks like an array-access relation in that tiled loop nest. The former
+is quasi-affine; the latter is affine. ISL already knows how to compose them.
+
+Hierarchical CuTe layouts fit the same model. Flatten
+$(4,(2,2)):(2,(1,8))$ to $(4,2,2):(2,1,8)$ to obtain the overall relation, then compose with the
+coordinate map of whichever compatible natural shape is wanted. The overall input-to-index
+mapping stays the same even though the intermediate coordinate space changes.
+
+The reverse direction is only partly automatic. Given a shape and a layout relation, invert the
+shape's coordinate relation and compose it with the layout relation. If the resulting index map is
+strictly affine, its coefficients are the strides. If it is still quasi-affine, that particular shape
+does not have an ordinary CuTe shape-and-stride representation. The paper leaves reconstructing
+both an unknown shape and unknown strides from only the layout mapping as an open problem.
+
+## Swizzles become arithmetic on bits
+
+A **swizzle** rearranges address bits, commonly to change shared-memory bank access patterns
+without moving the logical tensor. CuTe's swizzle $H_{b,m,s}$ is
+
+$$
+H_{b,m,s}(c)=c\oplus((c\mathbin{\&}y)\mathbin{\gg}s),
+\qquad
+y=(2^b-1)\mathbin{\ll}(m+\max(s,0)).
+$$
+
+Bitwise XOR is not affine over ordinary integers. The paper changes the coordinate system instead:
+split an $n$-bit integer into an $n$-dimensional set whose coordinates are each either zero or one.
+In this binary space,
+
+$$
+a\oplus b=(a+b)\bmod2,
+$$
+
+which ISL can express with quasi-affine constraints.
+
+For $H_{1,2,1}$, $n=1+2+1=4$ and $y=8=1000_2$. Only the second-highest bit receives the XOR;
+the two low bits stay unchanged:
+
+$$
+[c_0,c_1,c_2,c_3]
+\to[c_0,(c_0+c_1)\bmod2,c_2,c_3].
+$$
+
+The cells below are indexed by input $c$. The large value is the swizzled integer; the small label
+shows the input and output bit strings.
+
+<Matrix2D
+  name="Swizzle&lt;1,2,1&gt;"
+  layout={new CuteLayout([4, 4])}
+  data={swizzleValues}
+  labels={swizzleBits}
+/>
+
+Check $c=13=1101_2$. Masking keeps its top bit, shifting produces $0100_2$, and XOR gives
+$1101_2\oplus0100_2=1001_2=9$. Applying the same swizzle again returns $13$. This is an
+**involution**, a mapping equal to its own inverse; the relation formulation exposes that as
+$M_S^H\circ M_S^H=I$.
+
+The complete one-dimensional swizzle relation is a change of coordinates into bits, the binary
+swizzle, and a change back:
+
+$$
+M_L^H=M_R^{-1}\circ M_S^H\circ M_R.
+$$
+
+## Triton linear layouts use the same binary middle
+
+A Triton linear layout maps between binary vector spaces. It need only say where each **basis
+vector** goes; XOR-linearity determines every other point. For a $(4,4)$ input there are four basis
+inputs:
+
+| Basis input | Output |
+| --- | --- |
+| $(1,0)$ | $(1,1)$ |
+| $(2,0)$ | $(2,2)$ |
+| $(0,1)$ | $(0,1)$ |
+| $(0,2)$ | $(0,2)$ |
+
+The linearity rule is
+
+$$
+L(a\oplus b)=L(a)\oplus L(b),
+$$
+
+with XOR applied component-wise. These four rows generate the entire $4\times4$ mapping:
+
+<Matrix2D
+  name="L(t,w)=(t,t xor w)"
+  layout={new CuteLayout([4, 4])}
+  data={linearLayoutValues}
+/>
+
+Check one entry: $(3,3)=(2,0)\oplus(1,0)\oplus(0,2)\oplus(0,1)$. XOR the corresponding outputs:
+
+$$
+(2,2)\oplus(1,1)\oplus(0,2)\oplus(0,1)=(3,0).
+$$
+
+The paper encodes this binary transform as
+
+$$
+[c_0,c_1,c_2,c_3]\to
+[c_0,c_1,(c_0+c_2)\bmod2,(c_1+c_3)\bmod2].
+$$
+
+That is the same binary relation shape used for a CuTe swizzle. The surrounding conversions differ:
+Triton starts and ends with multidimensional natural coordinates. Its full pipeline contains five
+relations.
+
+<BoxDiagram
+  nodes={linearPipelineNodes}
+  edges={linearPipelineEdges}
+  title="A Triton linear layout factors through binary coordinate and index spaces"
+  grid={{ cellW: 112, cellH: 48, gapX: 38 }}
+/>
+
+In symbols,
+
+$$
+M_L^H=M_{ni}^H\circ M_{li}^H\circ M_{bv}^H\circ M_{bc}^H\circ M_{ic}^H.
+$$
+
+The middle relation $M_{bv}^H$ is matrix multiplication over $\mathbb F_2$, written using integer
+multiplication and modulo two. This is the unification at the heart of the paper: CuTe's swizzle and
+Triton's linear layout can be compared after both become relations between binary tuples. For this
+example, the paper identifies the same binary mapping as CuTe's $H_{2,0,-2}$ swizzle, accounting
+for the two systems' different coordinate-order conventions.
+
+## Layout operations become relation operations
+
+Once a layout is a relation, common transformations have direct mathematical counterparts.
+
+| Layout question | Relation operation | Extra work needed |
+| --- | --- | --- |
+| Apply $F$, then $G$ | Composition $M_G\circ M_F$ | Reconstruct a CuTe shape and strides |
+| Reverse a bijection | Reverse input and output tuples | Find the inverse layout's compatible shape |
+| Find missing indices | Range subtraction | Package gaps as a complement layout |
+| Check equivalence | Relation equality | Normalize both layout systems first |
+| Check an access | Membership/intersection | Carry the intended bounds |
+
+### Composition exposes a semantic trap
+
+Mathematical relation composition keeps only pairs for which the intermediate value belongs to the
+second relation's domain. CuTe can instead **implicitly promote** the receiving layout by extending
+its last shape mode. Therefore $M_G\circ M_F$ may contain fewer pairs than CuTe's $G\circ F$.
+
+The paper's example uses
+
+$$
+F=(2,2):(2,1),\qquad G=(2,1):(1,80).
+$$
+
+$F$ maps integral coordinates to $\{0,2,1,3\}$, but unpromoted $G$ accepts only $0$ and $1$.
+Ordinary relation composition therefore keeps inputs $0$ and $2$:
+
+| Input $c$ | $F(c)$ | In domain of $G$? | Relation result |
+| ---: | ---: | :---: | ---: |
+| 0 | 0 | yes | 0 |
+| 1 | 2 | no | -- |
+| 2 | 1 | yes | 1 |
+| 3 | 3 | no | -- |
+
+CuTe promotes $G$ to $(2,2):(1,80)$ and produces outputs $\{0,80,1,81\}$. The distinction is not
+cosmetic: using the promoted result without bounds that justify those added intermediate points can
+create out-of-bounds accesses. An explicit relation makes the missing domain visible and gives a
+compiler a place to synthesize a guard.
+
+### Complement fills holes
+
+For $H=(4,2):(1,16)$, the original range is two four-element runs:
+
+$$
+\operatorname{range}(H)=\{0,1,2,3,16,17,18,19\}.
+$$
+
+With target size $D=32$, the paper computes the complement $H' = 4:4$. Concatenating it adds
+offsets $0,4,8,12$ to each original point:
+
+<Matrix2D
+  name="(H,H')"
+  layout={new CuteLayout([[4, 2], 4], [[1, 16], 4])}
+  data={complementValues}
+/>
+
+The 32 cells contain every integer from $0$ through $31$ exactly once. ISL supplies the key set
+operation: subtract the current range from $[0,D)$ to find the first gap. The paper's algorithm then
+turns fillable gaps into extra shape-and-stride modes.
+
+### Inverse reverses a relation, with conditions
+
+For the bijective layout $(4,2,2):(2,1,8)$, ordering strides from smallest to largest gives the
+dimension permutation $(1,0,2)$. Apply its inverse to the shape, reverse the layout relation, and
+recover the affine coefficients of the new index map. The result is
+
+$$
+H^{-1}=(2,4,2):(4,1,8).
+$$
+
+Check $c=13$: the original layout sent $13\mapsto11$. Decomposing $11$ under inverse shape
+$(2,4,2)$ gives $(1,1,1)$, and $4\cdot1+1\cdot1+8\cdot1=13$. The reverse relation gets the
+semantics right; the remaining work is proving that it can again be packaged as a CuTe layout.
+
+## What the paper establishes---and what it does not
+
+The authors implement these translations and CuTe operations in a Python prototype called
+`isl-layout`. Their examples cover identity, transpose, broadcast and swizzled Triton layouts;
+ordinary and hierarchical CuTe layouts; and composition, inverse, complement, and swizzle cases.
+The paper reports symbolic outputs rather than runtime speedups or a benchmark suite.
+
+That scope matters. This is a foundations paper, not evidence that ISL has already improved a
+production kernel. Translation and manipulation happen at compile time. The authors argue that
+typical tensor ranks remain manageable even after several tiling levels, but operations such as
+relation composition and lexicographic minimum have exponential worst cases. The paper does not
+publish end-to-end compile-time measurements, generated-kernel performance, or a public artifact
+link for reproducing its tables.
+
+The representation is also deliberately more expressive than either source system. It can describe
+non-rectangular domains, domains with holes, and modulo shuffles that are neither strided CuTe
+layouts nor $\mathbb F_2$-linear Triton layouts. That is promising for layout search, but a compiler
+must still answer a practical question: can the chosen relation be lowered to the target layout
+system, or must it generate explicit index arithmetic?
+
+## Summary
+
+- An integer set relation represents a layout as bounded input-output integer tuples, making its
+  domain and range explicit.
+- A CuTe layout factors into mixed-radix coordinate conversion followed by an affine stride dot
+  product; composing those relations gives the complete layout.
+- Bitwise swizzles become quasi-affine after coordinates are split into bits, because XOR is
+  addition modulo two.
+- Triton linear layouts use the same binary relation in the middle, surrounded by conversions to
+  and from natural coordinates.
+- Relation algebra supplies a common basis for composition, inverse, complement, equivalence, and
+  safety checks, but the paper establishes the model rather than production performance.
+
+## References
+
+1. Somashekaracharya G. Bhaskaracharya, Aravind Acharya, Bastian Hagedorn, and Vinod Grover,
+   [*Modeling Layout Abstractions Using Integer Set Relations*](https://arxiv.org/abs/2511.10374),
+   arXiv:2511.10374v1, 2025.
+2. Sven Verdoolaege, [*isl: An Integer Set Library for the Polyhedral
+   Model*](https://doi.org/10.1007/978-3-642-15582-6_49), ICMS 2010.
+3. NVIDIA CUTLASS, [CuTe layout
+   documentation](https://github.com/NVIDIA/cutlass/blob/0b55a2f691d69981583568fd9eb69687b1f0de8a/media/docs/cpp/cute/01_layout.md)
+   and [layout
+   algebra](https://github.com/NVIDIA/cutlass/blob/0b55a2f691d69981583568fd9eb69687b1f0de8a/media/docs/cpp/cute/02_layout_algebra.md).
+4. Keren Zhou et al., [*Linear Layouts: Robust Code Generation of Efficient Tensor Computation
+   Using $\mathbb F_2$*](https://arxiv.org/abs/2505.23819), 2025.
+5. Triton,
+   [`LinearLayout.h`](https://github.com/triton-lang/triton/blob/88771e23f88b3e515cdcf585c4675248101ce72e/include/triton/Tools/LinearLayout.h),
+   basis-vector definition and worked swizzle example (pinned revision).

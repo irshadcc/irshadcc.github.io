@@ -1,0 +1,534 @@
+---
+title: "Retrieval and Recall in Recommender Systems"
+description: "How large recommenders find a few thousand promising items among millions: candidate channels, two-tower models, graphs, multi-interest and tree retrieval, ANN indexes, training objectives, and evaluation."
+date: 2026-10-03
+tags: [Draft, Recommendation systems]
+---
+
+import BoxDiagram from "../../utils/payments/BoxDiagram.astro";
+import {
+	funnelNodes,
+	funnelEdges,
+	channelNodes,
+	channelEdges,
+} from "../../utils/recommendation/retrievalFigures";
+
+## Background
+
+Suppose a video service has ten million playable videos. Its best ranking model needs a
+millisecond to score one video. Running it over the catalog would take almost three hours for one
+request. The feed has about 100 milliseconds.
+
+Large recommenders solve this with a cascade. **Retrieval**, also called **candidate generation**
+or **recall**, cheaply finds perhaps a thousand plausible items. Later models spend more compute
+ordering that small set. Retrieval matters because ranking cannot recover an item it never sees:
+the best possible ranker is bounded by the candidates that reach it.
+
+This post first makes “recall” precise. It then derives the main retrieval algorithms—popularity
+and content rules, item-to-item collaborative filtering, matrix factorization and two-tower
+models, sequence and multi-interest models, graph methods, and tree-based retrieval. Finally, it
+explains approximate nearest-neighbor indexes, training and evaluation, and how YouTube, Amazon,
+Twitter, Pinterest and Tmall combined these ideas in published systems. For how their large ID
+tables are stored during training, see [Storing an Embedding Table in a HashMap](/blog/embedding-table-hashmap/).
+
+## The retrieval contract
+
+The funnel below shows representative—not universal—sizes. Click a stage to see its job. The
+important boundary is between retrieval, whose work must be sublinear in the catalog size, and
+ranking, which can afford richer user-item interactions because it sees far fewer items.
+
+<BoxDiagram
+	nodes={funnelNodes}
+	edges={funnelEdges}
+	selected="retrieve"
+	grid={{ cellW: 112, cellH: 48, gapX: 22, gapY: 28 }}
+	title="A recommendation funnel: cheap breadth first, expensive precision later"
+/>
+
+Let the eligible catalog for request $u$ be $I_u$, and let an ideal but too-expensive relevance
+function be $r(u,i)$. Retrieval must return a set $C_K(u) \subset I_u$ of at most $K$ candidates
+under a latency and memory budget. Ranking then orders only $C_K(u)$.
+
+That contract creates three separate design problems, a useful decomposition made explicit by the
+2024 survey *A Comprehensive Survey on Retrieval Methods in Recommender Systems*:
+
+1. **Matching:** how do we estimate that user $u$ and item $i$ belong together?
+2. **Indexing:** how do we find high-scoring items without evaluating every $i \in I_u$?
+3. **Training:** which positives, negatives and loss teach the matching function what serving
+   actually needs?
+
+A model can improve matching but be impossible to index. An index can be fast but lose the best
+neighbors. A loss can look good offline while learning exposure bias. Production retrieval is the
+joint design of all three.
+
+### Three meanings of recall
+
+The word **recall** is overloaded:
+
+- The *recall stage* is the production stage this post calls retrieval.
+- **Recall@$K$** is an offline relevance metric. If $R_u$ is the set of relevant held-out items,
+  then
+
+  $$
+  \operatorname{Recall@K}(u)=\frac{|C_K(u)\cap R_u|}{|R_u|}.
+  $$
+
+- **ANN recall@$K$** measures an approximate index against exact vector search. If $E_K(u)$ is
+  the exact top-$K$ under the same vector score and $A_K(u)$ is the approximate result, then
+
+  $$
+  \operatorname{ANNRecall@K}(u)=\frac{|A_K(u)\cap E_K(u)|}{K}.
+  $$
+
+The last metric says whether the index reproduced its model. It says nothing about whether the
+model retrieved items a person wants. A system may have 99% ANN recall and poor relevance recall,
+or the reverse.
+
+There is another measurement trap. With one held-out positive per user, Recall@$K$ is either zero
+or one and is numerically identical to HitRate@$K$. With several relevant items, hit rate only asks
+whether at least one was found; recall measures the fraction found. Always state the evaluation
+protocol with the number.
+
+### A ten-item worked example
+
+Take a two-dimensional user vector $q=(0.8,0.2)$ and ten item vectors. For unit-normalized vectors,
+cosine similarity and dot product induce the same order. The exact scores, computed rather than
+hand-rounded, are:
+
+| Rank | Item | Cosine score | Relevant? |
+| ---: | --- | ---: | :---: |
+| 1 | road shoes | 0.9996 | yes |
+| 2 | socks | 0.9972 | yes |
+| 3 | trail shoes | 0.9910 | yes |
+| 4 | sandals | 0.9908 | yes |
+| 5 | hiking pack | 0.9841 | yes |
+| 6 | tent | 0.9487 | yes |
+| 7 | cookbook | 0.5855 | no |
+| 8 | dumbbells | 0.5369 | no |
+| 9 | headphones | 0.3610 | no |
+| 10 | yoga mat | 0.3482 | no |
+
+There are six relevant items. Exact Recall@3 is $3/6=0.500$; Recall@5 is $5/6=0.833$; Recall@6 is
+$6/6=1.000$. Check one score by hand: road shoes has $v=(0.82,0.18)$, so
+
+$$
+\cos(q,v)=\frac{0.8(0.82)+0.2(0.18)}
+{\sqrt{0.8^2+0.2^2}\sqrt{0.82^2+0.18^2}}=0.9996.
+$$
+
+If an approximate index returns `road shoes, socks, trail shoes, hiking pack, sandals` at $K=5$,
+its relevance Recall@5 remains $5/6=0.833$, but its ANN recall is also $5/5=1$: order does not
+matter for set recall. If it replaces sandals with cookbook, relevance Recall@5 and ANNRecall@5
+both fall to $4/6=0.667$ and $4/5=0.800$, respectively. The denominators differ.
+
+## Retrieval is usually an ensemble
+
+One model rarely covers fresh items, sparse users, long-term taste, current intent and policy at
+once. Industrial systems run **candidate channels** in parallel and take a controlled union. The
+figure shows a common arrangement; each branch fails differently, which is why their union is
+more useful than a larger result from one branch.
+
+<BoxDiagram
+	nodes={channelNodes}
+	edges={channelEdges}
+	selected="twotower"
+	grid={{ cellW: 126, cellH: 45, gapX: 34, gapY: 18 }}
+	title="Complementary retrieval channels feed one candidate set"
+/>
+
+In the worked example, suppose an item-to-item channel finds `trail shoes, road shoes, sandals,
+socks`, while a content channel finds `hiking pack, tent, trail shoes`. Each has recall $4/6$ and
+$3/6$. Their deduplicated union has all six relevant items and recall $1.0$. This is the central
+reason to inspect *marginal* recall—the new positives a channel contributes after earlier channels
+have run—not only its standalone recall.
+
+The merge needs quotas or score calibration. Scores from different channels are not naturally
+comparable: a cosine similarity of 0.8 is not the same thing as an item co-occurrence count of 80.
+Systems commonly reserve per-channel quotas, normalize scores, learn a lightweight blender, or let
+the pre-ranker score the union. They also over-fetch before eligibility filters; otherwise a
+nearest-neighbor query that returns 100 blocked or unavailable items may leave fewer than 100
+candidates.
+
+## The algorithms
+
+### Popularity, recency and content
+
+The simplest channel keeps top-item lists by context: trending videos in a country, popular shoes
+in a category, or fresh posts from followed creators. A decayed popularity score might be
+
+$$
+s(i,t)=\sum_{e\in E_i} w(e)\exp[-\lambda(t-t_e)],
+$$
+
+where event $e$ occurred at $t_e$ and $w(e)$ gives a purchase more weight than a view. A heap or
+sorted cache per segment makes online retrieval a lookup. The half-life is
+$t_{1/2}=\ln 2/\lambda$: with a six-hour half-life, an event contributes one quarter of its
+original weight after 12 hours.
+
+This channel is fast, fresh and robust for anonymous users. It is also self-reinforcing: exposure
+creates interactions, which raise popularity, which creates more exposure. Segmenting, time decay,
+exploration slots and exposure-corrected training reduce—but do not erase—that loop.
+
+**Content retrieval** embeds item text, images, audio or metadata and searches for items similar
+to a query or a user's recent items. It is especially valuable for a new item with no interaction
+history. Its weakness is that semantic resemblance is not the same as collaborative taste: two
+products can look alike but be substitutes that users rarely want together, or look different but
+be complements.
+
+### Item-to-item collaborative filtering
+
+**Collaborative filtering** infers preference from collective behavior rather than item content.
+For item-to-item CF, make one sparse vector $x_i$ per item, with a coordinate for each user. A
+binary coordinate says whether the user interacted; a weighted coordinate can encode event type,
+frequency or time decay. Cosine similarity is
+
+$$
+\operatorname{sim}(i,j)=\frac{x_i^\top x_j}{\lVert x_i\rVert_2\lVert x_j\rVert_2}.
+$$
+
+For every item in user $u$'s history $H_u$, look up its precomputed neighbor list $N(i)$ and add
+the evidence:
+
+$$
+s(u,j)=\sum_{i\in H_u}w(u,i)\operatorname{sim}(i,j),\qquad j\in\bigcup_{i\in H_u}N(i).
+$$
+
+The index is an item ID to a short neighbor list, so online work depends on history length and
+neighbors per item, not the catalog size. Amazon's published 2003 system emphasized this scaling
+property: compute item similarities offline, then combine the neighbors of items in the shopper's
+cart or history online.
+
+Raw co-occurrence $c_{ij}$ over-recommends popular items. Cosine normalization divides by
+$\sqrt{c_i c_j}$. Other choices include Jaccard $c_{ij}/(c_i+c_j-c_{ij})$, pointwise mutual
+information, shrinkage toward zero for small $c_{ij}$, and down-weighting prolific users. The
+algorithm remains easy to debug—“because you viewed $i$”—but cannot reach an item disconnected
+from the user's history and needs a plan for new users and new items.
+
+### Matrix factorization
+
+Let $X_{ui}$ be an implicit interaction matrix. **Matrix factorization** learns a user vector
+$p_u\in\mathbb{R}^d$ and item vector $q_i\in\mathbb{R}^d$ so their dot product predicts affinity:
+
+$$
+\hat y_{ui}=p_u^\top q_i+b_u+b_i.
+$$
+
+For implicit data, one common objective is weighted squared error over observed and unobserved
+pairs; another is Bayesian Personalized Ranking (BPR):
+
+$$
+\mathcal L_{\text{BPR}}=-\sum_{(u,i,j)}
+\log \sigma(p_u^\top q_i-p_u^\top q_j)+\lambda\lVert\Theta\rVert_2^2,
+$$
+
+where $i$ is a positive item and $j$ a sampled unobserved item. BPR asks only that the positive
+score higher than the negative. Once learned, maximum inner-product search over $q_i$ retrieves
+candidates.
+
+Factorization compresses the sparse interaction graph into latent dimensions and can find items
+that share no direct co-occurrence with a user's latest item. Plain ID factors, however, cannot
+compute a vector for an unseen user or item. Feature encoders lead to the modern generalization.
+
+### Two-tower retrieval
+
+A **two-tower model** separately encodes the request and item:
+
+$$
+z_u=f_\theta(\text{history, profile, context}),\qquad
+z_i=g_\phi(\text{ID, content, metadata}),\qquad
+s(u,i)=z_u^\top z_i.
+$$
+
+The separation is the important constraint. Item vectors can be computed offline and indexed;
+only $f_\theta$ runs per request. Arbitrary cross-attention between a user history and each item
+would be more expressive, but would destroy this factorization and require a catalog scan. The
+retriever spends expressiveness to buy indexability; the ranker restores rich cross-features on a
+small candidate set.
+
+YouTube's 2016 candidate generator cast the next watch as extreme multiclass classification. Given
+the user's watch and search history plus context, a network produced a user vector; each video ID
+was an output-class vector. Full softmax over millions of videos was too expensive, so training
+sampled thousands of negative classes and corrected for the sampling distribution.
+
+For a batch of $B$ observed user-item pairs, **in-batch softmax** reuses the other $B-1$ items as
+negatives:
+
+$$
+\mathcal L=-\frac{1}{B}\sum_{b=1}^{B}
+\log\frac{\exp(s(u_b,i_b)/\tau)}
+{\sum_{k=1}^{B}\exp(s(u_b,i_k)/\tau)}.
+$$
+
+The temperature $\tau$ sets how strongly score differences affect the probability. In-batch
+negatives are computationally efficient, but the batch sampling distribution biases the loss
+toward popular items and can create **false negatives**—items the user would like but happened not
+to consume. Correcting logits for sampling probability, mixing random with hard negatives, and
+removing known positives are common remedies.
+
+Negative choice changes the question learned by the model:
+
+| Negative source | What it teaches | Main risk |
+| --- | --- | --- |
+| Uniform catalog | Coarse separation from arbitrary items | Mostly too easy |
+| Popularity sampled | Distinguish plausible popular inventory | Reinforces exposure distribution |
+| In-batch | Many negatives with one matrix multiply | Biased by batch composition; false negatives |
+| ANN hard negatives | Separate near misses around the decision boundary | Stale index; mislabeled relevant items |
+| Shown but skipped | Distinguish items the user had a chance to choose | Position and presentation bias |
+
+Training-serving consistency also matters. If training compares a positive against random items
+but serving compares it against its nearest embedding neighbors, the model has not practiced its
+hardest decision. Periodically mining hard negatives with the serving index narrows that gap.
+
+### Sequence and multi-interest retrieval
+
+A mean of history embeddings is orderless. A **sequential retriever** uses a recurrent network or
+Transformer to make $z_u$ depend on order, time gaps and the current session. It can represent the
+transition from “camera” to “memory card,” not only a bag of long-term interests. The final vector
+still enters a dot-product index, so the result remains retrievable.
+
+One vector can be a bottleneck when a person shops for running shoes, reads science fiction and
+watches cooking videos. Alibaba's **Multi-Interest Network with Dynamic routing (MIND)** produces
+$K$ user vectors. Starting from behavior embeddings $e_i$, it iterates:
+
+$$
+w_{ij}=\operatorname{softmax}_j(b_{ij}),\qquad
+z_j=\sum_i w_{ij}Se_i,\qquad
+u_j=\operatorname{squash}(z_j),
+$$
+
+$$
+b_{ij}\leftarrow b_{ij}+u_j^\top Se_i.
+$$
+
+The agreement update raises the assignment of behavior $i$ to interest capsule $j$ when their
+vectors align. Repeating it performs a soft clustering of behaviors. During training, the positive
+target chooses the relevant interest through label-aware attention; during serving, every $u_j$
+issues an ANN query and the results are merged. MIND reported retrieving thousands of items from a
+billion-scale pool in under 15 ms before sending the top 1,000 to ranking at Mobile Tmall.
+
+Multiple vectors improve coverage but multiply index queries and create a quota question. Taking
+100 neighbors for each of eight interests may return far fewer than 800 unique items, and a noisy
+interest can consume its full quota. Adaptive interest counts, per-interest budgets and
+deduplication are part of the algorithm, not mere plumbing.
+
+### Graph walks and graph neural networks
+
+Represent interactions as a bipartite graph with users on one side and items on the other. A
+two-hop path user $u\rightarrow$ item $i\rightarrow$ user $v$ finds someone who touched the same
+item; one more hop reaches items touched by $v$. A random-walk recommender repeatedly samples these
+edges and counts destination items. Degree-aware transition probabilities or a restart probability
+keep the walk local and reduce domination by hubs.
+
+Twitter's **GraphJet** maintained a real-time, in-memory user–tweet interaction graph. Its random
+walk with restart used the query user's recent edges as seeds, visited similar users, and gathered
+their tweets. Because new edges were immediately visible to concurrent readers, the candidate
+channel captured breaking interactions that a batch embedding job would miss.
+
+**PinSage** turned Pinterest's pin–board graph into item embeddings. For each pin it used short
+random walks to select important local neighbors, transformed their features, pooled them with
+importance weights, concatenated the result with the pin's own representation, and normalized the
+output. Stacking these convolutions carried information across multiple hops. Pinterest reported
+training on 7.5 billion examples from a graph with 3 billion nodes and 18 billion edges, then using
+the embeddings for nearest-neighbor retrieval.
+
+Graph walks preserve very recent collaborative structure; graph neural networks amortize graph and
+content information into indexable vectors. The former needs a low-latency graph store, while the
+latter needs neighborhood sampling and embedding refreshes. Both must handle high-degree nodes and
+feedback loops.
+
+### Tree-based retrieval
+
+Vector search restricts the score to a geometry an ANN index understands. **Tree-based deep
+models** instead assign items to leaves of a tree and train a classifier for each internal routing
+decision. At serving time, beam search keeps the $B$ most promising nodes at one level, expands
+their children, and repeats until it reaches leaves.
+
+For a balanced tree with branching factor $b$ and $N$ items, the depth is about $\log_b N$ and a
+beam evaluates roughly $Bb\log_b N$ nodes rather than $N$ items. Unlike a dot product, the node
+scorer may use richer features. The cost is search error: pruning the right subtree near the root
+loses all of its items.
+
+The tree is part of the model. Alibaba's TDM work used a max-heap-like target in which a parent's
+preference reflected its best child, then retrieved leaves with layer-wise beam search. Later work
+jointly optimized item placement and the prediction model because a semantic clustering objective
+for the tree need not produce the best recommendation routing decisions.
+
+Recent **generative retrieval** replaces the explicit tree walk with an autoregressive model that
+generates an item's discrete identifier token by token. Each prefix is effectively a tree node;
+beam search over tokens retrieves IDs. It can share sequence-model machinery and condition on rich
+context, but identifier construction, constrained decoding, catalog updates and invalid IDs make it
+less operationally mature than vector retrieval. It is best understood as learned index traversal,
+not as making retrieval disappear.
+
+## Indexes: making a score searchable
+
+With $N$ item vectors of dimension $d$, exact search costs $O(Nd)$ dot-product work per query. A
+GPU can make that baseline surprisingly competitive for moderate catalogs or large query batches,
+and exact results are invaluable as an evaluation oracle. At larger scale or tight tail latency,
+an **approximate nearest-neighbor (ANN)** index trades some model recall for speed and memory.
+
+### Inverted files and product quantization
+
+An **inverted file (IVF)** clusters item vectors into $L$ coarse cells. At query time it finds the
+closest `nprobe` centroids and scans only their posting lists. Raising `nprobe` increases both ANN
+recall and work. The failure mode is a boundary: a true neighbor may sit in an unprobed adjacent
+cell.
+
+**Product quantization (PQ)** splits a $d$-dimensional vector into $m$ subvectors. Each subvector is
+replaced by the ID of its nearest small codeword. With 256 codewords, one subvector costs one byte;
+the database stores $m$ bytes per item instead of $4d$ bytes of float32. A query builds $m$
+distance tables and sums table entries for each compressed item. IVF-PQ first prunes cells, then
+scores compact codes, often re-ranking a short list with original vectors. Quantization saves
+memory bandwidth but distorts scores. ScaNN's anisotropic quantization weights error parallel to a
+database vector more heavily because that component changes the inner product more.
+
+### HNSW
+
+**Hierarchical Navigable Small World (HNSW)** builds a proximity graph with sparse upper layers
+and a denser bottom layer. Search starts at an entry point on the highest layer, greedily moves to
+a neighbor closer to the query, descends a layer, and finally runs a best-first search at layer
+zero. Long upper-layer links cross the space; short bottom-layer links refine the answer.
+
+`M`, the maximum neighborhood size, trades memory and build time for connectivity. `efSearch`, the
+candidate queue size at query time, trades latency for ANN recall. HNSW is accurate and does not
+require a trained quantizer, but the graph adds pointer-heavy memory overhead; filtering and rapid
+deletion are also harder than a simple posting list.
+
+There is no universally best index. Benchmark on the model's actual vectors and filters, report
+p50 and p99 latency, index size, build/refresh time, and ANN recall against exact top-$K$. Random
+public vectors may have very different density and norm distributions.
+
+## What published systems actually used
+
+These systems were published in different years and products; the table is evidence of design
+patterns, not a current inventory of each company's private stack.
+
+| System | Published retrieval solution | Why it fit |
+| --- | --- | --- |
+| Amazon, 2003 | Offline item-to-item similarities; online aggregation from a shopper's items | Online work scaled independently of total customers and catalog size |
+| YouTube, 2016 | Deep user encoder trained as sampled multiclass classification; hundreds of candidates plus other sources | Learned broad collaborative signals over millions of videos, then left fine discrimination to ranking |
+| Twitter GraphJet, 2016 | Real-time bipartite graph and random-walk recommendations | Newly created tweets and interactions needed to become retrievable immediately |
+| Pinterest PinSage, 2018 | Random-walk neighborhood sampling plus graph convolutions; nearest-neighbor lookup of pin embeddings | Combined visual/content features with a multi-billion-node pin–board graph |
+| Alibaba TDM, 2018–2019 | Learned tree index and layer-wise beam search with a deep node scorer | Allowed sublinear retrieval without requiring the score to be a dot product |
+| Tmall MIND, 2019 | Multiple user-interest vectors, one ANN query per interest, merged before ranking | A single vector blurred a shopper's unrelated interests |
+
+Three lessons recur. First, the deployed system is an ensemble; even YouTube's diagram includes
+other candidate sources. Second, the data structure determines which model is serveable. Third,
+freshness is architectural: GraphJet updated a live graph, while embedding systems need incremental
+item encoders, frequent index builds or delta indexes.
+
+## Training the retriever you intend to serve
+
+### Build examples without leaking the future
+
+For next-item training, choose an event at time $t$ as the label and use only events before $t$ as
+features. A random interaction split can put a user's future behavior into the training history
+used to predict their past. A temporal split is closer to deployment and also exposes catalog
+churn.
+
+An interaction is not automatically preference. A click depends on whether an item was exposed,
+its position and thumbnail. Non-interaction with an unshown item is missing data, not a clean
+negative. Impression logs support shown-but-skipped negatives and inverse-propensity weighting,
+though propensity estimates can themselves be noisy.
+
+### Match the objective to the product
+
+Clicks are abundant but can reward clickbait. Watch time, completion, saves, purchases and
+long-term return represent different utilities. Multi-task training can share representations
+while predicting several outcomes; serving can retrieve for one composite value or run separate
+channels. The label horizon matters too: a model trained only on immediate next clicks may forget
+durable interests.
+
+Sampled softmax estimates a probability over items; pairwise losses optimize positive-versus-
+negative order; contrastive losses organize the embedding space. None directly optimizes the final
+page after filtering, ranking and re-ranking. That mismatch is why offline improvements need online
+experiments.
+
+### Keep item and index versions aligned
+
+If training changes $g_\phi$, every item vector changes. Serving a new user tower against an old
+item index creates a coordinate-system mismatch even when dimensions agree. Version both towers
+and the index as one artifact, roll them out atomically, and monitor score distributions. For new
+items between full builds, encode them into a small mutable delta index and query both main and
+delta indexes.
+
+## Evaluating a retrieval system
+
+Offline evaluation should answer different questions at different layers:
+
+| Layer | Useful measurements | Question |
+| --- | --- | --- |
+| Matching model, exact search | Recall@$K$, HitRate@$K$, NDCG@$K$, coverage | Did the learned score put relevant items near the top? |
+| ANN index | ANN recall@$K$, p50/p99 latency, QPS, memory, build time | Did acceleration preserve the model's top neighbors cheaply enough? |
+| Channel ensemble | Union recall, marginal recall, overlap, source share | Does each source add candidates the others miss? |
+| Post-filter set | Valid count, filter-loss rate, category/creator coverage | Did policy and availability erase useful candidates? |
+| Online product | CTR, watch time, conversion, retention, complaints, diversity | Did the whole system improve user and business outcomes? |
+
+NDCG gives more credit when a relevant item appears earlier and supports graded relevance:
+
+$$
+\operatorname{DCG@K}=\sum_{k=1}^{K}\frac{2^{rel_k}-1}{\log_2(k+1)},
+\qquad
+\operatorname{NDCG@K}=\frac{\operatorname{DCG@K}}{\operatorname{IDCG@K}}.
+$$
+
+Retrieval often cares more about set coverage than fine ordering because a ranker follows, but the
+retriever's order still matters when a fixed quota truncates results.
+
+Slice every metric. New users, long-history users, new items, regions, languages and tail creators
+can move in opposite directions. Also plot recall against candidate count and latency rather than
+reporting one arbitrary $K$. A channel that reaches the same recall with half the candidates saves
+ranking compute.
+
+Finally, replay evaluation only judges items that the logging policy exposed. A new retriever may
+surface unseen inventory with no labels. Exploration traffic, interleaving or an A/B test is needed
+to measure that counterfactual. YouTube's paper explicitly notes that live results did not always
+correlate with offline experiments.
+
+## Choosing a design
+
+Start with the simplest channel whose failure mode you can measure:
+
+| Situation | Good first choice | Add when needed |
+| --- | --- | --- |
+| Small catalog | Exact scoring, popularity and business rules | ANN only after profiling proves the scan is too slow |
+| Strong basket/session signal | Item-to-item CF | Sequence tower for order and context |
+| Rich user and item features | Two-tower model + exact or ANN search | Hard-negative mining; multi-interest vectors |
+| Interaction graph changes by the second | Online graph walk | GNN embeddings for broader, feature-aware generalization |
+| Severe new-item cold start | Content encoder and fresh-item channel | Distill collaborative embeddings into the content tower |
+| Dot product is too restrictive | Tree retrieval or a wider pre-ranker | Generative retrieval only with a catalog/update plan |
+
+A solid first production stack is often less exotic than its model diagram: segmented popular and
+fresh lists, item-to-item neighbors, one two-tower ANN channel, strict eligibility filters, and a
+ranker over their union. Log source attribution and exact-search samples from day one. Those logs
+show whether the next improvement belongs in matching, indexing, training, or simply a missing
+candidate channel.
+
+## Summary
+
+- Retrieval is the high-recall, low-cost stage that makes ranking over a huge catalog possible;
+  ranking cannot rescue an item that retrieval omitted.
+- Keep relevance Recall@$K$, ANN recall, and the “recall stage” distinct. Measure the matching
+  model exactly before blaming or tuning the index.
+- Item CF, two-tower vectors, sequences, multi-interest capsules, graph walks and trees are not one
+  ladder of sophistication. They expose different signals and support different indexes.
+- Production systems combine complementary channels, then deduplicate, quota, filter and pre-rank
+  their union. Marginal recall reveals whether a channel earns its latency and candidate budget.
+- The negative sampler, temporal data split, index version, freshness path and online experiment
+  are as much a part of retrieval quality as the encoder architecture.
+
+## References
+
+1. Huang et al., [*A Comprehensive Survey on Retrieval Methods in Recommender Systems*](https://arxiv.org/abs/2407.21022), 2024. The main matching–indexing–training taxonomy used here.
+2. Rama, Kumar and Bhasker, [*Deep Learning to Address Candidate Generation and Cold Start Challenges in Recommender Systems: A Research Survey*](https://arxiv.org/abs/1907.08674), 2019.
+3. Guo et al., [*Deep Learning for Matching in Search and Recommendation*](https://doi.org/10.1561/1500000076), 2020.
+4. Linden, Smith and York, [*Amazon.com Recommendations: Item-to-Item Collaborative Filtering*](https://doi.org/10.1109/MIC.2003.1167344), 2003.
+5. Covington, Adams and Sargin, [*Deep Neural Networks for YouTube Recommendations*](https://research.google.com/pubs/archive/45530.pdf), 2016.
+6. Sharma et al., [*GraphJet: Real-Time Content Recommendations at Twitter*](https://www.vldb.org/pvldb/vol9/p1281-sharma.pdf), 2016.
+7. Ying et al., [*Graph Convolutional Neural Networks for Web-Scale Recommender Systems*](https://arxiv.org/abs/1806.01973), 2018.
+8. Li et al., [*Multi-Interest Network with Dynamic Routing for Recommendation at Tmall*](https://arxiv.org/abs/1904.08030), 2019.
+9. Zhu et al., [*Learning Tree-based Deep Model for Recommender Systems*](https://arxiv.org/abs/1801.02294), 2018; Zhu et al., [*Joint Optimization of Tree-based Index and Deep Model for Recommender Systems*](https://arxiv.org/abs/1902.07565), 2019.
+10. Malkov and Yashunin, [*Efficient and Robust Approximate Nearest Neighbor Search Using Hierarchical Navigable Small World Graphs*](https://arxiv.org/abs/1603.09320), 2016.
+11. Johnson, Douze and Jégou, [*Billion-scale Similarity Search with GPUs*](https://arxiv.org/abs/1702.08734), 2017.
+12. Guo et al., [*Accelerating Large-Scale Inference with Anisotropic Vector Quantization*](https://research.google/pubs/accelerating-large-scale-inference-with-anisotropic-vector-quantization/), 2020.
+13. Rajput et al., [*Recommender Systems with Generative Retrieval*](https://arxiv.org/abs/2305.05065), 2023.

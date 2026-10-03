@@ -213,6 +213,45 @@ trunks, `layoutGraph` keeps dagre's node positions and its dummy points, and com
 itself, in the seven steps below. The numbers come from the demo's code graph (`rankdir="LR"`,
 `nodesep` 24, `ranksep` 56), traced with a script that replays the routing loop.
 
+At a high level, dagre decides where the graph belongs and the custom router decides how its
+wires look:
+
+```
+GraphNode + GraphEdge
+         │
+         ▼
+ calculate node sizes
+         │
+         ▼
+ dagre chooses ranks, node centres and dummy points
+         │
+         ▼
+ attach the edge to the source and target borders
+         │
+         ▼
+ insert right-angle bends at the middle of rank gaps
+         │
+         ▼
+ remove duplicate and collinear points
+         │
+         ▼
+ shorten directed edges and add arrow triangles
+         │
+         ▼
+ PlacedEdge { points, d, arrow }
+```
+
+A `PlacedEdge` contains both the geometric route and its ready-to-render SVG form:
+
+```ts
+interface PlacedEdge extends GraphEdge {
+	directed: boolean;
+	points: Point[]; // orthogonal wire; stops at the arrow base when directed
+	d: string;       // the same points encoded as an SVG M/L path
+	arrow?: Point[]; // triangle: tip, then its two base corners
+}
+```
+
 #### 1. Work in "main" and "cross" coordinates
 
 ```ts
@@ -224,6 +263,19 @@ const pt = (m, c) => (lr ? { x: m, y: c } : { x: c, y: m });
 Every rule below is written in terms of `main` and `cross`, so the same code routes both
 `rankdir="LR"` (main = x) and `rankdir="TB"` (main = y). The rest of this section uses LR, where
 main is x and cross is y.
+
+```
+LR                                      TB
+
+       cross (y)                              main (y)
+           │                                     │
+           ▼                                     ▼
+source ───────────────► target                source
+        main (x)                                  │
+                                                  ▼
+                                                target
+                                      cross (x) ─────────►
+```
 
 #### 2. Measure the columns and the gaps between them
 
@@ -258,6 +310,21 @@ Each gap is `ranksep` (56) wide, give or take the half-pixel rounding of column 
 absorbs that rounding. Dummy points sit at a column centre or a gap centre, so their main
 coordinate always finds the right column.
 
+The midpoint is measured between the facing **boundaries**, not between the two node centres:
+
+```
+       current rank                    next rank
+
+       ┌──────────────┐              ┌────────┐
+       │              │              │        │
+       └──────────────┘              └────────┘
+                      │              │
+                  right edge     left edge
+                      └─────┬────────┘
+                            ▲
+                       bend coordinate
+```
+
 #### 3. Pick the start and end points
 
 dagre's border points depend on the angle of its diagonal line, so they land anywhere on the box.
@@ -272,6 +339,19 @@ const end = pt(main(bc) - bHalf, cross(bc));   // bc: target centre
 If the target were to the left of the source (`forward` is false, which can happen when dagre
 reverses an edge to break a cycle), the sides swap. The demo graphs have no cycles, so that branch
 is untested.
+
+For the usual forward LR edge, the attachment points look like this:
+
+```
+        source                             target
+   ┌─────────────┐                    ┌─────────────┐
+   │      ●──────┼────────────────────┼──────●      │
+   └─────────────┘                    └─────────────┘
+          centre  start          end         centre
+
+   start.x = source centre x + source width / 2
+   end.x   = target centre x - target width / 2
+```
 
 Example, `ts → components`: `ts` is the 32×32 icon at x 306–338 with centre y 284.5, so
 `start = (338, 284.5)`. `components` is the 245×58 card at x 394–639 with centre y 249.5, so
@@ -297,6 +377,33 @@ route.push(q);
 Because the bend's x depends only on the gap and not on the edge, every wire crossing the same gap
 bends on the same vertical line. That is what makes them merge into shared trunks, as in the
 reference image.
+
+A pair of waypoints that differs on both axes would make a diagonal. The router replaces that
+diagonal with two bends at the gap coordinate `m`:
+
+```
+before                              after
+
+p ●                                 p ●──────────┐ (m, p.y)
+   ╲                                              │
+    ╲                                             │
+     ╲                                            ▼
+      ● q                              (m, q.y) └──────────● q
+
+points: p, q                       points: p, (m,p.y), (m,q.y), q
+```
+
+All edges use the same `m` for a particular gap, which creates aligned, shared trunks:
+
+```
+source A ───────┐
+                │
+source B ───────┼──────── target
+                │
+source C ───────┘
+                ▲
+        one gap coordinate
+```
 
 Example, `ts → components`. dagre returns one dummy, `(366, 245.5)`, in the middle of gap 1 → 2:
 
@@ -326,6 +433,18 @@ back down, and step 5 cleans that up.
 
 ```
 (338, 284.5) → (366.25, 284.5) → (366.25, 249.5) → (394, 249.5)
+```
+
+In pictures, repeated and collinear points disappear but corners remain:
+
+```
+repeat:      A ──► B = B ──► C       becomes       A ─────────► C
+
+collinear:   ●──────●──────●          becomes       ●───────────●
+
+corner:      ●──────●                     stays     ●──────●
+                    │                                      │
+                    ●                                      ●
 ```
 
 A longer example, `n0 → n3` in a four-node chain (0 → 1 → 2 → 3 plus a shortcut 0 → 3). dagre
@@ -360,6 +479,21 @@ There is always room for the arrow. The last segment runs from a gap midpoint to
 side, which is at or right of its column's left edge, so it is at least half a gap long, roughly
 `ranksep / 2` = 28 px, well over 7.
 
+The path stops at the triangle's base so the line does not show through the arrowhead:
+
+```
+wire                         arrow
+────────────────────────────●───▶ target border
+                            ▲    tip
+                           base
+
+                              tip
+                               ●
+                              / \
+                             /   \
+                    base-left●───●base-right
+```
+
 #### 7. SVG path
 
 The points become an SVG path, `M` for the first and `L` (line to) for the rest, rounded to one
@@ -367,6 +501,17 @@ decimal:
 
 ```
 ts → components:  M338.0,284.5 L366.3,284.5 L366.3,249.5 L387.0,249.5
+```
+
+For example, four routed points become one SVG polyline path:
+
+```
+(100,30) ──────┐
+               │
+               └──────── (156,90)
+             x=128
+
+M100.0,30.0 L128.0,30.0 L128.0,90.0 L156.0,90.0
 ```
 
 The component draws each edge as `<g class="dg-edge" data-from data-to>` holding that `<path>` and

@@ -1,0 +1,470 @@
+---
+title: "Optimal Transport: Advanced Mathematics for Machine Learning"
+description: "A probability-first route from empirical distributions and couplings to Wasserstein distance, Sinkhorn scaling, Wasserstein GANs, and domain adaptation."
+date: 2026-10-03
+tags: [Draft, Machine Learning]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import OptimalTransportExplorer from "../../utils/probability/OptimalTransportExplorer.astro";
+
+## Background
+
+Machine learning often asks whether two collections of points are similar. A generator produces
+images that should resemble a dataset. A model trained on studio photographs must work on webcam
+images. A clustering algorithm compares two histograms. Ordinary point-by-point error is not
+enough, because the two collections do not come with matching pairs.
+
+**Optimal transport** (OT) supplies the missing matching. It treats each probability distribution
+as a pile of mass, considers every legal way to move one pile into the other, and chooses the
+cheapest. This matters because its distance uses the geometry of the sample space: moving a point
+by one unit costs less than moving it by one hundred.
+
+This post develops the mathematics behind three influential machine-learning papers: Cuturi's
+entropic regularization and Sinkhorn algorithm, Arjovsky, Chintala, and Bottou's Wasserstein GAN,
+and Courty and collaborators' use of transport for domain adaptation. We will build the primal
+problem from probability, derive its dual intuition, compute a complete two-by-two example, and
+then connect the same objects to each application.
+
+## Probability foundations
+
+Optimal transport compares probability distributions, so we first need to be precise about what
+those words mean. The main objects are simpler than their notation suggests.
+
+### Outcomes, random variables, and distributions
+
+A **sample space** $\Omega$ is the set of possible outcomes of an experiment. For a coin toss,
+$\Omega$ could be `heads, tails`. For an image generator, an outcome might include every random
+number used to create one image.
+
+A **random variable** is a function that turns an outcome into a value we care about:
+
+$$
+X:\Omega\to\mathcal X.
+$$
+
+The space $\mathcal X$ is the set of possible values. It could be the real line, a list of class
+labels, or the space of all $256\times256$ RGB images. The randomness is in the sampled outcome;
+once the outcome is fixed, $X$ is an ordinary deterministic function.
+
+The **probability distribution** of $X$ tells us how likely its possible values are. For a
+discrete variable, the probability mass function is
+
+$$
+p_X(x)=\Pr(X=x),
+\qquad
+p_X(x)\ge0,
+\qquad
+\sum_x p_X(x)=1.
+$$
+
+For example, let $X$ be the number of defective parts in a small batch, with
+
+| $x$ | $0$ | $1$ | $2$ |
+| ---: | ---: | ---: | ---: |
+| $p_X(x)$ | $0.50$ | $0.30$ | $0.20$ |
+
+The probability of at least one defect is $0.30+0.20=0.50$. The three probabilities behave like
+three piles of mass with total mass one. This is exactly the picture that optimal transport uses.
+
+A continuous variable usually has a **probability density** $p_X(x)$. Probability is the area
+under the density, not the height at one point:
+
+$$
+\Pr(a\le X\le b)=\int_a^b p_X(x)\,dx,
+\qquad
+\int_{-\infty}^{\infty}p_X(x)\,dx=1.
+$$
+
+The broader term **probability measure**, often written $\mu$, covers discrete masses,
+continuous densities, and distributions that mix both. Writing $X\sim\mu$ means “sample $X$
+according to distribution $\mu$.” This measure notation is useful in OT because a dataset or a
+generator need not have a convenient density.
+
+### Expectations are weighted averages
+
+The **expectation** of a function $f(X)$ is its probability-weighted average. In the discrete and
+continuous cases respectively,
+
+$$
+\mathbb E[f(X)]
+=\sum_x f(x)p_X(x),
+\qquad
+\mathbb E[f(X)]
+=\int f(x)p_X(x)\,dx.
+$$
+
+For the defect example, the expected number of defects is
+
+$$
+\mathbb E[X]
+=0(0.50)+1(0.30)+2(0.20)
+=0.70.
+$$
+
+This does not predict $0.70$ defects in one batch. It says the average approaches $0.70$ over
+many independent batches. Later, transport cost will also be an expectation: if $(X,Y)$ is a
+random source--target pair, then a plan pays $\mathbb E[c(X,Y)]$.
+
+### From a dataset to a distribution
+
+Machine learning starts with samples $x_1,\ldots,x_N$, not the unknown population distribution.
+The **empirical distribution** puts equal probability $1/N$ on each observation:
+
+$$
+\widehat\mu_N=\frac1N\sum_{i=1}^N\delta_{x_i}.
+$$
+
+The symbol $\delta_{x_i}$ is a **point mass**: all its probability sits at $x_i$. If the data are
+$(1,1,4,6)$, the empirical distribution puts mass $0.50$ at 1, $0.25$ at 4, and $0.25$ at 6.
+Repeated observations combine at the same location.
+
+An empirical expectation is therefore the familiar sample average:
+
+$$
+\mathbb E_{X\sim\widehat\mu_N}[f(X)]
+=\frac1N\sum_{i=1}^N f(x_i).
+$$
+
+This connection is important. When OT compares two minibatches, it usually compares two empirical
+distributions. The abstract measure notation eventually becomes a finite matrix problem.
+
+### Joint distributions and marginals
+
+A **joint distribution** describes two variables together. For discrete $X$ and $Y$, write
+$P_{ij}=\Pr(X=x_i,Y=y_j)$. Summing a joint distribution over one variable recovers the other
+variable's **marginal distribution**:
+
+$$
+\Pr(X=x_i)=\sum_jP_{ij},
+\qquad
+\Pr(Y=y_j)=\sum_iP_{ij}.
+$$
+
+Knowing the marginals does not determine the joint distribution. If $X$ has probabilities
+$a=(0.50,0.50)$ and $Y$ has $b=(0.25,0.75)$, one possible joint distribution assumes
+independence:
+
+$$
+P_{\mathrm{independent}}=ab^\mathsf T
+=\begin{bmatrix}
+0.125&0.375\\
+0.125&0.375
+\end{bmatrix}.
+$$
+
+Its row sums are $(0.50,0.50)$ and its column sums are $(0.25,0.75)$. But many other matrices
+have the same sums. A coupling is precisely one of these possible joint distributions. Optimal
+transport searches over them and selects one using geometry and cost.
+
+## From distributions to transport plans
+
+Let a source distribution put masses $a_1,\ldots,a_n$ at points $x_1,\ldots,x_n$, and let a
+target distribution put masses $b_1,\ldots,b_m$ at $y_1,\ldots,y_m$. The masses are non-negative
+and each list sums to one.
+
+A **coupling**, or **transport plan**, is a non-negative matrix $P\in\mathbb R^{n\times m}$.
+Its entry $P_{ij}$ says how much mass travels from $x_i$ to $y_j$. A legal plan must send all
+source mass and deliver exactly the requested target mass:
+
+$$
+\sum_{j=1}^{m}P_{ij}=a_i,
+\qquad
+\sum_{i=1}^{n}P_{ij}=b_j.
+$$
+
+In matrix notation these constraints are $P\mathbf 1_m=a$ and
+$P^\mathsf T\mathbf 1_n=b$. The set of all such plans is written $U(a,b)$. A coupling is a
+joint probability distribution whose marginals are $a$ and $b$: it creates a relationship
+between two distributions without changing either one.
+
+Now choose a **ground cost** $C_{ij}=c(x_i,y_j)$. For points on a line we might use
+$C_{ij}=|x_i-y_j|$. The discrete Kantorovich problem is the linear program
+
+$$
+\operatorname{OT}(a,b)
+=\min_{P\in U(a,b)}\langle P,C\rangle
+=\min_{P\in U(a,b)}\sum_{i,j}P_{ij}C_{ij}.
+$$
+
+The inner product simply adds “mass times travel cost” over every route. The optimization is
+global. Sending one source to its nearest target greedily can consume capacity that another
+source needs more.
+
+### A complete two-by-two example
+
+Put source masses $a=(0.50,0.50)$ at positions $(0,3)$ and target masses
+$b=(0.25,0.75)$ at positions $(1,4)$. With distance as the cost,
+
+$$
+C=
+\begin{bmatrix}
+|0-1| & |0-4|\\
+|3-1| & |3-4|
+\end{bmatrix}
+=
+\begin{bmatrix}
+1&4\\2&1
+\end{bmatrix}.
+$$
+
+Every legal plan is determined by one number, $x=P_{11}$:
+
+$$
+P(x)=
+\begin{bmatrix}
+x&0.50-x\\
+0.25-x&0.25+x
+\end{bmatrix},
+\qquad 0\le x\le0.25.
+$$
+
+The interval comes from requiring all four entries to be non-negative. Substitution turns the
+matrix optimization into a line:
+
+$$
+\langle P(x),C\rangle
+=x+4(0.50-x)+2(0.25-x)+(0.25+x)
+=2.75-4x.
+$$
+
+So the minimum occurs at $x=0.25$, with cost $1.75$. Check one route: the lower-right entry is
+$P_{22}=0.25+0.25=0.50$, and it contributes $0.50\times1=0.50$ to the cost. Move the slider to
+see why increasing $x$ replaces expensive crossed routes with short ones.
+
+<OptimalTransportExplorer />
+
+The row and column sums never change in the upper figure. That is the defining property of a
+coupling, not a cosmetic normalization.
+
+## Wasserstein distance
+
+When the ground cost is a metric raised to power $p$, the **$p$-Wasserstein distance** is
+
+$$
+W_p(\mu,\nu)
+=\left(
+\inf_{\pi\in\Pi(\mu,\nu)}
+\int \|x-y\|^p\,d\pi(x,y)
+\right)^{1/p}.
+$$
+
+Here $\mu$ and $\nu$ may be continuous distributions, $\Pi(\mu,\nu)$ is their set of couplings,
+and $\pi$ plays the role of the matrix $P$. The integral is the continuous version of the sum.
+For $p=1$, it is the least average distance that mass must travel.
+
+This is not the same as comparing probability values at fixed locations. Consider two point
+masses: $\mu=\delta_0$ at zero and $\nu_\theta=\delta_\theta$ at $\theta$. For every non-zero
+$\theta$, their supports do not overlap.
+
+| discrepancy | value when $\theta\ne0$ | as $\theta\to0$ |
+| --- | ---: | ---: |
+| $D_{\mathrm{KL}}(\mu\|\nu_\theta)$ | $+\infty$ | stays $+\infty$ |
+| Jensen--Shannon divergence | $\log 2$ | stays $\log 2$ |
+| $W_1(\mu,\nu_\theta)$ | $|\theta|$ | tends to $0$ |
+
+The Wasserstein value changes smoothly because it sees that the locations are getting closer.
+This weak notion of convergence is one reason OT is useful when data occupy thin, low-dimensional
+sets inside a high-dimensional space. It does not mean Wasserstein distance is always statistically
+or computationally better; estimating it accurately becomes difficult in high dimension, a form
+of the curse of dimensionality.
+
+## Why a dual problem appears
+
+The transport plan is the **primal** view: explicitly decide where every unit of mass goes. The
+**dual** view assigns potentials to locations. For discrete OT, linear-programming duality gives
+
+$$
+\max_{f\in\mathbb R^n,\,g\in\mathbb R^m}
+\left(
+\sum_i a_i f_i+\sum_j b_j g_j
+\right)
+\quad\text{subject to}\quad
+f_i+g_j\le C_{ij}.
+$$
+
+Why this constraint? Think of $f_i+g_j$ as a quoted price for route $(i,j)$. It cannot exceed
+the real cost $C_{ij}$. Therefore every feasible quote is a lower bound on every transport
+plan. At the optimum, strong duality says the best lower bound equals the cheapest plan.
+
+For $W_1$ with distance as the cost, the Kantorovich--Rubinstein theorem compresses the two
+potentials into one function:
+
+$$
+W_1(\mu,\nu)
+=\sup_{\|f\|_L\le1}
+\left(
+\mathbb E_{X\sim\mu}[f(X)]
+-\mathbb E_{Y\sim\nu}[f(Y)]
+\right).
+$$
+
+A function is **1-Lipschitz** when $|f(x)-f(y)|\le\|x-y\|$: its output cannot change faster
+than its input. The maximizing function, called a Kantorovich potential, gives high scores where
+source mass dominates and low scores where target mass dominates, but the Lipschitz constraint
+limits how sharply those scores can change.<Sidenote>The theorem requires regularity conditions,
+including finite first moments. The displayed form is the one used in the WGAN argument.</Sidenote>
+
+For the two point masses, choose $f(x)=-x$ when comparing $\delta_0$ against a positive
+$\delta_\theta$. It is 1-Lipschitz, and
+$f(0)-f(\theta)=0-(-\theta)=\theta$. The dual therefore recovers the primal cost of moving one
+unit of mass by distance $\theta$.
+
+## Entropy makes transport computable
+
+Exact discrete OT is a linear program. Marco Cuturi's 2013 paper proposed adding negative
+entropy to obtain a problem that is smooth and much faster to solve:
+
+$$
+P_\varepsilon
+=\arg\min_{P\in U(a,b)}
+\left[
+\langle P,C\rangle
++\varepsilon\sum_{i,j}P_{ij}(\log P_{ij}-1)
+\right].
+$$
+
+The parameter $\varepsilon>0$ controls the trade-off. Small $\varepsilon$ stays close to exact
+OT but is harder to compute. Large $\varepsilon$ rewards diffuse plans more strongly, making the
+solution smoother but more biased toward spreading mass across many routes.
+
+The optimizer has the special form
+
+$$
+P_\varepsilon=\operatorname{diag}(u)K\operatorname{diag}(v),
+\qquad K_{ij}=e^{-C_{ij}/\varepsilon}.
+$$
+
+The **Gibbs kernel** $K$ gives cheap routes large initial weights and expensive routes small
+weights. The vectors $u$ and $v$ then scale rows and columns until the required marginals are met.
+The Sinkhorn updates are
+
+$$
+u\leftarrow a\oslash(Kv),
+\qquad
+v\leftarrow b\oslash(K^\mathsf Tu),
+$$
+
+where $\oslash$ means element-wise division. Each $u$ update fixes the row sums; each $v$ update
+fixes the column sums. Fixing one side perturbs the other, so the algorithm alternates.
+
+In the lower half of the explorer, iteration 1 has row sums $(0.241,0.759)$ but exact column
+sums $(0.250,0.750)$. After eight iterations the row sums are approximately $(0.500,0.500)$ as
+well. The resulting plan is approximately
+
+$$
+P_\varepsilon=
+\begin{bmatrix}
+0.242&0.258\\
+0.008&0.492
+\end{bmatrix}
+\quad(\varepsilon=1).
+$$
+
+Its unregularized travel cost is about $1.783$, slightly above the exact $1.750$, because the
+entropy term keeps a little mass on expensive routes. In real implementations, log-domain
+updates are important when $C/\varepsilon$ is large; direct exponentiation can underflow.
+
+## Paper 1: Wasserstein GANs
+
+A **generative adversarial network** (GAN) trains a generator distribution $P_\theta$ against a
+learned discriminator. Arjovsky, Chintala, and Bottou proposed minimizing $W_1(P_r,P_\theta)$,
+where $P_r$ is the data distribution. Directly optimizing over all couplings of real and generated
+samples would be impractical, so WGAN uses the dual:
+
+$$
+\max_{\|f_w\|_L\le1}
+\mathbb E_{x\sim P_r}[f_w(x)]
+-\mathbb E_{z\sim p(z)}[f_w(g_\theta(z))].
+$$
+
+The neural network $f_w$ is called a **critic**, because it outputs a real-valued score rather
+than a probability of “real.” Training alternates between improving the critic and moving generated
+samples in the direction that raises their critic score.
+
+The point-mass example explains the hoped-for benefit. A divergence based only on overlapping
+density can be flat or infinite while generated and real supports are disjoint. $W_1$ still reports
+their distance, so it can supply a useful learning signal as the generator moves.
+
+The theorem requires a 1-Lipschitz critic. The original paper enforced a compact parameter space
+by clipping critic weights, an indirect and restrictive approximation. Later work introduced
+gradient penalties, but those are a different paper and not part of the original WGAN result.
+The important mathematical move is the duality: it replaces an impossible search over transport
+plans with a learned scalar function under a slope constraint.
+
+## Paper 2: Domain adaptation
+
+In **unsupervised domain adaptation**, labeled source examples are available, but the target
+examples have no labels. Imagine handwritten digits photographed by two cameras. Their pixel
+distributions shift even though their semantic classes should remain the same.
+
+Courty and collaborators proposed learning a coupling between empirical source and target
+samples. A transported source point is the barycenter of the targets to which its row of mass is
+sent:
+
+$$
+\widehat x_i
+=\frac{1}{a_i}\sum_j P_{ij}y_j.
+$$
+
+For example, if a source point of mass $0.5$ sends $0.2$ to $y_1=1$ and $0.3$ to $y_2=4$, its
+transported location is
+
+$$
+\widehat x
+=\frac{0.2(1)+0.3(4)}{0.5}
+=2.8.
+$$
+
+The classifier can then train on transported source features while retaining source labels. The
+paper also adds regularization that encourages source samples with the same label to move together.
+That extra structure matters: geometry alone can align the wrong classes when two domains contain
+symmetries or different class proportions.
+
+This exposes a general limitation of OT in machine learning. A cost matrix encodes what “similar”
+means. Euclidean distance in raw pixels may reward the wrong match. Useful transport therefore
+depends on a meaningful representation, a suitable ground cost, and sometimes label or structural
+regularization.
+
+## What the three papers teach together
+
+Cuturi's paper addresses computation: entropy changes a linear program into matrix scaling.
+The WGAN paper uses duality: a critic estimates transport discrepancy without constructing a
+sample-to-sample plan. The domain-adaptation paper uses the primal plan itself: its entries become
+soft correspondences that move labeled examples.
+
+| question | mathematical object | machine-learning role |
+| --- | --- | --- |
+| Which points correspond? | primal coupling $P$ | align source and target samples |
+| How different are two distributions? | Wasserstein value | training objective or metric |
+| Can we avoid building the coupling? | dual potential $f$ | neural critic in WGAN |
+| Can we solve the discrete problem quickly? | entropic plan $P_\varepsilon$ | differentiable, scalable approximation |
+
+These are not interchangeable tools. Use a primal plan when the correspondence is useful. Use a
+dual model when samples are plentiful but a full cost matrix is too large. Use entropic OT when a
+dense, smooth approximation and fast matrix operations are acceptable.
+
+## Summary
+
+- A dataset defines an empirical probability distribution, and a coupling is a joint distribution
+  with fixed marginals; optimal transport chooses the coupling with the lowest expected cost.
+- Wasserstein distance respects the geometry between samples, so nearby disjoint distributions
+  can be close even when density-based divergences are not.
+- Kantorovich duality replaces transport routes with constrained potentials; for $W_1$, the
+  potential is 1-Lipschitz.
+- Entropic regularization gives the factorization $P=\operatorname{diag}(u)K\operatorname{diag}(v)$,
+  and Sinkhorn iteration finds the scaling vectors by alternating marginal corrections.
+- WGAN uses the dual potential as a critic, while domain adaptation uses the primal coupling as a
+  soft correspondence between datasets.
+
+## References
+
+1. Marco Cuturi. [Sinkhorn Distances: Lightspeed Computation of Optimal Transportation
+   Distances](https://arxiv.org/abs/1306.0895). *NeurIPS*, 2013.
+2. Martin Arjovsky, Soumith Chintala, and Léon Bottou. [Wasserstein Generative Adversarial
+   Networks](https://proceedings.mlr.press/v70/arjovsky17a.html). *ICML*, 2017.
+3. Nicolas Courty, Rémi Flamary, Devis Tuia, and Alain Rakotomamonjy. [Optimal Transport for
+   Domain Adaptation](https://arxiv.org/abs/1507.00504). *IEEE TPAMI*, 2017.
+4. Gabriel Peyré and Marco Cuturi. [Computational Optimal
+   Transport](https://arxiv.org/abs/1803.00567). *Foundations and Trends in Machine Learning*,
+   2019.

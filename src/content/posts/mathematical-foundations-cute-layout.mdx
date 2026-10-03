@@ -1,0 +1,1062 @@
+---
+title: "Mathematical Foundations for CuTe Layouts"
+description: "Build the mathematics behind CuTe from mixed-radix coordinates and hierarchical tuples to composition, complements, logical division, and thread-value layouts."
+date: 2026-10-03
+tags: [Draft, CUDA]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import LayoutGrid from "../../utils/matrix/LayoutGrid.astro";
+import Matrix2D from "../../utils/matrix/Matrix2D.astro";
+import { cuteDslFigures as F } from "../../utils/matrix/cuteDslFigures";
+
+## Background
+
+A matrix has rows and columns, but GPU memory is a line of addresses. Every load therefore needs
+a rule that turns a logical coordinate such as $(m,n)$ into a physical offset. A conventional tensor
+library stores that rule as a flat shape and a flat stride. That is enough for row-major matrices,
+transposes, and many views. It becomes awkward when a tensor-core instruction distributes one tile
+across warps, lanes, and registers, or when shared memory is arranged as tiles inside tiles.
+
+**CuTe** (CUDA Templates) treats this indexing rule as a mathematical function called a **layout**.
+Its shapes and strides may be nested, and an algebra builds new layouts by composing, dividing, and
+combining old ones. This matters because the same language can describe memory, threads, values,
+and hardware instructions. Index arithmetic that would otherwise be scattered through a kernel
+becomes data that the compiler can inspect and often evaluate at compile time.
+
+This post builds that language from the ground up. We first need functions, tuples, mixed-radix
+coordinates, and strides. We then define a CuTe layout, explain its hierarchy, and work through the
+main algebraic operations. Finally, we use composition to turn a thread-value ownership pattern into
+the offsets each GPU thread must load. For the programming interface, see
+[A Tour of the CuTe DSL](/blog/cute-dsl/); here the goal is to understand *why* its layout operations
+work.
+
+## The problem is an indexing function
+
+Consider a $4\times 8$ matrix. In row-major storage, moving down one row skips eight elements and
+moving right one column skips one. Its indexing function is
+
+$$
+L_{\mathrm{row}}(m,n)=8m+n.
+$$
+
+In column-major storage the first coordinate changes fastest, so
+
+$$
+L_{\mathrm{col}}(m,n)=m+4n.
+$$
+
+CuTe writes a layout as `shape:stride`. These two functions are
+$(4,8):(8,1)$ and $(4,8):(1,4)$.
+
+<LayoutGrid name="row-major" shape={[4, 8]} stride={[8, 1]} />
+
+<LayoutGrid name="column-major" shape={[4, 8]} stride={[1, 4]} />
+
+The grid coordinate is the input. The number in a cell is the output offset. Check one cell:
+$L_{\mathrm{col}}(1,2)=1+4\cdot2=9$, which is the value in row 1, column 2 of the second figure.
+
+This function view separates three objects that are easy to conflate:
+
+- The **domain** is the set of legal logical coordinates, here all $(m,n)$ with
+  $0\le m<4$ and $0\le n<8$.
+- The **codomain** is the kind of output the function can produce, usually integers used as offsets.
+- The **image** is the finite set of outputs actually produced for legal coordinates.
+
+The distinction matters for padded and broadcast layouts. The padded layout $(4,8):(1,5)$ has 32
+inputs but its image has gaps: it produces offsets $0,1,2,3$, then $5,6,7,8$, and so on. The
+broadcast layout $(4,8):(0,1)$ maps four different row coordinates to the same offset. A layout need
+not be contiguous or one-to-one.
+
+### From loops to layouts
+
+A normalized loop starts at zero, increments by one, and keeps its bounds separate from its address
+calculation. For example,
+
+```cpp
+for (int n = 0; n < 8; ++n)
+  for (int m = 0; m < 4; ++m)
+    use(base[m * 1 + n * 5]);
+```
+
+has shape $(4,8)$ and stride $(1,5)$. The loop describes *which logical coordinates exist*. The
+stride describes *where each one goes*. CuTe packages those two facts as $(4,8):(1,5)$, allowing an
+algorithm to keep its loops while replacing the access rule.
+
+## The coordinate mathematics
+
+CuTe becomes much easier once we see a multidimensional coordinate as a numeral written in mixed
+bases. Ordinary decimal uses one base everywhere. A coordinate for shape $(M,N)$ uses base $M$ for
+its first digit and base $N$ for its second.
+
+### Colexicographic order
+
+CuTe uses **colexicographic order**: the leftmost coordinate changes fastest. For shape $(2,3)$, the
+enumeration is
+
+| Linear index $i$ | Coordinate $(c_0,c_1)$ |
+| ---: | :---: |
+| 0 | $(0,0)$ |
+| 1 | $(1,0)$ |
+| 2 | $(0,1)$ |
+| 3 | $(1,1)$ |
+| 4 | $(0,2)$ |
+| 5 | $(1,2)$ |
+
+The conversion from a linear index to a coordinate uses quotient and remainder:
+
+$$
+\operatorname{idx2crd}(i;(M,N))
+=\left(i\bmod M,\left\lfloor\frac{i}{M}\right\rfloor\right).
+$$
+
+The inverse conversion is
+
+$$
+\operatorname{crd2idx}((c_0,c_1);(M,N))=c_0+M c_1.
+$$
+
+For $i=5$ and shape $(2,3)$, $5\bmod2=1$ and $\lfloor5/2\rfloor=2$, so index 5 is
+coordinate $(1,2)$. Converting back gives $1+2\cdot2=5$.
+
+This is a **bijection**: every in-bounds linear index has exactly one coordinate and vice versa.
+That fact lets CuTe accept either form. A layout of shape $(4,8)$ may be called with the integral
+coordinate $9$ or the natural coordinate $(1,2)$; the shape converts between them before the stride
+is applied.
+
+### More than two modes
+
+For a flat shape $S=(S_0,S_1,\ldots,S_{r-1})$, define the exclusive prefix product
+
+$$
+P_k=\prod_{j=0}^{k-1}S_j,\qquad P_0=1.
+$$
+
+Then digit $k$ of linear index $i$ is
+
+$$
+c_k=\left\lfloor\frac{i}{P_k}\right\rfloor\bmod S_k,
+$$
+
+and the inverse is
+
+$$
+i=\sum_{k=0}^{r-1}c_kP_k.
+$$
+
+For shape $(2,3,4)$ and $i=17$, the prefix products are $(1,2,6)$. The digits are
+$(17\bmod2,\lfloor17/2\rfloor\bmod3,\lfloor17/6\rfloor\bmod4)=(1,2,2)$.
+The check is $1+2\cdot2+2\cdot6=17$.
+
+### Hierarchical tuples
+
+A **hierarchical tuple** is either one value or an ordered tuple whose children may themselves be
+hierarchical tuples. Thus $4$, $(4,8)$, and $((2,2),(2,4))$ are all hierarchical tuples. Its tree
+structure is called its **profile**.
+
+A CuTe **shape** is a hierarchical tuple of positive integers. Its size is the product of all leaves,
+so
+
+$$
+|((2,2),(2,4))|=2\cdot2\cdot2\cdot4=32.
+$$
+
+Nesting records meaning without changing the total number of coordinates. In
+$((2,2),(2,4))$, the first top-level mode has size 4 and the second has size 8. Each is refined into
+an inner coordinate and an outer coordinate: "position inside a tile" and "which tile".
+
+The compatible coordinate forms for the first mode are a single $m$ in $0\ldots3$ or a pair
+$(m_{\mathrm{inner}},m_{\mathrm{tile}})$ in shape $(2,2)$. Mixed-radix conversion connects them:
+$m=m_{\mathrm{inner}}+2m_{\mathrm{tile}}$. CuTe recursively applies the same rule at every node of
+the tuple tree.
+
+## Shape, stride, and layout
+
+A **stride** is a hierarchical tuple with the same profile as its shape. Each stride leaf says how
+much the output changes when the corresponding coordinate leaf increases by one. "Same profile" is
+more precise than "same number of leaves": shape $(4,(2,4))$ can pair with stride $(1,(8,2))$, but
+not with flat stride $(1,8,2)$.
+
+For natural coordinate $c$ and stride $D$, CuTe recursively takes an inner product:
+
+$$
+\langle c,D\rangle=\sum_k\langle c_k,D_k\rangle,
+\qquad \langle a,d\rangle=ad\text{ at a leaf}.
+$$
+
+A **layout** $L=S:D$ first converts an accepted coordinate into the natural coordinate of shape
+$S$, then applies that inner product. In function notation,
+
+$$
+L=D\circ S.
+$$
+
+The shape is not merely metadata. It is the mixed-radix function that interprets the input; the
+stride is the function that maps the resulting digits to an output.
+
+### A hierarchical layout by hand
+
+Take
+
+$$
+L=((2,2),(2,4)):((1,4),(2,8)).
+$$
+
+It describes a logical $4\times8$ matrix as $2\times2$ contiguous tiles. The row coordinate
+$m$ becomes $(m\bmod2,\lfloor m/2\rfloor)$; the column coordinate $n$ becomes
+$(n\bmod2,\lfloor n/2\rfloor)$. Therefore
+
+$$
+L(m,n)
+=(m\bmod2)+4\left\lfloor\frac m2\right\rfloor
++2(n\bmod2)+8\left\lfloor\frac n2\right\rfloor.
+$$
+
+<Matrix2D name="2×2 tiled storage" {...F.hier} />
+
+Check $(m,n)=(3,2)$. Its natural coordinate is $((1,1),(0,1))$, so the offset is
+$1\cdot1+1\cdot4+0\cdot2+1\cdot8=13$. The hierarchy makes "within tile" and "which tile"
+explicit; no new kind of arithmetic was needed.
+
+### Size, cosize, and rank
+
+Three measurements answer different questions:
+
+- **`rank(L)`** is the number of top-level modes. The tiled layout above has rank 2, even though it
+  has four leaves.
+- **`size(L)`** is the number of logical coordinates, the product of the shape leaves. It is 32.
+- **`cosize(L)`** is one plus the largest non-negative integer offset. For $(4,8):(2,8)$ it is 63,
+  although the layout has only 32 coordinates, because every other address is skipped.
+
+Rank concerns interface, size concerns iteration, and cosize concerns storage span. They coincide
+only for simple compact layouts.
+
+### Strides need not be integers
+
+The inner product needs addition and multiplication by integers, but its outputs do not have to be
+integer addresses. An **integer semimodule** is a set whose values can be added associatively and
+scaled by integers. This deliberately broad definition covers integers, coordinate tuples, and
+bitwise structures.
+
+For example, let $e_0=(1,0)$ and $e_1=(0,1)$. The layout
+
+$$
+(4,6):(e_0,e_1)
+$$
+
+returns $(m,n)$ rather than a memory offset. It is an identity coordinate layout. Such layouts are
+useful for boundary predicates and for hardware instructions that consume coordinates directly.
+
+<Matrix2D name="identity coordinate layout" {...F.identity} />
+
+The papers call layout evaluation **semi-linear** because it is linear in the stride after the shape
+has performed its piecewise quotient-and-remainder conversion. Within natural coordinates,
+$L(c)=\langle c,D\rangle$ looks like an ordinary dot product. Across a flattened coordinate, the
+modulo and floor operations create the boundaries between mixed-radix digits.
+
+## Tensors and slicing
+
+A **tensor** is an accessor composed with a layout. If $E$ turns an offset into a stored value, then
+
+$$
+T=E\circ L,\qquad T(c)=E(L(c)).
+$$
+
+An accessor may be a pointer dereference, a register array, or another object that knows how to
+interpret offsets. This separation is why the same layout algebra can describe global memory,
+shared memory, registers, or even thread identifiers.
+
+**Slicing** fixes some coordinates and leaves the others free. For a matrix layout
+$L=(M,N):(d_M,d_N)$, fixing column $j$ gives
+
+$$
+L(:,j)=M:d_M
+$$
+
+with a base offset of $jd_N$. The remaining layout says how to move within the slice; the fixed
+coordinate changes the accessor's starting point. With hierarchical modes, a slice can fix an outer
+tile coordinate while preserving the inner-tile layout.
+
+This leads to a pattern used throughout CuTe:
+
+1. Compose a tensor's layout with a layout that reorganizes its coordinates.
+2. Slice one mode, often with a runtime block, warp, or thread identifier.
+3. Keep the remaining layout as a compile-time description of that worker's values.
+
+## The layout algebra
+
+The algebra manipulates functions while preserving their layout representation. Not every arbitrary
+function is a CuTe layout, so each operation has conditions under which its result can still be
+written as a hierarchical shape and stride.
+
+### Concatenation
+
+**Concatenation** places layouts side by side as independent modes:
+
+$$
+(S_A:D_A,\ S_B:D_B)=(S_A,S_B):(D_A,D_B).
+$$
+
+At coordinate $(a,b)$ the result is $A(a)+B(b)$. Concatenation is the basic constructor behind
+multi-mode layouts. It does not mean "append the images in memory"; the strides decide whether the
+two modes are contiguous, interleaved, broadcast, or separated by gaps.
+
+### Coalescence
+
+**Coalescence** removes representational boundaries that do no work. Two adjacent flat modes
+$S_0:D_0$ and $S_1:D_1$ merge when
+
+$$
+D_1=S_0D_0.
+$$
+
+That equation says the second mode begins exactly where a full traversal of the first mode ends.
+For example,
+
+$$
+(2,6):(1,2)\quad\longrightarrow\quad12:1.
+$$
+
+Both map linear coordinate $i$ to offset $i$. A stride-zero mode contributes nothing and size-one
+modes carry no varying coordinate, so coalescence also simplifies those cases according to CuTe's
+rules.
+
+<Matrix2D name="before coalescing" {...F.coalesce_before} />
+
+<LayoutGrid name="the same function after coalescing by mode" shape={[2, 6]} stride={[1, 2]} />
+
+Coalescence changes syntax, not behavior. This is important before composition: simplifying a layout
+can reveal divisibility that was hidden by unnecessary mode boundaries.
+
+### Composition
+
+For layouts $A$ and $B$, **composition** is
+
+$$
+R=A\circ B,\qquad R(c)=A(B(c)).
+$$
+
+$B$ owns the result's domain because it receives the input first. $A$ owns the codomain because it
+produces the final output. The useful reading is: $B$ selects or rearranges logical coordinates, then
+$A$ maps those coordinates to physical offsets.
+
+Take a column-major $8\times8$ data layout $A=(8,8):(1,8)$ and a tiler
+$B=(4,4):(2,8)$. For $(i,j)$,
+
+$$
+B(i,j)=2i+8j.
+$$
+
+Interpreting that integer in $A$'s shape gives
+$(2i, j)$, so $A(B(i,j))=2i+8j$. The result selects every other row from the first four columns.
+
+<Matrix2D name="A, with the selected coordinates marked" {...F.compose_tiler_src} />
+
+<Matrix2D name="R = A composed with B" {...F.compose_tiler_res} />
+
+Check the result at $(i,j)=(3,2)$: $B(3,2)=22$;
+$\operatorname{idx2crd}(22;(8,8))=(6,2)$; and $A(6,2)=6+8\cdot2=22$.
+
+#### Why composition needs divisibility
+
+Sampling a mixed-radix function must align with its digit boundaries. In the rank-one base case,
+
+$$
+(S_0:D_0)\circ(s:d)=s:(dD_0),
+$$
+
+so composition is always representable. With several modes, sampling every $d$-th input may carry
+across a digit boundary. CuTe requires each prefix product $P_k$ of the left layout to divide $d$, or
+$d$ to divide $P_k$, for the relevant modes. It also requires the requested result size to end at a
+representable boundary.
+
+For intuition, sequence $0,1,2,3$ reshaped into digits of base 4 has one simple mode. Taking every
+second entry gives $0,2$, still a strided layout. But taking every third entry from a layout whose
+stride pattern changes every four coordinates can alternate between incompatible stride rules. One
+constant hierarchical stride may no longer describe the sampled function.
+
+These restrictions are useful. A failed composition often exposes a tile that does not align with a
+hardware layout, rather than silently generating complicated runtime index arithmetic. For a deeper
+worked derivation, see
+[Working Backwards Through CuTe Layout Composition](/blog/cute-layout-composition/).
+
+### Inverses
+
+An inverse asks for coordinates from offsets. Because layouts can skip or repeat offsets, CuTe uses
+two pseudo-inverses.
+
+A **right inverse** $L^\ddagger$ satisfies
+
+$$
+L(L^\ddagger(k))=k
+$$
+
+for its supported consecutive offsets. It answers: "where are the first contiguous physical
+elements?" CuTe uses that information to find a common vector width between source and destination
+layouts.
+
+A **left inverse** $L^\dagger$ satisfies
+
+$$
+L(L^\dagger(L(c)))=L(c).
+$$
+
+For an injective layout, this reduces to $L^\dagger(L(c))=c$. It answers: "if this physical offset
+exists in the layout, which logical coordinate owns it?" This is useful when checking whether a data
+layout contains every offset required by a hardware instruction.
+
+The words *left* and *right* record where the inverse appears in the composition. They do not promise
+that both sides undo the function. A broadcast layout cannot recover which of several coordinates
+produced a repeated offset.
+
+### Complements
+
+The **complement** $L^*$ describes the directions missing from $L$. Its image is disjoint from the
+image of $L$ except at the shared origin, and it enumerates missing directions in increasing order.
+
+For the 1D tiler $L=4:2$, the image is $0,2,4,6$. Within an eight-element space, the missing
+direction is $1:1$: combining tile coordinate $t$ and complement coordinate $g$ as $2t+g$ covers
+all offsets $0\ldots7$. The complement is not simply set subtraction. It is itself a layout that can
+be extended to generate independent copies of the original pattern.
+
+This one construction powers both product and division:
+
+- Product uses the complement to find how to place another non-overlapping copy.
+- Division uses the complement to recover the coordinates a tiler did not specify.
+
+### Logical product
+
+The **logical product** of $A$ and $B$ repeats tile $A$ over grid $B$:
+
+$$
+A\otimes B=(A, A^*\circ B).
+$$
+
+The first mode is the coordinate inside a tile. The second mode chooses a shifted copy. In the figure,
+a contiguous $2\times2$ tile is repeated over a $2\times3$ grid.
+
+<Matrix2D name="A ⊗ B" {...F.logical_product} />
+
+At the raw algebra level the result has `(tile, grid)` as two top-level modes. Related operations
+rearrange the nesting. A **blocked product** pairs each tile mode with the matching grid mode, so the
+small tile remains visibly blocked. A **raked product** puts the grid coordinate first within each
+mode, interleaving corresponding positions from different tiles. They contain the same ingredients
+but choose different coordinate orderings.
+
+### Logical division
+
+**Logical division** splits $A$ into the part selected by tiler $B$ and the remaining grid of such
+parts:
+
+$$
+A\oslash B=A\circ(B,B^*).
+$$
+
+If $A=24:1$ and $B=8:3$, then $B$ selects offsets
+$0,3,6,9,12,15,18,21$. Its complement supplies the three positions within each gap, producing
+
+$$
+24:1\oslash8:3=(8,3):(3,1).
+$$
+
+Check coordinate $(5,2)$: $5\cdot3+2\cdot1=17$. The first mode chooses the sixth every-third
+position, offset 15; the second moves two places within that group. All 24 offsets are represented
+exactly once.
+
+For a matrix, **zipped division** groups all within-tile modes together and all tile-grid modes
+together. The result has the especially useful interface `(tile_coordinate, tile_id)`. Slicing by
+`tile_id` then produces one tile without changing its internal layout.
+
+<Matrix2D name="zipped division result" {...F.zipped} />
+
+## Thread-value layouts
+
+A **thread-value layout** maps `(thread, value)` to a logical coordinate in a tensor tile. It is
+static metadata that describes who owns which values. Hardware instructions have fixed ownership
+patterns, but the data may be row-major, column-major, padded, or swizzled.
+
+The key is to compose ownership with storage:
+
+$$
+\underbrace{(\text{thread},\text{value})\longrightarrow\text{coordinate}}_{\text{TV layout}}
+\quad\xrightarrow{\text{data layout}}\quad
+\underbrace{\text{offset}}_{\text{address calculation}}.
+$$
+
+The figure below uses a scaled-down $4\times6$ tile. Each colour label names the owning thread; the
+large text names that thread's local value number.
+
+<Matrix2D name="scaled-down ownership grid" {...F.tv} />
+
+Suppose the ownership layout sends thread 4's values to four logical coordinates. Composition with
+a column-major data layout turns those coordinates into offsets. Slicing the composed layout at
+thread 4 removes the thread mode and leaves only a small value layout. The kernel can loop over that
+layout without knowing the original matrix's storage order.
+
+This gives CuTe a clean separation of concerns:
+
+- The data layout answers where logical matrix entries live.
+- The thread-value layout answers which logical entries a thread owns.
+- Composition answers which addresses that thread must access.
+- Slicing selects the current runtime thread.
+
+Change column-major storage to padded storage and only the first layout changes. Change the
+instruction's ownership pattern and only the second changes. The algorithm that copies or computes
+over each thread's values stays the same.
+
+## What category theory adds
+
+Category theory studies objects through the ways they can be transformed and composed. That is a
+good fit for CuTe: a layout is useful not only because it produces offsets, but because layouts can be
+composed, coalesced, divided, and completed by complements. The categorical paper turns these
+operations into a diagram calculus for an important class of layouts.
+
+The formal development has several layers. We will build them in order:
+
+1. categories capture the shared rules of composition;
+2. `Tuple` describes how flat shape factors occupy mixed-radix positions;
+3. `Nest` restores CuTe's hierarchical profiles;
+4. a realization functor turns those diagrams into layout functions; and
+5. categorical operations become CuTe layout operations.
+
+### Categories: objects, arrows, and composition
+
+A **category** consists of:
+
+- **objects**, such as sets, vector spaces, or tuples;
+- **morphisms**, drawn as arrows $f:X\to Y$ between objects;
+- a way to compose $f:X\to Y$ and $g:Y\to Z$ into $g\circ f:X\to Z$; and
+- an identity morphism $\operatorname{id}_X:X\to X$ for every object.
+
+Composition must obey two laws:
+
+$$
+h\circ(g\circ f)=(h\circ g)\circ f
+$$
+
+and
+
+$$
+f\circ\operatorname{id}_X=f=\operatorname{id}_Y\circ f.
+$$
+
+The first law is **associativity**. It says that a chain of compatible transformations does not depend
+on where we place parentheses. The second says that an identity does nothing. Sets with functions
+form a category. Vector spaces with matrices as morphisms form another, where composition is matrix
+multiplication.
+
+An **isomorphism** is a morphism with a two-sided inverse. It expresses that two objects contain the
+same structure, even if they are presented differently. For CuTe, flattening
+$(64,(8,8))$ to $(64,8,8)$ is an isomorphism: the parentheses change, but the leaf factors and the
+coordinates they represent do not.
+
+Category theory deliberately says little about what an object contains. It concentrates on which
+arrows exist and how they join. That is exactly the abstraction needed for layout algebra: factor
+boundaries and their connections determine whether two indexing transformations compose cleanly.
+
+### Functors: translating one category into another
+
+A **functor** $F:\mathcal C\to\mathcal D$ translates objects and morphisms from one category to
+another while preserving the two laws:
+
+$$
+F(g\circ f)=F(g)\circ F(f),
+\qquad
+F(\operatorname{id}_X)=\operatorname{id}_{F(X)}.
+$$
+
+This is stronger than merely converting data structures. It promises that composing first and
+translating later gives the same answer as translating each piece and then composing.
+
+The categorical account of CuTe constructs a **realization functor** from layout diagrams to finite
+sets and functions. This is the central bridge. On one side is a diagram of factors; on the other is
+the coordinate-to-index function computed by a CuTe layout. Because realization is a functor,
+diagram composition automatically implies functional composition.
+
+### Why divisibility becomes a category
+
+Before building layout diagrams, consider a small category called $\mathbf{Div}$. Its objects are
+positive integers. There is an arrow $a\to b$ exactly when $a$ divides $b$. If $a\mid b$ and
+$b\mid c$, then $a\mid c$, so the arrows compose. Every $a$ divides itself, giving the identity.
+
+CuTe's composition restrictions have this flavour. A shape factor can occupy a mixed-radix position
+only when the surrounding prefix products divide the relevant stride. What looked earlier like a list
+of arithmetic side conditions can therefore be encoded by arrows between factorized objects.
+
+### Tractable layouts
+
+The paper works with **tractable layouts**. Flatten a layout, discard its nesting for a moment, and
+sort its modes by increasing stride:
+
+$$
+\operatorname{sort}(L)=(s_1,\ldots,s_m):(d_1,\ldots,d_m).
+$$
+
+The layout is tractable when, for every neighbouring pair, either $d_i=0$ or
+
+$$
+s_i d_i\mid d_{i+1}.
+$$
+
+The product $s_i d_i$ is where a complete traversal of mode $i$ ends. The divisibility condition
+says the next stride begins on a compatible factor boundary. It may begin immediately, giving
+$d_{i+1}=s_i d_i$, or after an integer-sized gap.
+
+Common layouts satisfy this condition:
+
+- row-major and column-major layouts;
+- compact layouts with any mode order;
+- projections and broadcasts with stride zero;
+- dilated and padded layouts whose gaps respect the factor chain; and
+- the hierarchical tiled layouts used in normal CuTe kernels.
+
+Not every concatenation of individually tractable layouts remains tractable. The paper gives
+$((8,8),(5,5)):((8,1),(10,2))$ as a counterexample. After sorting, its independent factor chains
+interfere. This boundary matters: the category is a faithful model of a broad practical subset, not a
+claim that every possible CuTe layout has this diagram form.
+
+### Pointed maps: keeping, placing, and discarding factors
+
+The category `Tuple` is built from **pointed finite sets**
+
+$$
+\langle m\rangle_* = \{*,1,2,\ldots,m\}.
+$$
+
+The distinguished point $*$ means "discarded". A pointed map must send $*$ to $*$, but each ordinary
+source position may map to a target position or to $*$.
+
+For example, the map
+
+$$
+\alpha=(2,1,*,6):\langle4\rangle_*\to\langle6\rangle_*
+$$
+
+sends source entry 1 to target position 2, source entry 2 to position 1, drops source entry 3, and
+sends entry 4 to position 6.
+
+The map is **tractable** when no positive target position is used more than once. Several source
+factors may be discarded, and target positions may be empty, but two independent source factors may
+not collide at the same target position. This makes the arrows behave like partial placements rather
+than arbitrary many-to-one functions.
+
+### The category `Tuple`
+
+An object of `Tuple` is a flat tuple of positive integers, such as $(3,128,128)$. A morphism
+
+$$
+f:(s_1,\ldots,s_m)\longrightarrow(t_1,\ldots,t_n)
+$$
+
+is a tractable pointed map $\alpha$ with one extra requirement: if source entry $i$ maps to target
+position $\alpha(i)$, their values must match,
+
+$$
+s_i=t_{\alpha(i)}.
+$$
+
+The source tuple becomes the layout's shape. The target tuple is a factorization of the mixed-radix
+codomain. An arrow says where every source shape factor is placed inside that target factorization.
+Unhit target factors create dilation or padding. A source factor sent to $*$ becomes a stride-zero
+broadcast mode.
+
+The encoded stride follows directly from the target prefix products:
+
+$$
+d_i=
+\begin{cases}
+0, & \alpha(i)=*,\\
+\displaystyle\prod_{j<\alpha(i)}t_j, & \alpha(i)\ne *.
+\end{cases}
+$$
+
+This formula is the heart of the diagram representation. Follow the arrow from a source factor to its
+target position, then multiply every target factor before that position. The product is the factor's
+stride.
+
+#### Deriving a layout from one morphism
+
+Take the morphism
+
+$$
+f:(3,128,128)\longrightarrow(3,2,128,2,128)
+$$
+
+lying over $\alpha=(1,3,5)$. The three source factors land in target positions 1, 3, and 5.
+Therefore
+
+$$
+\begin{aligned}
+d_1 &= 1,\\
+d_2 &= 3\cdot2=6,\\
+d_3 &= 3\cdot2\cdot128\cdot2=1536.
+\end{aligned}
+$$
+
+The encoded layout is
+
+$$
+L_f=(3,128,128):(1,6,1536).
+$$
+
+The unused target factors of size 2 are visible as gaps. A full traversal of the first source mode
+occupies $3\cdot1=3$ positions, but the next stride is 6. A full traversal through the second source
+mode reaches $128\cdot6=768$, while the final stride is 1536. The diagram records those two
+dilations without storing strides explicitly.
+
+If a source factor instead mapped to $*$, its stride would be zero. If every target position were hit
+with no intervening factors, the result would be compact. Reordering arrows changes the mode order.
+Thus placement, permutation, dilation, and broadcast all use the same construction.
+
+### Why the tractability condition is exact
+
+Every `Tuple` morphism encodes a tractable flat layout. Conversely, every tractable flat layout can
+be converted into such a morphism. The construction sorts the non-zero strides and reconstructs the
+missing target factors from ratios such as
+
+$$
+\frac{d_{i+1}}{s_i d_i}.
+$$
+
+Tractability guarantees that each ratio is an integer. That integer becomes an unhit target factor,
+representing the gap between two used factors.
+
+Different diagrams can encode the same layout by inserting useless factors of 1 or leaving redundant
+structure after the final used position. The paper defines a **standard form** that removes these
+choices. It also excludes a small degeneracy: a size-one shape mode with a non-zero stride has no
+observable variation, so its placement cannot be recovered uniquely.
+
+After imposing standard form and **non-degeneracy**, there is a one-to-one correspondence:
+
+$$
+\left\{\text{non-degenerate tractable flat layouts}\right\}
+\longleftrightarrow
+\left\{\text{non-degenerate `Tuple` morphisms in standard form}\right\}.
+$$
+
+This is a classification result, not just a convenient encoding. Within this class, the layout
+function determines a canonical factor diagram.
+
+### Realization: how a diagram becomes indexing arithmetic
+
+For tuple $S=(s_1,\ldots,s_m)$, begin with its Cartesian coordinate set
+
+$$
+[0,S)=[0,s_1)\times\cdots\times[0,s_m).
+$$
+
+A morphism $f:S\to T$ over $\alpha$ maps a coordinate $(x_1,\ldots,x_m)$ into a target coordinate
+$(y_1,\ldots,y_n)$. If source factor $i$ lands at target position $j$, set $y_j=x_i$; positions not
+hit by an arrow get zero. A source coordinate sent to $*$ disappears.
+
+For the example above,
+
+$$
+(x_1,x_2,x_3)\longmapsto(x_1,0,x_2,0,x_3).
+$$
+
+Colexicographic flattening of the target then gives
+
+$$
+x_1+6x_2+1536x_3,
+$$
+
+exactly the layout $L_f$. The **realization functor** wraps these two steps:
+
+$$
+|f|=\operatorname{colex}_T\circ F(f)\circ\operatorname{colex}_S^{-1}.
+$$
+
+Read this right to left. Unflatten the input integer into source digits, place those digits in the
+target according to the arrows, then flatten the target digits back to an integer.
+
+Because realization is a functor,
+
+$$
+|g\circ f|=|g|\circ|f|.
+$$
+
+The realized function $|f|$ is precisely the indexing function of $L_f$. This yields the important
+compatibility theorem
+
+$$
+L_{g\circ f}=L_g\circ L_f
+$$
+
+for non-degenerate composable morphisms. Instead of re-deriving quotient-and-remainder formulas for
+the result, we paste factor diagrams and then read off the new layout.
+
+### From `Tuple` to hierarchical `Nest`
+
+`Tuple` forgets parentheses, while CuTe shapes are hierarchical. The category `Nest` restores them.
+Its objects are nested tuples of positive integers. A morphism $f:S\to T$ in `Nest` is defined by a
+`Tuple` morphism between their flattenings,
+
+$$
+f^\flat:S^\flat\longrightarrow T^\flat.
+$$
+
+The layout $L_f$ uses the flat morphism to compute its strides, then reapplies the nesting profile of
+the source $S$ to both shape and stride. For example, the nested morphism
+
+$$
+((8,8),(4,4))\longrightarrow(8,4,4,8)
+$$
+
+over $(1,4,3,2)$ encodes
+
+$$
+((8,8),(4,4)):((1,128),(32,8)).
+$$
+
+Check the arrows. The four source leaves land at target positions 1, 4, 3, and 2, whose prefix
+products are $1$, $8\cdot4\cdot4=128$, $8\cdot4=32$, and $8$. Reapplying the source profile groups
+the strides as $((1,128),(32,8))$.
+
+Flattening and unflattening are isomorphisms in `Nest`. They change the parenthesization but preserve
+the leaf sequence. In fact, `Tuple` and `Nest` are equivalent as categories: nesting adds the profile
+needed by CuTe's interface, while the underlying factor-arrow computation remains flat.
+
+The classification result extends accordingly:
+
+$$
+\left\{\text{non-degenerate tractable layouts}\right\}
+\longleftrightarrow
+\left\{\text{non-degenerate `Nest` morphisms in standard form}\right\}.
+$$
+
+### Refinement and profiles
+
+A nested tuple $S'$ **refines** $S$ when it replaces entries of $S$ by nested tuples of the same
+size. For example,
+
+$$
+(2,(2,2))\text{ refines }8,
+$$
+
+because both have size 8, but the former exposes three binary factors. Similarly,
+$((2,2),(3,3),(5,5))$ refines $(4,9,25)$.
+
+Refinement separates arithmetic size from semantic grouping. A kernel can refine a 32-element mode
+into warp, lane, and value factors without changing the number of elements. `Nest` provides mode and
+entry inclusion morphisms, so the algebra can operate on one hierarchical mode and then place it back
+into the whole layout.
+
+### How layout operations appear in the diagrams
+
+Once layouts are factor diagrams, the major algebraic operations have structural meanings.
+
+#### Composition is diagram pasting
+
+For $f:S\to T$ and $g:T\to U$, composition follows each arrow of $f$ through $g$. A factor discarded
+by either morphism is discarded by the composite. Because target entries and source entries must
+match at the shared object $T$, incompatible factor boundaries cannot be pasted. This is the
+diagrammatic version of CuTe's divisibility requirements.
+
+The realization theorem guarantees that pasting computes the same function as layout composition:
+
+$$
+L_{g\circ f}=L_g\circ L_f.
+$$
+
+#### Coalescence collapses adjacent arrows
+
+If neighbouring source factors land in neighbouring target positions with no gap, their mixed-radix
+roles are contiguous. Coalescence multiplies those factors and collapses the corresponding arrows.
+The paper proves
+
+$$
+L_{\operatorname{coal}(f)}=\operatorname{coal}(L_f).
+$$
+
+Thus coalescing the diagram and then realizing it is the same as coalescing the layout.
+
+#### A complement is the unused part of the codomain
+
+Suppose $f:S\to T$ uses some target factors. Its categorical complement
+$f^c:U\to T$ includes the target factors not hit by $f$. Concatenating the two gives an isomorphism
+
+$$
+(f,f^c):(S,U)\xrightarrow{\ \cong\ }T.
+$$
+
+This equation says that the selected factors and missing factors together reconstruct the entire
+target factorization, with neither overlap nor omission. Realizing $f^c$ gives CuTe's layout
+complement, after the required coalescence.
+
+#### Logical division selects and completes
+
+If $g:S\to T$ is a tiler and $f:T\to U$ is the data layout, logical division is
+
+$$
+f\oslash g=f\circ(g,g^c).
+$$
+
+The pair $(g,g^c)$ exposes two modes: what the tiler selected and what was needed to complete the
+domain. Composing with $f$ maps both to data offsets. This is exactly the `(tile, rest)` structure of
+CuTe logical division.
+
+#### Logical product repeats along missing directions
+
+Logical product uses the complement in the other direction. The first morphism supplies a tile. Its
+complement identifies independent target directions along which copies can be placed, and another
+morphism orders those copies. The categorical construction is associative when its admissibility
+conditions hold, explaining why repeated products can build grids of grids without changing meaning
+when regrouped.
+
+### What the categorical model proves—and what it does not
+
+The categorical model gives three strong results:
+
+- tractable layouts are exactly the layouts encoded by `Nest` morphisms;
+- after standardization and removal of degenerate size-one modes, the encoding is one-to-one; and
+- realization preserves composition and the corresponding coalesce, complement, division, and
+  product constructions.
+
+This replaces many operation-specific calculations with one structural argument: perform the
+operation on diagrams, then use functoriality to know that the realized indexing functions agree.
+
+The model does not cover every object in the broader CuTe specification. It focuses on integer-stride
+tractable layouts. Cecka's specification permits strides in general integer semimodules, including
+coordinate-valued layouts and XOR-based swizzles. Some operations also require non-degeneracy,
+disjoint images, injectivity, or other admissibility conditions. Those hypotheses are part of the
+theorem, not implementation clutter.<Sidenote>A size-one mode with non-zero stride is called
+degenerate here because changing its coordinate is impossible in-bounds. The stride is therefore
+unobservable, so several different diagrams can realize the same layout function.</Sidenote>
+
+You do not need category theory to write a CuTe kernel. Its practical value is a better mental model:
+strides are prefix products of a factorized target space; composition pastes compatible
+factorizations; coalescence removes artificial boundaries; and complements recover the factors an
+operation left unused.
+
+## A complete worked example
+
+We will divide an $8\times8$ column-major matrix into $2\times4$ tiles and assign each tile's eight
+values to four threads, two values per thread.
+
+### 1. Start with storage
+
+The matrix layout is
+
+$$
+A=(8,8):(1,8),\qquad A(m,n)=m+8n.
+$$
+
+It has size 64, cosize 64, and no gaps.
+
+### 2. Divide into tiles
+
+The tile shape is $(2,4)$. Zipped division produces a logical interface
+
+$$
+((2,4),(4,2)):((1,8),(2,32)).
+$$
+
+The first top-level mode is the coordinate inside a $2\times4$ tile. The second is the tile grid:
+four tile positions down and two across.
+
+Choose tile-grid coordinate $(g_m,g_n)=(2,1)$. Its base offset is
+
+$$
+2g_m+32g_n=2\cdot2+32\cdot1=36.
+$$
+
+Inside that tile, local coordinate $(u,v)=(1,3)$ adds
+
+$$
+u+8v=1+8\cdot3=25.
+$$
+
+The final offset is $36+25=61$. Checking directly, this is global matrix coordinate
+$(m,n)=(2\cdot2+1,4\cdot1+3)=(5,7)$, and $A(5,7)=5+8\cdot7=61$.
+
+### 3. Assign values to threads
+
+Within one tile, use the small thread-value map
+
+$$
+V=(4,2):(1,4).
+$$
+
+It maps `(thread, value)` to the tile's colexicographic linear coordinate. Thread 3 owns linear tile
+coordinates $3$ and $7$. Converting those through tile shape $(2,4)$ gives
+
+$$
+\operatorname{idx2crd}(3;(2,4))=(1,1),\qquad
+\operatorname{idx2crd}(7;(2,4))=(1,3).
+$$
+
+### 4. Compose ownership with the tile layout
+
+The tile's storage layout is $(2,4):(1,8)$. Composition gives the per-thread offsets
+
+$$
+(2,4):(1,8)\circ(4,2):(1,4)=(4,2):(1,16).
+$$
+
+For thread 3, value 0 has offset $3$ within the tile, and value 1 has offset
+$3+16=19$. Adding tile $(2,1)$'s base offset 36 gives global offsets 39 and 55.
+
+Check against global coordinates. Local $(1,1)$ becomes global $(5,5)$, whose offset is
+$5+8\cdot5=45$, not 39—so something is inconsistent. The check has caught a modeling error:
+linear coordinate 3 under shape $(2,4)$ is $(1,1)$, whose tile offset is $1+8=9$, not 3.
+The naive composition treated $V$'s integer output as though the tile layout were compact.
+
+The correct thread-value layout must map directly to coordinates, or equivalently encode the tile's
+logical enumeration before storage. Using coordinate-valued strides,
+
+$$
+V_{\mathrm{coord}}=(4,2):((1,0),(0,2))
+$$
+
+would still not enumerate the desired pairs; thread 3 would be out of the two-row bound. A valid
+ownership pattern is instead
+
+$$
+V_{\mathrm{coord}}=(2,(2,2)):((1,0),((0,1),(0,2))),
+$$
+
+where the thread is factored into row bit and column bit. This example shows why profiles and
+divisibility matter: a flat four-thread mode does not fit a two-row tile without being refactored.
+
+With thread coordinate $(t_r,t_c)=(1,1)$, value $v=0,1$ maps to local coordinates $(1,1)$ and
+$(1,3)$. Their tile offsets are 9 and 25; after adding base 36, the global offsets are 45 and 61.
+Both agree with direct evaluation: $A(5,5)=45$ and $A(5,7)=61$.
+
+The deliberate failed check is the important lesson. A layout is not merely a table with the right
+number of entries. Its shape determines how integer coordinates are factored, so a mismatched profile
+can change the function even when all sizes agree.
+
+## Practical rules for reading CuTe
+
+When a layout expression becomes dense, work from functions rather than names:
+
+1. Write the domain above every layout: coordinate to coordinate, or coordinate to offset.
+2. Expand one representative coordinate with quotient and remainder.
+3. Check the profile of every shape-stride pair, not only its total size.
+4. In $A\circ B$, follow data right to left: input enters $B$, then its output enters $A$.
+5. Read division as `(inside tile, which tile)` and product as `(inside copy, which copy)`.
+6. Verify one entry by both the transformed layout and the original direct address formula.
+7. Coalesce before deciding that a composition violates divisibility.
+
+For real kernels, keep instruction layouts static. Compose them with data layouts at compile time,
+then slice with runtime identifiers. That preserves the separation between hardware ownership,
+storage order, and algorithmic work.
+
+## Summary
+
+- A CuTe layout is a function. Its hierarchical shape interprets coordinates; its congruent stride
+  maps the resulting mixed-radix digits to offsets or other outputs.
+- Quotient and remainder connect linear, multidimensional, and nested coordinates. Hierarchy adds
+  semantic boundaries such as within-tile and which-tile without inventing new arithmetic.
+- Coalescence simplifies a representation, composition applies an indirection, inverses recover
+  coordinates from offsets, and complements describe missing independent directions.
+- Logical product repeats a tile. Logical division factors a layout into a tile and a grid of tiles.
+- Thread-value layouts turn hardware ownership into ordinary layout composition, keeping storage,
+  instruction metadata, and kernel logic separate.
+
+## References
+
+1. Cris Cecka, [“CuTe Layout Representation and Algebra,” arXiv:2603.02298v2](https://arxiv.org/abs/2603.02298v2), 2026.
+2. Jack Carlisle, Jay Shah, Reuben Stern, and Paul VanKoughnett,
+   [“Categorical Foundations for CuTe Layouts,” arXiv:2601.05972v1](https://arxiv.org/abs/2601.05972v1), 2026.
