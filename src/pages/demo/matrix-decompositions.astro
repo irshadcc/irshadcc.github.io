@@ -1,0 +1,15 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import DecompositionGeometry from "../../utils/matrix/DecompositionGeometry.astro";
+import MatrixDecompositionExplorer from "../../utils/matrix/MatrixDecompositionExplorer.astro";
+---
+
+<Layout title="Matrix Decomposition Explorer">
+	<h1>Matrix Decomposition Explorer</h1>
+	<p>Compare the structure and purpose of four common matrix factorizations.</p>
+	<MatrixDecompositionExplorer initial="lu" />
+	<DecompositionGeometry kind="lu" />
+	<DecompositionGeometry kind="qr" />
+	<DecompositionGeometry kind="eigen" />
+	<DecompositionGeometry kind="svd" />
+</Layout>

@@ -1,0 +1,187 @@
+---
+// A prompt as a row of token chips: each chip shows the token's text and id, coloured by kind
+// (special token, role, text, image placeholder...). A chip with `count` stands for a run of
+// identical tokens, such as the placeholder tokens of one image. Several views (for example a
+// prompt before and after the image placeholder is expanded) switch with buttons. Hover or tap
+// a chip to read its positions, id and, with `blockSize`, the KV-cache blocks it falls in; with
+// `blockSize`, a marker shows where each block starts. Layout is in tokenStrip.ts.
+// Usage in .mdx:
+//   import { chatTemplateViews } from "../../utils/inference/vllmInputFigures";
+//   <TokenStrip views={chatTemplateViews} blockSize={16} title="The rendered prompt" />
+import {
+	type TokenKind,
+	type TokenView,
+	describeChip,
+	placeTokens,
+	sequenceLength,
+	validateViews,
+} from "./tokenStrip";
+
+interface Props {
+	views: TokenView[];
+	/** Block size of the KV cache; draws block markers when given. */
+	blockSize?: number;
+	/** View shown on load. */
+	view?: number;
+	/** Chip selected on load, as an index into the view's tokens. */
+	selected?: number;
+	title?: string;
+}
+
+const { views, blockSize, view = 0, selected = 0, title } = Astro.props;
+const err = validateViews(views, blockSize);
+if (err) throw new Error(`TokenStrip: ${err}`);
+const placed = views.map((v) => placeTokens(v.tokens, blockSize));
+const kindLabels: Record<TokenKind, string> = {
+	special: "special token",
+	role: "role name",
+	text: "text",
+	space: "whitespace",
+	vision: "vision marker",
+	image: "image placeholder",
+	partial: "partial character",
+};
+const used = [...new Set(placed.flat().map((c) => c.kind))];
+const shown = Math.max(0, Math.min(views.length - 1, view));
+---
+
+<figure class="tks" data-view={shown} data-sel={selected}>
+	{title && <figcaption class="tks-title">{title}</figcaption>}
+	{
+		views.length > 1 && (
+			<div class="tks-tabs" role="tablist">
+				{views.map((v, i) => (
+					<button
+						type="button"
+						role="tab"
+						class="tks-tab"
+						data-i={i}
+						aria-selected={i === shown ? "true" : "false"}
+					>
+						{v.label}
+					</button>
+				))}
+			</div>
+		)
+	}
+	{
+		placed.map((chips, vi) => (
+			<div class="tks-view" data-i={vi} hidden={vi !== shown}>
+				<p class="tks-len">
+					{views[vi].label}: {sequenceLength(views[vi].tokens)} tokens
+				</p>
+				<div class="tks-row">
+					{chips.map((c, ci) => (
+						<>
+							{c.blockStart && c.firstBlock !== undefined && (
+								<span class="tks-block" aria-hidden="true">
+									block {c.firstBlock}
+								</span>
+							)}
+							<button
+								type="button"
+								class={`tks-chip k-${c.kind}${c.count > 1 ? " run" : ""}`}
+								data-ci={ci}
+								data-desc={describeChip(c)}
+								data-note={c.note ?? ""}
+							>
+								<span class="tks-text">{c.text}</span>
+								{c.count > 1 && <span class="tks-count">× {c.count}</span>}
+								{c.id !== undefined && <span class="tks-id">{c.id}</span>}
+							</button>
+						</>
+					))}
+				</div>
+			</div>
+		))
+	}
+	<p class="tks-detail" aria-live="polite"></p>
+	<p class="tks-legend">
+		{
+			used.map((k) => (
+				<span class="tks-key">
+					<span class={`tks-swatch k-${k}`} />
+					{kindLabels[k]}
+				</span>
+			))
+		}
+	</p>
+</figure>
+
+<script>
+	for (const fig of document.querySelectorAll<HTMLElement>(".tks")) {
+		const out = fig.querySelector<HTMLElement>(".tks-detail");
+		const views = [...fig.querySelectorAll<HTMLElement>(".tks-view")];
+		const pick = (chip: HTMLElement | null) => {
+			if (!chip) return;
+			for (const c of fig.querySelectorAll(".tks-chip")) c.classList.remove("on");
+			chip.classList.add("on");
+			const text = chip.querySelector(".tks-text")?.textContent ?? "";
+			const note = chip.dataset.note ? ` — ${chip.dataset.note}` : "";
+			if (out)
+				out.innerHTML = `<strong>${text.replace(/</g, "&lt;")}</strong> · ${chip.dataset.desc ?? ""}${note}`;
+		};
+		const show = (i: number, sel?: number) => {
+			for (const v of views) v.hidden = Number(v.dataset.i) !== i;
+			for (const t of fig.querySelectorAll<HTMLElement>(".tks-tab"))
+				t.setAttribute("aria-selected", String(Number(t.dataset.i) === i));
+			const chips = views[i]?.querySelectorAll<HTMLElement>(".tks-chip");
+			if (chips?.length) pick(chips[Math.min(sel ?? 0, chips.length - 1)]);
+		};
+		for (const t of fig.querySelectorAll<HTMLElement>(".tks-tab"))
+			t.addEventListener("click", () => show(Number(t.dataset.i)));
+		for (const c of fig.querySelectorAll<HTMLElement>(".tks-chip")) {
+			c.addEventListener("mouseenter", () => pick(c));
+			c.addEventListener("click", () => pick(c));
+			c.addEventListener("focus", () => pick(c));
+		}
+		show(Number(fig.dataset.view ?? 0), Number(fig.dataset.sel ?? 0));
+	}
+</script>
+
+<style>
+	.tks { margin: 1.75rem 0; font-family: var(--sans); }
+	.tks-title { text-align: center; font-size: 0.9rem; font-weight: 600; margin-bottom: 0.4rem; }
+	.tks-tabs { display: flex; gap: 0.4rem; justify-content: center; margin-bottom: 0.5rem; flex-wrap: wrap; }
+	.tks-tab {
+		font: 0.78rem var(--sans); padding: 0.25rem 0.7rem; border-radius: 999px;
+		border: 1px solid var(--faint); background: var(--bg); color: var(--text); cursor: pointer;
+	}
+	.tks-tab[aria-selected="true"] { background: var(--accent); border-color: var(--accent); color: var(--bg); }
+	.tks-view { padding: 0.6rem; border: 1px solid var(--faint); border-radius: 10px; background: var(--surface); }
+	.tks-view[hidden] { display: none; }
+	.tks-len { margin: 0 0 0.4rem; font-size: 0.72rem; color: var(--muted); }
+	.tks-row { display: flex; flex-wrap: wrap; gap: 0.3rem; align-items: stretch; }
+	.tks-block {
+		align-self: stretch; display: flex; align-items: center; padding: 0 0.3rem 0 0.4rem;
+		border-left: 2px solid var(--accent); font: 600 0.6rem var(--mono); color: var(--accent);
+	}
+	.tks-chip {
+		display: inline-flex; flex-direction: column; align-items: center; gap: 0.05rem;
+		min-width: 1.8rem; padding: 0.2rem 0.35rem; border-radius: 6px; cursor: pointer;
+		border: 1px solid color-mix(in oklch, #1a1a1a 22%, transparent); color: #1a1a1a;
+		font: inherit;
+	}
+	.tks-chip.on { outline: 2.5px solid var(--accent); outline-offset: 1px; }
+	.tks-text { font: 0.74rem var(--mono); white-space: pre; }
+	.tks-count { font: 600 0.66rem var(--mono); }
+	.tks-id { font: 0.56rem var(--mono); opacity: 0.7; }
+	.k-special { background: #e8b4b4; }
+	.k-role { background: #f5d38c; }
+	.k-text { background: #9fc8ef; }
+	.k-space { background: #d6d3ca; }
+	.k-vision { background: #c4b0e6; }
+	.k-image { background: #a8dbb0; }
+	.k-partial { background: #f2c49b; }
+	.tks-chip.run { border-style: dashed; border-width: 1.5px; }
+	.tks-detail {
+		margin: 0.5rem 0 0; padding: 0.45rem 0.75rem; border-left: 3px solid var(--accent);
+		background: var(--surface); font: 0.78rem var(--mono); min-height: 1.2rem;
+	}
+	.tks-legend { display: flex; flex-wrap: wrap; gap: 0.3rem 0.9rem; margin: 0.45rem 0 0; font-size: 0.72rem; color: var(--muted); }
+	.tks-key { display: inline-flex; align-items: center; gap: 0.3rem; }
+	.tks-swatch { width: 0.8rem; height: 0.8rem; border-radius: 3px; border: 1px solid color-mix(in oklch, #1a1a1a 22%, transparent); }
+	/* After the font shorthands above, which reset it: ligatures would draw "<|" as a triangle. */
+	.tks-text,
+	.tks-detail { font-variant-ligatures: none; font-feature-settings: "calt" 0, "liga" 0; }
+</style>

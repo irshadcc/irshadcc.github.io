@@ -1,0 +1,99 @@
+---
+// Compares LU, QR, symmetric eigendecomposition and SVD as pipelines of simple matrix maps.
+// Each tab shows a verified 2×2 example, the structure of its factors, and the question it answers.
+// Usage in .mdx:
+//   <MatrixDecompositionExplorer initial="svd" />
+import {
+	type DecompositionKind,
+	decompositionExamples,
+} from "./decompositions";
+
+interface Props {
+	initial?: DecompositionKind;
+}
+const { initial = "lu" } = Astro.props;
+const format = (x: number) => {
+	if (Math.abs(x) < 1e-10) return "0";
+	if (Math.abs(x - Math.round(x)) < 1e-10) return String(Math.round(x));
+	return x.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
+};
+---
+
+<figure class="decomp" data-active={initial}>
+	<div class="tabs" role="tablist" aria-label="Choose a matrix decomposition">
+		{decompositionExamples.map((example) => (
+			<button type="button" role="tab" data-kind={example.kind} aria-selected={example.kind === initial}>
+				{example.name}
+			</button>
+		))}
+	</div>
+	{decompositionExamples.map((example) => (
+		<section class="panel" data-kind={example.kind} hidden={example.kind !== initial}>
+			<div class="question">
+				<strong>{example.question}</strong>
+				<span>{example.answer}</span>
+			</div>
+			<div class="pipeline" aria-label={`${example.name} example: ${example.formula}`}>
+				<div class="matrix-wrap input">
+					<span class="label">A</span>
+					<div class="matrix">{example.matrix.flatMap((row) => row.map((x) => <span>{format(x)}</span>))}</div>
+					<small>original map</small>
+				</div>
+				<span class="equals">=</span>
+				{example.factors.map((factor, i) => (
+					<>
+						{i > 0 && <span class="times">×</span>}
+						<div class="matrix-wrap">
+							<span class="label">{factor.label}</span>
+							<div class="matrix">{factor.values.flatMap((row) => row.map((x) => <span>{format(x)}</span>))}</div>
+							<small>{factor.role}</small>
+						</div>
+					</>
+				))}
+			</div>
+			<p class="formula">{example.formula}</p>
+		</section>
+	))}
+	<figcaption>One matrix, rewritten as a pipeline of structured maps. Choose a tab to compare the jobs.</figcaption>
+</figure>
+
+<script>
+	document.querySelectorAll<HTMLElement>(".decomp").forEach((root) => {
+		const tabs = [...root.querySelectorAll<HTMLButtonElement>("[role=tab]")];
+		const panels = [...root.querySelectorAll<HTMLElement>(".panel")];
+		for (const tab of tabs) tab.addEventListener("click", () => {
+			const kind = tab.dataset.kind;
+			root.dataset.active = kind;
+			for (const candidate of tabs) candidate.setAttribute("aria-selected", String(candidate === tab));
+			for (const panel of panels) panel.hidden = panel.dataset.kind !== kind;
+		});
+	});
+</script>
+
+<style>
+	.decomp { margin: 2rem 0; border: 1px solid var(--faint); border-radius: 12px; overflow: hidden; background: var(--surface); }
+	.tabs { display: grid; grid-template-columns: repeat(4, 1fr); border-bottom: 1px solid var(--faint); }
+	.tabs button { border: 0; border-right: 1px solid var(--faint); padding: .65rem .4rem; color: var(--muted); background: transparent; font: 600 .78rem var(--sans); cursor: pointer; }
+	.tabs button:last-child { border-right: 0; }
+	.tabs button[aria-selected="true"] { color: var(--accent); background: var(--bg); box-shadow: inset 0 -2px var(--accent); }
+	.panel { padding: 1rem; background: var(--bg); }
+	.panel[hidden] { display: none; }
+	.question { display: grid; gap: .15rem; text-align: center; margin-bottom: 1rem; }
+	.question strong { font: 600 .88rem var(--sans); }
+	.question span { color: var(--muted); font-size: .86rem; }
+	.pipeline { display: flex; align-items: center; justify-content: center; gap: .55rem; overflow-x: auto; padding: .3rem .2rem .6rem; }
+	.matrix-wrap { flex: 0 0 auto; display: grid; justify-items: center; gap: .25rem; }
+	.matrix-wrap .label { color: var(--accent); font: 700 .8rem var(--sans); }
+	.matrix { display: grid; grid-template-columns: repeat(2, 2.05rem); position: relative; padding: .2rem .4rem; font: .78rem/1.7 var(--mono); text-align: center; }
+	.matrix::before, .matrix::after { content: ""; position: absolute; top: 0; bottom: 0; width: .28rem; border-top: 1.5px solid var(--text); border-bottom: 1.5px solid var(--text); }
+	.matrix::before { left: 0; border-left: 1.5px solid var(--text); }
+	.matrix::after { right: 0; border-right: 1.5px solid var(--text); }
+	.matrix-wrap small { width: 6.2rem; min-height: 2.3em; color: var(--muted); font: .62rem/1.15 var(--sans); text-align: center; }
+	.equals, .times { flex: 0 0 auto; color: var(--muted); font-family: var(--mono); }
+	.formula { margin: .6rem 0 0; color: var(--accent); font: 600 .9rem var(--mono); text-align: center; }
+	figcaption { padding: .65rem 1rem .75rem; border-top: 1px solid var(--faint); color: var(--muted); font-size: .8rem; text-align: center; }
+	@media (max-width: 560px) {
+		.pipeline { justify-content: flex-start; }
+		.matrix { grid-template-columns: repeat(2, 1.85rem); }
+	}
+</style>

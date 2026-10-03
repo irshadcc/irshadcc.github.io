@@ -1,0 +1,95 @@
+---
+// Step-through of SGLang's radix cache over a flat pool of token slots (simulated in
+// radixTree.ts, page_size = 1). Top: the radix tree, root on the left; each node shows its
+// tokens, the KV slots holding them and its lock_ref when a running request uses it, coloured
+// by the request that inserted it. Middle: every slot of the KV pool, coloured by a running
+// request, shaded as owned by the tree, or blank when free. Bottom: each running request's
+// req_to_token row; outlined entries came from the cache. Hover a node or slot for details.
+// Usage in .mdx:
+//   <RadixTreeSteps />
+//   <RadixTreeSteps step={3} title="A prefix match splits a node" />
+import StepControls from "../compiler/StepControls.astro";
+import { REQ_COLORS } from "./kvcache";
+import {
+	RADIX_EVENTS,
+	RADIX_SLOTS,
+	type REvent,
+	drawRadix,
+	runRadix,
+} from "./radixTree";
+
+interface Props {
+	events?: REvent[];
+	slots?: number;
+	step?: number;
+	title?: string;
+}
+
+const {
+	events = RADIX_EVENTS,
+	slots = RADIX_SLOTS,
+	step = 0,
+	title = "SGLang's radix cache, step by step",
+} = Astro.props;
+const frames = runRadix(slots, events);
+const reqIds = [...new Set(events.map((e) => e.req))];
+const colors = Object.fromEntries(
+	reqIds.map((id, i) => [id, REQ_COLORS[i % REQ_COLORS.length]]),
+);
+const at = Math.max(0, Math.min(frames.length - 1, step));
+---
+
+<figure class="rts" data-step={at} tabindex="-1">
+	<figcaption class="rts-title">{title}</figcaption>
+	<StepControls labels={frames.map((f) => f.label)} step={at} />
+	<div class="rts-canvas">
+		{frames.map((f, i) => <div class="rts-frame" hidden={i !== at} set:html={drawRadix(f, colors)} />)}
+	</div>
+	<div class="rts-notes">
+		{frames.map((f, i) => <p hidden={i !== at}>{f.note}</p>)}
+	</div>
+</figure>
+
+<script>
+	import { bindStepper } from "../compiler/stepper";
+	for (const fig of document.querySelectorAll<HTMLElement>(".rts")) {
+		const frames = [...fig.querySelectorAll<HTMLElement>(".rts-frame")];
+		const notes = [...fig.querySelectorAll<HTMLElement>(".rts-notes p")];
+		bindStepper(fig, frames.length, (i) => {
+			frames.forEach((f, k) => { f.hidden = k !== i; });
+			notes.forEach((n, k) => { n.hidden = k !== i; });
+		});
+	}
+</script>
+
+<style>
+	.rts { margin: 1.75rem 0; font-family: var(--sans); outline: none; }
+	.rts-title { text-align: center; font-size: 0.9rem; font-weight: 600; }
+	.rts-canvas { overflow-x: auto; padding: 0.6rem; border: 1px solid var(--faint); border-radius: 10px; background: var(--surface); }
+	.rts-frame[hidden] { display: none; }
+	.rts-frame :global(svg) { display: block; max-width: none; margin: 0 auto; }
+	.rts-frame :global(.rn rect) { stroke: color-mix(in oklch, #1a1a1a 25%, transparent); }
+	.rts-frame :global(.rn.root rect) { fill: var(--bg); stroke: var(--faint); }
+	.rts-frame :global(.rn.locked rect) { stroke: #1a1a1a; stroke-width: 1.6; }
+	.rts-frame :global(.rn.focus rect) { stroke: var(--accent); stroke-width: 2.5; }
+	.rts-frame :global(.rn-key) { font: 600 0.66rem var(--mono); fill: #1a1a1a; }
+	.rts-frame :global(.rn.root .rn-key) { fill: var(--muted); font-weight: 400; }
+	.rts-frame :global(.rn-val) { font: 0.58rem var(--mono); fill: #3a3a36; }
+	.rts-frame :global(.re) { fill: none; stroke: var(--muted); stroke-width: 1.2; }
+	.rts-frame :global(.rl) { font: 0.68rem var(--sans); fill: var(--muted); }
+	.rts-frame :global(.rs rect) { fill: var(--bg); stroke: var(--faint); }
+	.rts-frame :global(.rs.tree rect) { fill: var(--accent-soft); stroke: var(--accent); stroke-opacity: 0.5; }
+	.rts-frame :global(.rs.pad rect) { fill: var(--surface); stroke-dasharray: 2 2; }
+	.rts-frame :global(.rs.focus rect) { stroke: var(--accent); stroke-width: 2.2; stroke-opacity: 1; }
+	.rts-frame :global(.rs text) { font: 0.55rem var(--mono); fill: var(--muted); text-anchor: middle; }
+	.rts-frame :global(.rs.req text) { fill: #1a1a1a; }
+	.rts-frame :global(.rs.tree text) { fill: var(--text); }
+	.rts-frame :global(.rq rect) { fill: var(--bg); stroke: var(--faint); }
+	.rts-frame :global(.rq.hit rect) { stroke: var(--accent); stroke-width: 2; }
+	.rts-frame :global(.rq text),
+	.rts-frame :global(.rr-name) { font: 600 0.6rem var(--mono); fill: var(--text); text-anchor: middle; }
+	.rts-frame :global(.rr-name) { fill: #1a1a1a; }
+	.rts-notes { min-height: 3.2em; margin-top: 0.55rem; padding: 0.55rem 0.75rem; border-left: 3px solid var(--accent); background: var(--surface); font-size: 0.82rem; line-height: 1.5; }
+	.rts-notes p { margin: 0; }
+	.rts-notes p[hidden] { display: none; }
+</style>

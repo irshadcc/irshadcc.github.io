@@ -1,0 +1,261 @@
+---
+// Step-through or interactive sequence diagram of the Global Interpreter Lock (GIL) switching mechanism
+// Usage in .mdx:
+//   <GilDiagram />
+
+interface Step {
+	title: string;
+	t1State: string;
+	t2State: string;
+	gilState: string;
+	breakerState: string;
+	description: string;
+}
+
+const steps: Step[] = [
+	{
+		title: "1. Thread 1 Holds GIL",
+		t1State: "Executing Bytecode",
+		t2State: "Blocked (Waiting on CV)",
+		gilState: "Locked by Thread 1",
+		breakerState: "eval_breaker = 0",
+		description:
+			"Thread 1 holds the GIL mutex and executes straight-line bytecode at full speed. Thread 2 is suspended on the GIL condition variable (pthread_cond_wait).",
+	},
+	{
+		title: "2. Switch Interval Timeout (5ms)",
+		t1State: "Executing Bytecode",
+		t2State: "Wakes from Timeout",
+		gilState: "Locked by Thread 1",
+		breakerState: "eval_breaker = 0",
+		description:
+			"The switch interval (sys.getswitchinterval(), default 5ms) expires. Thread 2's timed wait returns without acquiring the lock.",
+	},
+	{
+		title: "3. GIL Drop Requested",
+		t1State: "Approaching Loop Back-Edge",
+		t2State: "Signals Drop Request",
+		gilState: "Locked (Drop Requested)",
+		breakerState: "eval_breaker = 1",
+		description:
+			"Thread 2 sets gil_drop_request = 1, which atomically triggers eval_breaker = 1 on Thread 1. Thread 2 resumes waiting on the condition variable.",
+	},
+	{
+		title: "4. Checkpoint Triggered",
+		t1State: "CHECK_EVAL_BREAKER() Triggered",
+		t2State: "Waiting for Release",
+		gilState: "About to Release",
+		breakerState: "Jump to handle_eval_breaker",
+		description:
+			"Thread 1 hits a loop back-edge (JUMP_BACKWARD) or function entry (RESUME). CHECK_EVAL_BREAKER() detects eval_breaker != 0 and branches to handle_eval_breaker.",
+	},
+	{
+		title: "5. GIL Handover & Thread Switch",
+		t1State: "Releases GIL & Waits",
+		t2State: "Acquires GIL & Runs",
+		gilState: "Locked by Thread 2",
+		breakerState: "eval_breaker = 0",
+		description:
+			"Thread 1 calls drop_gil(), releases the mutex, and signals the condition variable. Thread 2 takes the GIL (take_gil()) and starts executing bytecode. Thread 1 now waits.",
+	},
+];
+---
+
+<figure class="gilf" tabindex="-1">
+	<figcaption>The CPython Global Interpreter Lock (GIL) Handover Protocol</figcaption>
+
+	<!-- Controls / Step Selector -->
+	<div class="gil-stepper">
+		<div class="gil-buttons" role="tablist">
+			{steps.map((s, idx) => (
+				<button type="button" class:list={["gil-btn", { active: idx === 0 }]} data-step={idx}>
+					{s.title}
+				</button>
+			))}
+		</div>
+
+		<!-- State visualization board -->
+		<div class="gil-board">
+			<div class="gil-actor-card t1">
+				<div class="gil-actor-title">Thread 1 (CPU Thread)</div>
+				<div class="gil-actor-status" data-target="t1">{steps[0].t1State}</div>
+			</div>
+			<div class="gil-lock-card">
+				<div class="gil-lock-title">Global Interpreter Lock</div>
+				<div class="gil-lock-status" data-target="gil">{steps[0].gilState}</div>
+				<div class="gil-breaker-status" data-target="breaker">{steps[0].breakerState}</div>
+			</div>
+			<div class="gil-actor-card t2">
+				<div class="gil-actor-title">Thread 2 (Waiting Thread)</div>
+				<div class="gil-actor-status" data-target="t2">{steps[0].t2State}</div>
+			</div>
+		</div>
+
+		<!-- Explanation box -->
+		<div class="gil-explanation">
+			<div class="gil-expl-title">Handover Mechanism:</div>
+			<p class="gil-expl-text">{steps[0].description}</p>
+		</div>
+	</div>
+
+	<script type="application/json" class="gil-data" set:html={JSON.stringify(steps)} />
+</figure>
+
+<script>
+	for (const fig of document.querySelectorAll<HTMLElement>(".gilf")) {
+		const stepsData = JSON.parse(fig.querySelector(".gil-data")?.textContent ?? "[]") as Array<{
+			t1State: string;
+			t2State: string;
+			gilState: string;
+			breakerState: string;
+			description: string;
+		}>;
+
+		const btns = [...fig.querySelectorAll<HTMLButtonElement>(".gil-btn")];
+		const t1El = fig.querySelector<HTMLElement>('[data-target="t1"]');
+		const t2El = fig.querySelector<HTMLElement>('[data-target="t2"]');
+		const gilEl = fig.querySelector<HTMLElement>('[data-target="gil"]');
+		const breakerEl = fig.querySelector<HTMLElement>('[data-target="breaker"]');
+		const explEl = fig.querySelector<HTMLElement>(".gil-expl-text");
+
+		btns.forEach((btn, idx) => {
+			btn.addEventListener("click", () => {
+				btns.forEach((b, k) => b.classList.toggle("active", k === idx));
+				const s = stepsData[idx];
+				if (!s) return;
+				if (t1El) t1El.textContent = s.t1State;
+				if (t2El) t2El.textContent = s.t2State;
+				if (gilEl) gilEl.textContent = s.gilState;
+				if (breakerEl) breakerEl.textContent = s.breakerState;
+				if (explEl) explEl.textContent = s.description;
+			});
+		});
+	}
+</script>
+
+<style>
+	.gilf {
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+		outline: none;
+	}
+	.gilf figcaption {
+		text-align: center;
+		font-size: 0.9rem;
+		font-weight: 600;
+		margin-bottom: 0.65rem;
+		color: var(--text);
+	}
+	.gil-stepper {
+		border: 1px solid var(--faint);
+		border-radius: 8px;
+		background: var(--surface);
+		padding: 0.75rem;
+	}
+	.gil-buttons {
+		display: flex;
+		gap: 0.35rem;
+		flex-wrap: wrap;
+		margin-bottom: 0.75rem;
+		border-bottom: 1px solid var(--faint);
+		padding-bottom: 0.5rem;
+	}
+	.gil-btn {
+		background: var(--bg);
+		border: 1px solid var(--faint);
+		border-radius: 5px;
+		padding: 0.35rem 0.55rem;
+		font-size: 0.74rem;
+		font-family: var(--sans);
+		font-weight: 600;
+		color: var(--muted);
+		cursor: pointer;
+		transition: all 140ms ease;
+	}
+	.gil-btn:hover {
+		color: var(--text);
+		border-color: var(--accent);
+	}
+	.gil-btn.active {
+		background: var(--accent-soft);
+		border-color: var(--accent);
+		color: var(--text);
+	}
+	.gil-board {
+		display: grid;
+		grid-template-columns: 1fr 1.2fr 1fr;
+		gap: 0.65rem;
+		align-items: stretch;
+		margin-bottom: 0.75rem;
+	}
+	.gil-actor-card,
+	.gil-lock-card {
+		background: var(--bg);
+		border: 1px solid var(--faint);
+		border-radius: 6px;
+		padding: 0.65rem;
+		display: flex;
+		flex-direction: column;
+		gap: 0.35rem;
+	}
+	.gil-actor-title,
+	.gil-lock-title {
+		font-size: 0.72rem;
+		font-weight: 700;
+		text-transform: uppercase;
+		letter-spacing: 0.03em;
+		color: var(--muted);
+		border-bottom: 1px solid var(--faint);
+		padding-bottom: 0.25rem;
+	}
+	.gil-actor-status,
+	.gil-lock-status {
+		font-size: 0.8rem;
+		font-weight: 600;
+		color: var(--text);
+		line-height: 1.35;
+	}
+	.gil-lock-card {
+		border-color: var(--accent);
+		background: var(--accent-soft);
+		text-align: center;
+	}
+	.gil-lock-card .gil-lock-title {
+		border-color: var(--faint);
+		color: var(--accent);
+	}
+	.gil-breaker-status {
+		font-family: var(--mono);
+		font-size: 0.72rem;
+		color: var(--accent);
+		margin-top: auto;
+		padding: 0.2rem;
+		background: var(--bg);
+		border-radius: 4px;
+		border: 1px solid var(--faint);
+	}
+	.gil-explanation {
+		padding: 0.65rem 0.85rem;
+		background: var(--bg);
+		border-left: 3px solid var(--accent);
+		border-radius: 0 6px 6px 0;
+		font-size: 0.8rem;
+		line-height: 1.5;
+	}
+	.gil-expl-title {
+		font-weight: 700;
+		font-size: 0.72rem;
+		text-transform: uppercase;
+		color: var(--muted);
+		margin-bottom: 0.15rem;
+	}
+	.gil-expl-text {
+		margin: 0;
+		color: var(--text);
+	}
+	@media (max-width: 680px) {
+		.gil-board {
+			grid-template-columns: 1fr;
+		}
+	}
+</style>

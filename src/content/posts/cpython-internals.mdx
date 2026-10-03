@@ -1,0 +1,864 @@
+---
+title: "CPython Internals: The Interpreter Loop and Free-Threading"
+description: "A tour of CPython's execution engine: bytecode compilation, the computed gotos dispatch loop, frame layouts, essential runtime structs, the GIL, and Biased Reference Counting (PEP 703)."
+date: 2026-10-03
+tags: [Python, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import BytecodeStepper from "../../utils/cpython/BytecodeStepper.astro";
+import InterpreterLoopDiagram from "../../utils/cpython/InterpreterLoopDiagram.astro";
+import FrameMemoryDiagram from "../../utils/cpython/FrameMemoryDiagram.astro";
+import GilDiagram from "../../utils/cpython/GilDiagram.astro";
+import BrcDiagram from "../../utils/cpython/BrcDiagram.astro";
+
+## Background
+
+When you write `a + b * 2` in Python, the CPython runtime does not directly parse strings or evaluate
+syntax trees at runtime. Instead, Python compiles source code into an immutable sequence of compact
+instructions known as **bytecode**. The heart of CPython is an execution engine that fetches these
+instructions one by one and evaluates them against an operand stack.
+
+Understanding this engine matters for several reasons. First, performance profiling and high-performance
+libraries cannot treat Python as a black box: knowing whether an operation involves a dictionary lookup,
+an object allocation, or an inline cache hit explains why certain coding idioms run an order of magnitude
+faster. Second, recent CPython releases (Python 3.11 through 3.13) overhauled the virtual machine with
+adaptive specialization (PEP 659), contiguous thread-stack frames, per-interpreter GILs (PEP 684),
+and free-threaded execution (PEP 703) using Biased Reference Counting. Finally, major systems frameworks—including
+PyTorch's TorchDynamo compiler—hook directly into CPython's frame evaluation APIs (PEP 523) to intercept
+bytecode and produce optimized native kernels.
+
+This post walks through the CPython execution engine from the ground up:
+1. Bytecode compilation and 16-bit code units.
+2. Core runtime structs for objects, types, code, and threads.
+3. The contiguous memory layout of `_PyInterpreterFrame`.
+4. The central evaluation loop (`_PyEval_EvalFrameDefault`) and computed `goto` dispatching.
+5. The special C macros governing stack manipulation and frame inlining.
+6. A worked execution trace on the evaluation stack.
+7. Important bytecode instruction families.
+8. The Global Interpreter Lock (GIL) and its handover protocol.
+9. Biased Reference Counting (BRC) and lock-free multi-threading.
+10. Key internal runtime APIs and extensibility hooks.
+
+## Bytecode and Code Units
+
+Python's compilation pipeline converts human-readable source code into a binary **code object**
+(`PyCodeObject`) through three distinct phases:
+
+1. **Parsing**: The source text is parsed into an Abstract Syntax Tree (AST) using a PEG (Parsing Expression Grammar) parser.
+2. **Control Flow Graph (CFG)**: The compiler lowers the AST into basic blocks of instructions, resolving jumps and calculating the maximum required evaluation stack depth (`co_stacksize`).
+3. **Bytecode Emission**: The basic blocks are assembled into a linear array of bytes stored in `co_code`.
+
+In Python 3.11 and later, all instructions are formatted as uniform 16-bit **code units** (`_Py_CODEUNIT`).
+Each 16-bit code unit consists of two 8-bit bytes: an 8-bit **opcode** and an 8-bit **oparg**
+(instruction argument).
+
+```
++-------------------+-------------------+
+|    opcode (8-bit) |     oparg (8-bit) |
++-------------------+-------------------+
+ 0                 7 8                15
+```
+
+If an instruction requires an argument larger than 255 (the maximum value an 8-bit byte can store),
+the compiler emits an `EXTENDED_ARG` instruction immediately before it. Each `EXTENDED_ARG` supplies
+the next most significant 8 bits, shifting previously accumulated bits left:
+
+$$
+\text{accumulated\_oparg} = (\text{accumulated\_oparg} \ll 8) \mid \text{current\_oparg}
+$$
+
+Consider a simple function that computes $a + b \times 2$:
+
+```python
+def compute(a, b):
+    return a + b * 2
+```
+
+We can inspect the compiled bytecode using Python's standard `dis` module:
+
+```python
+import dis
+dis.dis(compute)
+```
+
+The disassembler outputs the following instruction sequence:
+
+```text
+  2           0 RESUME                   0
+              2 LOAD_FAST                0 (a)
+              4 LOAD_FAST                1 (b)
+              6 LOAD_CONST               1 (2)
+              8 BINARY_OP                5 (*)
+             12 BINARY_OP                0 (+)
+             16 RETURN_VALUE
+```
+
+Notice the offset numbering: instruction offsets advance by 2 bytes per 16-bit code unit. However,
+between offset 8 (`BINARY_OP 5`) and offset 12 (`BINARY_OP 0`), the offset increases by 4 bytes
+instead of 2. That extra 2-byte slot at offset 10 is an **inline cache entry** (`CACHE`), reserved
+by the compiler for modern CPython's adaptive specialization engine.
+
+<Sidenote>
+In Python 3.10 and earlier, opcodes occupied 2 bytes but instructions had no inline cache entries.
+PEP 659 introduced variable numbers of 16-bit cache entries placed directly after specialized instructions
+in the code array.
+</Sidenote>
+
+The bytecode instructions do not operate on general-purpose hardware registers (like `rax` or `rbx` in x86).
+Instead, CPython is a **stack machine**: instructions push operands onto an evaluation stack, and
+subsequent operations pop their inputs from the stack and push their result back onto it.
+
+## Core Runtime Structs
+
+Everything in CPython—from simple integers to running threads—is represented by concrete C structs.
+Understanding their layouts reveals how Python achieves object-oriented dynamism in C.
+
+### PyObject and PyVarObject
+
+Every Python object pointer can be safely cast to `PyObject*`. In standard builds with the GIL,
+`PyObject` is defined as:
+
+```c
+struct _object {
+    union {
+        Py_ssize_t ob_refcnt;
+#if SIZEOF_VOID_P > 4
+        uint32_t ob_refcnt_split[2];
+#endif
+    };
+    PyTypeObject *ob_type;
+};
+```
+
+- `ob_refcnt`: The reference count. When it reaches zero, the object is deallocated via `ob_type->tp_dealloc`. In Python 3.12+, static strings and small integers are marked immortal (`ob_refcnt = 0xFFFFFFFF`), eliminating atomic bus writes.
+- `ob_type`: Pointer to the object's type descriptor (`PyTypeObject`), which defines its methods, attributes, and memory footprint.
+
+For variable-length containers (such as `tuple`, `list`, `str`, and `bytes`), the header extends to
+`PyVarObject`:
+
+```c
+typedef struct {
+    PyObject ob_base;
+    Py_ssize_t ob_size; /* Number of items in variable part */
+} PyVarObject;
+```
+
+The `ob_size` field stores the logical count of items (for instance, the number of elements in a tuple),
+allowing C functions like `PyTuple_GET_SIZE` to read lengths in $O(1)$ time with a single memory load.
+
+### PyTypeObject
+
+In Python, classes are themselves objects (`type` is an instance of `type`). A type's layout and behavior
+are defined by `struct _typeobject`. Its most critical fields include:
+
+- `tp_name`: The human-readable name of the type (e.g. `"int"`, `"dict"`).
+- `tp_basicsize` and `tp_itemsize`: Allocation geometry. Fixed-size objects allocate `tp_basicsize` bytes; variable-length objects allocate $\text{tp\_basicsize} + N \times \text{tp\_itemsize}$.
+- `tp_dealloc`: Destructor function pointer invoked when the object's refcount drops to zero.
+- **Method Suites**: Pointers to feature-specific method tables:
+  - `tp_as_number`: Pointers to arithmetic operations (`nb_add`, `nb_multiply`, `nb_subtract`).
+  - `tp_as_sequence`: Pointers to indexing and slicing (`sq_item`, `sq_concat`).
+  - `tp_as_mapping`: Pointers to key-value lookups (`mp_subscript`, `mp_ass_subscript`).
+- `tp_call` and `tp_vectorcall_offset`: Pointers to the fast-call evaluation protocol.
+- `tp_iternext`: Function pointer invoked on every step of iteration (by `FOR_ITER`).
+
+### PyCodeObject
+
+A `PyCodeObject` holds the immutable binary representation of a compiled function or module:
+
+- `co_code`: `PyObject*` pointing to the raw bytes of 16-bit code units.
+- `co_consts`: A tuple containing literal constants (numbers, strings, sub-code objects).
+- `co_names`: A tuple of global attribute and variable names.
+- `co_varnames`: A tuple of fast local variable names.
+- `co_localsplusnames`: Unified metadata describing parameters, local variables, cell variables, and free closure variables.
+- `co_stacksize`: The statically computed maximum depth of the evaluation stack required by this code.
+- `co_exceptiontable`: A binary table mapping bytecode instruction ranges to exception handler offsets and stack unwinding depths.
+
+### PyDictObject and Split Tables
+
+Python dictionaries are among the most heavily optimized data structures in the runtime. Modern CPython
+uses a compact, split-table hash table (PEP 412):
+
+```c
+typedef struct {
+    PyObject_HEAD
+    Py_ssize_t ma_used;            /* Active item count */
+    uint64_t ma_version_tag;       /* Monotonically increasing version */
+    PyDictKeysObject *ma_keys;     /* Shared keys table */
+    PyDictValues *ma_values;       /* Per-instance values array (or NULL) */
+} PyDictObject;
+```
+
+Rather than storing a sparse array of 24-byte `(hash, key, value)` entries, `ma_keys` stores a compact
+sparse array of 8-bit or 16-bit indices into a dense array of entries:
+
+$$
+\text{hash}(key) \pmod{\text{table\_size}} \implies \text{index} \implies \text{entries}[\text{index}]
+$$
+
+For instances of classes, all instances of the same class share the exact same `ma_keys` pointer!
+Each instance stores only its own `ma_values` array, reducing instance memory usage by over 40%.
+The `ma_version_tag` counter powers inline cache validation in `LOAD_GLOBAL` and `LOAD_ATTR`.
+
+### Execution Hierarchy
+
+CPython organizes runtime execution into three nested scopes:
+
+```
+Process Singleton (_PyRuntime)
+   └── Interpreter (PyInterpreterState)
+          └── Thread (PyThreadState)
+                 └── Frame (_PyInterpreterFrame)
+```
+
+1. **`_PyRuntimeState` (`_PyRuntime`)**: The process-wide singleton. It manages process initialization, the memory allocator (`obmalloc`), signal handling queues, and pre-allocated static objects.
+2. **`PyInterpreterState` (`interp`)**: An isolated execution sandbox. Each interpreter possesses its own loaded module dictionary (`interp->modules`), imported built-ins, frame evaluation hook (`eval_frame`), and—since Python 3.12 (PEP 684)—its own dedicated Global Interpreter Lock (`interp->ceval.gil`).
+3. **`PyThreadState` (`tstate`)**: Represents an operating system thread executing Python bytecode. It holds the active interpreter frame (`cframe.current_frame`), thread-local recursion limit counters, asynchronous exception queues, and the thread's contiguous data stack chunk (`datastack_chunk`).
+
+## The Frame Stack
+
+Every invocation of a Python function needs an execution context to store its local variables, its
+current instruction pointer, and its evaluation stack. In CPython, this execution context is called
+an **interpreter frame**.
+
+Before Python 3.11, every single function call allocated a full heap object (`PyFrameObject`) via `PyObject_GC_New`.
+For programs with deep call chains or recursion, constantly allocating and freeing heap frames resulted in
+heavy allocator churn and poor CPU data cache locality.
+
+Starting in Python 3.11, CPython separated the user-visible Python frame object from the internal execution
+frame. The internal execution frame is a lightweight C struct named `_PyInterpreterFrame`. These structs
+are allocated contiguously on a per-thread data stack (`tstate->datastack_chunk`). A full `PyFrameObject`
+is created lazily on the heap only if user code explicitly inspects the call stack (for example, by calling
+`sys._getframe()` or inspecting a traceback).
+
+<FrameMemoryDiagram />
+
+The `_PyInterpreterFrame` struct contains four primary sections:
+
+1. **Linkage & Control**:
+   - `previous`: Pointer to the caller's `_PyInterpreterFrame`, forming a linked stack of frames.
+   - `prev_instr`: Pointer to the previously executed 16-bit `_Py_CODEUNIT`.
+   - `stacktop`: Integer offset indicating the current top-of-stack depth.
+   - `return_offset`: The bytecode offset where execution resumes in the caller upon return.
+   - `owner`: Flag indicating whether the frame memory is owned by the thread stack, a generator object, or the C stack.
+
+2. **Execution Specials**:
+   - `f_code`: Strong reference to the `PyCodeObject` being executed.
+   - `f_funcobj`: Strong reference to the `PyFunctionObject` that was invoked.
+   - `f_globals` and `f_builtins`: Borrowed references to the module's global and built-in dictionaries.
+   - `f_locals`: Strong reference to the function's local dictionary (for module or class scopes; `NULL` for optimized functions).
+   - `frame_obj`: Pointer to the heap `PyFrameObject` if one was materialized.
+
+3. **Fast Locals Array (`localsplus`)**:
+   - Defined as a flexible array member: `PyObject *localsplus[1]`.
+   - The first `co_nlocalsplus` slots store the function's local arguments and fast variables.
+   - Accessing local variable `oparg` requires no hash table lookup: the runtime performs a direct array index `frame->localsplus[oparg]`, running in $O(1)$ time with a single memory read.
+
+4. **Operand Evaluation Stack**:
+   - The evaluation stack occupies the memory immediately following the local variables in `localsplus`.
+   - The register variable `stack_pointer` points to the memory slot just above the current top of stack.
+   - Pushing an object writes to `*stack_pointer++`, and popping reads from `*--stack_pointer`.
+
+Because `localsplus` and the evaluation stack reside contiguously inside `_PyInterpreterFrame`, all
+temporary values accessed by a function remain hot in the CPU's L1 data cache.
+
+## The Evaluation Loop
+
+The main execution engine of CPython lives in `Python/ceval.c` inside the function:
+
+```c
+PyObject* _Py_HOT_FUNCTION
+_PyEval_EvalFrameDefault(PyThreadState *tstate, _PyInterpreterFrame *frame, int throwflag)
+```
+
+When called, `_PyEval_EvalFrameDefault` caches key pointers into CPU registers:
+
+```c
+_Py_CODEUNIT *next_instr;   /* Instruction pointer */
+PyObject **stack_pointer;  /* Top of operand stack */
+```
+
+### Computed GOTO Dispatch
+
+A textbook bytecode interpreter uses a `while (true)` loop with a giant C `switch (opcode)` statement:
+
+```c
+/* Naive switch-based interpreter */
+while (1) {
+    opcode = next_instr->op.code;
+    oparg = next_instr->op.arg;
+    next_instr++;
+    switch (opcode) {
+        case LOAD_FAST:
+            /* ... */
+            break;
+        case BINARY_OP:
+            /* ... */
+            break;
+    }
+}
+```
+
+While simple, this naive design hits a severe hardware bottleneck on modern pipelined CPUs.
+In a switch statement, every single opcode handler ends with a `break`, jumping back to the top of the
+loop to execute a single shared indirect branch instruction:
+
+$$
+\text{JMP}\ *(\text{switch\_table} + \text{opcode} \times 8)
+$$
+
+Because all opcodes share one jump instruction, the CPU's hardware branch predictor attempts to predict
+the next instruction from a single branch site. In real-world Python code, subsequent opcodes vary wildly
+(for example, `LOAD_FAST` may be followed by `LOAD_FAST`, `LOAD_CONST`, `LOAD_GLOBAL`, or `STORE_FAST`).
+As a result, the branch predictor mispredicts frequently. A branch misprediction flushes the CPU's instruction
+pipeline, wasting 15 to 20 clock cycles per bytecode instruction.
+
+CPython solves this on supported compilers (GCC and Clang) using **computed gotos** (also known as
+**direct threaded code**).
+
+```c
+/* opcode_targets is an array of 256 label addresses */
+static void * const opcode_targets[256] = {
+    &&TARGET_NOP,
+    &&TARGET_LOAD_FAST,
+    &&TARGET_BINARY_OP,
+    /* ... 256 jump targets ... */
+};
+```
+
+Instead of returning to a central switch statement, each instruction handler terminates with its own
+dedicated indirect jump:
+
+```c
+#define DISPATCH_GOTO() goto *opcode_targets[opcode]
+```
+
+Because each opcode handler has its own distinct indirect jump site at the end of its code block,
+the CPU's **Branch Target Buffer (BTB)** learns the transition probabilities between pairs of opcodes
+(such as `LOAD_FAST` $\to$ `LOAD_FAST` or `COMPARE_OP` $\to$ `POP_JUMP_IF_FALSE`). Direct threading
+yields a 15% to 20% throughput improvement over a centralized switch statement on modern x86-64 and ARM processors.
+
+<InterpreterLoopDiagram />
+
+### Instruction Generation
+
+In Python 3.12, CPython refactored the interpreter loop implementation. Instead of manually editing
+a 4,000-line C function with repetitive stack adjustments and refcount management, instruction handlers
+are written in a Domain-Specific Language (DSL) in `Python/bytecodes.c`.
+
+Each instruction definition specifies its stack inputs and outputs using stack effect syntax:
+
+```c
+/* Instruction definition in Python/bytecodes.c */
+inst(LOAD_FAST, (-- value)) {
+    value = GETLOCAL(oparg);
+    assert(value != NULL);
+    Py_INCREF(value);
+}
+
+inst(STORE_FAST, (value --)) {
+    SETLOCAL(oparg, value);
+}
+```
+
+A generator script (`Tools/cases_generator/generate_cases.py`) parses `bytecodes.c` during build time
+and emits `Python/generated_cases.c.h`. The generator automatically generates:
+
+- Pointer arithmetic for stack growth and shrinkage (`STACK_GROW`, `STACK_SHRINK`).
+- Temporary variable extraction from `stack_pointer[-1]`, `stack_pointer[-2]`, etc.
+- Error handling labels (`ERROR_IF`, unwinding to exception tables).
+- Super-instruction pairings (such as `LOAD_FAST__LOAD_FAST`).
+- Macro expansion for `DISPATCH()`.
+
+`Python/ceval.c` then `#include`s `generated_cases.c.h` directly inside `_PyEval_EvalFrameDefault`.
+
+## Loop Macros
+
+The interpreter loop relies on a collection of C macros to manage instruction dispatch, stack movement,
+frame linkage, and asynchronous event polling.
+
+### Dispatch Macros
+
+The primary dispatch macro is `DISPATCH()`, which executes at the tail of nearly every instruction:
+
+```c
+#define DISPATCH() \
+    { \
+        NEXTOPARG(); \
+        PRE_DISPATCH_GOTO(); \
+        DISPATCH_GOTO(); \
+    }
+```
+
+- `NEXTOPARG()`: Reads the 16-bit code unit at `next_instr++`, extracting `opcode = next_instr->op.code` and `oparg = next_instr->op.arg`.
+- `PRE_DISPATCH_GOTO()`: When compiled with low-level tracing enabled (`LLTRACE`), prints the current stack state and opcode for debugging.
+- `DISPATCH_GOTO()`: Jumps directly to `goto *opcode_targets[opcode]`.
+
+When an instruction label is declared, the macro `TARGET(op)` establishes the jump label and updates
+frame tracking:
+
+```c
+#define TARGET(op) TARGET_##op: INSTRUCTION_START(op);
+#define INSTRUCTION_START(op) (frame->prev_instr = next_instr++)
+```
+
+### Frame Inlining
+
+Historically, when a Python function called another Python function, `_PyEval_EvalFrameDefault`
+invoked itself recursively in C. A Python recursion depth of 1,000 would consume 1,000 stack frames
+on the operating system's C stack, eventually causing a C stack overflow segmentation fault.
+
+Modern CPython uses `DISPATCH_INLINED(NEW_FRAME)` to execute Python-to-Python calls without consuming
+a single C stack frame:
+
+```c
+#define DISPATCH_INLINED(NEW_FRAME)                     \
+    do {                                                \
+        assert(tstate->interp->eval_frame == NULL);     \
+        _PyFrame_SetStackPointer(frame, stack_pointer); \
+        frame->prev_instr = next_instr - 1;             \
+        (NEW_FRAME)->previous = frame;                  \
+        frame = cframe.current_frame = (NEW_FRAME);     \
+        CALL_STAT_INC(inlined_py_calls);                \
+        goto start_frame;                               \
+    } while (0)
+```
+
+Instead of invoking C functions, `DISPATCH_INLINED` pushes the new frame onto the thread's contiguous
+data stack chunk, links `(NEW_FRAME)->previous = frame`, points the local register `frame` to the new frame,
+and executes a local C jump: `goto start_frame;`.
+
+When the callee finishes, `RETURN_VALUE` performs the symmetric unwinding: it pops the frame, restores
+`frame = frame->previous`, places the return value onto the caller's stack, and calls `DISPATCH()` to
+continue running the caller.
+
+### Stack Manipulation
+
+Within instruction handlers, the stack pointer is manipulated via:
+
+- `STACK_GROW(n)`: Expands the evaluation stack depth: `stack_pointer += (n)`.
+- `STACK_SHRINK(n)`: Contracts the evaluation stack depth: `stack_pointer -= (n)`.
+- `stack_pointer[-1]`: References the current Top of Stack (TOS).
+- `stack_pointer[-2]`: References the second element on the stack (TOS1).
+- `GETLOCAL(oparg)`: Direct read from `frame->localsplus[oparg]`.
+- `SETLOCAL(oparg, value)`: Releases the previous value via `Py_XDECREF(frame->localsplus[oparg])` and assigns `frame->localsplus[oparg] = value`.
+
+### Adaptive Specialization
+
+Under PEP 659, generic instructions monitor their argument types in trailing inline cache entries.
+When an instruction proves monomorphic, the opcode is replaced in-place in `co_code` with a specialized
+counterpart (for example, `BINARY_OP` becomes `BINARY_OP_MULTIPLY_INT`).
+
+The specialized instruction guards its execution with `DEOPT_IF`:
+
+```c
+TARGET(BINARY_OP_MULTIPLY_INT) {
+    PyObject *right = stack_pointer[-1];
+    PyObject *left = stack_pointer[-2];
+    DEOPT_IF(!PyLong_CheckExact(left), BINARY_OP);
+    DEOPT_IF(!PyLong_CheckExact(right), BINARY_OP);
+    /* ... fast multiplication ... */
+}
+```
+
+If the types ever change (for instance, if float or matrix operands are passed to a function previously
+specialized for integers), `DEOPT_IF` deoptimizes: it jumps to the original generic handler (`BINARY_OP`),
+reverting the specialized opcode so subsequent calls re-profile.
+
+### The Eval Breaker
+
+The interpreter loop must periodically respond to external events:
+- Operating system signals (e.g. `SIGINT` from Ctrl+C).
+- GIL (Global Interpreter Lock) drop requests to allow other threads to run.
+- Asynchronous exceptions scheduled via `PyThreadState_SetAsyncExc`.
+- Pending C callbacks scheduled via `Py_AddPendingCall`.
+
+Checking multiple atomic flags on every instruction would degrade performance. Instead, CPython
+consolidates all pending requests into a single atomic integer: `eval_breaker`.
+
+```c
+#define CHECK_EVAL_BREAKER() \
+    if (_Py_atomic_load_relaxed_int32(&tstate->interp->ceval.eval_breaker)) { \
+        goto handle_eval_breaker; \
+    }
+```
+
+Furthermore, CPython does not check `eval_breaker` on every instruction. It checks it strictly at loop
+back-edges (`JUMP_BACKWARD`), function entry (`RESUME`), and returns from calls. Because infinite loops
+and recursive calls must encounter these checkpoints, threads never hang, while straight-line code
+executes with zero interruption checks.
+
+When triggered, execution jumps to `handle_eval_breaker:`:
+
+```c
+handle_eval_breaker:
+    if (_Py_HandlePending(tstate) != 0) {
+        goto error;
+    }
+    DISPATCH();
+```
+
+Inside `_Py_HandlePending(tstate)`, CPython releases the GIL if requested, invokes signal handlers,
+or triggers pending calls, and then immediately resumes bytecode execution via `DISPATCH()`.
+
+## Execution Trace
+
+Let us trace the concrete execution of our sample function with real values:
+
+$$
+\text{compute}(a = 10, b = 20) \implies 10 + 20 \times 2 = 50
+$$
+
+The interactive stepper below illustrates how the instruction pointer (`next_instr`), the evaluation
+stack (`stack_pointer`), the fast locals array (`localsplus`), and the CPython loop macros interact
+at each step.
+
+<BytecodeStepper />
+
+### Trace Walkthrough
+
+Let us trace through each instruction in detail:
+
+#### 0: RESUME
+- **Stack**: `[]` (empty)
+- **Locals**: `localsplus[0] = 10 (a)`, `localsplus[1] = 20 (b)`
+- `RESUME` validates the code object's instrumentation version against `tstate->interp->monitoring_version`. If a profiler or debugger attached via PEP 669, instrumentation trampolines are installed. Otherwise, it tests `eval_breaker` and calls `DISPATCH()`.
+
+#### 2: LOAD_FAST a
+- **Stack**: `[10]` (TOS = 10)
+- The opcode reads local slot 0 via `GETLOCAL(0)`.
+- It increments the reference count of the integer object `10`.
+- It grows the stack pointer via `STACK_GROW(1)` and writes `stack_pointer[-1] = value`.
+- It calls `DISPATCH()` to advance to offset 4.
+
+#### 4: LOAD_FAST b
+- **Stack**: `[10, 20]` (TOS = 20, TOS1 = 10)
+- Reads local slot 1 via `GETLOCAL(1)`.
+- Increments the reference count of `20`.
+- Pushes `20` onto the stack. In warm loops, CPython fuses adjacent `LOAD_FAST` instructions into the super-instruction `LOAD_FAST__LOAD_FAST`, pushing both values in a single dispatch step.
+
+#### 6: LOAD_CONST 2
+- **Stack**: `[10, 20, 2]` (TOS = 2)
+- Retrieves constant index 1 from `co_consts` tuple (`GETITEM(frame->f_code->co_consts, 1)`).
+- In Python 3.12+, small integer objects (from -5 to 256) and static literals are **immortal**: their reference counts are masked with a sentinel flag (`_Py_IMMORTAL_REFCNT`), avoiding atomic memory writes on `Py_INCREF` and `Py_DECREF`.
+- Pushes `2` to top of stack.
+
+#### 8: BINARY_OP *
+- **Stack**: `[10, 40]` (TOS = 40)
+- Operands popped: `right = 2` (`stack_pointer[-1]`), `left = 20` (`stack_pointer[-2]`).
+- Specialized path checks: `PyLong_CheckExact(left)` and `PyLong_CheckExact(right)`.
+- Multiplication runs directly via `_PyLong_Multiply((PyLongObject *)left, (PyLongObject *)right)`, allocating integer `40`.
+- Both inputs are decrefed using `_Py_DECREF_SPECIALIZED`.
+- Stack shrinks by 1 (`STACK_SHRINK(1)`), and `stack_pointer[-1]` is set to `40`.
+- `next_instr` skips 1 code unit (2 bytes) over the inline `CACHE` entry at offset 10, then calls `DISPATCH()`.
+
+#### 12: BINARY_OP +
+- **Stack**: `[50]` (TOS = 50)
+- Operands popped: `right = 40`, `left = 10`.
+- Specialized integer addition computes $10 + 40 = 50$ via `_PyLong_Add`.
+- Temporary integer `40` is freed (`ob_refcnt` drops to zero), and `stack_pointer[-1]` receives `50`.
+- Skips cache entry at offset 14 and calls `DISPATCH()`.
+
+#### 16: RETURN_VALUE
+- **Stack**: `[]`
+- Pops `retval = 50` from `stack_pointer[-1]`.
+- Clears local variable references in `frame->localsplus` via `_PyEvalFrameClearAndPop()`.
+- Unlinks the frame: `frame = frame->previous`.
+- If the caller was a Python frame, pushes `50` onto the caller's evaluation stack and resumes caller execution via `DISPATCH()`. If called from C, returns `retval` directly.
+
+## Bytecode Instructions
+
+CPython contains over 150 opcodes. They fall into several foundational families:
+
+| Instruction | Inputs $\to$ Outputs | Specialized Form (PEP 659) | Description |
+| :--- | :--- | :--- | :--- |
+| `LOAD_FAST` | `-- val` | `LOAD_FAST__LOAD_FAST` | Reads local variable from `localsplus[oparg]` with zero hash overhead. |
+| `STORE_FAST` | `val --` | `STORE_FAST__LOAD_FAST` | Writes TOS into `localsplus[oparg]`, releasing the old value. |
+| `LOAD_CONST` | `-- val` | `LOAD_CONST__LOAD_FAST` | Pushes constant from `co_consts[oparg]` onto stack. |
+| `LOAD_GLOBAL` | `-- val` | `LOAD_GLOBAL_MODULE`, `LOAD_GLOBAL_BUILTIN` | Searches module globals, then built-in namespace. Caches dictionary version pointers. |
+| `LOAD_ATTR` | `obj -- val` | `LOAD_ATTR_INSTANCE_VALUE`, `LOAD_ATTR_SLOT` | Looks up attribute on object. Specializes to fixed struct offset reads. |
+| `BINARY_OP` | `left, right -- res` | `BINARY_OP_ADD_INT`, `BINARY_OP_MULTIPLY_FLOAT` | Evaluates arithmetic or bitwise operation based on `oparg`. |
+| `COMPARE_OP` | `left, right -- bool` | `COMPARE_OP_INT`, `COMPARE_OP_FLOAT` | Rich comparison (`<`, `<=`, `==`, `!=`, `>`, `>=`). |
+| `POP_JUMP_IF_FALSE` | `cond --` | - | Pops boolean condition; jumps relative offset if condition evaluates to false. |
+| `JUMP_BACKWARD` | `--` | - | Jumps backward in code array to create loops; includes `CHECK_EVAL_BREAKER()`. |
+| `FOR_ITER` | `iter -- iter, next_val` | - | Calls `tp_iternext(iter)`. Pushes next value or jumps forward on `StopIteration`. |
+| `CALL` | `callable, args... -- res` | `CALL_PY_EXACT_ARGS`, `CALL_NO_KW_BUILTIN_O` | Calls callable. For pure Python functions, uses `DISPATCH_INLINED`. |
+| `RETURN_VALUE` | `retval --` | - | Pops return value, tears down current frame, and hands result to caller. |
+
+### LOAD_GLOBAL Optimization
+
+Consider `LOAD_GLOBAL`: in dynamic Python, globals can be modified at any moment, and missing globals
+fall back to built-ins. Looking up `len` or `math.sin` naively requires two dictionary hash table lookups
+on every call.
+
+Under PEP 659, `LOAD_GLOBAL` allocates inline cache entries. On first execution, it records the dictionary
+keys version:
+
+```c
+TARGET(LOAD_GLOBAL_MODULE) {
+    uint16_t version = read_cache_version(next_instr);
+    DEOPT_IF(dict->ma_keys->dk_version != version, LOAD_GLOBAL);
+    PyObject *val = read_cache_value(next_instr);
+    Py_INCREF(val);
+    STACK_GROW(1);
+    stack_pointer[-1] = val;
+    next_instr += INLINE_CACHE_ENTRIES_LOAD_GLOBAL;
+    DISPATCH();
+}
+```
+
+If the global dictionary's version has not changed, the lookup skips dictionary hashing entirely and
+reads the cached value pointer directly from the inline cache.
+
+## The GIL
+
+The **Global Interpreter Lock (GIL)** is a mutual exclusion lock that serializes execution of Python bytecode
+across multiple threads within an interpreter process. Even on a modern 64-core server, standard CPython
+executes bytecode on exactly one core at any given millisecond.
+
+### Why Python Has a GIL
+
+The GIL was introduced in CPython's earliest days for three practical reasons:
+1. **Memory Allocator Thread Safety**: CPython's custom memory allocator (`obmalloc`) is optimized for small, fast allocations ($< 512$ bytes) using arena pools. Without the GIL, every single memory allocation would require locking.
+2. **Reference Counting Correctness**: Every assignment and variable read updates `ob_refcnt`. Without a lock, two threads modifying an object's reference count concurrently would suffer race conditions and corrupt memory.
+3. **C Extension Compatibility**: C extensions (such as NumPy, database drivers, and legacy libraries) write standard C code that accesses Python objects directly without implementing internal concurrency locks.
+
+### Handover Protocol
+
+The GIL is managed by `struct _gil_runtime_state` in `Python/ceval_gil.c`. It consists of a mutex
+and a condition variable (`pthread_mutex_t` and `pthread_cond_t`):
+
+```c
+struct _gil_runtime_state {
+    atomic_int locked;              /* 1 if held, 0 if free */
+    PyThreadState *last_holder;     /* Prevents immediate re-acquisition */
+    PyMutex mutex;                  /* Low-level OS lock */
+    PyCond cond;                    /* CV for waiting threads */
+    PyCond switch_cond;             /* CV for release acknowledgment */
+};
+```
+
+Rather than releasing the GIL on every instruction, CPython uses a time-sliced **switch interval**
+(`sys.getswitchinterval()`, default $5\ \text{ms} = 5,000\ \mu\text{s}$):
+
+<GilDiagram />
+
+The handover protocol operates as follows:
+
+1. **Thread 1 (Running)** holds the GIL and executes bytecode uninterrupted. **Thread 2 (Waiting)** is suspended on the GIL condition variable (`pthread_cond_wait`).
+2. After 5 ms, Thread 2's timed wait expires. Thread 2 wakes up and detects that Thread 1 still holds the lock.
+3. Thread 2 sets `gil_drop_request = 1`. This atomically triggers `eval_breaker = 1` on Thread 1. Thread 2 then goes back to sleeping on the condition variable.
+4. When Thread 1 encounters its next checkpoint instruction (`JUMP_BACKWARD` or `RESUME`), `CHECK_EVAL_BREAKER()` branches to `handle_eval_breaker:`.
+5. Thread 1 calls `drop_gil()`, releases the mutex, and signals the condition variable.
+6. Thread 2 wakes up, claims the GIL via `take_gil()`, clears `gil_drop_request = 0`, and resumes running bytecode. Thread 1 now sleeps until the next switch interval expires.
+
+<Sidenote>
+The GIL handover protocol suffers from the classic **convoy effect**. If a compute-intensive background
+thread runs alongside an interactive I/O thread, the I/O thread may wake up when data arrives over the
+network but remain blocked for up to 5 ms waiting for the CPU thread to hit an eval breaker checkpoint.
+</Sidenote>
+
+### Per-Interpreter GIL
+
+In Python 3.12, CPython introduced PEP 684, moving the `_gil_runtime_state` from the process-wide
+`_PyRuntimeState` into individual `PyInterpreterState` structures.
+
+This architectural shift allows multiple subinterpreters in the same operating system process to each
+possess their own independent GIL. Multi-threaded applications using subinterpreters can execute pure
+Python code simultaneously across separate CPU cores without lock contention, sharing data across
+subinterpreters via immutable bytes channels.
+
+## Biased Reference Counting
+
+While subinterpreters allow isolated parallel runtimes, Python programmers long desired true shared-memory
+multi-threading without a GIL. Python 3.13 introduced an experimental **free-threaded build** (`--disable-gil`),
+standardized in **PEP 703** by Sam Gross.
+
+### Atomic Contention
+
+The naive way to remove the GIL is simple: replace every non-atomic `ob_refcnt++` and `ob_refcnt--` with
+hardware atomic operations:
+
+```c
+/* Naive atomic reference counting */
+atomic_fetch_add(&op->ob_refcnt, 1);
+```
+
+However, benchmarks in PEP 703 showed this naive approach causes a devastating **30% to 40% single-threaded
+performance drop**!
+
+Why are atomic instructions so slow? On modern multi-core x86 and ARM architectures, an atomic instruction
+(`LOCK XADD` or `LDREX`/`STREX`) forces memory barrier synchronization and invalidates the corresponding
+cache line across all CPU cores via the hardware cache coherency protocol (MESI). Even when multiple threads
+are not accessing the same object, executing atomic instructions on every local variable read floods the
+CPU memory bus with cache-invalidation traffic.
+
+### The BRC Model
+
+To solve this, PEP 703 adopted **Biased Reference Counting (BRC)**, based on the research paper:
+
+> *"Biased Reference Counting: Minimizing Atomic Operations for Objects in Multithreaded Runtimes"*  
+> Jiho Choi, Hyeon-Gyu Choi, and Gwangmu Lee (PACT 2018 / IEEE).
+
+The core empirical insight of BRC is:
+**In dynamic runtimes, over 85% to 90% of objects are thread-confined**: they are allocated, manipulated,
+and deallocated entirely within a single thread. Only a small fraction of objects escape to other threads.
+
+BRC assigns each object an **owner thread** (the bias), typically the thread that allocated the object.
+The reference count is split into two separate fields:
+
+1. **Local reference count (`ob_ref_local`)**: Modified *only* by the owner thread. Because only the owner ever touches this field, modifications use fast, non-atomic CPU instructions.
+2. **Shared reference count (`ob_ref_shared`)**: Modified by foreign (non-owner) threads. Because multiple foreign threads can access an escaped object simultaneously, modifications use atomic compare-and-swap operations.
+
+### Object Header Layout
+
+In Python 3.13 free-threaded builds (`Py_GIL_DISABLED`), the object header is redefined in `Include/object.h`:
+
+```c
+struct _object {
+    uintptr_t ob_tid;           /* Thread ID of owner thread (bias) */
+    uint16_t _padding;
+    PyMutex ob_mutex;           /* 1-byte per-object lightweight lock */
+    uint8_t ob_gc_bits;         /* Garbage collection flags */
+    uint32_t ob_ref_local;      /* Local non-atomic refcount (owner only) */
+    Py_ssize_t ob_ref_shared;   /* Shared atomic refcount + status flags */
+    PyTypeObject *ob_type;
+};
+```
+
+The two least significant bits of `ob_ref_shared` store flags:
+- `_Py_REF_SHARED_INIT (0x0)`: Unmerged, biased state.
+- `_Py_REF_MAYBE_WEAKREF (0x1)`: Object may have weak references.
+- `_Py_REF_QUEUED (0x2)`: Object is queued for deallocation.
+- `_Py_REF_MERGED (0x3)`: Local and shared refcounts have been merged (unbiased).
+
+<BrcDiagram />
+
+### Increment Fast Path
+
+When CPython increments an object's reference count, it checks whether the current thread is the owner:
+
+```c
+static inline int
+_Py_TryIncrefFast(PyObject *op) {
+    uint32_t local = _Py_atomic_load_uint32_relaxed(&op->ob_ref_local);
+    local += 1;
+    if (local == 0) {
+        /* Object is marked immortal */
+        return 1;
+    }
+    if (_Py_IsOwnedByCurrentThread(op)) {
+        /* FAST PATH: Local non-atomic store directly in L1 cache */
+        _Py_atomic_store_uint32_relaxed(&op->ob_ref_local, local);
+        return 1;
+    }
+    return 0;
+}
+```
+
+If `_Py_IsOwnedByCurrentThread(op)` matches (`op->ob_tid == _Py_ThreadId()`), the operation completes
+in a few nanoseconds via a standard register increment and store, entirely avoiding memory bus locking.
+
+If the thread is not the owner, it falls back to `_Py_TryIncRefShared`:
+
+```c
+static inline int
+_Py_TryIncRefShared(PyObject *op) {
+    Py_ssize_t shared = _Py_atomic_load_ssize_relaxed(&op->ob_ref_shared);
+    for (;;) {
+        if (shared == 0 || shared == _Py_REF_MERGED) return 0;
+        if (_Py_atomic_compare_exchange_ssize(
+                &op->ob_ref_shared,
+                &shared,
+                shared + (1 << _Py_REF_SHARED_SHIFT))) {
+            return 1;
+        }
+    }
+}
+```
+
+### Decrement and Merging
+
+When the owner thread drops a reference (`Py_DECREF`), it decrements `ob_ref_local`. If `ob_ref_local`
+reaches zero, the owner thread cannot simply free the memory, because foreign threads may still hold
+shared references.
+
+Instead, it invokes `_Py_MergeZeroLocalRefcount(op)`:
+- It atomically evaluates `ob_ref_shared`.
+- If `ob_ref_shared == 0`, both local and shared references are zero $\implies$ the object is immediately deallocated via `_Py_Dealloc(op)`.
+- If `ob_ref_shared > 0`, foreign threads still hold references $\implies$ the object transitions to `_Py_REF_MERGED`, clearing `ob_tid = _Py_UNOWNED_TID` so subsequent operations use the atomic shared field.
+
+### Supporting Pillars
+
+Biased Reference Counting is supported by three runtime subsystems in PEP 703:
+1. **Immortal Objects**: Common constants (`None`, `True`, `False`, small ints, static strings) are initialized with `ob_ref_local = _Py_IMMORTAL_REFCNT_LOCAL`. Both `Py_INCREF` and `Py_DECREF` exit immediately on immortal objects, allowing thousands of threads to read shared constants without memory synchronization.
+2. **Per-Object Locks (`PyMutex ob_mutex`)**: Embedded directly in the 8-byte padding of `struct _object`, this 1-byte parking-lot mutex protects mutable objects (like lists and dicts) during in-place mutations without a coarse global lock.
+3. **Thread-Safe Allocator (`mimalloc`)**: CPython replaced the thread-unsafe `obmalloc` with Microsoft's `mimalloc`, providing thread-local allocation heaps that eliminate memory allocator contention across CPU cores.
+
+## Internal APIs
+
+Beneath the interpreter loop sits a hierarchy of runtime C APIs that enable debugging, profiling,
+and machine learning compilation.
+
+### Frame Evaluation Hook (PEP 523)
+
+One of the most consequential internal APIs in modern CPython is PEP 523. `PyInterpreterState` exposes
+a function pointer for evaluating frames:
+
+```c
+typedef PyObject *(*_PyFrameEvalFunction)(
+    PyThreadState *tstate,
+    _PyInterpreterFrame *frame,
+    int throwflag
+);
+```
+
+By default, `interp->eval_frame` points directly to `_PyEval_EvalFrameDefault`. However, external C extensions
+and compilers can replace this function pointer with a custom evaluator:
+
+```c
+/* Installing a custom frame evaluation function */
+_PyInterpreterState_SetEvalFrameFunc(interp, my_custom_eval_frame);
+```
+
+Whenever a Python function is invoked, CPython routes the frame through the installed hook before
+executing bytecode. This single hook powers major systems tools:
+
+- **PyTorch TorchDynamo**: Intercepts Python bytecode execution during neural network execution, analyzes the frame's bytecode with symbolic evaluation, extracts tensor operations into a computation graph, and compiles the graph with TorchInductor—all while falling back cleanly to `_PyEval_EvalFrameDefault` for unsupported Python code.
+- **Python Debuggers & Tracers**: Fast debuggers (such as PyCharm's Cython speedups) use frame evaluation hooks to set targeted breakpoints without paying the high overhead of global `sys.settrace()`.
+- **Just-In-Time (JIT) Compilers**: Experimental JIT engines (such as Pyjion or Cinder) intercept frames to compile hot Python functions into machine code on first invocation.
+
+### Signal Handling
+
+Operating system signals (like `SIGINT` or `SIGTERM`) cannot execute arbitrary Python code directly
+inside the OS signal handler because signal handlers run asynchronously and interrupt arbitrary C memory
+allocations.
+
+CPython's signal subsystem uses a clean two-step dispatch model:
+
+1. When the OS delivers a signal, CPython's low-level C signal handler sets a bit in `_PyRuntime.signals` and atomically triggers `eval_breaker = 1` on all running threads.
+2. When running threads hit their next bytecode checkpoint (`RESUME` or `JUMP_BACKWARD`), `CHECK_EVAL_BREAKER()` detects the flag and calls `_Py_HandlePending()`.
+3. In the main thread, `_Py_HandlePending` queries pending signals, invokes the registered Python signal handler functions synchronously, and resumes normal bytecode evaluation.
+
+## Summary
+
+- **Stack-based Bytecode**: Python source compiles into 16-bit code units (`_Py_CODEUNIT`), pairing an 8-bit opcode with an 8-bit oparg. Execution operates by pushing and popping operands on an evaluation stack.
+- **Contiguous Frame Stack**: In Python 3.11+, `_PyInterpreterFrame` structs are allocated contiguously on a per-thread data stack (`tstate->datastack_chunk`). Heap-allocated `PyFrameObject`s are created lazily only when requested.
+- **Direct Threaded Dispatch**: The evaluation loop (`_PyEval_EvalFrameDefault`) uses GCC/Clang computed gotos (`goto *opcode_targets[opcode]`), allowing hardware branch target buffers to predict opcode transitions and boosting execution throughput by 15% to 20%.
+- **Zero-C-Recursion Calls**: Python-to-Python function calls use `DISPATCH_INLINED(NEW_FRAME)` to link frames and jump to `start_frame:` within the same C function execution, eliminating C stack consumption for pure Python calls.
+- **Adaptive Specialization (PEP 659)**: Monomorphic operations use inline `CACHE` entries to patch bytecode at runtime into specialized fast paths (e.g. `BINARY_OP_MULTIPLY_INT` and `LOAD_GLOBAL_MODULE`), falling back via `DEOPT_IF` if types change.
+- **The GIL Handover**: The Global Interpreter Lock uses an OS mutex and condition variable with a 5 ms switch interval, using `eval_breaker` at loop back-edges to safely hand off execution between threads.
+- **Biased Reference Counting (PEP 703)**: Free-threaded Python splits object reference counts into an owner-local field (`ob_ref_local`) updated with non-atomic instructions and a shared atomic field (`ob_ref_shared`), eliminating the 40% memory bus contention penalty of naive multi-threaded refcounting.
+- **Extensible Hooks (PEP 523)**: The `eval_frame` function pointer allows compiler frameworks like PyTorch TorchDynamo to intercept Python frames and perform Just-In-Time compilation into native kernels.
+
+## References
+
+- [Python 3.12 `Python/ceval.c`](https://github.com/python/cpython/blob/v3.12.7/Python/ceval.c): Core evaluation loop and computed goto dispatch table.
+- [Python 3.12 `Python/bytecodes.c`](https://github.com/python/cpython/blob/v3.12.7/Python/bytecodes.c): Domain-specific language defining bytecode instructions and stack effects.
+- [Python 3.12 `Include/internal/pycore_frame.h`](https://github.com/python/cpython/blob/v3.12.7/Include/internal/pycore_frame.h): `_PyInterpreterFrame` layout and thread stack allocation.
+- [PEP 659: Specializing Adaptive Interpreter](https://peps.python.org/pep-0659/): Dynamic opcode specialization and inline caches in CPython.
+- [PEP 684: A Per-Interpreter GIL](https://peps.python.org/pep-0684/): Subinterpreters with isolated GIL states.
+- [PEP 703: Making the Global Interpreter Lock Optional in CPython](https://peps.python.org/pep-0703/): Free-threaded CPython and Biased Reference Counting.
+- [Biased Reference Counting Paper (Choi et al., PACT 2018)](https://ieeexplore.ieee.org/document/8573426): The foundational research paper minimizing atomic operations in multithreaded runtimes.
+- [PEP 523: Adding a Frame Evaluation API to CPython](https://peps.python.org/pep-0523/): The hook powering TorchDynamo and external JIT compilers.
+- [The PyTorch Dispatcher](/blog/pytorch-dispatcher/): Related post on how PyTorch routes tensor operations from Python down to C++ kernels.

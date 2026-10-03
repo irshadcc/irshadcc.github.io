@@ -1,0 +1,28 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import BrcDiagram from "../../utils/cpython/BrcDiagram.astro";
+import BytecodeStepper from "../../utils/cpython/BytecodeStepper.astro";
+import FrameMemoryDiagram from "../../utils/cpython/FrameMemoryDiagram.astro";
+import GilDiagram from "../../utils/cpython/GilDiagram.astro";
+import InterpreterLoopDiagram from "../../utils/cpython/InterpreterLoopDiagram.astro";
+---
+
+<Layout title="CPython Internals">
+	<h1>CPython Internals Components</h1>
+	<p>Interactive visualizations for the CPython interpreter loop, bytecode execution, frame memory layout, GIL protocol, and Biased Reference Counting.</p>
+
+	<h2>Interpreter Loop Architecture</h2>
+	<InterpreterLoopDiagram />
+
+	<h2>Frame Memory Layout</h2>
+	<FrameMemoryDiagram />
+
+	<h2>Bytecode Execution & Stack Trace</h2>
+	<BytecodeStepper />
+
+	<h2>Global Interpreter Lock (GIL) Switching</h2>
+	<GilDiagram />
+
+	<h2>Biased Reference Counting (BRC / PEP 703)</h2>
+	<BrcDiagram />
+</Layout>

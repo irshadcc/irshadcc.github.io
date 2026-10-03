@@ -1,0 +1,1481 @@
+---
+title: "Inside vLLM: From an HTTP Request to a CUDA Kernel"
+description: "How vLLM serves a language model: its processes, the path of one request from the API server through the scheduler to the GPU, the paged KV cache and its prefix cache, the CUDA kernels that write and read that cache, and prefill/decode disaggregation over NIXL."
+date: 2026-10-03
+tags: [Inference, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import BoxDiagram from "../../utils/payments/BoxDiagram.astro";
+import SequenceSteps from "../../utils/payments/SequenceSteps.astro";
+import BatchTimeline from "../../utils/inference/BatchTimeline.astro";
+import BlockPoolSteps from "../../utils/inference/BlockPoolSteps.astro";
+import PagedAddress from "../../utils/inference/PagedAddress.astro";
+import TokenStrip from "../../utils/inference/TokenStrip.astro";
+import {
+	vllmNodes,
+	vllmEdges,
+	vllmParticipants,
+	vllmLifecycle,
+	vllmMmNodes,
+	vllmMmEdges,
+	vllmPdParticipants,
+	vllmPdFlow,
+} from "../../utils/inference/servingFigures";
+import { chatTemplateViews, imageExpansionViews } from "../../utils/inference/vllmInputFigures";
+
+## Background
+
+A language model answers a prompt in two phases. **Prefill** runs the whole prompt through the
+model at once and produces the first output token. **Decode** then produces one token per forward
+pass until the answer is complete. Both phases store a key and a value vector per token, per
+layer, in the **KV cache**, so that later tokens can attend to earlier ones without recomputing
+them. [The KV cache, from First Principles to PagedAttention](/blog/kv-cache-and-paged-attention/)
+derives the cache and explains why vLLM stores it in fixed-size blocks.
+
+That post explains the idea; this one follows the code. A serving engine has to accept thousands
+of concurrent requests, decide every few milliseconds which of them run in the next forward pass,
+find GPU memory for their caches, and keep the GPU busy while it does all that in Python. How
+vLLM divides that work between processes, data structures and kernels explains most of its
+behaviour: why throughput rises with load, why a long prompt can delay other users' tokens, and
+what a "prefix cache hit" saves.
+
+We follow one request through vLLM, reading the code at each step. First the processes and what
+each one owns. Then the request's path: the HTTP route, the chat template, tokenization, the
+engine core loop, the scheduler, the GPU worker and, on the way back, detokenization. Then the KV
+cache: how big it is, how it is laid out, and how blocks are allocated, shared and evicted. Then
+multimodal requests: how an image in a chat message becomes a run of placeholder tokens, when the
+vision encoder runs, and how its output replaces those tokens' embeddings. Then the CUDA code that
+writes keys and values into the cache, reads them back during attention, merges partial attention
+results and all-reduces across GPUs. Last, prefill/decode disaggregation, where two vLLM instances
+split the two phases and move the KV cache between them.<Sidenote>All code links
+point to vLLM commit [`b0e21b3`](https://github.com/vllm-project/vllm/tree/b0e21b308352587a6fd02f72722a2e815bfd62f0)
+(October 2026) and to vLLM's FlashAttention fork at [`9cd61de`](https://github.com/vllm-project/flash-attention/tree/9cd61de38763d712bb6ce56e2a02cc2bf718c89f).
+vLLM moves fast; names and defaults may have changed since.</Sidenote>
+
+## The architecture
+
+### Three kinds of process
+
+A running vLLM server is several processes that talk over sockets and shared memory. Click a box
+to read what it does.
+
+<BoxDiagram
+	nodes={vllmNodes}
+	edges={vllmEdges}
+	selected="sched"
+	title="The processes of a vLLM server with two GPUs"
+/>
+
+- The **API server** process holds the HTTP routes, a **renderer** and `AsyncLLM`, the client of
+  the engine. It applies chat templates, tokenizes prompts, preprocesses images and detokenizes
+  outputs, all CPU-heavy work that would otherwise compete with scheduling.
+- The **engine core** process runs one loop: schedule a step, run it, update every request with
+  the result. It owns the scheduler and the KV cache manager. Two helper threads move messages
+  between its sockets and in-memory queues, so the loop never waits on the network.
+- One **worker** process per GPU holds that GPU's share of the weights and of the KV cache, and a
+  **model runner** that turns a schedule into tensors and runs the model.
+
+The split matters because Python has one interpreter lock per process. Tokenizing a 100,000-token
+prompt in the same process as the scheduler would stall every running request for the time it
+takes. With separate processes, the front end can tokenize the next request while the engine core
+schedules and the GPUs compute.
+
+### What vLLM provides
+
+Most of vLLM's features hang off three places: the scheduler, the KV cache manager and the model
+runner. The table lists the ones this post touches.
+
+| Feature | What it does | Where it lives |
+| --- | --- | --- |
+| Continuous batching | Requests join and leave the batch at every step | `Scheduler.schedule()` |
+| Chunked prefill | A long prompt is split across steps and shares them with decodes | `Scheduler.schedule()` |
+| Paged KV cache | The cache is split into fixed-size blocks; a block table maps a request to them | `KVCacheManager`, `BlockPool` |
+| Prefix caching | Full blocks are hashed and reused by later requests with the same prefix | `BlockPool`, `kv_cache_utils.py` |
+| CUDA graphs, `torch.compile` | The forward pass is captured once and replayed with little CPU overhead | model runner, `vllm/compilation/` |
+| Tensor, pipeline, data, expert parallelism | One model across many GPUs | `vllm/distributed/`, executors |
+| Speculative decoding | A cheap proposer drafts tokens, the model verifies several per step | `vllm/v1/spec_decode/` |
+| Structured outputs | A grammar masks the logits | `vllm/v1/structured_output/` |
+| Multimodal inputs | Images, audio and video are encoded into the prompt's embeddings | `vllm/multimodal/` |
+| KV connectors | Load and save KV blocks outside the GPU: CPU, storage, another instance | `vllm/distributed/kv_transfer/` |
+
+## Following one request
+
+The figure walks through one request, from the HTTP call to the first streamed token. Step through
+it, then read the sections below for the code behind each step.
+
+<SequenceSteps
+	participants={vllmParticipants}
+	messages={vllmLifecycle}
+	title="One request through vLLM"
+	colWidth={150}
+/>
+
+### The HTTP route
+
+The OpenAI-compatible server is a FastAPI app. The chat route
+([`create_chat_completion`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/entrypoints/openai/chat_completion/api_router.py#L54))
+does almost nothing itself. It hands the parsed request to an `OpenAIServingChat` object and
+looks at what comes back:
+
+```python
+@router.post("/v1/chat/completions", dependencies=[Depends(validate_json_request)], ...)
+@with_cancellation
+@load_aware_call
+async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
+    handler = chat(raw_request)
+    generator = await handler.create_chat_completion(request, raw_request)
+
+    if isinstance(generator, ErrorResponse):
+        return JSONResponse(content=generator.model_dump(), status_code=generator.error.code)
+    elif isinstance(generator, ChatCompletionResponse):
+        return JSONResponse(content=generator.model_dump(), ...)
+
+    return StreamingResponse(
+        content=with_sse_keep_alive(generator, float(keep_alive_interval)),
+        media_type="text/event-stream",
+    )
+```
+
+Three outcomes are possible. An `ErrorResponse` (a bad parameter, a prompt that is too long)
+becomes a JSON error with its HTTP status. A finished `ChatCompletionResponse` (`"stream": false`)
+becomes one JSON body. Anything else is an async generator of server-sent-event strings, and
+FastAPI streams it as `text/event-stream`, one `data: {...}` line per chunk. The two decorators
+matter for a server under load: `with_cancellation` cancels the handler when the client
+disconnects, which aborts the request in the engine and frees its KV blocks, and, when server
+load tracking is enabled, `load_aware_call` counts the requests in flight for a load-aware
+router.
+
+The handler,
+[`OpenAIServingChat._create_chat_completion()`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/entrypoints/openai/chat_completion/serving.py#L274),
+does four things. Shortened:
+
+```python
+result = await self.render_chat_request(request)        # 1. template + tokenize + images
+conversation, engine_inputs = result
+request_id = f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
+
+for i, engine_input in enumerate(engine_inputs):
+    max_tokens = get_max_tokens(                           # 2. how many tokens may it generate?
+        max_model_len,
+        request.max_completion_tokens or request.max_tokens,
+        self._extract_prompt_len(engine_input),
+        self.default_sampling_params, ...)
+    sampling_params = request.to_sampling_params(max_tokens, self.default_sampling_params)
+    generator = self.engine_client.generate(               # 3. hand it to the engine
+        engine_input, sampling_params, sub_request_id,
+        lora_request=lora_request, priority=self._get_priority(request, raw_request), ...)
+
+if request.stream:                                         # 4. format the outputs
+    return self.chat_completion_stream_generator(request, result_generator, ...)
+return await self.chat_completion_full_generator(request, result_generator, ...)
+```
+
+Step 1 turns the JSON messages into token ids; the next two sections follow it. Step 2 caps the
+output length: [`get_max_tokens()`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/entrypoints/serve/utils/api_utils.py#L169)
+returns the smallest of `max_model_len − prompt length`, the request's `max_tokens` (or the
+server default), and any override. Sampling defaults that the request leaves out come from the
+model's `generation_config.json`. Step 3 returns at once with an async generator; nothing has run
+on the GPU yet. Step 4 wraps that generator. The streaming version turns each `RequestOutput`
+into a `chat.completion.chunk` and also runs the tool-call and reasoning parsers, which split the
+model's raw text into `content`, `reasoning` and `tool_calls`.
+
+### The chat template
+
+A chat model is trained on text in one exact format, with special tokens around every message.
+The **chat template** is a Jinja2 program, shipped with the model's tokenizer, that turns a list
+of messages into that format. vLLM's renderer applies it in
+[`HfRenderer.render_messages_async()`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/renderers/hf.py#L1123):
+
+```python
+conversation, mm_data, mm_uuids = await parse_chat_messages_async(
+    messages, model_config,
+    content_format=resolve_chat_template_content_format(...),
+    media_io_kwargs=params.media_io_kwargs, ...)
+
+chat_template_kwargs = params.get_apply_chat_template_kwargs()
+prompt_raw = await self._render_with_timeout(
+    self._apply_chat_template_async(model_config, tokenizer, conversation,
+                                    **chat_template_kwargs))
+prompt = parse_dec_only_prompt(prompt_raw)
+if mm_data is not None:
+    prompt["multi_modal_data"] = mm_data
+```
+
+`parse_chat_messages_async()` normalises the OpenAI messages. Text parts stay text; image, audio
+and video parts are pulled out into `mm_data` and, as we will see, replaced by placeholders. The
+**content format** decides how a message reaches the template: `"openai"` keeps the list of parts
+(`[{"type": "image"}, {"type": "text", ...}]`) for templates that loop over them, and `"string"`
+flattens it to one string. vLLM picks the format by parsing the template's Jinja syntax tree and
+looking for a loop over `message["content"]`
+([`_detect_content_format`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/renderers/hf.py#L491)).
+
+The template itself runs in
+[`safe_apply_chat_template()`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/renderers/hf.py#L759),
+which calls the Hugging Face tokenizer's `apply_chat_template()` with `tokenize=False` for most
+models, so the result is a string. Two details there are worth knowing. If the conversation uses
+the newer `developer` role and the template does not mention it, vLLM rewrites those messages as
+`system`. And an exception raised inside the template, which is how templates reject an
+unsupported option, becomes a 400 error carrying the template's own message rather than a 500.
+
+Here is a real example. Llama-3.1-8B, the model used in the rest of this post, has no vision
+encoder, so this section and the multimodal one use **Qwen2-VL-7B-Instruct**. The request is one
+user message with an image and a question:
+
+```json
+{"messages": [{"role": "user", "content": [
+  {"type": "image_url", "image_url": {"url": "https://example.com/cat.jpg"}},
+  {"type": "text", "text": "What is in this image?"}]}]}
+```
+
+Qwen2-VL's template renders it as:
+
+```text
+<|im_start|>system
+You are a helpful assistant.<|im_end|>
+<|im_start|>user
+<|vision_start|><|image_pad|><|vision_end|>What is in this image?<|im_end|>
+<|im_start|>assistant
+```
+
+The template added a default system message, wrapped each message in `<|im_start|>` and
+`<|im_end|>`, wrote one `<|image_pad|>` where the image goes, and ended with an open assistant
+turn (`add_generation_prompt`), so the model's next token starts the answer.
+
+### Tokenization
+
+**Tokenization** turns that string into the integer ids the model's embedding table is indexed
+by. Qwen2's tokenizer is a **byte-level BPE** (byte-pair encoding): the text is first split into
+words and punctuation by a regular expression, each piece is mapped to its UTF-8 bytes, and the
+tokenizer then applies a list of learned **merges**, pairs of adjacent symbols to join, in order
+of priority, until no merge applies. Qwen2's vocabulary has 151,643 regular tokens built from
+151,387 merges, plus 14 special tokens such as `<|im_start|>`, which are matched as whole strings
+before BPE runs.
+
+Common words end up as one token and rare ones as several. `"Hello, world!"` becomes four tokens,
+`Hello`, `,`, `␣world` and `!` (ids 9707, 11, 1879, 0), where `␣` marks the leading space that
+belongs to the word. `" tokenization"` becomes `␣token` and `ization`. Hover over the tokens of
+the rendered prompt above:
+
+<TokenStrip
+	views={chatTemplateViews}
+	blockSize={16}
+	selected={15}
+	title="The rendered Qwen2-VL prompt as 28 tokens (Qwen2-VL-7B-Instruct tokenizer)"
+/>
+
+Look at three things. Each special token is a single id (151644 for `<|im_start|>`), so the model
+cannot confuse it with the same characters typed by a user. The image is one token,
+`<|image_pad|>` at position 15, although the vision encoder will produce more than a thousand
+embeddings for it. And the block markers show where the KV cache's 16-token blocks begin: the
+first block is positions 0 to 15, which is everything up to and including the image placeholder.
+
+vLLM tokenizes in [`BaseRenderer._tokenize_prompt()`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/renderers/base.py#L628):
+
+```python
+def _tokenize_prompt(self, prompt: TextPrompt, params: TokenizeParams) -> TokensPrompt:
+    tokenizer = self.get_tokenizer()
+    kwargs = params.get_encode_kwargs()
+    encoding = tokenizer(prompt["prompt"], **kwargs)
+    return self._build_tokens_prompt(encoding["input_ids"], prompt, ...)
+```
+
+Three parameters in `kwargs` deserve a closer look.
+
+- **`add_special_tokens` is `False` for chat requests.** The template already wrote every special
+  token the model expects. Adding the tokenizer's own (a beginning-of-sequence token for Llama)
+  on top would put two of them at the start, a prompt the model never saw in training.
+- **`max_length` is set even when nothing is truncated.** `get_encode_kwargs()` passes
+  `max_input_tokens + 1`, where `max_input_tokens = max_model_len − max_tokens`. The tokenizer
+  stops there, so a client that posts 10 MB of text costs one context's worth of tokenization
+  before the length check rejects it, not 10 MB's worth.
+- **The length check** (`_token_len_check`) then raises the familiar "This model's maximum
+  context length is ... tokens" error, which the route returns as a 400.
+
+Check the arithmetic for Qwen2-VL-7B, whose `max_model_len` is 32,768. A request with
+`max_tokens = 1000` may have at most 32,768 − 1,000 = 31,768 prompt tokens, and the
+tokenizer is called with `max_length = 31,769`. A request without `max_tokens` may use the whole
+context for the prompt; our 28-token prompt then gets `max_tokens` = 32,768 − 28 = 32,740.
+
+Tokenizing a long prompt is slow, pure CPU work. vLLM runs it on a thread pool rather than on the
+asyncio event loop, which must stay free to accept connections and stream other requests' tokens
+([`BaseRenderer.__init__`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/renderers/base.py#L143)):
+
+```python
+# Thread pool executor for blocking tokenizer operations.
+pool_workers = config.model_config.renderer_num_workers
+self._executor = _SwappableExecutor(max_workers=pool_workers)
+
+# Separate single-worker executor so tokenization never queues behind
+# MM preprocessing
+self._mm_executor = ThreadPoolExecutor(max_workers=1)
+
+self._tokenize_prompt_async = make_async(self._tokenize_prompt, executor=self._executor)
+self._process_multimodal_async = make_async(self._process_multimodal,
+                                            executor=self._mm_executor)
+```
+
+Image preprocessing gets its own single-thread pool, so a request with ten large images cannot
+hold up the tokenization of a short text request behind it.
+
+### The front end: AsyncLLM
+
+The handler passes the rendered input, now token ids plus any images, to
+[`AsyncLLM.generate()`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/v1/engine/async_llm.py#L673),
+an async generator. Its docstring lists the four things it does:
+
+```python
+async def generate(self, prompt, sampling_params, request_id, ...):
+    """Main function called by the API server to kick off a request
+        * 1) Making an AsyncStream corresponding to the Request.
+        * 2) Processing the Input.
+        * 3) Adding the Request to the Detokenizer.
+        * 4) Adding the Request to the EngineCore (separate process).
+    """
+    q = await self.add_request(request_id, prompt, sampling_params, ...)
+    finished = False
+    while not finished:
+        out = q.get_nowait() or await q.get()
+        finished = out.finished
+        if out is not STREAM_FINISHED:
+            yield out
+```
+
+The **InputProcessor** turns the rendered input into an `EngineCoreRequest`: token ids, sampling
+parameters, arrival time, priority and, for images, a list of `mm_features`. It also makes the
+request stop at the model's end-of-sequence tokens: the tokenizer's (151645, `<|im_end|>`, for
+Qwen2-VL) and any others listed in `generation_config.json` (here 151643, `<|endoftext|>`). Then
+[`_add_request()`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/v1/engine/async_llm.py#L533)
+registers the request and sends it:
+
+```python
+# Register locally before the first await so concurrent tasks see this request.
+self.output_processor.add_request(request, prompt, parent_req, index, queue)
+
+# Add the EngineCoreRequest to EngineCore (separate process).
+await self.engine_core.add_request_async(request)
+```
+
+The order matters. The OutputProcessor entry, with the queue that `generate()` reads and a
+detokenizer for this request, exists before the request can produce any output, so the first
+token never arrives for a request the front end does not know. `add_request_async()` serialises
+the request with msgpack and sends it over a ZMQ socket.
+
+Outputs come back the other way, through one background task per `AsyncLLM`,
+[`output_handler`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/v1/engine/async_llm.py#L820):
+
+```python
+while True:
+    # 1) Pull EngineCoreOutputs from the EngineCore.
+    outputs = await engine_core.get_output_async()
+    # Split outputs into chunks of at most VLLM_V1_OUTPUT_PROC_CHUNK_SIZE, so that we
+    # don't block the event loop for too long.
+    for start in range(0, num_outputs, chunk_size):
+        outputs_slice = engine_core_outputs[start:start + chunk_size]
+        # 2) Process EngineCoreOutputs.
+        processed_outputs = output_processor.process_outputs(outputs_slice, ...)
+        if end < num_outputs:
+            await asyncio.sleep(0)
+        # 3) Abort any reqs that finished due to stop strings.
+        if processed_outputs.reqs_to_abort:
+            await engine_core.abort_requests_async(processed_outputs.reqs_to_abort)
+```
+
+One engine step can return outputs for a thousand requests. Detokenizing all of them in one go
+would block the event loop, and with it every stream, for that long; the `await asyncio.sleep(0)`
+between chunks lets other coroutines run. Step 3 exists because only the front end sees text:
+the engine core knows token ids, so when the detokenizer finds a stop string, the front end has
+to tell the engine to stop the request. The coroutine that serves an HTTP request never touches
+the engine directly; it only reads its queue.
+
+### The engine core loop
+
+The engine core process starts two threads. The input thread reads the sockets, decodes messages
+and puts them on `input_queue`. The output thread takes results from `output_queue` and sends
+them. The main thread runs [`run_busy_loop()`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/v1/engine/core.py#L1473):
+
+```python
+def run_busy_loop(self):
+    """Core busy loop of the EngineCore."""
+    while self._handle_shutdown():
+        # 1) Poll the input queue until there is work to do.
+        self._process_input_queue()
+        # 2) Step the engine core and return the outputs.
+        self._process_engine_step()
+```
+
+`_process_input_queue()` blocks while there is no work and otherwise drains the queue: new
+requests go to `Scheduler.add_request()`, aborts remove requests. Then one step runs.
+[`step()`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/v1/engine/core.py#L630)
+is three calls:
+
+```python
+def step(self):
+    scheduler_output = self.scheduler.schedule(...)
+    future = self.model_executor.execute_model(scheduler_output, non_block=True)
+    grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+    model_output = future.result()
+    if model_output is None:
+        model_output = self.model_executor.sample_tokens(grammar_output)
+    engine_core_outputs = self.scheduler.update_from_output(
+        scheduler_output, model_output
+    )
+    return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
+```
+
+The forward pass starts before the grammar bitmask is computed, so structured-output work on the
+CPU overlaps the GPU. **Async scheduling**, on by default unless an option conflicts with it, goes
+further: the loop runs `step_with_batch_queue()`, which keeps two steps in flight (one more per
+pipeline stage) and schedules step $n+1$ before step $n$'s tokens are known. The new tokens'
+positions are reserved as placeholders and filled in on the GPU, so the CPU work of one step hides
+behind the GPU work of the previous one.
+
+### The scheduler: one token budget
+
+[`Scheduler.schedule()`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/v1/core/sched/scheduler.py#L571)
+is the heart of vLLM. Its opening comment states the design:
+
+```python
+# NOTE(woosuk) on the scheduling algorithm:
+# There's no "decoding phase" nor "prefill phase" in the scheduler.
+# Each request just has the num_computed_tokens and
+# num_tokens_with_spec. num_tokens_with_spec =
+# len(prompt_token_ids) + len(output_token_ids) + len(spec_token_ids).
+# At each step, the scheduler tries to assign tokens to the requests
+# so that each request's num_computed_tokens can catch up its
+# num_tokens_with_spec.
+```
+
+A request is just two counters: how many of its tokens exist and how many have KV in the cache.
+A new request with a 5-token prompt is 5 tokens behind; a decoding request is 1 token behind (the
+token it sampled last step). Every step has a **token budget**, `max_num_batched_tokens`, and the
+scheduler hands it out in two passes:
+
+1. **Running requests first**, in order. Each gets `min(tokens behind, budget left)`: 1 for a
+   decode, the next chunk for a prompt that did not fit last time.
+2. **Waiting requests next**, in arrival order (or priority order with `--scheduling-policy
+   priority`). Each new request first looks up its prompt in the prefix cache, then gets as many
+   of the remaining prompt tokens as the budget allows. A prompt that does not fit is cut, which
+   is **chunked prefill**.
+
+The first pass is a loop over `self.running`. Stripped of speculative decoding, pipeline
+lookahead and connector checks, it reads:
+
+```python
+token_budget = self.max_num_scheduled_tokens
+encoder_compute_budget = self.max_num_encoder_input_tokens
+req_index = 0
+while req_index < len(self.running) and token_budget > 0:
+    request = self.running[req_index]
+
+    num_new_tokens = (request.num_tokens_with_spec
+                      + request.num_output_placeholders
+                      - request.num_computed_tokens)
+    if 0 < long_prefill_token_threshold < num_new_tokens:
+        num_new_tokens = long_prefill_token_threshold
+    num_new_tokens = min(num_new_tokens, token_budget)
+
+    if request.has_encoder_inputs:              # images: see "Multimodal requests"
+        (encoder_inputs_to_schedule, num_new_tokens,
+         new_encoder_compute_budget, _) = self._try_schedule_encoder_inputs(
+            request, request.num_computed_tokens, num_new_tokens,
+            encoder_compute_budget)
+
+    new_blocks = self.kv_cache_manager.allocate_slots(request, num_new_tokens, ...)
+    # (if new_blocks is None: preempt someone and retry, below)
+
+    scheduled_running_reqs.append(request)
+    num_scheduled_tokens[request.request_id] = num_new_tokens
+    token_budget -= num_new_tokens
+    req_index += 1
+```
+
+`num_tokens_with_spec − num_computed_tokens` is the "tokens behind" count; for a decoding request
+it is 1. `num_output_placeholders` is how async scheduling plans step $n+1$ before step $n$'s
+token is known: the request counts as one token further along, and the token id is filled in on
+the GPU. The `min` with `token_budget` is chunked prefill: a prompt that does not fit takes what
+is left. A request with images can have its count cut further, down to the tokens before an image
+whose encoder cannot run this step. Only then does the scheduler ask for memory, so blocks are
+reserved for exactly the tokens that will run. The second pass, over `self.waiting`, has the same
+shape plus the prefix-cache lookup and a cap on the number of running requests (`max_num_seqs`).
+It is skipped entirely in a step that had to preempt: there is no point admitting new work when
+memory is already short.
+
+Because prefill chunks and decodes share one forward pass, the GPU sees one flat sequence of
+tokens from different requests. The attention kernel is told where each request's tokens start
+and end; every other layer just processes a long matrix of tokens.
+
+Here is a scaled-down run with a budget of 8 tokens (the real default is a few thousand). A and B
+arrive at step 0 with prompts of 5 and 3 tokens; C arrives at step 2 with a 14-token prompt and D
+at step 3 with 4 tokens. Each cell is the number of tokens a request puts into a step; a dot marks
+a step in which the request samples a token.
+
+<BatchTimeline policy="vllm" />
+
+Check step 3 by hand. A and B are decoding: 1 token each, 6 left. C is running with 14 − 6 = 8
+prompt tokens still to compute, so it takes all 6, and D, which arrived this step, waits. In step 4
+C needs only its last 2 tokens, which leaves 4 for D's whole prompt. Both C and D sample their first
+token in step 4, and every step from 2 to 4 is full. A and B never miss a step, so their
+inter-token latency stays at one step while C prefills.<Sidenote>The simulation (`batching.ts`)
+models the token budget, running-first order and chunking. It leaves out memory limits,
+`max_num_seqs` and `long_prefill_token_threshold`, which caps how many tokens one prompt may take
+per step when others are waiting.</Sidenote>
+
+The scheduler does not send whole requests to the workers. Its `SchedulerOutput` lists new
+requests in full, but for running requests only what changed: new block ids and the number of
+tokens to compute. The workers keep the rest.
+
+#### When memory runs out: preemption
+
+Before a request is scheduled, the scheduler asks the KV cache manager for blocks to hold its new
+tokens with
+[`allocate_slots()`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/v1/core/kv_cache_manager.py#L371).
+If there are not enough free blocks for a running request, the scheduler **preempts** one: the
+last request in the running list, or the lowest priority one under the priority policy. The
+retry loop, simplified to the default first-come-first-served policy:
+
+```python
+while True:
+    new_blocks = self.kv_cache_manager.allocate_slots(request, num_new_tokens, ...)
+    if new_blocks is not None:
+        break                                   # the request can be scheduled
+    preempted_req = self.running.pop()          # the most recently admitted request
+    self._preempt_request(preempted_req, scheduled_timestamp)
+    preempted_reqs.append(preempted_req)
+    if preempted_req == request:
+        break                                   # we preempted ourselves: give up
+if new_blocks is None:
+    break                                       # stop scheduling running requests
+```
+
+The victim is the request at the end of the running list, the one admitted last, so the oldest
+requests keep making progress. Each preemption frees blocks and the allocation is retried; if the
+request runs out of others to evict, it preempts itself. Under the priority policy the victim is
+`max(self.running, key=lambda r: (r.priority, r.arrival_time))`, the least important and, among
+equals, the newest, and if that request was already scheduled in this step its tokens and blocks
+are handed back to the budget.
+[`_preempt_request()`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/v1/core/sched/scheduler.py#L1542)
+frees all of its blocks, sets `num_computed_tokens = 0` and puts it back at the front of the
+waiting queue. When it runs again, it recomputes its KV, usually much faster than the first time
+because its full blocks are probably still in the prefix cache.
+
+A waiting request that does not get its blocks simply stays waiting, and the scheduler stops
+admitting new requests for this step, which keeps the order fair.
+
+### The worker: from SchedulerOutput to logits
+
+On each GPU, the model runner keeps a **persistent batch**: the token ids, positions and block
+table of every running request, in GPU tensors that survive from step to step. Each step it
+applies the scheduler's diff (add new requests, append new block ids, drop finished ones), then
+builds the inputs for this step:
+
+- `input_ids` and `positions`: all scheduled tokens of all requests, concatenated;
+- `query_start_loc`: where each request's tokens start in that flat list;
+- `seq_lens`: each request's total length after this step;
+- the **block table**: for each request, its physical block ids in order;
+- the **slot mapping**: for each scheduled token, the cache slot where its key and value go.
+
+The slot mapping is computed on the GPU by a Triton kernel,
+[`_compute_slot_mappings_kernel`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/v1/worker/gpu/block_table.py#L287).
+For a token at position $p$ in a request whose block table is $T$ and block size is $B$:
+
+$$
+\text{slot} = T[\lfloor p / B \rfloor] \cdot B + (p \bmod B)
+$$
+
+```python
+block_indices = local_positions // kernel_block_size
+block_offsets = local_positions % kernel_block_size
+block_numbers = tl.load(
+    block_table_ptr + req_state_idx * block_table_stride + block_indices, ...
+)
+slot_ids = block_numbers * kernel_block_size + block_offsets
+```
+
+The figure shows one request of 10 tokens with block size 4 (vLLM's default is 16) and block table
+`[5, 2, 7]`. Hover a token to follow it to its slot.
+
+<PagedAddress
+	blockSize={4}
+	tokens={10}
+	blockTable={[5, 2, 7]}
+	numBlocks={8}
+	selected={6}
+	title="Token position → block table → physical slot (block size 4)"
+/>
+
+Check one entry: token 6 is in logical block $\lfloor 6/4 \rfloor = 1$ at offset 2; the table maps
+block 1 to physical block 2, so its slot is $2 \cdot 4 + 2 = 10$. With the default block size of 16
+and the same table, token 20 would land in slot $2 \cdot 16 + 4 = 36$.
+
+The runner then runs the model. For decode-heavy batches it replays a **CUDA graph** captured at
+start-up for that batch size, which replaces thousands of kernel launches from Python with one
+launch. The graph reads its inputs from fixed buffers, which is why the runner copies inputs into
+persistent tensors instead of allocating new ones, and why padded slots are marked with slot
+$-1$, which the cache kernels skip. Finally the runner samples, and the sampled token ids go back
+to the engine core.
+
+### Back to text: incremental detokenization
+
+The engine core returns token ids; the client wants text, as it is generated. Turning ids back
+into text one token at a time, **incremental detokenization**, is harder than it looks, for two
+reasons. A token can end in the middle of a character, and the text of a token can depend on
+the tokens before it (a leading-space marker, a byte fallback). Decoding each new token on its own
+and appending the result would print broken characters.
+
+For fast tokenizers vLLM uses `DecodeStream` from the Hugging Face `tokenizers` library, created
+once per request in
+[`FastIncrementalDetokenizer`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/v1/engine/detokenizer.py#L165):
+
+```python
+# Use native prefill to prime the decode stream with prompt tokens.
+self.stream = tokenizers.decoders.DecodeStream(
+    ids=request.prompt_token_ids,
+    skip_special_tokens=self.skip_special_tokens,
+)
+
+def _protected_step(self, next_token_id: int) -> str | None:
+    token = self.stream.step(self.tokenizer, next_token_id)
+    ...
+```
+
+`step()` adds one id and returns the new text it completes, or `None` if the bytes so far do not
+end on a whole character. Priming it with the prompt matters: the first output token is decoded
+in the context of the prompt's last tokens, so a leading space comes out right. Here is what it
+returns, token by token, when Qwen2-VL generates `naïve café 🦙`:
+
+| Step | Token id | UTF-8 bytes | `step()` returns |
+| ---: | ---: | --- | --- |
+| 1 | 3376 | `6E 61` | `"na"` |
+| 2 | 37572 | `C3 AF` | `"ï"` |
+| 3 | 586 | `76 65` | `"ve"` |
+| 4 | 51950 | `20 63 61 66 C3 A9` | `" café"` |
+| 5 | 11162 | `20 F0 9F` | `None` |
+| 6 | 99 | `A6` | `None` |
+| 7 | 247 | `99` | `" 🦙"` |
+
+The llama emoji is U+1F999, four UTF-8 bytes `F0 9F A6 99`, and the tokenizer has no single
+token for it, so it is spread over the last three tokens. `F0` announces a four-byte character,
+so after steps 5 and 6 the stream holds an incomplete character and returns nothing; step 7
+completes it and returns the space and the emoji together. Without this, the client would see
+two replacement characters (`�`) and then garbage.<Sidenote>Computed with the Qwen2-VL-7B-Instruct
+tokenizer and `tokenizers` 0.23.2 `DecodeStream`, primed with no prompt.</Sidenote>
+
+After detokenizing, [`update()`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/v1/engine/detokenizer.py#L95)
+checks the request's **stop strings**, which the engine core cannot check because it never sees
+text:
+
+```python
+stop_check_offset = len(self.output_text)
+for new_token_id in new_token_ids:
+    self.token_ids.append(new_token_id)
+    self.output_text += self.decode_next(new_token_id)
+
+if self.stop and self.num_output_tokens() > self.min_tokens:
+    stop = check_stop_strings(
+        output_text=self.output_text,
+        new_char_count=len(self.output_text) - stop_check_offset,
+        stop=self.stop,
+        include_in_output=self.include_stop_str_in_output,
+    )
+    if stop is not None:
+        stop_string, truncate_to = stop
+        if truncate_to != -1:
+            self.output_text = self.output_text[:truncate_to]
+```
+
+[`check_stop_strings()`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/v1/engine/detokenizer.py#L307)
+searches only the tail of the text, `output_text.find(stop_str, 1 - new_char_count -
+len(stop_str))`: the new characters plus enough old ones to catch a stop string that straddles
+the boundary. A whole-text search would make every step cost time proportional to the answer so
+far.
+
+Streaming adds one more wrinkle. If the stop string is `"\n\nUser:"` (7 characters) and the
+model has produced `"...done.\n\nUs"`, the last four characters may be the start of the stop
+string, and once sent they cannot be taken back. So the detokenizer holds back
+`stop_buffer_length = max(len(s) for s in stop) - 1` characters, here 6, and streams only the
+text before them; the held-back text goes out once it can no longer be part of a match, or when
+the request finishes. When a stop string matches, the front end aborts the request in the engine
+core (step 3 of `output_handler` above), which frees its blocks.
+
+## The KV cache
+
+### Sizing the cache at start-up
+
+vLLM decides the size of the KV cache once, at start-up, by measuring. Each worker loads the
+weights, runs a forward pass on a dummy batch of the maximum size, and records the peak memory.
+[`determine_available_memory()`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/v1/worker/gpu_worker.py#L600)
+then returns what is left of `gpu_memory_utilization` (default 0.92) times the GPU's memory. The
+engine core divides that by the size of one block across all layers and gets the number of
+blocks.
+
+A **block** holds the keys and values of `block_size` consecutive tokens (16 by default) for one
+layer; block id $b$ means "block $b$ in every layer". Its size is
+
+$$
+\text{page} = \text{block\_size} \times n_\text{kv\_heads} \times 2 \times d_\text{head} \times \text{bytes per element}.
+$$
+
+For Llama-3.1-8B in bf16 on one 80 GB H100:
+
+| Quantity | Value |
+| --- | ---: |
+| Layers, KV heads, head size | 32, 8, 128 |
+| KV per token, all layers ($2 \cdot 32 \cdot 8 \cdot 128 \cdot 2$ bytes) | 128 KiB |
+| One block, one layer (16 tokens) | 64 KiB |
+| One block id, all 32 layers | 2 MiB |
+| Budget: $0.92 \times 80$ GiB | 73.6 GiB |
+| Weights (8.03 B parameters × 2 bytes) | 15.0 GiB |
+| Activation peak (assumed) | 2.0 GiB |
+| Left for the KV cache | 56.6 GiB |
+| Blocks ($56.6\ \text{GiB} / 2\ \text{MiB}$) | 29,001 |
+| Tokens ($\times 16$) | 464,016 |
+
+That is enough for 113 requests of 4,096 tokens at once, or 3.5 requests at the model's full
+128K context.<Sidenote>The weights and the assumed 2 GiB activation peak are illustrative; the
+real number comes from profiling and also depends on CUDA graph memory, which vLLM measures
+separately. vLLM logs the result as "GPU KV cache size" and "Maximum concurrency".</Sidenote>
+
+### How the cache is laid out in memory
+
+The KV cache is one large allocation per GPU.
+[`allocate_kv_cache()`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/v1/worker/utils.py#L395)
+allocates a flat `int8` buffer and gives every layer a strided view of it. Logically each layer's
+view is `[num_blocks, num_kv_heads, block_size, 2 * head_size]`: keys and values of a token sit
+side by side in the last dimension. Physically, the order of the dimensions is a
+**layout**. When the attention backend does not ask for one, vLLM picks `LBNHC`
+([`_DEFAULT_LAYOUT_PREFERENCE`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/v1/attention/backends/utils.py#L195)):
+layer, then block, then token in the block, then head, then the key and value.
+
+| Dimension | Size (Llama-3.1-8B) | Stride in elements |
+| --- | ---: | ---: |
+| layer $L$ | 32 | 950,304,768 |
+| block $B$ | 29,001 | 32,768 |
+| token in block $N$ | 16 | 2,048 |
+| KV head $H$ | 8 | 256 |
+| key, then value $C$ | 256 | 1 |
+
+So one token's keys and values for all 8 heads of one layer are a contiguous 4 KiB, and a block of
+one layer is a contiguous 64 KiB page. That contiguity matters twice: the attention kernel reads a
+page with wide loads, and the KV transfer in the last section can move a page as one RDMA
+operation.
+
+### Blocks, hashes and the free queue
+
+The scheduler process keeps the bookkeeping. The
+[`BlockPool`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/v1/core/block_pool.py#L136)
+holds one `KVCacheBlock` object per physical block, with a reference count and, once the block is
+full, a hash. Three structures tie them together:
+
+- the **block table** of each request: the ids of its blocks, in order;
+- the **free queue**, a doubly linked list of blocks with reference count 0, in eviction order;
+- the **cached-block map**, from block hash to block.
+
+A full block's hash covers its tokens and the hash of the block before it
+([`hash_block_tokens()`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/v1/core/kv_cache_utils.py#L684)):
+
+```python
+def hash_block_tokens(hash_function, parent_block_hash,
+                      curr_block_token_ids, extra_keys=None):
+    if not parent_block_hash:
+        parent_block_hash = NONE_HASH
+    curr_block_token_ids_tuple = tuple(curr_block_token_ids)
+    return BlockHash(
+        hash_function((parent_block_hash, curr_block_token_ids_tuple, extra_keys))
+    )
+```
+
+Chaining makes the hash of block $i$ identify the whole prefix up to block $i$, not just its 16
+tokens. A new request computes the chain for its prompt and walks it until the first miss; every
+hit is a block whose KV it does not need to compute. `extra_keys` mixes in anything else that
+changes the KV for the same tokens, such as a LoRA adapter or image hashes. The default hash
+function is SHA-256 over a pickled tuple, which makes collisions between different prefixes
+practically impossible.
+
+Step through two requests that share an 8-token system prompt, with blocks of 4 tokens and a pool
+of 10 blocks:
+
+<BlockPoolSteps />
+
+Three rules from the code produce what you see:
+
+- **A hit at most covers the prompt minus one token**
+  ([`get_computed_blocks()`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/v1/core/kv_cache_manager.py#L264)).
+  The model needs the hidden state of the last prompt token to sample, so that token is always
+  recomputed. If B had repeated A's 12-token prompt exactly, it would hit 2 blocks, not 3.
+- **New blocks come from the front of the free queue.** If the block taken still has a hash, the
+  hash is evicted from the map. The cache never "makes room": a cached block is just a free block
+  that has not been reused yet.
+- **Freed blocks go to the front if they have no hash and to the back if they do**
+  ([`free_blocks()`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/v1/core/block_pool.py#L777)).
+  A request frees its blocks tail first, so within one request the deepest blocks are evicted
+  before the shared root. Across requests, blocks freed earlier are evicted earlier: least
+  recently used.
+
+The free queue is a hand-written linked list rather than a Python `deque` because a hit must
+remove a block from the middle of the queue in $O(1)$. The `KVCacheBlock` objects carry their own
+`prev_free_block` and `next_free_block` pointers, so no list nodes are allocated.
+
+## Multimodal requests
+
+A **vision-language model** is a language model with a **vision encoder** in front of it. The
+encoder turns an image into a sequence of vectors the same width as the language model's token
+embeddings. The prompt holds one **placeholder token** for each of those vectors, and before the
+first decoder layer the vectors are written over the placeholders' embeddings. From then on,
+image positions are ordinary prompt tokens: they take KV-cache blocks, they count against the
+token budget, and attention treats them like text.
+
+So vLLM's work for an image is all around the edges. The front end must know how many
+placeholders an image needs before any GPU sees it, because the scheduler plans in tokens. The
+engine must run the encoder at the right step, not run it twice for the same image, and keep the
+prefix cache from confusing two different images. The figure shows where each piece lives; the
+sections below follow one 1280×720 image through Qwen2-VL-7B-Instruct.
+
+<BoxDiagram
+	nodes={vllmMmNodes}
+	edges={vllmMmEdges}
+	grid={{ cellW: 150, cellH: 48, gapX: 72, gapY: 36 }}
+	selected="upd"
+	title="Where an image goes in vLLM"
+/>
+
+### From content part to placeholder tokens
+
+#### Parsing the message and fetching the image
+
+While parsing the chat messages, each image part is handed to a tracker, which returns the
+placeholder string to put in the text and queues the download
+([`AsyncMultiModalContentParser`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/entrypoints/chat_utils.py#L1270)):
+
+```python
+async def _image_with_uuid_async(self, image_url: str | None, uuid: str | None):
+    image = await self._connector.fetch_image_async(image_url) if image_url else None
+    return image, uuid
+
+def parse_image(self, image_url: str | None, uuid: str | None = None) -> None:
+    placeholder = self._tracker.add(
+        "image", partial(self._image_with_uuid_async, image_url, uuid))
+    self._add_placeholder("image", placeholder)
+```
+
+`self._tracker.add()` first checks the image count against `--limit-mm-per-prompt`, so a request
+with too many images fails before anything is downloaded. It returns the model's placeholder
+string, which for Qwen2-VL is `<|vision_start|><|image_pad|><|vision_end|>`
+([`get_placeholder_str`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/model_executor/models/qwen2_vl.py#L1394)).
+When the chat template takes plain-string content, vLLM puts this string in front of the
+message's text. Qwen2-VL's template loops over the
+content parts and writes the same string itself, as we saw above.
+
+The download does not start until all messages are parsed. Then `resolve_items()` awaits all of
+a request's images concurrently. `MediaConnector.load_from_url_async()` accepts three kinds of
+URL: a `data:` URL is base64-decoded; an `http(s)://` URL is checked against
+`--allowed-media-domains` if that is set, then fetched with a size limit and a timeout
+(`VLLM_IMAGE_FETCH_TIMEOUT`, 5 seconds by default), and cached on disk if `VLLM_MEDIA_CACHE`
+names a directory; a `file://` URL works only under `--allowed-local-media-path`. The bytes are decoded into an RGB PIL image on a thread pool, since
+decoding a large JPEG takes milliseconds of CPU.
+
+#### The multimodal processor
+
+After the chat template and tokenizer have run, the prompt is 28 token ids with one
+`<|image_pad|>`, and the image is a PIL image. The renderer passes both to the model's
+**multimodal processor**,
+[`BaseMultiModalProcessor.apply()`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/multimodal/processing/processor.py#L1797),
+whose docstring lists its four steps:
+
+```python
+def apply(self, inputs: ProcessorInputs, timing_ctx: TimingContext) -> MultiModalInput:
+    """
+    1. Perform MM-specific post-processing to the token inputs.
+    2. Apply HF Processor on multi-modal data together with optional
+       dummy text, outputting processed multi-modal data tensors.
+    3. Find and update sequences in the token IDs with placeholder tokens.
+       The number of placeholder tokens equals the feature size of the
+       multi-modal data outputted by the multi-modal encoder.
+    4. Extract information about the placeholder tokens from the
+       processed token IDs.
+    """
+    mm_res = self._cached_apply_hf_processor(inputs, timing_ctx)
+    prompt_ids, mm_placeholders = self._maybe_apply_prompt_updates(
+        mm_items=inputs.mm_data_items, mm_res=mm_res)
+    mm_placeholder_ranges = {
+        modality: [item.to_range() for item in placeholders]
+        for modality, placeholders in mm_placeholders.items()}
+    return mm_input(prompt_token_ids=prompt_ids, mm_kwargs=mm_res.kwargs,
+                    mm_hashes=mm_res.hashes, mm_placeholders=mm_placeholder_ranges)
+```
+
+Step 2 runs the model's own Hugging Face image processor: resize, normalise, cut into patches. Its
+output, `mm_kwargs`, holds the tensors the vision encoder will take as input. Step 3 is vLLM's
+part. Each model says how to expand its placeholder; Qwen2-VL's rule is
+([`_get_prompt_updates`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/model_executor/models/qwen2_vl.py#L1236)):
+
+```python
+merge_length = image_processor.merge_size**2
+
+def get_replacement_qwen2vl(item_idx: int, modality: str):
+    out_item = out_mm_kwargs[modality][item_idx]
+    grid_thw = out_item[f"{modality}_grid_thw"].data
+    num_tokens = int(grid_thw.prod()) // merge_length
+    return [placeholder[modality]] * num_tokens
+
+return [
+    PromptReplacement(
+        modality=modality,
+        target=[placeholder[modality]],
+        replacement=partial(get_replacement_qwen2vl, modality=modality),
+    )
+    for modality in ("image", "video")
+]
+```
+
+Find the single `<|image_pad|>` and replace it with `num_tokens` copies of itself. The count comes
+from `grid_thw`, the number of 14×14-pixel patches along time, height and width, divided by 4
+because Qwen2-VL's encoder merges each 2×2 group of patches into one output vector.
+
+#### How many tokens is an image?
+
+The patch grid depends on the image size. Qwen2-VL first rounds each side to a multiple of
+$28 = 14 \times 2$ (patch size times merge size) with `smart_resize`, scaling the whole image down
+if it has more than `max_pixels` pixels (12,845,056 in this checkpoint's
+`preprocessor_config.json`) or up if it has fewer than `min_pixels` (3,136). Then:
+
+$$
+\text{tokens} = \frac{(H' / 14)\,(W' / 14)}{4}
+$$
+
+for a resized image of $H' \times W'$ pixels (the time dimension is 1 for an image).
+
+| Image (W × H) | Resized | Patch grid | Patches | Tokens |
+| --- | --- | --- | ---: | ---: |
+| 224 × 224 | 224 × 224 | 16 × 16 | 256 | 64 |
+| 640 × 480 | 644 × 476 | 34 × 46 | 1,564 | 391 |
+| 1280 × 720 | 1288 × 728 | 52 × 92 | 4,784 | 1,196 |
+| 4000 × 3000 | 4004 × 2996 | 214 × 286 | 61,204 | 15,301 |
+
+Check the 1280×720 row: $720 / 28 = 25.7$ rounds to 26, so $H' = 26 \cdot 28 = 728$; $1280 / 28 =
+45.7$ rounds to 46, so $W' = 1288$. The grid is $728/14 = 52$ by $1288/14 = 92$, 4,784 patches,
+and 4,784 / 4 = 1,196 tokens. A 12-megapixel photo costs 15,301 tokens, almost half of the
+32,768-token context. Serving many photos, it is worth capping the size, for example with
+`--mm-processor-kwargs '{"max_pixels": 1003520}'` (1280 × 28 × 28), which limits an image to
+1,280 tokens.<Sidenote>Computed with a copy of Hugging Face's `smart_resize` and the checkpoint's
+`min_pixels` and `max_pixels`. vLLM's `Qwen2VLProcessingInfo._get_vision_info()` uses the same
+formula to predict token counts without running the processor.</Sidenote>
+
+Switch between the two views to see the prompt before and after step 3:
+
+<TokenStrip
+	views={imageExpansionViews}
+	blockSize={16}
+	view={1}
+	selected={15}
+	title="The Qwen2-VL prompt before and after placeholder expansion (1280×720 image)"
+/>
+
+The prompt grew from 28 to 28 − 1 + 1,196 = 1,223 tokens. The image occupies positions 15 to
+1,210, which the processor records as `PlaceholderRange(offset=15, length=1196)`, and spans KV
+blocks 0 to 75. The user's text and the assistant header follow at positions 1,211 to 1,222.
+
+#### Hashes, and not sending the same image twice
+
+Before step 2, the processor **hashes** each image: BLAKE3 over the model id and the image's
+pixels, plus any per-request processor arguments such as `max_pixels`, since they change the
+output. A client can send its own `uuid` for an image instead, which saves hashing large inputs
+([`MultiModalHasher`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/multimodal/hasher.py#L85)).
+The hash names the image everywhere downstream: in the processor cache, in the encoder cache, and
+in the prefix cache's block hashes.
+
+The processed image is large. Our 1280×720 image becomes 4,784 patches of 3 × 2 × 14 × 14 =
+1,176 values each, about 21.5 MiB of float32, and it must cross from the API server
+process to the engine core. The **processor cache** avoids sending it twice. It is a pair of LRU
+caches of the same size (`--mm-processor-cache-gb`, 4 GiB by default), one in each process, that
+make the same eviction decisions
+([`LruKeyReplicatedSenderCache`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/multimodal/cache/lru.py#L22)):
+
+```python
+def get_and_update_item(self, mm_item, mm_hash):
+    if (cached_item := self._cache.get(mm_hash)) is not None:
+        return None, cached_item.prompt_updates     # engine core has it: send no data
+
+    self.cache_if_fits(self._cache, mm_hash,
+                       MultiModalProcessorCacheItemMetadata(*mm_item))
+    return mm_item                                  # first time: send the tensors
+```
+
+The API server's copy stores only metadata (the item's size and its prompt update), so it can
+mirror the engine core's evictions without holding the tensors; the engine core's copy stores the
+tensors. When the
+same image comes again, for example in every turn of a conversation about it, the front end skips
+the Hugging Face processor and sends `data=None`, and the engine core fills the data in from its
+own cache. If the two drift apart, the engine core reports a miss and the front end drops its
+entry, so the next request sends the data again.
+
+The InputProcessor then packs each image into a
+[`MultiModalFeatureSpec`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/multimodal/inputs.py#L344),
+sorted by position in the prompt: the tensors (or `None`), the modality, the hash, and the
+`PlaceholderRange`. A list of these is the `mm_features` of the `EngineCoreRequest`.
+
+### Running the vision encoder
+
+#### Scheduling the encoder
+
+The scheduler treats an image as a dependency of its placeholder tokens: the tokens at positions
+15 to 1,210 cannot be computed until the encoder has produced their embeddings. In the running
+and waiting loops shown earlier, a request with images goes through
+[`_try_schedule_encoder_inputs()`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/v1/core/sched/scheduler.py#L1745)
+before it gets blocks. The core of it, for each image that overlaps the tokens to be computed
+this step:
+
+```python
+if self.encoder_cache_manager.check_and_update_cache(request, i):
+    # The encoder input is already computed and cached from a previous step.
+    continue
+
+if not self.encoder_cache_manager.can_allocate(
+        request, i, encoder_compute_budget, num_embeds_to_schedule):
+    # The encoder cache is full or the encoder budget is exhausted.
+    if num_computed_tokens + shift_computed_tokens < start_pos:
+        # We only schedule the decoder tokens just before the encoder input.
+        num_new_tokens = start_pos - (num_computed_tokens + shift_computed_tokens)
+    else:
+        num_new_tokens = 0
+    break
+
+num_embeds_to_schedule += num_encoder_embeds
+encoder_compute_budget -= num_encoder_embeds
+encoder_inputs_to_schedule.append(i)
+```
+
+Three outcomes. If the image's embeddings are already in the encoder cache, from an earlier step
+of this request or from another request with the same image hash, nothing runs. If they are not
+and there is room, the image is scheduled and its embedding count is charged to the step's
+**encoder budget**. If there is no room, the request's tokens are cut to stop just before the
+image: here, the 15 text tokens at positions 0 to 14 can still run, and the rest waits for a
+later step.
+
+An image is encoded whole, never in pieces, because a vision encoder's attention is
+bidirectional: every patch attends to every other. The decoder side can still be chunked. With
+the H100 default `max_num_batched_tokens = 8192`, our 1,223-token prompt fits in one step, but the
+15,301-token photo does not. Its prefill runs over two steps (8,192 tokens, then the remaining 7,136,
+including the text after the image), while the encoder runs once in the first step and the second
+step reads the rest of the embeddings from the encoder cache. Both the encoder budget and the
+encoder cache default to `max_num_batched_tokens` embeddings, raised to the largest single item
+if that is bigger
+([`compute_mm_encoder_budget`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/v1/core/encoder_cache_manager.py#L316)),
+so one image always fits. For Qwen2-VL, 8,192 embeddings of width 3,584 in bf16 are 56 MiB, and
+the 15,301-token photo alone needs 105 MiB.
+
+#### Encoding and merging the embeddings
+
+On the worker, before the forward pass, the model runner runs the scheduled encoder inputs and
+assembles the input embeddings
+([`prepare_inputs_embeds`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/v1/worker/gpu/model_states/default.py#L100)):
+
+```python
+if self.supports_mm_inputs:
+    self.execute_mm_encoder(scheduled_encoder_inputs)
+    mm_embeds, is_mm_embed = super().gather_mm_embeddings(input_batch)
+    inputs_embeds = self.encoder_runner.get_inputs_embeds(
+        input_ids_unpadded, mm_embeds, is_mm_embed)
+else:
+    input_embeddings = self.model.embed_input_ids(input_ids_unpadded)
+```
+
+[`execute_mm_encoder()`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/v1/worker/gpu/mm/encoder_runner.py#L150)
+groups the scheduled images by modality, batches them, and calls the model's
+`embed_multimodal()`, which for Qwen2-VL is a 32-layer vision transformer followed by the 2×2
+merger that projects to width 3,584. The outputs go into the worker's encoder cache, keyed by
+image hash. Then
+[`gather_mm_embeddings()`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/v1/worker/gpu/mm/encoder_runner.py#L204)
+walks the step's requests and, for each image overlapping the step's tokens, slices out the rows
+those tokens need and marks their positions:
+
+```python
+start_idx = max(cur_query_start - start_pos, 0)
+end_idx = min(cur_query_end - start_pos, num_encoder_tokens)
+encoder_output = self.encoder_cache.encoder_outputs.get(mm_hash, None)
+mm_embeds_item = encoder_output[start_idx:end_idx]
+
+req_start_pos = query_start_loc[i] + start_pos - cur_query_start
+is_mm_embed[req_start_pos + start_idx : req_start_pos + end_idx] = True
+mm_embeds.append(mm_embeds_item)
+```
+
+Work through our request in one step: `cur_query_start = 0`, `cur_query_end = 1223`,
+`start_pos = 15` and 1,196 encoder tokens, so `start_idx = 0`, `end_idx = 1196`, all rows are
+used, and positions 15 to 1,210 of the request's slice of the batch are marked. In the
+two-step photo, the second step starts at 8,192, so `start_idx` = 8,192 − 15 = 8,177 and the
+step takes rows 8,177 to 15,300.
+
+Last,
+[`_merge_multimodal_embeddings()`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/model_executor/models/utils.py#L709),
+called from the model's `embed_input_ids()`, does the splice in one masked assignment:
+
+```python
+mm_embeds_flat = _flatten_embeddings(multimodal_embeddings)
+# If is_multimodal is on CPU this avoids a D2H sync
+inputs_embeds[is_multimodal] = mm_embeds_flat.to(dtype=input_dtype)
+```
+
+The text embedding of every token is looked up as usual, including the meaningless embedding of
+`<|image_pad|>`, and the image rows are written over the placeholder positions. If the number of
+rows and the number of `True` entries differ, the processor's token count and the encoder's
+output disagree, and vLLM raises an error naming both numbers. The result goes into the same
+fixed buffer the CUDA graphs read from, and the decoder runs exactly as for text.
+
+Qwen2-VL adds one more thing: **M-RoPE**, a rotary position embedding with three position
+components (time, height, width), so that an image token knows its row and column. The model
+runner computes those positions for each step (`rope_state.prepare_positions()`) instead of the
+plain token index.
+
+### Images and the prefix cache
+
+Every placeholder token of every image has the same id, 151655. Two requests with the same
+question about different pictures therefore have identical token ids, and with token-only block
+hashes the second would reuse the first one's KV cache and describe the wrong picture. So a block
+that overlaps an image mixes the image's hash into its block hash, through the `extra_keys` of
+`hash_block_tokens()` seen earlier
+([`_gen_mm_extra_hash_keys`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/v1/core/kv_cache_utils.py#L499)):
+
+```python
+offset = mm_feature.mm_position.offset
+length = mm_feature.mm_position.length
+if end_token_idx > offset:
+    if start_token_idx >= offset + length:
+        # This block has passed the current mm input.
+        curr_mm_idx += 1
+        continue
+    # The block contains the current mm input. Include its offset
+    # relative to the start of the block ...
+    extra_keys.append(("mm", mm_feature.identifier, offset - start_token_idx))
+```
+
+For our image at offset 15, the keys are:
+
+| Block | Tokens | Extra key |
+| ---: | --- | --- |
+| 0 | 0–15 | `("mm", h, 15)` |
+| 1 | 16–31 | `("mm", h, -1)` |
+| 2 | 32–47 | `("mm", h, -17)` |
+| 75 | 1200–1215 | `("mm", h, -1185)` |
+| 76 | 1216–1222 | none: the block is not full, so it has no hash |
+
+The relative offset matters as much as the hash: the same image placed one token later produces
+different KV values, and the offset makes those blocks hash differently. Because block hashes
+chain, block 76 onwards would differ for different images anyway; the extra key is what makes
+blocks 0 to 75 safe.
+
+With these keys, a follow-up turn in a conversation about the same image hits the prefix cache
+for at least the 76 full blocks that cover the image (positions 0 to 1,215) and computes only what
+comes after. Its encoder does
+not run either, unless the scheduler has to compute some image tokens again: an image is encoded
+only when tokens inside its range are scheduled, and a prefix hit skips them.
+
+## The CUDA code
+
+The model's linear layers, norms and activations are ordinary GPU kernels (cuBLAS, CUTLASS,
+Triton). The code specific to serving is about the cache: writing new keys and values into it,
+attending over it in place, and combining partial attention results. Multi-GPU serving adds an
+all-reduce in every layer.
+
+### Writing keys and values: reshape_and_cache_flash
+
+Every attention layer, before it attends, stores the keys and values of this step's tokens. The
+FlashAttention backend's `do_kv_cache_update()` splits the layer's cache view into a key view and a
+value view and calls
+[`reshape_and_cache_flash_kernel`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/csrc/libtorch_stable/cache_kernels.cu#L326).
+One thread block handles one token:
+
+```cpp
+const int64_t token_idx = blockIdx.x;
+const int64_t slot_idx = slot_mapping[token_idx];
+// NOTE: slot_idx can be -1 if the token is padded
+if (slot_idx < 0) {
+  return;
+}
+const int64_t block_idx = slot_idx / block_size;
+const int64_t block_offset = slot_idx % block_size;
+
+const scalar_t* __restrict__ key_src = key + token_idx * key_stride;
+cache_t* __restrict__ key_dst =
+    key_cache + block_idx * block_stride + block_offset * page_stride;
+...
+if (is_contiguous_heads && kv_scale_stride == 0) {
+  // NHD layout: all heads of the token are one contiguous run
+  vectorize_with_alignment<VEC_SIZE>(key_src, key_dst, n_elems, threadIdx.x,
+                                     blockDim.x, k_op);
+  vectorize_with_alignment<VEC_SIZE>(value_src, value_dst, n_elems,
+                                     threadIdx.x, blockDim.x, v_op);
+} else {
+  // heads are strided: one warp per head, 32 lanes copy its head_size elements
+  for (int head = warp_id; head < num_heads; head += warps_per_block) {
+    ...
+    vectorize_with_alignment<VEC_SIZE>(k_src_h, k_dst_h, head_size, lane, 32, k_op);
+    vectorize_with_alignment<VEC_SIZE>(v_src_h, v_dst_h, head_size, lane, 32, v_op);
+  }
+}
+```
+
+The kernel is a scatter: the source rows are consecutive, the destinations are wherever the slot
+mapping says. `vectorize_with_alignment` copies 16 bytes at a time (`VEC_SIZE` = 8 bf16 values)
+when both pointers are aligned, and `CopyWithScaleOp` converts to FP8 on the way when the cache is
+quantized (`--kv-cache-dtype fp8`), using a per-tensor or per-head scale.
+
+Work through the launch for Llama-3.1-8B on one GPU. The launcher uses one thread block per token
+and `min(num_heads * head_size, 512)` = $\min(8 \cdot 128, 512) = 512$ threads, 16 warps. In the
+default layout, keys and values of one head are interleaved, so consecutive heads are 256 elements
+apart while a head is 128 elements: the heads are not contiguous and the kernel takes the second
+branch. Warp $w$ copies head $w$; each head is $128 \times 2 = 256$ bytes, or sixteen 16-byte
+vectors, so lanes 0 to 15 each move one vector of the key and one of the value. Warps 8 to 15 have
+no head and exit. A prefill of 2,048 tokens launches 2,048 such blocks per layer; a decode step of
+64 requests launches 64.
+
+### Reading the cache: paged attention
+
+The attention kernel itself comes from vLLM's fork of FlashAttention (FA2 on Ampere, FA3 on
+Hopper, FA4 on Blackwell when available), or from FlashInfer or vLLM's own Triton kernels on other
+setups. vLLM passes the queries, the
+whole key and value caches, `cu_seqlens_q` (where each request's query tokens start), `seqused_k`
+(each request's total length) and the block table. The kernel never sees a contiguous key matrix;
+it gathers each tile of keys through the block table. In the FA2 kernel, for a tile of `kBlockN`
+keys, every thread computes its own source address with
+[`resolve_thread_kv_page_slice_offset`](https://github.com/vllm-project/flash-attention/blob/9cd61de38763d712bb6ce56e2a02cc2bf718c89f/csrc/flash_attn/src/utils.h#L301):
+
+```cpp
+const int64_t col_offset = tidx % kGmemThreadsPerRow * kGmemElemsPerLoad;
+int64_t block_row_offset = tidx / kGmemThreadsPerRow * kGmemRowsPerThread;
+...
+const int64_t global_row_offset = block_row_offset + n_block * kBlockN;
+const int64_t page_offset = global_row_offset % page_block_size;
+const int64_t virtual_page_idx = global_row_offset / page_block_size;
+
+return ((int64_t) block_table[virtual_page_idx]) * ((int64_t) page_stride)
+    + page_offset * ((int64_t) row_stride)
+    + col_offset;
+```
+
+This is the slot formula from the figure above, done per thread: the key row $r$ of the sequence
+is in page $\lfloor r / 16 \rfloor$ at row $r \bmod 16$, and the page's physical location comes from
+the block table. Say a tile covers keys 128 to 255 (`n_block` = 1, `kBlockN` = 128) and a thread's
+row offset in the tile is 37. Its key row is 165, in logical page 10 at row 5, so it reads from
+`block_table[10] * page_stride + 5 * row_stride + col_offset`. With the default layout,
+`row_stride` is 2,048 elements (one token, all heads, keys and values) and the head's offset is
+added before the loop. Everything after the load (the dot products, the online softmax, the
+weighted sum of values) is the same as in non-paged FlashAttention; see
+[FlashAttention](/blog/flash-attention/).
+
+Paging costs little because each page is 16 contiguous rows: a thread's 16-byte loads stay
+coalesced within a page, and only the base address changes from page to page.
+
+### Merging partial attention: merge_attn_states
+
+Sometimes attention over one sequence is computed in two parts: over a shared prefix and over each
+request's own suffix (vLLM's **cascade attention**), or over chunks of the keys handled by
+different thread blocks or GPUs. Each part returns its output $o_i$ and the log-sum-exp of its
+scores, $\ell_i = \log \sum_j e^{s_j}$. The full result is a weighted average:
+
+$$
+o = \frac{e^{\ell_1} o_1 + e^{\ell_2} o_2}{e^{\ell_1} + e^{\ell_2}}, \qquad
+\ell = \log\left(e^{\ell_1} + e^{\ell_2}\right).
+$$
+
+[`merge_attn_states_kernel`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/csrc/libtorch_stable/attention/merge_attn_states.cu#L19)
+computes this with one thread per 16-byte pack of a head (8 bf16 values), subtracting the larger
+LSE first so the exponentials cannot overflow:
+
+```cpp
+const float max_lse = fmaxf(p_lse, s_lse);
+p_lse = p_lse - max_lse;
+s_lse = s_lse - max_lse;
+const float p_se = expf(p_lse);
+const float s_se = expf(s_lse);
+const float out_se = p_se + s_se;
+const float p_scale = p_se / out_se;
+const float s_scale = s_se / out_se;
+// output = prefix_output * p_scale + suffix_output * s_scale, element-wise
+```
+
+A worked example with one query $q = (1, 0.5)$, head size 2 and four keys, split as two and two:
+
+| | keys | scores $q \cdot k / \sqrt{2}$ | output | LSE |
+| --- | --- | --- | --- | ---: |
+| prefix | $(1,0), (0,1)$ | 0.7071, 0.3536 | $(1.8250, 2.8250)$ | 1.2390 |
+| suffix | $(1,1), (-1,0.5)$ | 1.0607, −0.5303 | $(5.3385, 6.3385)$ | 1.2461 |
+| merged | | | $(3.5880, 4.5880)$ | 1.9357 |
+
+The weights are $e^{1.2390} / (e^{1.2390} + e^{1.2461}) = 0.4982$ and $0.5018$; check the first
+output entry: $0.4982 \cdot 1.8250 + 0.5018 \cdot 5.3385 = 3.5880$, the same as attention over all
+four keys at once.<Sidenote>Values are $v = (1,2), (3,4), (5,6), (7,8)$. The script that computed
+the table also computed full attention over the four keys directly; the outputs and LSEs agree to
+four decimals.</Sidenote>
+
+### All-reduce across GPUs
+
+With tensor parallelism, each attention block and each MLP ends in an all-reduce of the hidden
+states (see [Tensor parallelism](/blog/tensor-parallelism/)). During decode these messages are
+small: 16 tokens of a 4,096-wide bf16 hidden state are 128 KiB. NCCL's ring algorithm needs
+$2(n-1)$ steps for $n$ GPUs, each with a fixed latency, which dominates at that size. vLLM's
+[custom all-reduce](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/csrc/custom_all_reduce.cuh#L9)
+uses CUDA IPC instead: every GPU maps the other GPUs' input buffers into its address space, and the
+kernel reads them directly over NVLink.
+
+```cpp
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1)
+    cross_device_reduce_1stage(RankData* _dp, RankSignals sg, Signal* self_sg,
+                               T* __restrict__ result, int rank, int size) {
+  ...
+  barrier_at_start<ngpus>(sg, self_sg, rank);
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size;
+       idx += gridDim.x * blockDim.x) {
+    ((P*)result)[idx] = packed_reduce<P, ngpus, A>((const P**)&dp.ptrs[0], idx);
+  }
+  barrier_at_end<ngpus, true>(sg, self_sg, rank);
+}
+```
+
+The **one-stage** kernel has every GPU read all $n$ inputs and sum the whole buffer itself: one
+round of communication, but each GPU reads $n$ times the message. The **two-stage** kernel is a
+reduce-scatter followed by an all-gather: GPU $r$ sums only its $1/n$ slice, writes it to a shared
+buffer, and after a barrier every GPU gathers the $n$ slices. The barriers are flags in shared
+memory that each GPU writes and the others poll. The choice depends on the size:
+
+| GPUs (fully NVLink-connected) | one-stage below | custom all-reduce limit on H100 |
+| --- | ---: | ---: |
+| 2 | always | 64 MiB |
+| 4 | 512 KiB | 32 MiB |
+| 8 | 256 KiB | 256 KiB |
+
+Above the limit, vLLM falls back to NCCL. On 8 H100s the limit equals the one-stage threshold, so
+the custom kernel there is effectively one-stage only.<Sidenote>Thresholds from the dispatch
+macro in `custom_all_reduce.cuh` and `CUSTOM_ALL_REDUCE_MAX_SIZES` in
+[`all_reduce_utils.py`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/distributed/device_communicators/all_reduce_utils.py#L31);
+other GPU generations have their own limits. See
+[collective communication](/blog/collective-communication/) for ring and tree all-reduce.</Sidenote>
+
+## Prefill/decode disaggregation
+
+### Why split the two phases
+
+Prefill is compute-bound: a 4,096-token prompt is a large matrix multiplication. Decode is
+memory-bound: each step reads all the weights and every running request's KV cache to produce one
+token per request. On one GPU the two compete. Chunked prefill limits the damage, but every step
+that carries a prefill chunk takes longer, and every decoding request waits for it. That shows up
+as **inter-token latency** (ITL) spikes. Prefill work queued behind decodes in turn raises
+**time to first token** (TTFT).
+
+**Disaggregation** runs prefill and decode on different vLLM instances, often on different
+machines. Each can then be sized and tuned for its own phase: more prefill instances for long
+prompts, larger decode batches for throughput. The price is moving every request's KV cache from
+the prefill instance to the decode instance.
+
+### The KV connector interface
+
+vLLM moves KV through a **KV connector**, a plug-in with two halves
+([`KVConnectorBase_V1`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/distributed/kv_transfer/kv_connector/v1/base.py)).
+The scheduler-side half decides; the worker-side half moves bytes.
+
+| Side | Method | Called when |
+| --- | --- | --- |
+| scheduler | `get_num_new_matched_tokens()` | a waiting request is considered: how many tokens can be loaded, and asynchronously? |
+| scheduler | `update_state_after_alloc()` | blocks were allocated for those tokens |
+| scheduler | `build_connector_meta()` | every step: what the workers should load and save |
+| scheduler | `request_finished()` | a request ends: free its blocks now, or keep them for a transfer? |
+| worker | `start_load_kv()`, `wait_for_layer_load()` | before and during the forward pass |
+| worker | `save_kv_layer()`, `wait_for_save()` | after each layer and at the end of the pass |
+| worker | `get_finished()` | which asynchronous sends and receives completed |
+
+The same interface serves CPU offloading, LMCache, Mooncake and NIXL, so the scheduler does not
+know where the bytes come from. It only sees that a request has some tokens "computed externally".
+
+### One request through NixlConnector
+
+**NIXL** (NVIDIA Inference Xfer Library) moves memory between GPUs and hosts over RDMA, NVLink or
+TCP. vLLM's `NixlConnector` is pull-based by default: the decode instance reads the KV from the
+prefill instance. A small proxy in front of both instances drives the protocol:
+
+<SequenceSteps
+	participants={vllmPdParticipants}
+	messages={vllmPdFlow}
+	title="Prefill/decode disaggregation with NixlConnector (pull mode)"
+	colWidth={150}
+/>
+
+The two ends of the protocol in the code:
+
+- On the prefill side,
+  [`request_finished()`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py#L191)
+  returns `delay_free_blocks = True` and a dictionary with `remote_block_ids`,
+  `remote_engine_id`, `remote_host` and `remote_port`. The proxy passes that dictionary to the
+  decode instance as `kv_transfer_params`.
+- On the decode side,
+  [`get_num_new_matched_tokens()`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py#L34)
+  returns the number of prompt tokens to load and `True` for "asynchronously". The scheduler
+  allocates blocks for them and parks the request in `WAITING_FOR_REMOTE_KVS`, while other
+  requests keep running. The worker's
+  [`_read_blocks()`](https://github.com/vllm-project/vllm/blob/b0e21b308352587a6fd02f72722a2e815bfd62f0/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py#L399)
+  posts NIXL `READ` transfers from the remote blocks into the local ones and, when they finish,
+  notifies the prefill worker, which frees its blocks.
+
+When the decode instance already has some of the prompt in its own prefix cache, it reads only
+the rest, and a full local hit sends just the notification. Block sizes and tensor-parallel sizes
+may differ between the two instances; the worker maps blocks and heads between them. A
+`NixlPushConnector` reverses the direction: the decode instance registers its blocks with the
+prefill instance, which writes the KV as soon as it is computed.
+
+### How long the transfer takes
+
+For Llama-3.1-8B, a 4,096-token prompt has $4096 \times 128\ \text{KiB} = 512$ MiB of KV. With the
+default layout that is 256 blocks of 64 KiB in each of 32 layers, 8,192 pages, each one
+contiguous, so each can move as a single RDMA transfer.
+
+| Link | Transfer time |
+| --- | ---: |
+| 200 Gb/s (25 GB/s) | 21.5 ms |
+| 400 Gb/s (50 GB/s) | 10.7 ms |
+| 800 Gb/s (100 GB/s) | 5.4 ms |
+
+The prefill itself costs about $2 \times 8.03 \times 10^9 \times 4096 = 65.8$ TFLOP, which takes
+110 ms at an assumed 600 TFLOP/s of sustained bf16 throughput on an H100, ignoring attention. The
+transfer adds roughly 10% to the time to first token on a 400 Gb/s link, in exchange for decode
+steps that never wait for a prefill.<Sidenote>Bandwidths are line rates; real RDMA throughput is
+somewhat lower, and a model with more layers or KV heads moves proportionally more. Grouped-query
+attention is what keeps this number small: with 32 KV heads instead of 8, the cache, and the
+transfer, would be four times larger.</Sidenote>
+
+## Summary
+
+- vLLM splits serving into an **API server** (chat template, tokenize, preprocess images,
+  detokenize, stream), an **engine core** (schedule, update) and one **worker per GPU** (tensors,
+  kernels), connected by ZMQ and shared memory, so Python work in one never stalls another.
+- Before the engine sees a request, the **chat template** turns messages into one string with the
+  model's special tokens, and the **tokenizer** turns it into ids on a thread pool. On the way back,
+  a per-request **DecodeStream** turns ids into text without splitting characters, and the front
+  end checks **stop strings**.
+- The scheduler has no prefill or decode phase: every request is a count of tokens behind, and
+  each step hands out one **token budget**, running requests first, cutting long prompts into
+  chunks.
+- The KV cache is a pool of fixed-size **blocks**. Block tables map requests to blocks; a chained
+  hash of each full block makes **prefix caching** a lookup; freed blocks stay cached until the
+  free queue reaches them.
+- An **image** becomes a run of identical placeholder tokens, as many as the vision encoder
+  outputs (1,196 for a 1280×720 image in Qwen2-VL). The scheduler runs the encoder when those
+  tokens are reached, caches its output by image hash, and the worker writes the embeddings over
+  the placeholders; block hashes include the image hash so different images never share KV.
+- The CUDA work specific to serving is a **scatter** into the cache through the slot mapping, a
+  **gather** from it through the block table inside FlashAttention, an LSE-weighted **merge** of
+  partial results, and a low-latency **all-reduce** over NVLink.
+- **Disaggregation** moves each request's KV from a prefill instance to a decode instance through
+  a KV connector; with NIXL, the decode instance reads the prefill instance's blocks over RDMA
+  while it keeps decoding other requests.
+
+## References
+
+- W. Kwon et al., [Efficient Memory Management for Large Language Model Serving with PagedAttention](https://arxiv.org/abs/2309.06180), SOSP 2023.
+- vLLM source at commit [`b0e21b3`](https://github.com/vllm-project/vllm/tree/b0e21b308352587a6fd02f72722a2e815bfd62f0): `vllm/v1/engine/`, `vllm/v1/core/`, `vllm/v1/worker/gpu/`, `csrc/libtorch_stable/cache_kernels.cu`, `csrc/custom_all_reduce.cuh`, `vllm/distributed/kv_transfer/kv_connector/v1/nixl/`.
+- vLLM's FlashAttention fork at [`9cd61de`](https://github.com/vllm-project/flash-attention/tree/9cd61de38763d712bb6ce56e2a02cc2bf718c89f), `csrc/flash_attn/src/flash_fwd_kernel.h` and `utils.h`.
+- Y. Zhong et al., [DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving](https://arxiv.org/abs/2401.09670), OSDI 2024.
+- Section 2.2 of Y. Ye et al., [FlashInfer: Efficient and Customizable Attention Engine for LLM Inference Serving](https://arxiv.org/abs/2501.01005), cited in `merge_attn_states.cu` for the merge formula.
+- NVIDIA, [NIXL](https://github.com/ai-dynamo/nixl).
+- P. Wang et al., [Qwen2-VL: Enhancing Vision-Language Model's Perception of the World at Any Resolution](https://arxiv.org/abs/2409.12191), 2024, for naive dynamic resolution and M-RoPE.
+- Hugging Face Transformers, [`smart_resize` in `image_processing_qwen2_vl.py`](https://github.com/huggingface/transformers/blob/c587bc884db2c2e31fc2b8102314656b17aa07b1/src/transformers/models/qwen2_vl/image_processing_qwen2_vl.py#L62), and the [Qwen2-VL-7B-Instruct](https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct) tokenizer, chat template and `preprocessor_config.json`.
+- R. Sennrich et al., [Neural Machine Translation of Rare Words with Subword Units](https://arxiv.org/abs/1508.07909), ACL 2016, for byte-pair encoding.

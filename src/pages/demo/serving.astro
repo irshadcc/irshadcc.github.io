@@ -1,0 +1,57 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import BatchTimeline from "../../utils/inference/BatchTimeline.astro";
+import BlockPoolSteps from "../../utils/inference/BlockPoolSteps.astro";
+import OverlapTimeline from "../../utils/inference/OverlapTimeline.astro";
+import PagedAddress from "../../utils/inference/PagedAddress.astro";
+import RadixTreeSteps from "../../utils/inference/RadixTreeSteps.astro";
+import TokenStrip from "../../utils/inference/TokenStrip.astro";
+import {
+	chatTemplateViews,
+	imageExpansionViews,
+} from "../../utils/inference/vllmInputFigures";
+---
+
+<Layout title="Serving engine demo">
+	<h1>Serving engine demo</h1>
+	<p>
+		Figures from <code>batching.ts</code>, <code>blockPool.ts</code>, <code>radixTree.ts</code>,
+		<code>pagedAddress.ts</code> and <code>overlap.ts</code>, used by the vLLM and SGLang posts.
+	</p>
+
+	<h2>BatchTimeline</h2>
+	<BatchTimeline policy="vllm" />
+	<BatchTimeline policy="sglang" />
+	<BatchTimeline
+		policy="vllm"
+		budget={4}
+		requests={[
+			{ id: "X", prompt: 9, output: 2, arrival: 0 },
+			{ id: "Y", prompt: 1, output: 4, arrival: 1 },
+		]}
+		title="Budget 4, one long and one short prompt"
+	/>
+
+	<h2>BlockPoolSteps</h2>
+	<BlockPoolSteps step={4} />
+
+	<h2>RadixTreeSteps</h2>
+	<RadixTreeSteps step={7} />
+
+	<h2>PagedAddress</h2>
+	<PagedAddress blockSize={4} tokens={10} blockTable={[5, 2, 7]} numBlocks={8} selected={9} />
+	<PagedAddress blockSize={1} tokens={7} blockTable={[1, 2, 3, 4, 5, 9, 10]} numBlocks={12} selected={5} />
+
+	<h2>TokenStrip</h2>
+	<TokenStrip views={chatTemplateViews} blockSize={16} selected={15} />
+	<TokenStrip views={imageExpansionViews} blockSize={16} view={1} selected={15} title="Two views, a run of 1196 tokens" />
+	<TokenStrip
+		views={[
+			{ label: "No block size", tokens: [{ text: "na", id: 3376 }, { text: "C3 AF", id: 37572, kind: "partial" }, { text: "pad", kind: "image", count: 4 }] },
+		]}
+	/>
+
+	<h2>OverlapTimeline</h2>
+	<OverlapTimeline />
+	<OverlapTimeline batches={3} schedule={2} forward={2} process={2} title="CPU-bound: overlap cannot hide everything" />
+</Layout>

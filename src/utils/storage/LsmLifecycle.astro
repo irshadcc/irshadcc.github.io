@@ -1,0 +1,65 @@
+---
+// Step-through view of the write or point-read path through an LSM storage engine.
+// Usage in .mdx:
+//   <LsmLifecycle mode="write" />
+import StepControls from "../compiler/StepControls.astro";
+import { readStages, validateStages, writeStages } from "./lsmLifecycle";
+
+interface Props {
+	mode?: "write" | "read";
+	step?: number;
+}
+
+const { mode = "write", step = 0 } = Astro.props;
+const stages = mode === "write" ? writeStages : readStages;
+const err = validateStages(stages);
+if (err) throw new Error(`LsmLifecycle: ${err}`);
+const at = Math.max(0, Math.min(stages.length - 1, step));
+const nodes = [
+	["client", "Client / WriteBatch"],
+	["wal", "WAL (.log)"],
+	["mem", "mutable memtable"],
+	["imm", "immutable memtable"],
+	["l0", "level 0 SSTs"],
+	["l1", "level 1 SSTs"],
+	["l2", "level 2+ SSTs"],
+	["cache", "block cache / filter"],
+	["sst", "index → data block"],
+] as const;
+---
+
+<figure class="lsmf" data-step={at} tabindex="-1">
+	<figcaption>{mode === "write" ? "A write moving down the LSM tree" : "A point read searching from newest to oldest"}</figcaption>
+	<StepControls labels={stages.map((s) => s.label)} step={at} />
+	<div class="lsm-grid" aria-label={`${mode} path through an LSM tree`}>
+		{nodes.map(([id, label]) => <div class="lsm-node" data-id={id}>{label}</div>)}
+	</div>
+	<div class="lsm-notes">{stages.map((s, i) => <p hidden={i !== at}>{s.note}</p>)}</div>
+	<script type="application/json" class="lsm-data" set:html={JSON.stringify(stages.map((s) => s.active))} />
+</figure>
+
+<script>
+	import { bindStepper } from "../compiler/stepper";
+	for (const fig of document.querySelectorAll<HTMLElement>(".lsmf")) {
+		const active = JSON.parse(fig.querySelector(".lsm-data")?.textContent ?? "[]") as string[][];
+		const nodes = [...fig.querySelectorAll<HTMLElement>(".lsm-node")];
+		const notes = [...fig.querySelectorAll<HTMLElement>(".lsm-notes p")];
+		bindStepper(fig, active.length, (i) => {
+			nodes.forEach((n) => n.classList.toggle("active", active[i]?.includes(n.dataset.id ?? "")));
+			notes.forEach((n, k) => { n.hidden = k !== i; });
+		});
+	}
+</script>
+
+<style>
+	.lsmf { margin: 1.75rem 0; font-family: var(--sans); outline: none; }
+	.lsmf figcaption { text-align: center; font-size: .9rem; font-weight: 600; }
+	.lsm-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: .55rem; padding: .8rem; border: 1px solid var(--faint); border-radius: 10px; background: var(--surface); }
+	.lsm-node { padding: .7rem .45rem; border: 1px solid var(--faint); border-radius: 7px; background: var(--bg); color: var(--muted); text-align: center; font: 600 .75rem var(--sans); transition: 160ms ease; }
+	.lsm-node.active { border-color: var(--accent); color: var(--text); box-shadow: inset 0 0 0 2px var(--accent-soft); transform: translateY(-1px); }
+	.lsm-notes { min-height: 3.2em; margin-top: .55rem; padding: .55rem .75rem; border-left: 3px solid var(--accent); background: var(--surface); font-size: .82rem; line-height: 1.5; }
+	.lsm-notes p { margin: 0; }
+	.lsm-notes p[hidden] { display: none; }
+	@media (max-width: 560px) { .lsm-grid { grid-template-columns: repeat(2, 1fr); } }
+</style>
+

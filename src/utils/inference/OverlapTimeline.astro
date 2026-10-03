@@ -1,0 +1,69 @@
+---
+// The scheduler loop without and with CPU/GPU overlap (simulated in overlap.ts), drawn on one
+// time axis. S = schedule a batch on the CPU, F = run its forward pass on the GPU, P = process
+// its output on the CPU. Hover a span for its start and end time.
+// Usage in .mdx:
+//   <OverlapTimeline />
+//   <OverlapTimeline batches={5} schedule={1} forward={3} process={1} />
+import { drawLoop, gpuBusy, simulateLoop } from "./overlap";
+
+interface Props {
+	batches?: number;
+	schedule?: number;
+	forward?: number;
+	process?: number;
+	title?: string;
+}
+
+const {
+	batches = 4,
+	schedule = 1,
+	forward = 3,
+	process = 1,
+	title = "The same four batches without and with overlap",
+} = Astro.props;
+const t = { schedule, forward, process };
+const normal = simulateLoop("normal", batches, t);
+const overlap = simulateLoop("overlap", batches, t);
+const total = Math.max(...normal.map((s) => s.end));
+const scale = 560 / total;
+const rows = [
+	{ name: "event_loop_normal", spans: normal },
+	{ name: "event_loop_overlap", spans: overlap },
+].map((r) => ({
+	...r,
+	end: Math.max(...r.spans.map((s) => s.end)),
+	busy: Math.round(gpuBusy(r.spans) * 100),
+	svg: drawLoop(r.spans, scale, total),
+}));
+---
+
+<figure class="olt">
+	<figcaption class="olt-title">{title}</figcaption>
+	{
+		rows.map((r) => (
+			<div class="olt-row">
+				<p class="olt-name">
+					<code>{r.name}</code>: done at t = {r.end}, GPU busy {r.busy}% of the time
+				</p>
+				<div class="olt-canvas" set:html={r.svg} />
+			</div>
+		))
+	}
+</figure>
+
+<style>
+	.olt { margin: 1.75rem 0; font-family: var(--sans); }
+	.olt-title { text-align: center; font-size: 0.9rem; font-weight: 600; margin-bottom: 0.4rem; }
+	.olt-row { margin-top: 0.6rem; }
+	.olt-name { margin: 0 0 0.25rem; font-size: 0.78rem; color: var(--muted); }
+	.olt-canvas { overflow-x: auto; }
+	.olt-canvas :global(svg) { display: block; max-width: none; }
+	.olt-canvas :global(.ol-lane) { font: 600 0.66rem var(--mono); fill: var(--muted); }
+	.olt-canvas :global(.ol-axis) { stroke: var(--faint); }
+	.olt-canvas :global(.ol-span rect) { stroke: color-mix(in oklch, #1a1a1a 25%, transparent); }
+	.olt-canvas :global(.ol-span.S rect) { fill: #f5d38c; }
+	.olt-canvas :global(.ol-span.F rect) { fill: #9fc8ef; }
+	.olt-canvas :global(.ol-span.P rect) { fill: #a9dba6; }
+	.olt-canvas :global(.ol-span text) { font: 600 0.62rem var(--mono); fill: #1a1a1a; text-anchor: middle; }
+</style>

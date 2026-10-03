@@ -1,0 +1,152 @@
+---
+// How an LLM server fills each forward pass, one column per step and one row per request
+// (simulated in batching.ts). A coloured cell is the number of tokens the request put into
+// that step's batch: a prefill chunk (thick outline) or one decode token; a dot marks a step that
+// sampled an output token. Dashed outlines are requests that are waiting to be admitted;
+// faint ones are admitted requests left out of the batch. The bottom row sums each step.
+// Hover a cell for details.
+// Usage in .mdx:
+//   <BatchTimeline policy="vllm" />
+//   <BatchTimeline policy="sglang" budget={8} />
+import {
+	BATCH_BUDGET,
+	BATCH_WORKLOAD,
+	type BatchPolicy,
+	type BatchRequest,
+	drawBatching,
+	simulateBatching,
+} from "./batching";
+import { REQ_COLORS } from "./kvcache";
+
+interface Props {
+	policy: BatchPolicy;
+	requests?: BatchRequest[];
+	budget?: number;
+	title?: string;
+}
+
+const {
+	policy,
+	requests = BATCH_WORKLOAD,
+	budget = BATCH_BUDGET,
+	title,
+} = Astro.props;
+const res = simulateBatching(policy, requests, budget);
+const svg = drawBatching(res, requests, budget, REQ_COLORS);
+const name = policy === "vllm" ? "vLLM" : "SGLang";
+const caption =
+	title ?? `${name}: tokens per request per step, budget ${budget} tokens`;
+---
+
+<figure class="bt">
+	<figcaption class="bt-title">{caption}</figcaption>
+	<div class="bt-canvas" set:html={svg} />
+	<div class="bt-legend">
+		<span><i class="sw prefill"></i>prefill chunk</span>
+		<span><i class="sw decode"></i>decode token</span>
+		<span><i class="sw dot"></i>samples a token</span>
+		<span><i class="sw waiting"></i>waiting</span>
+		<span><i class="sw idle"></i>running, not in batch</span>
+	</div>
+</figure>
+
+<style>
+	.bt {
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+	}
+	.bt-title {
+		text-align: center;
+		font-size: 0.9rem;
+		font-weight: 600;
+		margin-bottom: 0.5rem;
+	}
+	.bt-canvas {
+		overflow-x: auto;
+		display: flex;
+		justify-content: center;
+	}
+	.bt-canvas :global(svg) {
+		max-width: none;
+	}
+	.bt-canvas :global(.bt-step),
+	.bt-canvas :global(.bt-total) {
+		font: 0.62rem var(--mono);
+		fill: var(--muted);
+		text-anchor: middle;
+	}
+	.bt-canvas :global(.bt-total.full) {
+		fill: var(--text);
+		font-weight: 700;
+	}
+	.bt-canvas :global(.bt-req) {
+		font: 600 0.75rem var(--sans);
+		fill: var(--text);
+		text-anchor: middle;
+	}
+	.bt-canvas :global(.bt-cell text) {
+		font: 600 0.7rem var(--mono);
+		fill: #1a1a1a;
+		text-anchor: middle;
+	}
+	.bt-canvas :global(.bt-cell rect) {
+		stroke: color-mix(in oklch, #1a1a1a 22%, transparent);
+	}
+	.bt-canvas :global(.bt-cell.prefill rect) {
+		stroke-width: 2;
+		stroke: color-mix(in oklch, #1a1a1a 45%, transparent);
+	}
+	.bt-canvas :global(.bt-cell circle) {
+		fill: #1a1a1a;
+	}
+	.bt-canvas :global(.bt-waiting) {
+		fill: none;
+		stroke: var(--muted);
+		stroke-dasharray: 3 2;
+	}
+	.bt-canvas :global(.bt-idle) {
+		fill: var(--surface);
+		stroke: var(--faint);
+	}
+	.bt-legend {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.4rem 1rem;
+		margin-top: 0.5rem;
+		font-size: 0.75rem;
+		color: var(--muted);
+	}
+	.bt-legend span {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.35rem;
+	}
+	.sw {
+		display: inline-block;
+		width: 0.85rem;
+		height: 0.85rem;
+		border-radius: 3px;
+		background: #c9c6bd;
+	}
+	.sw.prefill {
+		border: 2px solid color-mix(in oklch, #1a1a1a 45%, transparent);
+	}
+	.sw.decode {
+		border: 1px solid color-mix(in oklch, #1a1a1a 22%, transparent);
+	}
+	.sw.dot {
+		width: 0.4rem;
+		height: 0.4rem;
+		border-radius: 50%;
+		background: var(--text);
+	}
+	.sw.waiting {
+		background: none;
+		border: 1px dashed var(--muted);
+	}
+	.sw.idle {
+		background: var(--surface);
+		border: 1px solid var(--faint);
+	}
+</style>

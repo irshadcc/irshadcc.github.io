@@ -22,6 +22,8 @@ in two or three short paragraphs:
 - **Why does it matter?** A cost, a failure mode or a design choice it explains.
 - **What will this post cover?** Name the parts, in order, so the reader can find their way.
 
+The new posts should always have "Draft" tag.
+
 Link related posts on the blog (`[title](/blog/<slug>/)`) instead of re-explaining them.
 
 ### 2. A picture for every important idea
@@ -118,6 +120,13 @@ has a demo page under `src/pages/demo/`, listed at `/demo`.
 | `BoxDiagram` | `src/utils/payments/BoxDiagram.astro` | Clickable boxes-and-arrows diagram on a grid: architectures, state machines, deployments |
 | `DependencyGraph` | `src/utils/graph/DependencyGraph.astro` | Code or build dependency graph laid out by dagre: icon cards, bare icons, placeholders, junctions, right-angled (optionally directed) wires, clickable active node, dark/light theme |
 | `ShardRouting` | `src/utils/payments/ShardRouting.astro` | Keys placed on shards by range, hash mod N or bucket directory, with keys moved when a shard is added |
+| `PagedKvCache` | `src/utils/inference/PagedKvCache.astro` | Contiguous vs paged KV-cache allocation of a request stream |
+| `BatchTimeline` | `src/utils/inference/BatchTimeline.astro` | Tokens per request per step under vLLM-style (token budget) or SGLang-style (prefill first) batching |
+| `BlockPoolSteps` | `src/utils/inference/BlockPoolSteps.astro` | Step-through vLLM block pool: ref counts, block hashes, free queue, prefix hits and eviction |
+| `RadixTreeSteps` | `src/utils/inference/RadixTreeSteps.astro` | Step-through SGLang radix cache over a token-slot pool: match, split, lock, insert, evict |
+| `PagedAddress` | `src/utils/inference/PagedAddress.astro` | Hover a token to follow it through a block table (or `req_to_token` row) to its KV slot |
+| `OverlapTimeline` | `src/utils/inference/OverlapTimeline.astro` | CPU/GPU timeline of a serving loop with and without overlapped scheduling |
+| `TokenStrip` | `src/utils/inference/TokenStrip.astro` | A prompt as token chips (text, id, kind), runs of repeated tokens, KV-block markers, switchable views |
 
 ### Building a new component
 

@@ -1,0 +1,350 @@
+---
+// Step-through view of rank collapse in a deep linear network: n points on the unit circle (one
+// colour per angle) are sent through the same 2 × 2 layer h ← W h again and again. Each step shows
+// the batch after L layers, the ellipse the whole circle has been mapped to, the long axis of the
+// batch, and two ringed points whose distance is tracked. The panel beside it gives the singular
+// values of the centred batch, their ratio, the effective and exact rank, the tracked distance,
+// and how many points are still distinct after rounding. Axes are fixed across steps, so a
+// shrinking direction really shrinks on screen. The numbers come from rankCollapse.ts.
+// Usage in .mdx:
+//   <RankCollapseSteps
+//     matrix={[[5 / 6, 1 / 6], [1 / 6, 5 / 6]]}
+//     depths={[0, 1, 2, 4, 8, 16, 32]}
+//     pair={[0, 3]}
+//     title="Twelve points through one mixing layer, repeated"
+//   />
+import StepControls from "../compiler/StepControls.astro";
+import { type Mat2, type Vec2, collapseSteps } from "./rankCollapse";
+
+interface Props {
+	matrix: Mat2;
+	depths: number[];
+	/** Number of points on the circle (evenly spaced from 0°). */
+	n?: number;
+	/** Indices of the two points to ring and measure. */
+	pair?: [number, number];
+	/** Decimal places used when counting distinct points. */
+	decimals?: number;
+	/** Optional sentence per depth, shown under the numbers. */
+	notes?: string[];
+	step?: number;
+	title?: string;
+}
+
+const {
+	matrix,
+	depths,
+	n = 12,
+	pair = [0, 3],
+	decimals = 3,
+	notes = [],
+	step = 0,
+	title,
+} = Astro.props;
+const { angles, steps } = collapseSteps({ matrix, n, depths, pair, decimals });
+const at = Math.max(0, Math.min(steps.length - 1, step));
+
+// One scale for every step: the largest coordinate any outline reaches, plus a margin.
+const size = 320;
+const extent =
+	Math.max(
+		1,
+		...steps.flatMap((s) =>
+			s.outline.flatMap(([x, y]) => [Math.abs(x), Math.abs(y)]),
+		),
+	) * 1.26;
+const r1 = (v: number) => Math.round(v * 10) / 10;
+const px = ([x, y]: Vec2): Vec2 => [
+	r1(((x + extent) / (2 * extent)) * size),
+	r1(((extent - y) / (2 * extent)) * size),
+];
+const path = (pts: Vec2[]) =>
+	`${pts.map((p, i) => `${i ? "L" : "M"}${px(p).join(",")}`).join(" ")} Z`;
+const unit = path(
+	Array.from({ length: 96 }, (_, k) => [
+		Math.cos((k * Math.PI) / 48),
+		Math.sin((k * Math.PI) / 48),
+	]),
+);
+
+const sup: Record<string, string> = {
+	"-": "⁻",
+	0: "⁰",
+	1: "¹",
+	2: "²",
+	3: "³",
+	4: "⁴",
+	5: "⁵",
+	6: "⁶",
+	7: "⁷",
+	8: "⁸",
+	9: "⁹",
+};
+const fmt = (v: number) => {
+	if (v === 0) return "0";
+	if (Math.abs(v) >= 0.01) return Number(v.toPrecision(3)).toString();
+	const e = Math.floor(Math.log10(Math.abs(v)));
+	const m = Number((v / 10 ** e).toPrecision(3));
+	return `${m} × 10${[...String(e)].map((c) => sup[c]).join("")}`;
+};
+const label = (s: (typeof steps)[number]) =>
+	s.depth === 0 ? "input" : `L = ${s.depth}`;
+const [pi, pj] = pair;
+---
+
+<figure class="rc" data-step={at} tabindex="-1">
+	{title && <figcaption class="rc-title">{title}</figcaption>}
+	<StepControls labels={steps.map(label)} step={at} />
+	<div class="rc-body">
+		<svg class="rc-plot" viewBox={`0 0 ${size} ${size}`} role="img" aria-label="Points after each depth">
+			<line class="rc-axis" x1="0" y1={size / 2} x2={size} y2={size / 2}></line>
+			<line class="rc-axis" x1={size / 2} y1="0" x2={size / 2} y2={size}></line>
+			<path class="rc-unit" d={unit}></path>
+			{
+				steps.map((s, i) => {
+					const [a, b] = [px(s.points[pi]), px(s.points[pj])];
+					const far = extent * 1.5;
+					const [m0, m1] = [px([-s.major[0] * far, -s.major[1] * far]), px([s.major[0] * far, s.major[1] * far])];
+					return (
+						<g class="rc-step" data-i={i} hidden={i !== at}>
+							{s.ratio < 0.999 && <line class="rc-major" x1={m0[0]} y1={m0[1]} x2={m1[0]} y2={m1[1]} />}
+							<path class="rc-outline" d={path(s.outline)} />
+							<line class="rc-pair" x1={a[0]} y1={a[1]} x2={b[0]} y2={b[1]} />
+							{s.points.map((p, k) => {
+								const [x, y] = px(p);
+								const ringed = k === pi || k === pj;
+								return (
+									<circle class:list={["rc-pt", { ringed }]} cx={x} cy={y} r={ringed ? 6.5 : 5} style={`--h: ${angles[k]}`}>
+										<title>{`${angles[k]}° input → (${p.map((v) => v.toFixed(4)).join(", ")})`}</title>
+									</circle>
+								);
+							})}
+							{s.depth === 0 &&
+								s.points.map((p, k) => {
+									const [x, y] = px([p[0] * 1.13, p[1] * 1.13]);
+									return (
+										<text class="rc-angle" x={x} y={y + 3.5}>
+											{angles[k]}°
+										</text>
+									);
+								})}
+						</g>
+					);
+				})
+			}
+		</svg>
+		<div class="rc-side">
+			{
+				steps.map((s, i) => (
+					<div class="rc-stats" data-i={i} hidden={i !== at}>
+						<table>
+							<tbody>
+								<tr>
+									<th>depth L</th>
+									<td>{s.depth}</td>
+								</tr>
+								<tr>
+									<th>σ₁, σ₂</th>
+									<td>
+										{fmt(s.sigma[0])}, {fmt(s.sigma[1])}
+									</td>
+								</tr>
+								<tr>
+									<th>σ₂ / σ₁</th>
+									<td>{fmt(s.ratio)}</td>
+								</tr>
+								<tr>
+									<th>effective rank</th>
+									<td>{s.effectiveRank.toFixed(3)}</td>
+								</tr>
+								<tr>
+									<th>exact rank</th>
+									<td>{s.exactRank}</td>
+								</tr>
+								<tr>
+									<th>
+										distance {angles[pi]}° ↔ {angles[pj]}°
+									</th>
+									<td>{fmt(s.pairDistance)}</td>
+								</tr>
+								<tr>
+									<th>distinct at {decimals} d.p.</th>
+									<td>
+										{s.distinct} of {s.points.length}
+									</td>
+								</tr>
+							</tbody>
+						</table>
+						{notes[i] && <p class="rc-note">{notes[i]}</p>}
+					</div>
+				))
+			}
+			<p class="rc-legend">
+				<span class="rc-key outline"></span> image of the unit circle
+				<span class="rc-key major"></span> long axis
+				<span class="rc-key ring"></span> tracked pair
+			</p>
+		</div>
+	</div>
+</figure>
+
+<script>
+	import { bindStepper } from "../compiler/stepper";
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".rc")) {
+		const groups = [...fig.querySelectorAll<SVGGElement>(".rc-step")];
+		const stats = [...fig.querySelectorAll<HTMLElement>(".rc-stats")];
+		bindStepper(fig, groups.length, (i) => {
+			groups.forEach((g, k) => g.toggleAttribute("hidden", k !== i));
+			stats.forEach((s, k) => {
+				s.hidden = k !== i;
+			});
+		});
+	}
+</script>
+
+<style>
+	.rc {
+		margin: 1.6rem 0;
+		font-family: var(--sans);
+	}
+	.rc-title {
+		font-size: 0.85rem;
+		color: var(--muted);
+		margin-bottom: 0.3rem;
+	}
+	.rc-body {
+		display: flex;
+		gap: 1.2rem;
+		align-items: flex-start;
+	}
+	.rc-plot {
+		flex: 0 1 320px;
+		width: 100%;
+		max-width: 320px;
+		aspect-ratio: 1;
+		background: var(--surface);
+		border-radius: 8px;
+	}
+	.rc-step[hidden] {
+		display: none;
+	}
+	.rc-axis {
+		stroke: var(--faint);
+		stroke-width: 1;
+	}
+	.rc-unit {
+		fill: none;
+		stroke: var(--muted);
+		stroke-width: 1;
+		stroke-dasharray: 3 4;
+		opacity: 0.6;
+	}
+	.rc-outline {
+		fill: var(--accent-soft);
+		fill-opacity: 0.7;
+		stroke: var(--accent);
+		stroke-width: 1.4;
+	}
+	.rc-major {
+		stroke: var(--accent);
+		stroke-width: 1;
+		stroke-dasharray: 6 4;
+		opacity: 0.7;
+	}
+	.rc-pair {
+		stroke: var(--text);
+		stroke-width: 1.2;
+	}
+	.rc-pt {
+		fill: hsl(var(--h) 62% 45%);
+		stroke: var(--bg);
+		stroke-width: 1.2;
+	}
+	.rc-pt.ringed {
+		stroke: var(--text);
+		stroke-width: 2;
+	}
+	.rc-angle {
+		font: 10px var(--sans);
+		fill: var(--muted);
+		text-anchor: middle;
+	}
+	.rc-side {
+		flex: 1 1 14rem;
+		min-width: 0;
+	}
+	.rc-stats table {
+		width: 100%;
+		border-collapse: collapse;
+		font-size: 0.82rem;
+		margin: 0;
+	}
+	.rc-stats th {
+		text-align: left;
+		font-weight: 500;
+		color: var(--muted);
+		padding: 0.22rem 0.6rem 0.22rem 0;
+		border-bottom: 1px solid var(--faint);
+	}
+	.rc-stats td {
+		text-align: right;
+		font-family: var(--mono);
+		font-size: 0.78rem;
+		padding: 0.22rem 0;
+		border-bottom: 1px solid var(--faint);
+		white-space: nowrap;
+	}
+	.rc-note {
+		margin: 0.6rem 0 0;
+		font-size: 0.82rem;
+		line-height: 1.45;
+		color: var(--text);
+	}
+	.rc-legend {
+		margin: 0.7rem 0 0;
+		font-size: 0.74rem;
+		color: var(--muted);
+		line-height: 1.8;
+	}
+	.rc-key {
+		display: inline-block;
+		width: 1.1rem;
+		height: 0.6rem;
+		margin: 0 0.25rem 0 0.5rem;
+		vertical-align: middle;
+	}
+	.rc-key:first-child {
+		margin-left: 0;
+	}
+	.rc-key.outline {
+		background: var(--accent-soft);
+		border: 1.4px solid var(--accent);
+		border-radius: 50%;
+	}
+	.rc-key.major {
+		height: 0;
+		border-top: 1.5px dashed var(--accent);
+	}
+	.rc-key.ring {
+		width: 0.7rem;
+		height: 0.7rem;
+		border: 2px solid var(--text);
+		border-radius: 50%;
+	}
+	@media (prefers-color-scheme: dark) {
+		.rc-pt {
+			fill: hsl(var(--h) 70% 64%);
+		}
+	}
+	@media (max-width: 640px) {
+		.rc-body {
+			flex-direction: column;
+			align-items: stretch;
+		}
+		.rc-plot {
+			max-width: 100%;
+			flex-basis: auto;
+		}
+	}
+</style>

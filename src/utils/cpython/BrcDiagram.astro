@@ -1,0 +1,396 @@
+---
+// Interactive diagram illustrating Biased Reference Counting (BRC) in Python 3.13 free-threading (PEP 703)
+// Usage in .mdx:
+//   <BrcDiagram />
+---
+
+<figure class="brcf" tabindex="-1">
+	<figcaption>Biased Reference Counting (BRC) Object Header & Execution Paths (PEP 703)</figcaption>
+
+	<!-- Header Layout Comparison -->
+	<div class="brc-headers-compare">
+		<div class="brc-header-card standard">
+			<div class="brc-card-title">Traditional CPython Object Header (With GIL)</div>
+			<div class="brc-fields">
+				<div class="brc-field" style="flex: 1;">
+					<code>ob_refcnt</code>
+					<span>64-bit signed int</span>
+				</div>
+				<div class="brc-field" style="flex: 1;">
+					<code>ob_type</code>
+					<span>PyTypeObject*</span>
+				</div>
+			</div>
+			<div class="brc-card-sub">Protected from data races entirely by the Global Interpreter Lock.</div>
+		</div>
+
+		<div class="brc-header-card free-threaded">
+			<div class="brc-card-title">Free-Threaded CPython Header (PEP 703 / BRC)</div>
+			<div class="brc-fields">
+				<div class="brc-field" style="flex: 1.2;">
+					<code>ob_tid</code>
+					<span>Owner Thread ID (64-bit)</span>
+				</div>
+				<div class="brc-field" style="flex: 0.8;">
+					<code>ob_mutex</code>
+					<span>1-byte lock</span>
+				</div>
+				<div class="brc-field" style="flex: 1;">
+					<code>ob_ref_local</code>
+					<span>32-bit (Non-atomic)</span>
+				</div>
+				<div class="brc-field" style="flex: 1.2;">
+					<code>ob_ref_shared</code>
+					<span>64-bit (Atomic CAS)</span>
+				</div>
+				<div class="brc-field" style="flex: 1.2;">
+					<code>ob_type</code>
+					<span>PyTypeObject*</span>
+				</div>
+			</div>
+			<div class="brc-card-sub">Splits reference count into thread-local and atomic shared fields to avoid bus lock stalls.</div>
+		</div>
+	</div>
+
+	<!-- Interactive Path Switcher -->
+	<div class="brc-paths-container">
+		<div class="brc-tabs" role="tablist">
+			<button type="button" class="brc-tab active" data-path="owner">1. Owner Thread (Fast Path)</button>
+			<button type="button" class="brc-tab" data-path="foreign">2. Foreign Thread (Atomic Path)</button>
+			<button type="button" class="brc-tab" data-path="merge">3. Local Zero Merging</button>
+			<button type="button" class="brc-tab" data-path="immortal">4. Immortal Objects</button>
+		</div>
+
+		<!-- Path 1: Owner Thread Fast Path -->
+		<div class="brc-panel" data-panel="owner">
+			<div class="brc-panel-header">
+				<span class="brc-status-pill fast">Fast Path: Non-Atomic Instruction</span>
+				<span class="brc-condition">Condition: <code>ob-&gt;ob_tid == _Py_ThreadId()</code></span>
+			</div>
+			<div class="brc-flow-grid">
+				<div class="brc-step-box">
+					<div class="brc-step-num">Step 1</div>
+					<div class="brc-step-body">Compare thread ID with owner: matches current thread.</div>
+				</div>
+				<div class="brc-step-arrow">&rarr;</div>
+				<div class="brc-step-box active-fast">
+					<div class="brc-step-num">Step 2</div>
+					<div class="brc-step-body">Increment or decrement <code>ob_ref_local</code> non-atomically in L1 cache.</div>
+				</div>
+				<div class="brc-step-arrow">&rarr;</div>
+				<div class="brc-step-box">
+					<div class="brc-step-num">Step 3</div>
+					<div class="brc-step-body">Zero memory bus contention. No atomic <code>LOCK</code> prefix needed.</div>
+				</div>
+			</div>
+			<pre class="brc-code"><code>/* Fast non-atomic increment for owner thread */
+if (_Py_IsOwnedByCurrentThread(op)) &#123;
+    op-&gt;ob_ref_local++;
+    return 1;
+&#125;</code></pre>
+		</div>
+
+		<!-- Path 2: Foreign Thread Atomic Path -->
+		<div class="brc-panel" data-panel="foreign" hidden>
+			<div class="brc-panel-header">
+				<span class="brc-status-pill atomic">Slow Path: Atomic CAS Operation</span>
+				<span class="brc-condition">Condition: <code>ob-&gt;ob_tid != _Py_ThreadId()</code></span>
+			</div>
+			<div class="brc-flow-grid">
+				<div class="brc-step-box">
+					<div class="brc-step-num">Step 1</div>
+					<div class="brc-step-body">Foreign thread detects object belongs to another thread.</div>
+				</div>
+				<div class="brc-step-arrow">&rarr;</div>
+				<div class="brc-step-box active-atomic">
+					<div class="brc-step-num">Step 2</div>
+					<div class="brc-step-body">Atomically increments <code>ob_ref_shared</code> by <code>1 &lt;&lt; 2</code> (shifted past flag bits).</div>
+				</div>
+				<div class="brc-step-arrow">&rarr;</div>
+				<div class="brc-step-box">
+					<div class="brc-step-num">Step 3</div>
+					<div class="brc-step-body">Hardware ensures cache coherency across cores via MESI protocol.</div>
+				</div>
+			</div>
+			<pre class="brc-code"><code>/* Atomic shared increment across thread boundaries */
+_Py_atomic_add_ssize(&amp;op-&gt;ob_ref_shared, (1 &lt;&lt; _Py_REF_SHARED_SHIFT));</code></pre>
+		</div>
+
+		<!-- Path 3: Local Zero Merging -->
+		<div class="brc-panel" data-panel="merge" hidden>
+			<div class="brc-panel-header">
+				<span class="brc-status-pill merge">Zero Merging: Re-evaluation &amp; Unbiasing</span>
+				<span class="brc-condition">Condition: <code>ob_ref_local == 0</code></span>
+			</div>
+			<div class="brc-flow-grid">
+				<div class="brc-step-box">
+					<div class="brc-step-num">Step 1</div>
+					<div class="brc-step-body">Owner thread drops its last local reference: <code>ob_ref_local == 0</code>.</div>
+				</div>
+				<div class="brc-step-arrow">&rarr;</div>
+				<div class="brc-step-box active-merge">
+					<div class="brc-step-num">Step 2</div>
+					<div class="brc-step-body">Invoke <code>_Py_MergeZeroLocalRefcount(op)</code>: check if <code>ob_ref_shared == 0</code>.</div>
+				</div>
+				<div class="brc-step-arrow">&rarr;</div>
+				<div class="brc-step-box">
+					<div class="brc-step-num">Step 3</div>
+					<div class="brc-step-body">If shared count is 0, deallocate immediately. If shared references remain, unbias (<code>_Py_REF_MERGED</code>).</div>
+				</div>
+			</div>
+			<pre class="brc-code"><code>/* Merging local count to check for deallocation */
+if (local == 0) &#123;
+    _Py_MergeZeroLocalRefcount(op);
+&#125;</code></pre>
+		</div>
+
+		<!-- Path 4: Immortal Objects -->
+		<div class="brc-panel" data-panel="immortal" hidden>
+			<div class="brc-panel-header">
+				<span class="brc-status-pill immortal">Immortal Objects: Zero-Op Bypass</span>
+				<span class="brc-condition">Condition: <code>ob_ref_local == _Py_IMMORTAL_REFCNT_LOCAL</code></span>
+			</div>
+			<div class="brc-flow-grid">
+				<div class="brc-step-box">
+					<div class="brc-step-num">Step 1</div>
+					<div class="brc-step-body">Object header carries immortal sentinel constant.</div>
+				</div>
+				<div class="brc-step-arrow">&rarr;</div>
+				<div class="brc-step-box active-immortal">
+					<div class="brc-step-num">Step 2</div>
+					<div class="brc-step-body">Both <code>Py_INCREF</code> and <code>Py_DECREF</code> execute immediate early return.</div>
+				</div>
+				<div class="brc-step-arrow">&rarr;</div>
+				<div class="brc-step-box">
+					<div class="brc-step-num">Step 3</div>
+					<div class="brc-step-body">Zero memory writes. Safe to share read-only across all CPU cores.</div>
+				</div>
+			</div>
+			<pre class="brc-code"><code>/* Immortal fast bypass */
+if (local == _Py_IMMORTAL_REFCNT_LOCAL) &#123;
+    return;
+&#125;</code></pre>
+		</div>
+	</div>
+</figure>
+
+<script>
+	for (const fig of document.querySelectorAll<HTMLElement>(".brcf")) {
+		const tabs = [...fig.querySelectorAll<HTMLButtonElement>(".brc-tab")];
+		const panels = [...fig.querySelectorAll<HTMLElement>(".brc-panel")];
+
+		tabs.forEach((tab) => {
+			tab.addEventListener("click", () => {
+				const path = tab.dataset.path;
+				tabs.forEach((t) => t.classList.toggle("active", t === tab));
+				panels.forEach((p) => {
+					p.hidden = p.dataset.panel !== path;
+				});
+			});
+		});
+	}
+</script>
+
+<style>
+	.brcf {
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+		outline: none;
+	}
+	.brcf figcaption {
+		text-align: center;
+		font-size: 0.9rem;
+		font-weight: 600;
+		margin-bottom: 0.65rem;
+		color: var(--text);
+	}
+	.brc-headers-compare {
+		display: grid;
+		grid-template-columns: 1fr 1.6fr;
+		gap: 0.75rem;
+		margin-bottom: 0.75rem;
+	}
+	.brc-header-card {
+		background: var(--surface);
+		border: 1px solid var(--faint);
+		border-radius: 8px;
+		padding: 0.65rem 0.75rem;
+		display: flex;
+		flex-direction: column;
+		gap: 0.45rem;
+	}
+	.brc-card-title {
+		font-size: 0.75rem;
+		font-weight: 700;
+		color: var(--text);
+		text-transform: uppercase;
+		letter-spacing: 0.03em;
+		border-bottom: 1px solid var(--faint);
+		padding-bottom: 0.3rem;
+	}
+	.brc-fields {
+		display: flex;
+		gap: 0.35rem;
+		flex-wrap: wrap;
+	}
+	.brc-field {
+		background: var(--bg);
+		border: 1px solid var(--faint);
+		border-radius: 5px;
+		padding: 0.35rem 0.45rem;
+		display: flex;
+		flex-direction: column;
+		gap: 0.15rem;
+		font-size: 0.72rem;
+	}
+	.brc-field code {
+		font-family: var(--mono);
+		font-weight: 700;
+		color: var(--accent);
+		font-size: 0.74rem;
+	}
+	.brc-field span {
+		font-size: 0.65rem;
+		color: var(--muted);
+	}
+	.brc-card-sub {
+		font-size: 0.72rem;
+		color: var(--muted);
+		line-height: 1.35;
+	}
+	.brc-paths-container {
+		border: 1px solid var(--faint);
+		border-radius: 8px;
+		background: var(--surface);
+		padding: 0.75rem;
+	}
+	.brc-tabs {
+		display: flex;
+		gap: 0.4rem;
+		flex-wrap: wrap;
+		margin-bottom: 0.65rem;
+		border-bottom: 1px solid var(--faint);
+		padding-bottom: 0.5rem;
+	}
+	.brc-tab {
+		background: var(--bg);
+		border: 1px solid var(--faint);
+		border-radius: 5px;
+		padding: 0.35rem 0.65rem;
+		font-size: 0.75rem;
+		font-family: var(--sans);
+		font-weight: 600;
+		color: var(--muted);
+		cursor: pointer;
+		transition: all 140ms ease;
+	}
+	.brc-tab:hover {
+		color: var(--text);
+		border-color: var(--accent);
+	}
+	.brc-tab.active {
+		background: var(--accent-soft);
+		border-color: var(--accent);
+		color: var(--text);
+	}
+	.brc-panel-header {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: 0.4rem;
+		margin-bottom: 0.65rem;
+	}
+	.brc-status-pill {
+		font-size: 0.7rem;
+		font-weight: 700;
+		text-transform: uppercase;
+		letter-spacing: 0.03em;
+		padding: 0.2rem 0.55rem;
+		border-radius: 4px;
+	}
+	.brc-status-pill.fast {
+		background: var(--accent-soft);
+		color: var(--accent);
+		border: 1px solid var(--accent);
+	}
+	.brc-status-pill.atomic {
+		background: var(--draft-bg);
+		color: var(--draft-text);
+		border: 1px solid var(--draft-border);
+	}
+	.brc-status-pill.merge {
+		background: var(--surface);
+		color: var(--text);
+		border: 1px solid var(--muted);
+	}
+	.brc-status-pill.immortal {
+		background: var(--accent-soft);
+		color: var(--text);
+		border: 1px solid var(--faint);
+	}
+	.brc-condition code {
+		font-family: var(--mono);
+		font-size: 0.74rem;
+		color: var(--accent);
+	}
+	.brc-flow-grid {
+		display: flex;
+		align-items: center;
+		gap: 0.4rem;
+		margin-bottom: 0.65rem;
+	}
+	.brc-step-box {
+		flex: 1;
+		background: var(--bg);
+		border: 1px solid var(--faint);
+		border-radius: 6px;
+		padding: 0.5rem;
+		display: flex;
+		flex-direction: column;
+		gap: 0.2rem;
+		font-size: 0.72rem;
+	}
+	.brc-step-num {
+		font-weight: 700;
+		color: var(--muted);
+		font-size: 0.68rem;
+		text-transform: uppercase;
+	}
+	.brc-step-body {
+		color: var(--text);
+		line-height: 1.35;
+	}
+	.brc-step-arrow {
+		color: var(--muted);
+		font-weight: bold;
+		flex: none;
+	}
+	.brc-step-box.active-fast {
+		border-color: var(--accent);
+		background: var(--accent-soft);
+	}
+	.brc-code {
+		margin: 0;
+		padding: 0.45rem 0.65rem;
+		background: var(--bg);
+		border: 1px solid var(--faint);
+		border-radius: 5px;
+		font-family: var(--mono);
+		font-size: 0.72rem;
+		line-height: 1.35;
+		color: var(--text);
+		overflow-x: auto;
+	}
+	@media (max-width: 760px) {
+		.brc-headers-compare {
+			grid-template-columns: 1fr;
+		}
+		.brc-flow-grid {
+			flex-direction: column;
+		}
+		.brc-step-arrow {
+			transform: rotate(90deg);
+		}
+	}
+</style>

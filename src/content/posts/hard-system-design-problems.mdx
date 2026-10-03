@@ -1,0 +1,975 @@
+---
+title: "Five Hard System Design Problems, Worked from First Principles"
+description: "How to design distributed IDs, a celebrity-scale news feed, flash-sale tickets, hotel reservations and a crash-safe job scheduler—by finding the bottleneck, making the failure explicit and choosing the smallest mechanism that fixes it."
+date: 2026-10-03
+tags: [Distributed systems, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import BoxDiagram from "../../utils/payments/BoxDiagram.astro";
+import SequenceSteps from "../../utils/payments/SequenceSteps.astro";
+import DependencyGraph from "../../utils/graph/DependencyGraph.astro";
+import {
+	idNodes, idEdges, feedNodes, feedEdges, ticketParticipants, ticketMessages,
+	schedulerNodes, schedulerEdges, hotelParticipants, hotelMessages,
+	hotelArchitectureNodes, hotelArchitectureEdges,
+} from "../../utils/systemdesign/systemDesignFigures";
+
+## Background
+
+A system design interview rarely fails because someone forgot to draw a load balancer. It becomes
+hard when one innocent requirement forces two machines to agree: IDs must never collide, a famous
+user has 50 million followers, two buyers want the last seat, a hotel room spans several nights,
+or a worker crashes just after doing something irreversible.
+
+Recent interview guides repeatedly put news feeds, ticketing and flash sales, distributed job
+schedulers, booking systems, and unique-ID generators among the harder prompts. The names differ,
+but the hard parts repeat. This post solves five of them from first principles. For each one, we will state the
+contract, estimate the load, break the naive design, build the production design, and name the
+trade-off we accepted.
+
+The numbers below are deliberately small enough to check and large enough to expose the bottleneck.
+They are illustrative workloads, not claims about any company's current traffic. The designs are
+grounded in primary accounts from Twitter, Google, Amazon and the PostgreSQL documentation.
+
+## A method for hard design problems
+
+Before drawing boxes, write four lines:
+
+1. **Contract:** what must never happen? "No sold seat has two owners" is useful; "be consistent"
+   is not.
+2. **Workload:** average and peak requests per second, object size, retention, and the skew between
+   the hottest and median key.
+3. **Failure boundary:** what happens if a process dies after its last durable write but before its
+   next message?
+4. **Degradation:** what can become stale, delayed, approximate or unavailable when the system is
+   stressed?
+
+These four lines stop a design from becoming a catalogue of products. A cache, queue or database is
+only an answer after we know which property it supplies.
+
+| Problem | Invariant | Dominant pressure | Deliberate compromise |
+| --- | --- | --- | --- |
+| Distributed IDs | no collision | coordination and clock skew | roughly, not perfectly, ordered |
+| News feed | bounded read latency | fan-out skew | celebrity posts merged on read |
+| Ticket sale | at most one owner per seat | one hot inventory set | admission control and short holds |
+| Hotel booking | every night has capacity | multi-night inventory | hold room type, assign room later |
+| Job scheduler | no lost logical run | crashes between effects and acknowledgements | duplicate delivery, idempotent effect |
+
+## Problem 1: globally unique, sortable IDs
+
+### Requirements and capacity
+
+The service has one functional operation: return a new ID. It may also expose a batch operation to
+reduce network overhead:
+
+```http
+POST /v1/ids
+{ "count": 100 }
+
+200 OK
+{ "ids": [4194373635, 4194373636, ...] }
+```
+
+The **functional requirements** are stricter than the small API suggests:
+
+- Every successful call returns an ID that has never been returned before.
+- IDs fit in a signed 64-bit integer and are roughly ordered by creation time.
+- Any application node can request an ID; there is no application-specific state in the generator.
+- A batch contains unique IDs and does not overlap any other batch.
+
+The **non-functional requirements** are 99.99% availability, a p99 generation latency below 5 ms
+inside a region, and enough capacity for a 10× traffic spike. Perfectly gap-free IDs and a perfect
+global order are explicitly out of scope. A client can time out after the service allocated an ID,
+so gaps are unavoidable unless every caller participates in a transaction.
+
+Assume 500 million new objects per day:
+
+| Quantity | Calculation | Result |
+| --- | ---: | ---: |
+| Average rate | $500{,}000{,}000 / 86{,}400$ | 5,787 IDs/s |
+| Peak rate | average × 10 | 57,870 IDs/s |
+| Annual IDs | $500\text{M} \times 365$ | 182.5 billion |
+| Raw ID storage/year | annual IDs × 8 bytes | 1.46 TB |
+
+The generator stores no record per ID, so the last line is application storage, not generator
+storage. With 16 generator workers, the peak is about 3,617 IDs/s per worker—less than one ID per
+millisecond on average and far below the 4,096 IDs/ms sequence limit. Capacity is not the hard
+part; ownership and time are.
+
+### High-level architecture and low-level flow
+
+Clients call a regional load balancer, which spreads requests across stateless ID-generator
+processes. Each process owns one worker ID. A small strongly consistent **worker registry** grants
+that identity as a renewable lease. The registry is off the request path: the generator contacts it
+at startup and periodically renews, but issuing an ID needs only local memory and the local clock.
+
+For every request, a worker performs these steps under a local mutex:
+
+1. Read the current millisecond. If it exceeds `last_ms`, set `sequence = 0`.
+2. If it equals `last_ms`, increment the 12-bit sequence.
+3. If the sequence reaches 4,096, wait for the next millisecond instead of wrapping.
+4. If time is below `last_ms`, stop and apply the clock-rollback policy.
+5. Pack the three fields, save `last_ms`, and return the integer.
+
+The mutex is local, not distributed. Different workers cannot collide because their worker fields
+differ. Threads on one process need serialization because they share one sequence counter.
+
+#### State and database choice
+
+The hot path needs no database. It has only this local state:
+
+```text
+worker_id: 17
+lease_generation: 903
+last_ms: 1000
+sequence: 3
+```
+
+The worker registry does require linearizable compare-and-set and expiring leases. A consensus
+store such as etcd, ZooKeeper or a small strongly consistent SQL table is a good fit. Redis without
+a consensus-backed ownership protocol is not enough: during failover, two nodes can believe they
+own worker 17. The registry contains at most 1,024 leases, so throughput is irrelevant; correctness
+and operational simplicity dominate.
+
+| Choice | Strength | Weakness | Use it when |
+| --- | --- | --- | --- |
+| Database sequence | simple, total order | central dependency and write bottleneck | one database already owns all writes |
+| UUIDv4 | no coordination, opaque | 128 bits, random index writes, no time order | public identifiers and decentralization matter |
+| UUIDv7 | time-ordered, standardized shape | 128 bits; collision probability, not worker partitioning | 128-bit IDs are acceptable |
+| Snowflake-shaped ID | 64 bits, local generation, index locality | clock and worker-ID operations | very high-rate sharded writes |
+
+The service should expose worker lease age, clock offset, rollback events, sequence exhaustion and
+IDs issued per worker. A rollback alert is a correctness alert, not merely a latency alert.
+
+#### Why an auto-increment column stops scaling
+
+On one database, `AUTO_INCREMENT` gives compact, ordered IDs. After sharding, each database can
+generate `42`. Sending every insert through one sequence server restores uniqueness but puts one
+network hop and one failure domain back on the write path.
+
+Twitter faced exactly this while moving tweet storage from one MySQL system to Cassandra and
+sharded MySQL. Its Snowflake service needed tens of thousands of IDs per second, high availability,
+rough time ordering and a 64-bit representation. Those requirements point to an **uncoordinated ID**:
+each worker uses a disjoint part of the number space.
+
+#### Pack time, worker and sequence into 64 bits
+
+A Snowflake-shaped ID uses one unused sign bit, 41 bits of milliseconds since a custom epoch, 10
+bits of worker identity, and a 12-bit per-millisecond sequence:
+
+$$
+\text{id} = ((t - t_0) \ll 22)\; |\; (w \ll 12)\; |\; s
+$$
+
+<BoxDiagram nodes={idNodes} edges={idEdges} selected="pack1" title="Two workers issue IDs in the same millisecond without talking" />
+
+The fields give $2^{10}=1{,}024$ workers and $2^{12}=4{,}096$ IDs per millisecond per worker.
+That is 4,096,000 IDs/s per worker if every millisecond is full, and 4,194,304,000 IDs/s over all
+workers. The 41-bit time field lasts
+$2^{41}/(1000 \times 60 \times 60 \times 24 \times 365.2425) \approx 69.7$ years.
+
+Check one ID. Let $t-t_0=1{,}000$, worker $w=17$, and sequence $s=3$:
+
+$$
+(1000 \times 2^{22}) + (17 \times 2^{12}) + 3
+= 4{,}194{,}373{,}635.
+$$
+
+Decoding recovers `time = id >> 22 = 1000`, `worker = (id >> 12) & 1023 = 17`, and
+`sequence = id & 4095 = 3`.
+
+#### The real problem is the clock
+
+The bit packing is easy. The contract fails if worker 17 is accidentally assigned to two live
+processes, or if its clock moves backwards and it repeats an earlier `(time, sequence)` pair.
+Worker IDs therefore need leases or static ownership tied to a machine identity. They cannot be a
+random number chosen at startup.
+
+For a small clock rollback, stop issuing IDs until wall time catches up. For a larger rollback,
+fail the node and alert; silently using the old time risks collision. Persisting the last timestamp
+across restarts closes another hole. IDs are only **roughly ordered** because clocks on different
+workers differ. If the product needs one global order, it needs coordination, such as a consensus
+log, and must pay its latency and availability cost.
+
+Use random UUIDs when opacity and decentralization matter more than index locality. Use a database
+sequence when one database already owns every write. Use a Snowflake-style ID when 64-bit storage,
+time locality and sharded generation are actual requirements.
+
+## Problem 2: a news feed with celebrity fan-out
+
+### Requirements and capacity
+
+The **functional requirements** are:
+
+- Users publish text and media posts, follow or unfollow authors, and delete their own posts.
+- `GET /feed` returns a paginated, ranked home feed from followed and recommended authors.
+- Blocks, mutes and audience rules remove content the reader is not allowed to see.
+- New posts should appear quickly, and pagination must not repeat or skip items merely because new
+  posts arrived.
+
+The **non-functional requirements** are a p99 feed latency below 300 ms, high read availability,
+durable post creation, and feed freshness within roughly five seconds for ordinary authors.
+Ranking order and like counts may be eventually consistent. Privacy checks may not: it is better to
+omit a post than expose one after a block.
+
+Continue with 100 million daily active users, 20 feed opens per user per day, and 10 million posts
+per day. Assume an average post record of 1 KiB excluding media, a 5× read peak, a 10× write peak,
+and three copies of durable data:
+
+| Quantity | Calculation | Result |
+| --- | ---: | ---: |
+| Feed reads | $100\text{M} \times 20 / 86{,}400$ | 23,148/s average; 115,741/s peak |
+| Post writes | $10\text{M}/86{,}400$ | 116/s average; 1,157/s peak |
+| Post metadata/day | $10\text{M} \times 1$ KiB | 9.54 GiB |
+| Replicated metadata/year | 9.54 GiB × 365 × 3 | 10.2 TiB |
+| Active timeline cache | $100\text{M} \times 800 \times 16$ bytes | 1.28 TB logical |
+
+Media dwarfs metadata. A 2 MiB average attachment on only 20% of posts adds about 3.8 TiB/day
+before replication, so media belongs in object storage behind a content delivery network (CDN),
+not in the post database.
+
+### APIs and data model
+
+```http
+POST /v1/posts                 { text, media_keys, audience }
+PUT  /v1/users/{id}/following/{author_id}
+DELETE /v1/users/{id}/following/{author_id}
+GET  /v1/feed?cursor={opaque}&limit=30
+DELETE /v1/posts/{post_id}
+```
+
+The feed cursor should encode the last score and post ID, not a page number. Offset pagination
+becomes unstable when new posts are inserted at the front. A composite `(score, post_id)` cursor
+also gives a deterministic tie-breaker.
+
+The logical records are small:
+
+```text
+Post(post_id, author_id, created_at, text, media_keys, audience, deleted_at)
+Follow(follower_id, followee_id, created_at)
+AuthorOutbox(author_id, created_at, post_id)
+HomeTimeline(user_id, rank_score, post_id, source, inserted_at)
+```
+
+Partition `Post` by a hash of `post_id` for balanced writes and direct lookup. Partition the
+following list by `follower_id`, because feed generation asks "whom does this user follow?" Store a
+reverse follower index by `followee_id` as a separate denormalized table because fan-out asks the
+opposite question. Trying to serve both directions from one distributed index creates scatter
+queries.
+
+### High-level architecture and low-level flow
+
+On the write path, the post service first stores the post and an outbox event atomically. A relay
+publishes `PostCreated(post_id, author_id)` to a partitioned event log. Fan-out workers read the
+author's follower index and append the ID to bounded home timelines. Replaying an event is safe
+because `(user_id, post_id)` is unique. Slow or inactive users can be skipped and rebuilt on demand.
+
+On the read path:
+
+1. Fetch 200–500 IDs from the reader's home-timeline cache.
+2. Fetch recent IDs from each followed celebrity's author outbox in parallel.
+3. Add recommendation candidates, then deduplicate by `post_id`.
+4. Apply blocks, mutes, deletion and audience filters before ranking.
+5. Run a cheap first-stage ranker, then an expensive ranker on the smaller candidate set.
+6. Hydrate the top 30 post records and return an opaque cursor.
+
+If a home timeline is missing, fall back to merging author outboxes. That response is slower but
+keeps the product available while a cache is cold. Backfill the cache asynchronously rather than
+making the reader wait for a complete rebuild.
+
+#### Database and cache choices
+
+No single store fits every access pattern:
+
+| Data | Suitable store | Reason |
+| --- | --- | --- |
+| Post metadata | sharded SQL, Cassandra or Dynamo-style KV | durable point writes and point reads by post ID |
+| Media | object storage + CDN | large immutable blobs and global delivery |
+| Follow graph | wide-column/KV tables in both directions | very large adjacency lists, predictable key access |
+| Event stream | Kafka/Pulsar-like log | durable fan-out, replay and consumer backpressure |
+| Home timeline | Redis sorted set or wide-column table | bounded ordered list with cheap trim and range read |
+| Search | inverted index | token and relevance queries do not match the primary store |
+
+Redis is a cache, not the only copy of a post. If timeline loss is acceptable because it can be
+rebuilt, Redis persistence can be relaxed. The post and follow records need durable replication.
+Cross-region reads can use local replicas; post creation should have one home region per author or
+ID to avoid making every write wait for an intercontinental consensus round.
+
+Operationally, measure feed generation lag by author class, candidate count, cache hit rate,
+filtered-content rate, ranker latency and fan-out queue age. A single overall queue-depth graph can
+hide one celebrity partition that is hours behind.
+
+#### Push and pull move the cost
+
+Assume 100 million daily users, each opening the feed 20 times per day. That is
+$2\text{ billion}/86{,}400 \approx 23{,}148$ average feed reads/s; at a 5× peak, about 116,000
+reads/s. Suppose 10 million posts arrive per day, only 116 posts/s on average. Reads dominate, so
+precomputing each user's home timeline looks attractive.
+
+**Fan-out on write** means appending a new post ID to every follower's cached timeline. A normal
+author with 500 followers creates 500 small writes. If one entry is 16 bytes—an 8-byte post ID and
+an 8-byte score—that is only 8 KB of logical payload.
+
+A celebrity with 50 million followers turns the same action into 50 million writes and at least
+800 MB of logical entries before replication and database overhead. At 100,000 timeline writes/s,
+one post takes 500 seconds to drain. The queue is not broken; the workload is skewed.
+
+**Fan-out on read** stores one author timeline and merges timelines from every followed account
+when a reader opens the app. It makes a celebrity post cheap, but moves graph traversal, fetching
+and merging onto the latency-sensitive path. A reader following 500 accounts may need 500 reads
+before ranking one page.
+
+#### Use a hybrid feed
+
+The practical answer is not to choose one globally. Push ordinary authors into followers'
+precomputed home timelines, but leave high-fan-out authors in their own outboxes and pull their
+recent posts during reads.
+
+<BoxDiagram nodes={feedNodes} edges={feedEdges} selected="merge" title="Hybrid fan-out: push the long tail, pull celebrities" />
+
+The celebrity threshold is an operating decision, not a constant of nature. Let $F$ be follower
+count, $C_w$ the measured cost of one fan-out write, $R$ the number of active followers expected to
+read before the post expires, and $C_r$ the incremental cost of merging that author on a read.
+Push while $F C_w \lt R C_r$ and while the write completes inside the freshness target. Measure
+those quantities and adjust the threshold; do not copy "one million followers" from a diagram.
+
+Keep IDs, not post bodies, in timeline caches. Cap each home timeline, for example at 800 entries:
+$800 \times 16 = 12.5$ KiB of logical data per active user. Merge cached IDs with the recent
+outboxes of followed celebrities, remove deleted or blocked posts, rank candidates, and only then
+**hydrate** the top page by fetching post bodies. This keeps large media and frequently edited
+metadata out of millions of duplicated lists.
+
+The feed may be seconds stale, but privacy cannot be. A block or deletion must be checked again at
+read time even if a stale ID remains in a cache. This is a common system-design distinction:
+eventual consistency is acceptable for ordering, not automatically for authorization.
+
+## Problem 3: the last ticket in a flash sale
+
+### Requirements and capacity
+
+The **functional requirements** are:
+
+- Browse events, sections, seat maps and approximate availability.
+- Search for adjacent seats or select exact seats.
+- Hold seats for five minutes, purchase them, cancel a hold, and retrieve an order.
+- Ensure a seat is never sold twice and one idempotency key never creates two orders.
+
+The **non-functional requirements** separate browsing from buying. Event pages should have p99
+latency below 200 ms and remain available under extreme load. A reservation may take up to one
+second, but it needs strong consistency and durability. The sale must be fair enough that bypassing
+the waiting room does not help. Payment and inventory must be auditable.
+
+For 50,000 seats and two million buyers, assume five page views per buyer, 1 KiB of event metadata
+per response after compression, and the earlier 33,333 reservation-attempt burst:
+
+| Quantity | Calculation | Result |
+| --- | ---: | ---: |
+| Browse requests | $2\text{M} \times 5 / 600$ | 16,667/s average |
+| Opening reservation burst | $1\text{M}/30$ | 33,333/s |
+| Maximum successful holds | one per seat | 50,000 total |
+| Success fraction | $50{,}000/2\text{M}$ | at most 2.5% |
+| Event response egress | 16,667/s × 1 KiB | 16.3 MiB/s before CDN |
+
+The success fraction reveals the architecture: at least 97.5% of buyers cannot win. Static event
+pages, seat-map tiles and approximate counts should be cached at the CDN. Only admitted buyers may
+touch the strongly consistent reservation path.
+
+### APIs and relational model
+
+```http
+GET  /v1/events/{event_id}
+GET  /v1/events/{event_id}/availability?section=A
+POST /v1/holds       Idempotency-Key: 8f...  { event_id, seat_ids }
+POST /v1/orders      Idempotency-Key: b2...  { hold_id, payment_method }
+GET  /v1/orders/{order_id}
+DELETE /v1/holds/{hold_id}
+```
+
+For multiple adjacent seats, lock or conditionally update every requested seat in sorted
+`seat_id` order inside one short transaction. Sorted acquisition avoids deadlocks. The request
+succeeds only if the number of updated rows equals the number requested; otherwise roll it back.
+
+```sql
+CREATE TABLE seats (
+  event_id       BIGINT NOT NULL,
+  seat_id        BIGINT NOT NULL,
+  status         TEXT NOT NULL,
+  hold_id        UUID,
+  hold_token     BIGINT NOT NULL DEFAULT 0,
+  expires_at     TIMESTAMPTZ,
+  order_id       UUID,
+  PRIMARY KEY (event_id, seat_id)
+);
+
+CREATE TABLE requests (
+  account_id      BIGINT NOT NULL,
+  idempotency_key UUID NOT NULL,
+  request_hash    BYTEA NOT NULL,
+  hold_id         UUID,
+  response        JSONB,
+  PRIMARY KEY (account_id, idempotency_key)
+);
+```
+
+The idempotency row and seat updates belong in the same transaction. A repeated key with a
+different request hash is rejected rather than silently returning an unrelated hold.
+
+### High-level architecture and low-level flow
+
+The CDN serves event details and a periodically refreshed availability summary. A waiting-room
+service assigns a signed admission token containing the event, account, expiry and queue position.
+The reservation gateway validates that token and rate limits it before forwarding to the inventory
+service. Inventory owns the SQL transaction. An order service orchestrates payment and the final
+sale, while an immutable event or ledger stream supports reconciliation and audit.
+
+The exact-seat flow is:
+
+1. The client submits seats, an admission token and an idempotency key.
+2. Inventory inserts the idempotency record, then conditionally claims seats in one transaction.
+3. It commits a hold with an expiry and returns the fencing token.
+4. The order service calls payment with `order_id` as its idempotency key.
+5. On approval, inventory conditionally changes the matching hold to `sold`.
+6. An outbox publishes `TicketsSold`; email and analytics consume it asynchronously.
+
+If step 5 repeatedly fails after a successful charge, reconciliation has two explicit options:
+finish the sale while the valid hold still exists, or refund the payment. It must never improvise a
+different seat without the buyer's consent.
+
+#### Database choice and partitioning
+
+A relational database is the default choice because a purchase needs conditional writes, unique
+constraints, short multi-row transactions and an auditable relation between seats, holds and
+orders. PostgreSQL or MySQL supplies those directly. A distributed SQL database is attractive when
+one event cannot fit on one primary or synchronous regional failover is mandatory, but its
+cross-range transactions add latency and operational complexity.
+
+Redis can accelerate approximate counts and seat-map reads, but a Redis lock should not be the
+source of ownership. Losing a lock during a pause does not stop the old process from writing;
+database predicates and fencing tokens do. A queue is useful after the sale for email and ticket
+generation, not as the sole arbiter of who owns an exact seat.
+
+Keep all seats for one event on one shard while an event fits comfortably. Very large general-
+admission events can partition inventory into numbered buckets and atomically decrement a bucket,
+because individual seats are interchangeable. Assigned seating needs event-local transactions.
+
+Monitor admitted rate, database lock wait, hold success, expiry, payment-without-order count,
+oversell count (which must remain zero), and waiting-room bypass attempts. Load-test with everyone
+requesting the same seat; uniform random traffic misses the failure the design exists to prevent.
+
+#### Start with the invariant, not the cache
+
+Consider 50,000 seats and two million buyers arriving in ten minutes: 3,333 reservation attempts/s
+on average. If half arrive in the first 30 seconds, the opening burst is 33,333 attempts/s. Almost
+all buyers lose, so letting every request reach the inventory database wastes the scarce resource.
+
+The invariant is: **a seat has at most one valid owner**. Availability counts may be slightly stale;
+ownership may not. A cache can show "12 seats left", but the authoritative transition must be a
+conditional database write:
+
+```sql
+UPDATE seats
+   SET status = 'held', hold_id = :hold_id,
+       hold_token = hold_token + 1,
+       expires_at = now() + interval '5 minutes'
+ WHERE event_id = :event_id AND seat_id = :seat_id
+   AND (status = 'available'
+        OR (status = 'held' AND expires_at &lt; now()))
+RETURNING hold_token, expires_at;
+```
+
+Exactly one competing transaction changes the row. Everyone else gets zero rows and loses.
+The returned token is a **fencing token**, a number that increases on every new hold. Any later
+write must include it, so a slow buyer whose lease expired cannot overwrite the newer owner.
+
+<SequenceSteps participants={ticketParticipants} messages={ticketMessages} step={2} colWidth={130} title="Two buyers race for seat 7A" />
+
+#### A hold is a lease, not a sale
+
+Do not hold a database transaction open while the buyer types card details. Create a durable
+five-minute hold, commit, then call the payment provider. Payment uses `hold_id` or `order_id` as an
+idempotency key. On approval, update `held → sold` only if the hold ID and fencing token still
+match. On decline, release it. A sweeper can release expired holds, but the conditional claim above
+must also treat an expired hold as available so correctness does not depend on the sweeper running
+on time.
+
+There is no atomic transaction spanning an ordinary SQL database and a payment network. If payment
+succeeds and the process crashes before marking the seat sold, reconciliation looks up the payment
+by idempotency key and finishes the transition or triggers a refund. This is a small **saga**: a
+sequence of local transactions with an explicit compensating action.
+
+#### Protect the authoritative path
+
+The row update prevents overselling but does not make 33,333 losing requests cheap. Put a waiting
+room in front of the reservation API. Admit only the rate the database and payment path can finish,
+give each admitted client a signed, short-lived token, rate-limit by account and device, and reject
+bots before they take a database connection.
+
+Partition inventory by `event_id` so an event's seats and constraints are local. That creates a hot
+event shard during a sale, which is intentional: correctness stays simple, while admission control
+keeps its load bounded. Randomly sharding individual seats spreads writes but makes "best two
+adjacent seats" and event-level limits distributed transactions. Partitioning is a trade-off
+between load balance and transaction locality, not a reflex.
+
+## Problem 4: a scheduler that survives every crash point
+
+### Requirements and capacity
+
+The **functional requirements** are:
+
+- Create, update, pause and delete one-time or recurring schedules.
+- Launch a logical run near its scheduled time and expose its status and history.
+- Retry transient failures, cancel queued work and replay a dead-lettered run.
+- Respect time zones and a documented daylight-saving-time policy.
+
+The **non-functional requirements** are no silently lost runs, at-least-once delivery, horizontal
+scale, and recovery after a scheduler or worker crash. Assume 99.99% control-plane availability,
+99% of strict jobs starting within 30 seconds, and retention of run history for 30 days. Execution
+itself can last hours and is not part of the API latency target.
+
+For ten million active schedules and 500,000 launches at midnight:
+
+| Quantity | Calculation | Result |
+| --- | ---: | ---: |
+| Average launches | $10\text{M}/86{,}400$ | 116/s |
+| Midnight burst drained in 5 min | $500{,}000/300$ | 1,667/s |
+| Poller claims at 200 rows/batch | $1{,}667/200$ | 8.34 batches/s |
+| 30-day run records | $10\text{M} \times 30$ | 300 million rows |
+| Run storage at 500 bytes, 3 copies | $300\text{M} \times 500 \times 3$ | 450 GB |
+
+If an average job runs for 30 seconds and the midnight drain rate is 1,667/s, Little's Law gives
+about $1{,}667 \times 30 = 50{,}010$ concurrent executions. The scheduler may be able to enqueue
+that rate while the execution fleet cannot. Per-tenant concurrency limits and queue backpressure
+are therefore functional safeguards, not late optimizations.
+
+### APIs and data model
+
+```http
+POST /v1/schedules       Idempotency-Key: ...
+PATCH /v1/schedules/{id}
+POST /v1/schedules/{id}/pause
+GET /v1/schedules/{id}/runs?cursor=...
+POST /v1/runs/{run_id}/replay
+```
+
+```sql
+CREATE TABLE schedules (
+  partition_id   SMALLINT NOT NULL,
+  schedule_id    UUID NOT NULL,
+  tenant_id      BIGINT NOT NULL,
+  expression     TEXT NOT NULL,
+  time_zone      TEXT NOT NULL,
+  next_run_at    TIMESTAMPTZ NOT NULL,
+  payload_ref    TEXT NOT NULL,
+  state          TEXT NOT NULL,
+  version        BIGINT NOT NULL,
+  PRIMARY KEY (partition_id, schedule_id)
+);
+CREATE INDEX schedules_due
+  ON schedules (partition_id, next_run_at)
+  WHERE state = 'active';
+
+CREATE TABLE runs (
+  run_id          BYTEA PRIMARY KEY,
+  schedule_id     UUID NOT NULL,
+  scheduled_at    TIMESTAMPTZ NOT NULL,
+  attempt         INTEGER NOT NULL,
+  status          TEXT NOT NULL,
+  lease_until     TIMESTAMPTZ,
+  UNIQUE (schedule_id, scheduled_at)
+);
+```
+
+The unique `(schedule_id, scheduled_at)` key makes recovery deterministic. `version` provides
+optimistic concurrency when a user edits a schedule while a poller is advancing it.
+
+### High-level architecture and low-level flow
+
+The control plane validates schedules and stores them. Time partitions or hashed virtual
+partitions split the due-time index among pollers. Pollers create run records and outbox events in
+the same transaction. Relays publish to tenant-sharded queues. Workers lease runs, execute target
+operations with `run_id`, record the result, and acknowledge only after durable completion.
+
+The crash matrix is the low-level design:
+
+| Crash point | Durable state | Recovery |
+| --- | --- | --- |
+| Before schedule transaction commits | no schedule | client retries its idempotent create |
+| After run/outbox commit, before publish | outbox row | relay publishes it later |
+| After publish, before marking outbox sent | queue may contain a duplicate | `run_id` deduplicates it |
+| Worker dies before effect | unacknowledged message or expired lease | another worker retries |
+| Worker dies after effect, before acknowledgement | effect exists; message returns | target deduplicates `run_id` |
+| Result write fails | target may have result | reconcile by `run_id`, then finish |
+
+This table is more useful than claiming "exactly once." It shows which durable fact the next
+process uses after every ambiguous outcome.
+
+#### Database, queue and timer choices
+
+PostgreSQL is a good starting point up to millions of schedules because it combines the due-time
+index, `SKIP LOCKED`, unique run IDs and transactional outbox. Partition the table by time or a
+stable hash once indexes or vacuum pressure grow. A wide-column store can scale further, but it
+usually needs explicit time buckets such as `(minute_bucket, partition_id)` and a separate
+deduplication store; moving a rescheduled job between buckets must be carefully made idempotent.
+
+Use a durable queue such as Kafka, SQS, Pub/Sub or a broker with visibility timeouts for execution.
+Kafka is strong when ordered partitions, replay and high throughput matter. A visibility-timeout
+queue is simpler for independent jobs whose completion time varies. Neither replaces the schedule
+database: a queue is good at "deliver this ready item," not "find every calendar expression due in
+six months."
+
+A hierarchical timing wheel is useful inside a poller for the next few seconds, but it is an
+in-memory acceleration. On restart, the database remains the recovery source. Store large payloads
+in object storage and place only a reference in the queue so retries do not amplify megabytes of
+traffic.
+
+Shard queues by tenant hash, then enforce per-tenant rate and concurrency limits at workers. This
+prevents one customer's million-job burst from consuming every worker. Record separate service-
+level objectives for schedule lag, queue lag and execution duration; combining them hides whether
+the timer, broker or target is slow.
+
+#### "Exactly once" is the wrong first promise
+
+Suppose ten million schedules run once per day. The average is only
+$10{,}000{,}000/86{,}400 \approx 116$ launches/s, but human schedules cluster at midnight and on
+the hour. If 5% target midnight, 500,000 jobs become due together. A design that scans the table
+once per minute and immediately executes work creates a thundering herd and loses jobs when its
+single scheduler dies.
+
+Store `next_run_at` durably and index it. Several pollers claim small batches. PostgreSQL's
+`FOR UPDATE SKIP LOCKED` is explicitly suitable for avoiding lock contention with multiple
+consumers of a queue-like table:<Sidenote>`SKIP LOCKED` gives an inconsistent view, so it is a poor
+choice for a normal report. Here that is exactly what we want: each poller skips work another
+poller has claimed.</Sidenote>
+
+```sql
+SELECT schedule_id, next_run_at
+  FROM schedules
+ WHERE next_run_at &lt;= now()
+ ORDER BY next_run_at
+ FOR UPDATE SKIP LOCKED
+ LIMIT 200;
+```
+
+In the same transaction, create a stable `run_id = hash(schedule_id, scheduled_time)`, advance the
+recurring schedule's next time, and insert an outbox row. A relay publishes outbox rows to a durable
+queue. The transaction closes the dangerous gap between "marked scheduled" and "published".
+
+<BoxDiagram nodes={schedulerNodes} edges={schedulerEdges} selected="target" title="A crash-safe, horizontally scalable scheduler" />
+
+The queue delivers **at least once**. A worker holds a lease and heartbeats while it runs. If it
+dies, the lease expires and another worker receives the same `run_id`. Acknowledging before the
+effect can lose the run; acknowledging after the effect can duplicate it when the worker crashes
+between those two actions. No queue protocol can atomically commit an arbitrary external effect.
+
+Make the target operation idempotent instead. Record `(target, run_id)` under a unique constraint
+in the same transaction as the local effect, or pass `run_id` as the target API's idempotency key.
+Amazon describes this client-token pattern for safe retries; the token and mutation must form one
+atomic operation on the server.
+
+#### Time is part of the data model
+
+Store the user's time zone, the schedule expression, and the next occurrence as a UTC instant.
+Define what happens when daylight saving time skips or repeats a local time. A run is identified by
+the intended occurrence, not the poller's wall clock, so retrying it produces the same `run_id`.
+
+Spread flexible jobs with deterministic jitter. Google extended cron syntax so a question mark can
+mean "choose any value in this range" and hashes the job configuration into the range. Unlike
+random jitter, deterministic jitter keeps the chosen time stable across restarts. Strict jobs stay
+at their requested instant and queues absorb their burst.
+
+Retry transient failures with exponential backoff and jitter, but cap attempts. A poison job moves
+to a **dead-letter queue** with its error and run ID so an operator can inspect and replay it. Track
+schedule lag (`now - scheduled_time`), queue age, lease expirations, retries and dead-letter rate;
+CPU usage alone will not say that payroll is two hours late.
+
+## Problem 5: hotel booking across several nights
+
+### Requirements and the inventory model
+
+A hotel search result says "one deluxe room, October 10–13." That is not one inventory item. It is
+one unit on each of the nights October 10, 11 and 12; checkout day October 13 does not consume a
+night. The booking succeeds only if every night has capacity. This makes hotel inventory a range
+problem, unlike a concert seat that has one permanent owner after sale.
+
+The **functional requirements** are:
+
+- Search properties by destination and stay dates, then filter by guests, room type and price.
+- Quote a rate with taxes and cancellation rules, place a short checkout hold, and confirm payment.
+- Retrieve bookings by guest, confirmation code or property and arrival date.
+- Modify or cancel a booking without overselling any affected night.
+- Let hotel staff assign a physical room later, check the guest in and check them out.
+
+The **non-functional requirements** separate search from reservation. Search should remain highly
+available with p99 latency below 300 ms and may show availability that is a few seconds stale.
+Creating or changing a booking may take up to one second, but must strongly enforce nightly
+capacity. Bookings and money changes must be durable and auditable. A retry must not create a
+second booking or charge.
+
+The critical modeling choice is whether inventory represents a **room type** or a physical room.
+Most hotels sell a type—"deluxe king"—and assign room 412 near check-in. Holding a particular room
+months ahead fragments inventory and makes operational swaps difficult. Therefore the availability
+path counts units by `(property_id, room_type_id, stay_date)`. A separate assignment table maps a
+confirmed booking to a physical room when needed.
+
+Assume 100,000 properties, 200 rooms per property, 70% occupancy, an average three-night stay,
+500 million searches per day and ten million booking attempts per day:
+
+| Quantity | Calculation | Result |
+| --- | ---: | ---: |
+| Search rate | $500\text{M}/86{,}400$ | 5,787/s average; 57,870/s at 10× peak |
+| Booking attempts | $10\text{M}/86{,}400$ | 116/s average; 1,157/s at 10× peak |
+| Nightly inventory rows for 18 months | $100{,}000 \times 10$ types × 548 days | 548 million rows |
+| Occupied room-nights/day | $100{,}000 \times 200 \times 0.70$ | 14 million |
+| New stays/day | occupied room-nights ÷ 3 nights | about 4.67 million |
+
+Search is read-heavy and geographically broad, while the write path for one property is small but
+correctness-sensitive. The ten million attempts include failed payments and abandoned holds; the
+occupied estate implies about 4.67 million completed stays per day. Inventory rows can be generated
+only for the saleable horizon and archived by date.
+
+The high-level architecture separates the stale-tolerant search path, the strongly consistent
+property booking path, and the guest-keyed retrieval path. Hover a component to trace only its
+direct connections; click it to keep that path highlighted.
+
+<DependencyGraph
+	nodes={hotelArchitectureNodes}
+	edges={hotelArchitectureEdges}
+	directed
+	active="booking"
+	ranksep={52}
+	title="High-level architecture of the hotel booking system"
+/>
+
+### APIs, booking storage and indexes
+
+```http
+GET  /v1/search?destination=SG&check_in=2026-10-10&check_out=2026-10-13&guests=2
+POST /v1/quotes              { property_id, room_type_id, dates, guests, rate_plan_id }
+POST /v1/holds               Idempotency-Key: ...  { quote_id }
+POST /v1/bookings            Idempotency-Key: ...  { hold_id, guest, payment_method }
+GET  /v1/bookings/{booking_id}
+GET  /v1/guests/{guest_id}/bookings?cursor=...
+GET  /v1/properties/{property_id}/bookings?arrival_date=2026-10-10
+POST /v1/bookings/{id}/cancel
+```
+
+The public confirmation code should be random and non-sequential so it cannot be guessed. Internally,
+use a sortable unique `booking_id`. Store money in minor units plus currency; never reconstruct the
+charged price from today's rate table.
+
+```sql
+CREATE TABLE inventory_day (
+  property_id       BIGINT NOT NULL,
+  room_type_id      BIGINT NOT NULL,
+  stay_date         DATE NOT NULL,
+  total_units       INTEGER NOT NULL,
+  held_units        INTEGER NOT NULL DEFAULT 0,
+  booked_units      INTEGER NOT NULL DEFAULT 0,
+  version           BIGINT NOT NULL DEFAULT 0,
+  PRIMARY KEY (property_id, room_type_id, stay_date),
+  CHECK (held_units >= 0 AND booked_units >= 0),
+  CHECK (held_units + booked_units <= total_units)
+);
+
+CREATE TABLE booking (
+  booking_id        BIGINT PRIMARY KEY,
+  confirmation_code TEXT NOT NULL UNIQUE,
+  guest_id          BIGINT NOT NULL,
+  property_id       BIGINT NOT NULL,
+  room_type_id      BIGINT NOT NULL,
+  check_in          DATE NOT NULL,
+  check_out         DATE NOT NULL,
+  status            TEXT NOT NULL,
+  currency          CHAR(3) NOT NULL,
+  room_minor        BIGINT NOT NULL,
+  tax_minor         BIGINT NOT NULL,
+  total_minor       BIGINT NOT NULL,
+  cancellation_json JSONB NOT NULL,
+  created_at        TIMESTAMPTZ NOT NULL,
+  updated_at        TIMESTAMPTZ NOT NULL,
+  CHECK (check_in < check_out)
+);
+
+CREATE INDEX booking_by_guest
+  ON booking (guest_id, created_at DESC, booking_id DESC);
+CREATE INDEX booking_by_arrival
+  ON booking (property_id, check_in, status, booking_id);
+```
+
+Those indexes implement the two main retrieval paths without a scan. The guest index supports an
+opaque `(created_at, booking_id)` cursor. The property index gives the front desk its arrival list.
+A unique confirmation-code index supports customer service lookup. For "all guests currently in
+house," add `(property_id, status, check_out)` or maintain a small operational view; do not expect
+one index to optimize every report.
+
+Store one `booking_night(booking_id, stay_date, price_minor, tax_minor)` row per consumed night.
+This preserves the nightly price that was sold, supports partial-stay modifications and makes
+revenue reports explainable. Personal guest data can live in a separately protected customer
+table; the booking keeps the guest ID and a minimal immutable contact snapshot needed to fulfill
+the stay.
+
+### Holding inventory during checkout
+
+"Lock the room during checkout" should not mean holding SQL row locks while a guest types a card
+number. Database locks last only for a short transaction. The user-facing lock is a durable
+**inventory hold** with a 10–15 minute expiry.
+
+<SequenceSteps participants={hotelParticipants} messages={hotelMessages} step={1} colWidth={135} title="Holding three hotel nights, paying, and creating the booking" />
+
+To place one hold for October 10–13, begin a transaction and conditionally increment `held_units`
+on the three rows October 10, 11 and 12:
+
+```sql
+UPDATE inventory_day
+   SET held_units = held_units + 1,
+       version = version + 1
+ WHERE property_id = :property
+   AND room_type_id = :room_type
+   AND stay_date >= DATE '2026-10-10'
+   AND stay_date <  DATE '2026-10-13'
+   AND held_units + booked_units < total_units;
+```
+
+The service expects exactly three updated rows. If it gets fewer, it rolls back, so it cannot hold
+only two nights of a three-night stay. In production, first select the rows in ascending
+`stay_date FOR UPDATE`, verify the count and capacity, then update them. Every transaction uses the
+same ascending order to avoid deadlocks between overlapping stays.
+
+In the same transaction, insert:
+
+```text
+InventoryHold(
+  hold_id, idempotency_key, guest_id, property_id, room_type_id,
+  check_in, check_out, units, quote_snapshot, status, expires_at
+)
+```
+
+Commit immediately. A second request can now read the reduced capacity, while no database
+transaction remains open. The checkout page carries `hold_id`, not ownership inferred from a
+cookie. A background reaper releases expired holds, but booking must also check `expires_at`; the
+system's correctness cannot depend on a cleanup worker running exactly on time.
+
+After an idempotent payment authorization, one transaction locks the hold, verifies it is active,
+creates `booking` and `booking_night` rows, changes `held_units - 1` and `booked_units + 1` for every
+night, marks the hold consumed, and writes an outbox event. If payment succeeds but this transaction
+fails, reconciliation queries payment by `booking_id`: either retry consuming the still-valid hold
+or void/refund the authorization. It must not create a new hold at a new price silently.
+
+Cancellation performs the reverse inventory transition for future nights and records a refund or
+fee as a new money event. Never delete the booking row; change its state and retain an audit trail.
+For a date change, claim the newly required nights before releasing old nights in one transaction,
+otherwise a failed modification can destroy a valid reservation.
+
+### Exact-room assignment and overlap protection
+
+Room-type counters prevent selling 11 deluxe rooms when the hotel owns 10; they do not say which
+guest receives room 412. Assigning a physical room is a second problem. PostgreSQL range types and
+an exclusion constraint can make overlapping assignments impossible:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+
+CREATE TABLE room_assignment (
+  property_id BIGINT NOT NULL,
+  room_id     BIGINT NOT NULL,
+  booking_id  BIGINT NOT NULL REFERENCES booking,
+  stay        DATERANGE NOT NULL,
+  EXCLUDE USING gist (
+    property_id WITH =,
+    room_id     WITH =,
+    stay        WITH &&
+  )
+);
+```
+
+Use half-open ranges such as `[2026-10-10, 2026-10-13)`: a guest checking out on the 13th does not
+overlap a guest checking in that day. PostgreSQL's exclusion constraint rejects two rows whose
+property and room are equal and whose date ranges overlap. This is stronger than "query, see no
+conflict, then insert," which races unless protected by serializable isolation or explicit locks.
+
+Room assignment can happen days before arrival, and staff may swap rooms without changing sold
+inventory. Properties with operational rules—connecting rooms, accessibility, maintenance blocks—
+can run a matching process over the confirmed bookings and available physical rooms.
+
+#### Database choice, search and scaling
+
+Use a relational database such as PostgreSQL or MySQL for the authoritative booking path. It needs
+multi-row transactions across several nights, conditional capacity checks, unique idempotency
+keys, state transitions and auditable relations. PostgreSQL has an extra advantage for exact-room
+assignment: built-in date ranges, GiST indexes and exclusion constraints.
+
+| Concern | Store | Why |
+| --- | --- | --- |
+| Booking and nightly inventory | relational or distributed SQL | transactions, constraints and retrieval indexes |
+| Destination/property search | OpenSearch/Elasticsearch-like index | geography, text, facets and ranking |
+| Hotel images | object storage + CDN | large immutable media |
+| Hot search results | cache | read volume and tolerance for brief staleness |
+| Booking events | transactional outbox + durable log | email, analytics and partner updates without dual writes |
+
+Search is not the source of truth for availability. It narrows millions of properties to perhaps
+hundreds using a periodically updated minimum-price and availability index. Before showing the
+final checkout price, the quote service reads authoritative nightly inventory and rates. Before
+creating the hold, the database checks capacity again.
+
+Shard the transactional data by `property_id`: inventory and property-side booking operations then
+stay local. Guest booking history spans properties, so either maintain a denormalized
+`guest_booking_index` through the outbox or query a separate read model keyed by guest. Do not send
+a scatter query to every property shard when a user opens "My trips."
+
+One exceptionally large property still has only hundreds or thousands of rooms, so a property
+shard's contention is bounded. The harder scaling problem is a popular destination search, which
+belongs in caches and a search index. Multi-region systems can give each property a home region for
+writes and replicate booking read models globally. Strong multi-region writes are justified only
+if the business requires booking to continue through loss of that home region.
+
+Monitor hold success and expiry rates, nightly inventory below zero (always zero incidents),
+payment-without-booking reconciliation, booking lookup latency by index, search-to-authoritative
+availability mismatch, lock wait time and deadlocks. Test two overlapping stays competing for the
+last room type, not only many independent hotels.
+
+## How the five solutions connect
+
+The same few ideas solved all four designs:
+
+- **Move coordination off the common path.** Snowflake divides the ID space. Hybrid feeds avoid
+  pushing celebrity posts. Scheduler pollers claim disjoint rows.
+- **Serialize only the invariant.** A ticket seat needs one authoritative conditional update; its
+  availability counter and page cache do not need the same consistency.
+- **Give retries an identity.** A hold ID, payment idempotency key and scheduler run ID turn a
+  repeated message into the same logical operation.
+- **Bound work before it enters the bottleneck.** Timeline caps, a ticket waiting room, scheduler
+  batch sizes and retry limits prevent one burst from becoming unbounded debt.
+- **Treat skew as a first-class workload.** Averages hide the celebrity, the last seat and midnight.
+
+In an interview, draw the simple system first. Then pick one invariant and walk a request through
+every crash point. That is usually more convincing than adding another database logo.
+
+## Summary
+
+- A 64-bit Snowflake-style ID trades perfect global order for coordination-free generation; worker
+  identity and clock rollback are the real correctness problems.
+- A scalable feed uses hybrid fan-out: push ordinary authors, pull celebrities, rank IDs, and
+  hydrate only the final page.
+- A ticket hold is a short lease created by a conditional database write. Fencing tokens reject
+  stale owners, while admission control protects the hot event shard.
+- A hotel booking consumes capacity on every night in a half-open date range. A short durable hold
+  protects checkout; a separate assignment maps room type inventory to a physical room later.
+- A distributed scheduler should prefer at-least-once delivery plus an idempotent effect. Stable
+  run IDs, an outbox, leases and dead-letter handling make crashes recoverable.
+- Start every design with an invariant, quantified workload, crash boundary and degradation policy.
+
+## References
+
+- Twitter Engineering, [Announcing Snowflake](https://blog.x.com/engineering/en_us/a/2010/announcing-snowflake)
+  and the [archived Snowflake source](https://github.com/twitter-archive/snowflake).
+- Twitter Engineering, [Using Deep Learning at Scale in Twitter's Timelines](https://blog.x.com/engineering/en_us/topics/insights/2017/using-deep-learning-at-scale-in-twitters-timelines)
+  and [The Infrastructure Behind Twitter: Scale](https://blog.x.com/engineering/en_us/topics/infrastructure/2017/the-infrastructure-behind-twitter-scale).
+- Google SRE Book, [Distributed Periodic Scheduling with Cron](https://sre.google/sre-book/distributed-periodic-scheduling/).
+- PostgreSQL documentation, [`SELECT` locking clauses](https://www.postgresql.org/docs/current/sql-select.html).
+- PostgreSQL documentation, [range types and exclusion constraints](https://www.postgresql.org/docs/current/rangetypes.html)
+  and [explicit row locking](https://www.postgresql.org/docs/current/explicit-locking.html).
+- Amazon Builders' Library, [Making retries safe with idempotent APIs](https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-APIs/)
+  and [Timeouts, retries, and backoff with jitter](https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/).
+- Martin Kleppmann, [How to do distributed locking](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html),
+  for leases and fencing tokens.

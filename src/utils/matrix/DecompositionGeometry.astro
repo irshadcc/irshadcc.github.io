@@ -1,0 +1,131 @@
+---
+// Draws coordinate-space geometry for one decomposition: LU shear, QR projection,
+// eigendirections, or SVD's circle-to-line map. All plotted points come from
+// decompositionGeometry.ts so their numerical relationships can be tested.
+// Usage in .mdx:
+//   <DecompositionGeometry kind="eigen" />
+import {
+	GEOMETRY,
+	type GeometryKind,
+	apply2,
+	circle,
+	project,
+	transform,
+} from "./decompositionGeometry";
+
+interface Props {
+	kind: GeometryKind;
+}
+const { kind } = Astro.props;
+const W = 620;
+const H = 280;
+const scale = kind === "eigen" || kind === "svd" ? 25 : 48;
+const panels = { left: { cx: kind === "qr" ? 310 : 155, cy: 135 }, right: { cx: 465, cy: 135 } };
+const p = (point: { x: number; y: number }, panel = panels.left) => ({
+	x: panel.cx + point.x * scale,
+	y: panel.cy - point.y * scale,
+});
+const path = (points: { x: number; y: number }[], panel = panels.left) =>
+	points
+		.map(
+			(point, i) =>
+				`${i ? "L" : "M"}${p(point, panel).x.toFixed(1)},${p(point, panel).y.toFixed(1)}`,
+		)
+		.join(" ");
+const segment = (
+	a: { x: number; y: number },
+	b: { x: number; y: number },
+	panel = panels.left,
+) => {
+	const pa = p(a, panel);
+	const pb = p(b, panel);
+	return `M${pa.x},${pa.y} L${pb.x},${pb.y}`;
+};
+const arrow = (point: { x: number; y: number }, panel = panels.left) =>
+	segment({ x: 0, y: 0 }, point, panel);
+const unit = circle();
+const qrProjection =
+	kind === "qr" ? project(GEOMETRY.qr.b, GEOMETRY.qr.q) : { x: 0, y: 0 };
+const scenes = {
+	lu: {
+		title: "LU records elimination as reversible shears",
+		caption:
+			"L shears the coordinate grid. U then handles the remaining triangular map.",
+	},
+	qr: {
+		title: "QR turns least squares into a projection",
+		caption:
+			"The fitted vector lies in the column space; the residual is perpendicular to it.",
+	},
+	eigen: {
+		title: "Eigenvectors keep their directions",
+		caption:
+			"The unit circle becomes an ellipse whose principal axes are the two eigenvectors.",
+	},
+	svd: {
+		title: "A zero singular value collapses a dimension",
+		caption:
+			"The input circle collapses to a line: v₁ stretches by 5, while v₂ maps to zero.",
+	},
+};
+const scene = scenes[kind];
+---
+
+<figure class="geometry">
+	<figcaption class="title">{scene.title}</figcaption>
+	<svg viewBox={`0 0 ${W} ${H}`} role="img" aria-label={`${scene.title}. ${scene.caption}`}>
+		<defs>
+			<marker id={`geo-arrow-${kind}`} viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0.5 L8,4 L0,7.5 z" /></marker>
+		</defs>
+		{kind === "lu" && <>
+			{[-2,-1,0,1,2].map((v) => <><path class="grid" d={segment({x:v,y:-2},{x:v,y:2})}/><path class="grid" d={segment({x:-2,y:v},{x:2,y:v})}/></>)}
+			{[-2,-1,0,1,2].map((v) => <><path class="grid out" d={segment(apply2(GEOMETRY.lu.matrix,{x:v,y:-2}),apply2(GEOMETRY.lu.matrix,{x:v,y:2}),panels.right)}/><path class="grid out" d={segment(apply2(GEOMETRY.lu.matrix,{x:-2,y:v}),apply2(GEOMETRY.lu.matrix,{x:2,y:v}),panels.right)}/></>)}
+			<text class="panel-label" x="155" y="264">before L</text><text class="panel-label" x="465" y="264">after L</text>
+		</>}
+		{kind === "qr" && <>
+			<path class="space" d={segment({x:-2.6,y:-1.95},{x:2.6,y:1.95})}/>
+			<path class="vector primary" d={arrow(GEOMETRY.qr.b)} marker-end={`url(#geo-arrow-${kind})`}/>
+			<path class="vector fit" d={arrow(qrProjection)} marker-end={`url(#geo-arrow-${kind})`}/>
+			<path class="vector residual" d={segment(qrProjection,GEOMETRY.qr.b)} marker-end={`url(#geo-arrow-${kind})`}/>
+			<text class="annotation" x={p(GEOMETRY.qr.b).x+6} y={p(GEOMETRY.qr.b).y}>b</text>
+			<text class="annotation" x={p(qrProjection).x-2} y={p(qrProjection).y+18}>Ax̂</text>
+			<text class="annotation" x={p(GEOMETRY.qr.b).x-10} y={p(qrProjection).y-8}>r ⟂ col(A)</text>
+			<text class="panel-label" x="155" y="264">observation space</text>
+		</>}
+		{kind === "eigen" && <>
+			<path class="shape input" d={path(unit)}/><path class="shape output" d={path(transform(unit,GEOMETRY.eigen.matrix),panels.right)}/>
+			<path class="vector fit" d={segment({x:-1.15,y:-1.15},{x:1.15,y:1.15})}/>
+			<path class="vector fit" d={arrow({x:1.15,y:1.15})} marker-end={`url(#geo-arrow-${kind})`}/>
+			<path class="vector residual" d={segment({x:-1.15,y:1.15},{x:1.15,y:-1.15})}/>
+			<path class="vector residual" d={arrow({x:1.15,y:-1.15})} marker-end={`url(#geo-arrow-${kind})`}/>
+			<path class="vector fit" d={segment({x:-3.1,y:-3.1},{x:3.1,y:3.1},panels.right)}/>
+			<path class="vector fit" d={arrow({x:3.1,y:3.1},panels.right)} marker-end={`url(#geo-arrow-${kind})`}/>
+			<path class="vector residual" d={segment({x:-1.55,y:1.55},{x:1.55,y:-1.55},panels.right)}/>
+			<path class="vector residual" d={arrow({x:1.55,y:-1.55},panels.right)} marker-end={`url(#geo-arrow-${kind})`}/>
+			<text class="annotation" x="545" y="60">λ₁ = 4</text><text class="annotation" x="510" y="202">λ₂ = 2</text>
+			<text class="panel-label" x="155" y="264">unit circle</text><text class="panel-label" x="465" y="264">after A</text>
+		</>}
+		{kind === "svd" && <>
+			<path class="shape input" d={path(unit)}/><path class="shape output" d={path(transform(unit,GEOMETRY.svd.matrix),panels.right)}/>
+			<path class="vector fit" d={arrow(GEOMETRY.svd.v1)}/><path class="vector residual" d={arrow(GEOMETRY.svd.v2)}/>
+			<path class="vector fit" d={arrow(apply2(GEOMETRY.svd.matrix,GEOMETRY.svd.v1),panels.right)} marker-end={`url(#geo-arrow-${kind})`}/>
+			<circle class="origin" cx={panels.right.cx} cy={panels.right.cy} r="4"/>
+			<text class="annotation" x="198" y="74">v₁</text><text class="annotation" x="102" y="91">v₂</text>
+			<text class="annotation" x="510" y="46">σ₁ = 5</text><text class="annotation" x="474" y="158">σ₂ = 0</text>
+			<text class="panel-label" x="155" y="264">input directions</text><text class="panel-label" x="465" y="264">output</text>
+		</>}
+		{kind !== "qr" && <path class="map-arrow" d="M286,135 L334,135" marker-end={`url(#geo-arrow-${kind})`}/>} 
+	</svg>
+	<p class="caption">{scene.caption}</p>
+</figure>
+
+<style>
+	.geometry { margin: 1.75rem 0; border: 1px solid var(--faint); border-radius: 10px; overflow: hidden; background: var(--surface); }
+	.title { padding: .7rem 1rem; border-bottom: 1px solid var(--faint); color: var(--text); font: 600 .86rem var(--sans); text-align: center; }
+	svg { display: block; width: 100%; height: auto; background: var(--bg); }
+	.grid { stroke: var(--faint); stroke-width: 1; fill: none; }.grid.out { stroke: color-mix(in srgb,var(--accent) 35%,var(--faint)); }
+	.shape { fill: color-mix(in srgb,var(--accent) 12%,transparent); stroke-width: 2; }.shape.input { stroke: var(--muted); }.shape.output { stroke: var(--accent); }
+	.vector,.space,.map-arrow { fill: none; stroke-width: 2; }.space { stroke: var(--faint); stroke-width: 5; }.primary { stroke: var(--text); }.fit { stroke: #2e8b68; }.residual { stroke: #c2674c; stroke-dasharray: 5 4; }.map-arrow { stroke: var(--muted); }
+	marker path { fill: var(--muted); }.origin { fill: #c2674c; }
+	.annotation,.panel-label { fill: var(--muted); font-family: var(--sans); font-size: 12px; }.panel-label { text-anchor: middle; font-size: 11px; }.caption { margin: 0; padding: .65rem 1rem .75rem; border-top: 1px solid var(--faint); color: var(--muted); font-size: .8rem; text-align: center; }
+</style>

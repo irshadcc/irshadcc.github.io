@@ -1,0 +1,95 @@
+---
+// Step-through of vLLM's KV block pool with prefix caching (simulated in blockPool.ts). Top
+// row: every physical block with its tokens, reference count (r) and hash (#); coloured blocks
+// hold data of the request that wrote them, faded ones are free but still cached, blank ones
+// are free and empty. Under it: the free queue in eviction order, then each live request's
+// block table, with blocks that came from the cache outlined. Hover a block for its contents.
+// Usage in .mdx:
+//   <BlockPoolSteps />
+//   <BlockPoolSteps step={3} title="A prefix-cache hit" />
+import StepControls from "../compiler/StepControls.astro";
+import {
+	POOL_BLOCKS,
+	POOL_BLOCK_SIZE,
+	POOL_EVENTS,
+	type PoolEvent,
+	drawPool,
+	runPool,
+} from "./blockPool";
+import { REQ_COLORS } from "./kvcache";
+
+interface Props {
+	events?: PoolEvent[];
+	blocks?: number;
+	blockSize?: number;
+	step?: number;
+	title?: string;
+}
+
+const {
+	events = POOL_EVENTS,
+	blocks = POOL_BLOCKS,
+	blockSize = POOL_BLOCK_SIZE,
+	step = 0,
+	title = "vLLM's block pool, step by step",
+} = Astro.props;
+const frames = runPool(blocks, blockSize, events);
+const reqIds = [...new Set(events.map((e) => e.req))];
+const colors = Object.fromEntries(
+	reqIds.map((id, i) => [id, REQ_COLORS[i % REQ_COLORS.length]]),
+);
+const at = Math.max(0, Math.min(frames.length - 1, step));
+---
+
+<figure class="bps" data-step={at} tabindex="-1">
+	<figcaption class="bps-title">{title}</figcaption>
+	<StepControls labels={frames.map((f) => f.label)} step={at} />
+	<div class="bps-canvas">
+		{frames.map((f, i) => <div class="bps-frame" hidden={i !== at} set:html={drawPool(f, colors, blockSize)} />)}
+	</div>
+	<div class="bps-notes">
+		{frames.map((f, i) => <p hidden={i !== at}>{f.note}</p>)}
+	</div>
+</figure>
+
+<script>
+	import { bindStepper } from "../compiler/stepper";
+	for (const fig of document.querySelectorAll<HTMLElement>(".bps")) {
+		const frames = [...fig.querySelectorAll<HTMLElement>(".bps-frame")];
+		const notes = [...fig.querySelectorAll<HTMLElement>(".bps-notes p")];
+		bindStepper(fig, frames.length, (i) => {
+			frames.forEach((f, k) => { f.hidden = k !== i; });
+			notes.forEach((n, k) => { n.hidden = k !== i; });
+		});
+	}
+</script>
+
+<style>
+	.bps { margin: 1.75rem 0; font-family: var(--sans); outline: none; }
+	.bps-title { text-align: center; font-size: 0.9rem; font-weight: 600; }
+	.bps-canvas { overflow-x: auto; padding: 0.6rem; border: 1px solid var(--faint); border-radius: 10px; background: var(--surface); }
+	.bps-frame[hidden] { display: none; }
+	.bps-frame :global(svg) { display: block; max-width: none; margin: 0 auto; }
+	.bps-frame :global(.pb rect) { fill: var(--bg); stroke: var(--faint); }
+	.bps-frame :global(.pb.cached rect) { opacity: 0.4; stroke-dasharray: 4 2; }
+	.bps-frame :global(.pb.null rect) { fill: var(--surface); stroke-dasharray: 3 2; }
+	.bps-frame :global(.pb.focus rect) { stroke: var(--accent); stroke-width: 2.5; }
+	.bps-frame :global(.pb-id) { font: 600 0.65rem var(--mono); fill: var(--muted); text-anchor: middle; }
+	.bps-frame :global(.pb-null) { font: 0.65rem var(--mono); fill: var(--muted); text-anchor: middle; }
+	.bps-frame :global(.pb-tok) { font: 0.6rem var(--mono); fill: var(--text); }
+	.bps-frame :global(.pb.used .pb-tok),
+	.bps-frame :global(.pb.used .pb-meta) { fill: #1a1a1a; }
+	.bps-frame :global(.pb.cached .pb-tok),
+	.bps-frame :global(.pb.cached .pb-meta) { fill: var(--text); }
+	.bps-frame :global(.pb-meta) { font: 600 0.58rem var(--mono); fill: var(--muted); }
+	.bps-frame :global(.pb-label) { font: 0.68rem var(--sans); fill: var(--muted); }
+	.bps-frame :global(.pq rect) { fill: var(--bg); stroke: var(--faint); }
+	.bps-frame :global(.pq.cached rect) { fill: var(--accent-soft); }
+	.bps-frame :global(.pq.hit rect) { stroke: var(--accent); stroke-width: 2; }
+	.bps-frame :global(.pq text),
+	.bps-frame :global(.pt-name) { font: 600 0.65rem var(--mono); fill: var(--text); text-anchor: middle; }
+	.bps-frame :global(.pt-name) { fill: #1a1a1a; }
+	.bps-notes { min-height: 3.2em; margin-top: 0.55rem; padding: 0.55rem 0.75rem; border-left: 3px solid var(--accent); background: var(--surface); font-size: 0.82rem; line-height: 1.5; }
+	.bps-notes p { margin: 0; }
+	.bps-notes p[hidden] { display: none; }
+</style>

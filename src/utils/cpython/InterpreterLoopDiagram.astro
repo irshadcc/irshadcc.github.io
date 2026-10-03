@@ -1,0 +1,245 @@
+---
+// Step-through architecture diagram of the CPython interpreter loop (_PyEval_EvalFrameDefault)
+// Usage in .mdx:
+//   <InterpreterLoopDiagram />
+import StepControls from "../compiler/StepControls.astro";
+import { loopStages, validateLoopStages } from "./interpreterLoop";
+
+interface Props {
+	step?: number;
+}
+
+const { step = 0 } = Astro.props;
+const err = validateLoopStages(loopStages);
+if (err) throw new Error(`InterpreterLoopDiagram: ${err}`);
+
+const at = Math.max(0, Math.min(loopStages.length - 1, step));
+
+const archNodes = [
+	{ id: "tstate", label: "PyThreadState", group: "runtime" },
+	{ id: "frame", label: "_PyInterpreterFrame", group: "runtime" },
+	{ id: "registers", label: "CPU Regs (next_instr, stack_ptr)", group: "cpu" },
+	{ id: "fetch", label: "16-bit Code Unit (_Py_CODEUNIT)", group: "pipeline" },
+	{ id: "decode", label: "Opcode (8-bit) & Oparg (8-bit)", group: "pipeline" },
+	{
+		id: "dispatch",
+		label: "Computed GOTO (opcode_targets)",
+		group: "dispatch",
+	},
+	{ id: "targets", label: "TARGET(op) Handler", group: "dispatch" },
+	{ id: "stack", label: "Evaluation Stack (TOS)", group: "memory" },
+	{ id: "locals", label: "Fast Locals (localsplus)", group: "memory" },
+	{ id: "cache", label: "Inline CACHE Entries", group: "opt" },
+	{ id: "specialize", label: "PEP 659 Specialization & DEOPT", group: "opt" },
+	{ id: "inline_call", label: "DISPATCH_INLINED (Zero C-call)", group: "call" },
+	{ id: "breaker", label: "eval_breaker (Atomic flag)", group: "async" },
+	{
+		id: "signals",
+		label: "Signals / GIL Drop / Pending Calls",
+		group: "async",
+	},
+];
+---
+
+<figure class="ilf" data-step={at} tabindex="-1">
+	<figcaption>CPython Evaluation Loop Architecture (<code>_PyEval_EvalFrameDefault</code>)</figcaption>
+	<StepControls labels={loopStages.map((s) => s.shortName)} step={at} />
+
+	<!-- Architectural Nodes Grid -->
+	<div class="il-nodes-container" aria-label="Interpreter Loop Components">
+		{archNodes.map((n) => (
+			<div
+				class:list={["il-node", `group-${n.group}`, { active: loopStages[at].activeNodes.includes(n.id) }]}
+				data-node-id={n.id}
+			>
+				<span class="il-node-dot" />
+				<span class="il-node-label">{n.label}</span>
+			</div>
+		))}
+	</div>
+
+	<!-- Stage detail card -->
+	<div class="il-stage-card">
+		<div class="il-stage-header">
+			<span class="il-stage-title">{loopStages[at].title}</span>
+			<div class="il-meta-badges">
+				<span class="il-badge-macro">{loopStages[at].macro}</span>
+				<span class="il-badge-fn">{loopStages[at].cFunction}</span>
+			</div>
+		</div>
+		<div class="il-hw-note">
+			<span class="il-hw-label">Hardware & CPU Path:</span>
+			<span class="il-hw-text">{loopStages[at].hardwareDetail}</span>
+		</div>
+		<p class="il-stage-desc">{loopStages[at].description}</p>
+	</div>
+
+	<script type="application/json" class="il-data" set:html={JSON.stringify(loopStages)} />
+</figure>
+
+<script>
+	import { bindStepper } from "../compiler/stepper";
+	import type { LoopStage } from "./interpreterLoop";
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".ilf")) {
+		const stages = JSON.parse(fig.querySelector(".il-data")?.textContent ?? "[]") as LoopStage[];
+		const nodes = [...fig.querySelectorAll<HTMLElement>(".il-node")];
+		const titleEl = fig.querySelector<HTMLElement>(".il-stage-title");
+		const macroEl = fig.querySelector<HTMLElement>(".il-badge-macro");
+		const fnEl = fig.querySelector<HTMLElement>(".il-badge-fn");
+		const hwEl = fig.querySelector<HTMLElement>(".il-hw-text");
+		const descEl = fig.querySelector<HTMLElement>(".il-stage-desc");
+
+		bindStepper(fig, stages.length, (i) => {
+			const s = stages[i];
+			if (!s) return;
+
+			nodes.forEach((n) => {
+				const id = n.dataset.nodeId ?? "";
+				n.classList.toggle("active", s.activeNodes.includes(id));
+			});
+
+			if (titleEl) titleEl.textContent = s.title;
+			if (macroEl) macroEl.textContent = s.macro;
+			if (fnEl) fnEl.textContent = s.cFunction;
+			if (hwEl) hwEl.textContent = s.hardwareDetail;
+			if (descEl) descEl.textContent = s.description;
+		});
+	}
+</script>
+
+<style>
+	.ilf {
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+		outline: none;
+	}
+	.ilf figcaption {
+		text-align: center;
+		font-size: 0.9rem;
+		font-weight: 600;
+		margin-bottom: 0.5rem;
+		color: var(--text);
+	}
+	.il-nodes-container {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+		gap: 0.5rem;
+		padding: 0.85rem;
+		border: 1px solid var(--faint);
+		border-radius: 10px;
+		background: var(--surface);
+	}
+	.il-node {
+		display: flex;
+		align-items: center;
+		gap: 0.45rem;
+		padding: 0.5rem 0.65rem;
+		background: var(--bg);
+		border: 1px solid var(--faint);
+		border-radius: 6px;
+		font-size: 0.76rem;
+		color: var(--muted);
+		transition: all 160ms ease;
+	}
+	.il-node-dot {
+		width: 7px;
+		height: 7px;
+		border-radius: 50%;
+		background: var(--muted);
+		flex-shrink: 0;
+		transition: background-color 160ms ease;
+	}
+	.il-node-label {
+		line-height: 1.25;
+		font-weight: 500;
+	}
+	.il-node.active {
+		border-color: var(--accent);
+		background: var(--accent-soft);
+		color: var(--text);
+		font-weight: 600;
+		transform: translateY(-1px);
+		box-shadow: 0 2px 6px rgba(0, 0, 0, 0.05);
+	}
+	.il-node.active .il-node-dot {
+		background: var(--accent);
+		box-shadow: 0 0 6px var(--accent);
+	}
+	.il-stage-card {
+		margin-top: 0.65rem;
+		padding: 0.75rem 0.95rem;
+		border: 1px solid var(--faint);
+		border-left: 3px solid var(--accent);
+		border-radius: 0 8px 8px 0;
+		background: var(--surface);
+	}
+	.il-stage-header {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: 0.4rem;
+		margin-bottom: 0.45rem;
+	}
+	.il-stage-title {
+		font-size: 0.88rem;
+		font-weight: 700;
+		color: var(--text);
+	}
+	.il-meta-badges {
+		display: flex;
+		gap: 0.35rem;
+		flex-wrap: wrap;
+	}
+	.il-badge-macro,
+	.il-badge-fn {
+		font-family: var(--mono);
+		font-size: 0.7rem;
+		padding: 0.15rem 0.45rem;
+		border-radius: 4px;
+		border: 1px solid var(--faint);
+		background: var(--bg);
+	}
+	.il-badge-macro {
+		color: var(--accent);
+		font-weight: 600;
+	}
+	.il-badge-fn {
+		color: var(--muted);
+	}
+	.il-hw-note {
+		display: flex;
+		gap: 0.4rem;
+		font-size: 0.75rem;
+		margin-bottom: 0.45rem;
+		color: var(--muted);
+		background: var(--bg);
+		padding: 0.25rem 0.5rem;
+		border-radius: 4px;
+		border: 1px solid var(--faint);
+	}
+	.il-hw-label {
+		font-weight: 600;
+		color: var(--text);
+		white-space: nowrap;
+	}
+	.il-hw-text {
+		color: var(--muted);
+	}
+	.il-stage-desc {
+		margin: 0;
+		font-size: 0.82rem;
+		line-height: 1.5;
+		color: var(--text);
+	}
+	@media (max-width: 600px) {
+		.il-nodes-container {
+			grid-template-columns: 1fr;
+		}
+		.il-stage-header {
+			flex-direction: column;
+			align-items: flex-start;
+		}
+	}
+</style>

@@ -1,0 +1,303 @@
+---
+title: "LevelDB and RocksDB Internals: From Put to SSTable"
+description: "A byte-level tour of LevelDB and RocksDB: WAL records, internal keys, memtables, SSTable blocks, manifests, reads, compaction and crash recovery."
+date: 2026-10-03
+tags: [Databases, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import LsmLifecycle from "../../utils/storage/LsmLifecycle.astro";
+
+## Background
+
+A B-tree updates pages in place. That works well, but a small random write can turn into several
+random reads and writes as pages split and metadata changes. **LevelDB** takes a different route:
+it collects writes in memory, writes them sequentially to a log, and later turns them into immutable
+sorted files. **RocksDB** began as a fork of LevelDB and keeps that shape, but extends it for
+multi-core servers, flash storage, large databases and operational control.
+
+Both are embedded ordered key-value engines, not database servers. An application links the
+library and calls `Put`, `Get`, `Delete` or an iterator. There is no query language or network
+protocol. Their core data structure is a **log-structured merge tree (LSM tree)**: several sorted
+runs of different ages that background work continually merges.
+
+This post follows one key all the way through the engine. We will cover the write-ahead log (WAL),
+internal keys and memtables, the byte layout of an SSTable, point reads, compaction, manifests and
+crash recovery. Then we will separate the small LevelDB design from the production machinery that
+RocksDB adds.
+
+## The database is a directory
+
+The first useful mental model is not a tree but a directory of files. The names differ slightly
+between versions, but the roles are stable.
+
+| File | What it contains | Mutable? |
+| --- | --- | :---: |
+| `000123.log` | Recent write batches: the **WAL** | append-only |
+| `000456.sst` / `.ldb` | An immutable sorted string table (**SSTable**) | no |
+| `MANIFEST-000789` | A journal of which files form the current database version | append-only |
+| `CURRENT` | The name of the active manifest, plus a newline | replaced atomically |
+| `LOCK` | Prevents two processes from opening the same database for writing | held open |
+| `LOG`, `LOG.old` | Human-readable diagnostic output | yes |
+
+The WAL journals *logical data that is still in memory*. The manifest journals *changes to the set
+of durable files*. Confusing the two is a common source of bad explanations: replaying the WAL
+reconstructs memtables, while replaying the manifest reconstructs the LSM tree.
+
+An **SSTable** is immutable. Flushing and compaction therefore create new files and then publish a
+small metadata edit; they do not patch old files in place. Once no live database version references
+an old file, the engine may delete it.
+
+## The write path
+
+Suppose the application calls `Put("cat", "orange")`. At a high level, LevelDB and RocksDB do four
+things. Step through the figure and watch which durable and in-memory structures participate.
+
+<LsmLifecycle mode="write" />
+
+### A batch gets one ordered place in history
+
+The public operation becomes a **write batch**, a sequence of puts and deletes committed as one
+unit. The writer assigns the batch a monotonically increasing **sequence number**. Every stored
+entry uses an **internal key**:
+
+$$
+\text{internal key} = \text{user key} \;\Vert\;
+\operatorname{fixed64}((\text{sequence} \ll 8) \;|\; \text{type})
+$$
+
+The type distinguishes a value from a deletion marker, also called a **tombstone**. The internal
+comparator orders user keys ascending, then sequence numbers descending. Consequently, all versions
+of `cat` are adjacent and its newest version comes first. A snapshot is just a sequence-number
+boundary: return the first version whose sequence is not newer than the snapshot.
+
+For example, a value for `cat` at sequence 100 has tag
+$100 \times 256 + 1 = 25{,}601 = \texttt{0x0000000000006401}$. On a little-endian machine the
+eight stored tag bytes are `01 64 00 00 00 00 00 00`. The comparator interprets the number; a raw
+byte comparison would put versions in the wrong order.
+
+### WAL before acknowledgement
+
+The engine appends the batch to the WAL before treating it as durable. Its physical format is built
+from 32 KiB blocks. Every fragment has a seven-byte header:
+
+```text
+checksum: fixed32   length: fixed16   type: byte   payload: length bytes
+```
+
+`FULL` holds a logical record that fits in the current block. A larger record is split into
+`FIRST`, zero or more `MIDDLE` fragments, and `LAST`. The checksum covers the type byte and payload,
+so recovery can reject torn or corrupted fragments. A record never begins in the final six bytes of
+a physical block; those bytes are padding.
+
+`WriteOptions.sync = true` asks the engine to sync the WAL before returning. Without it, the write
+is safe from a process crash after it reaches the operating system, but a machine or power failure
+may lose data still in the page cache.<Sidenote>Exact persistence also depends on the filesystem,
+device and environment implementation. A successful library call is not stronger than the storage
+stack below it.</Sidenote> Both engines can group concurrent writers so several batches share one
+WAL append and, for synchronous writes, one sync.
+
+### The memtable makes the log searchable
+
+The same batch is inserted into the active **memtable**, an in-memory sorted map. LevelDB's default
+implementation is a skip list. A lookup can therefore see a just-written value without scanning the
+WAL. The WAL is for recovery, not normal reads.
+
+When the configured write buffer fills, the engine freezes it as an **immutable memtable** and
+installs a new WAL and active memtable. A background flush iterates the immutable table in internal-
+key order and writes a level-0 SSTable. Only after the data is installed in the durable version can
+the corresponding old WAL become obsolete.
+
+## Inside an SSTable
+
+An SSTable is a sorted, immutable container designed to answer two questions cheaply: “can this
+file contain the key?” and “which small block could contain it?” Its footer is at a fixed position
+from the end, so a reader starts there and works backward to metadata, then jumps to one data block.
+
+```text
+low file offset
+┌─────────────────────────────────────────────┐
+│ data block 0 │ data block 1 │ ... │ block N │
+├─────────────────────────────────────────────┤
+│ filter / properties / other meta blocks     │
+├─────────────────────────────────────────────┤
+│ metaindex block                             │
+├─────────────────────────────────────────────┤
+│ index block                                 │
+├─────────────────────────────────────────────┤
+│ fixed-size footer: handles + magic number   │
+└─────────────────────────────────────────────┘
+high file offset
+```
+
+A **block handle** is two varints: file offset and size. The footer holds handles for the index and
+metaindex plus a magic number identifying the format. An index entry maps a separator key to the
+handle of a data block. The metaindex maps names such as a filter name to other metadata blocks.
+RocksDB's block-based table follows this LevelDB layout but adds richer properties, partitioned
+indexes and filters, compression dictionaries, range deletions and versioned footer variants.
+
+Each data, index or meta block is followed by a trailer containing a one-byte compression type and
+a checksum. Compression is per block, so reading one key need not decompress the whole file.
+
+### Prefix-compressed data blocks
+
+Keys inside one data block are prefix-compressed. An entry stores three varints—bytes shared with
+the previous key, unshared key bytes and value length—followed by the key suffix and value. Every
+few entries the shared length is forced to zero. These **restart points** make seeking bounded: binary
+search the restart keys, reconstruct forward within one interval.
+
+Here is a scaled-down block with restart interval 3. All lengths fit in one-byte varints.
+
+| Key | Shared bytes | Stored suffix | Value | Entry bytes | Restart? |
+| --- | ---: | --- | --- | ---: | :---: |
+| `ant` | 0 | `ant` | `A` | 7 | yes |
+| `ape` | 1 | `pe` | `B` | 6 | no |
+| `apple` | 2 | `ple` | `C` | 7 | no |
+| `apricot` | 0 | `apricot` | `D` | 11 | yes |
+| `banana` | 0 | `banana` | `E` | 10 | no |
+
+The entries occupy 41 bytes. Their restart offsets are `[0, 20]`; two little-endian `fixed32`
+offsets plus the final restart count add 12 bytes, making a 53-byte block before its trailer. Check
+one entry: `apple` shares `ap` (2 bytes) with `ape`, so it stores the three-byte suffix `ple`.
+Its encoded size is $1 + 1 + 1 + 3 + 1 = 7$ bytes. A script computed every row and offset.
+
+### Filters avoid unnecessary reads
+
+A **Bloom filter** is a probabilistic set. It can say “definitely absent” or “possibly present,”
+but never “definitely present.” On a point miss, that negative answer can avoid reading the index or
+data block. False positives cost an extra lookup but do not change results. Filters help point reads;
+they do not remove the work of returning a range of keys.
+
+LevelDB can store filter metadata selected by a `FilterPolicy`. RocksDB's default block-based format
+supports full-file and partitioned filters; its older block-based filter format is deprecated.
+
+## The read path
+
+For `Get("cat")`, the engine searches from newest state to oldest because the first visible internal
+entry decides the result. A tombstone decides it just as firmly as a value: “not found” must stop the
+search, or an older value could incorrectly reappear.
+
+<LsmLifecycle mode="read" />
+
+The mutable memtable comes first, followed by immutable memtables. Level-0 files are ordered by
+recency and may overlap, so several can be candidates. From level 1 downward, leveled compaction
+keeps file key ranges disjoint within a level; binary search chooses at most one file per level.
+
+Inside a candidate SSTable, a typical cold point lookup is:
+
+1. Consult the filter. Stop for this file if it proves absence.
+2. Read or find the index block in cache and choose a data-block handle.
+3. Read, checksum and decompress that data block, unless it is already cached.
+4. Binary-search its restart points, then scan and reconstruct a short run of keys.
+
+A range iterator is more involved. It creates child iterators over memtables and relevant SSTables,
+then performs a heap-like merge by internal key. Version filtering hides overwritten entries and
+tombstones from the caller.
+
+## Compaction pays the deferred bill
+
+Fast foreground writes create overlapping sorted runs. **Compaction** merge-sorts selected input
+files into new output files. It reduces read amplification, removes overwritten versions and, when
+safe, drops tombstones. The price is **write amplification**: one logical byte may be rewritten
+several times as it moves down the levels.
+
+With leveled compaction, L0 is special because its files may overlap. Levels 1 and below are each a
+sorted run partitioned into non-overlapping files. When a level exceeds its target, the engine picks
+files from level $L$ plus overlapping files from $L+1$, merge-sorts them, and writes replacements
+into $L+1$. If adjacent level capacities grow by a factor $T$, the deepest level holds most data but
+frequently absorbs merges from the smaller level above.
+
+Compaction cannot discard every old entry it sees. A snapshot may still need an older version, and
+a tombstone must remain until the engine knows no deeper level contains the value it hides. This is
+why long-lived snapshots can increase space usage.
+
+RocksDB offers three main policies:
+
+| Policy | Main trade-off | Typical shape |
+| --- | --- | --- |
+| Leveled (default) | lower space/read amplification, more rewriting | overlapping L0; one sorted run per lower level |
+| Universal | lower write amplification, higher temporary space/read amplification | several size-sorted runs merged together |
+| FIFO | bounded space, but expiration by file age rather than key liveness | old files dropped when the size limit is crossed |
+
+If flush or compaction cannot keep up, immutable memtables and L0 files accumulate. RocksDB first
+slows writers and can eventually stop them at configured thresholds. This **write stall** is not a
+mysterious latency spike; it is backpressure from the deferred work of the LSM design.
+
+## Manifest, versions and recovery
+
+Creating an SSTable is not enough. The engine must atomically declare which old files disappeared
+and which new files replaced them. It appends a **version edit** to the manifest. An edit can add or
+delete files, advance the last sequence number, or update other recovery metadata. Applying the edit
+to the previous **version** produces a new immutable view of the database's file set.
+
+`CURRENT` contains the active manifest's filename. To roll a manifest, the engine writes a new one
+containing a snapshot of the current version, syncs it, then atomically replaces `CURRENT`. Readers
+already using an older version can finish safely; obsolete files remain alive until no version needs
+them.
+
+After a crash, opening the database follows this logic:
+
+1. Read `CURRENT`, then replay the named manifest to reconstruct the live SSTables and metadata.
+2. Enumerate the WALs that may contain updates newer than the recovered durable state.
+3. Verify and replay complete write batches into memtables, respecting the selected corruption
+   recovery policy.
+4. Resume background flush and compaction, and delete files proven obsolete.
+
+The order matters. A fully written SSTable that was never installed by a durable manifest edit is
+an orphan, not part of the database. Conversely, the manifest must not reference a file that was not
+made durable first.
+
+## LevelDB versus RocksDB
+
+RocksDB preserves the teachable LevelDB core, but they are not interchangeable file formats or
+feature sets.
+
+| Area | LevelDB | RocksDB |
+| --- | --- | --- |
+| Goal | small, portable ordered key-value library | production engine tuned for fast storage and servers |
+| Key spaces | one database-wide key space | multiple **column families** with separate LSM state |
+| Background work | deliberately simple scheduling | concurrent flushes, compactions and subcompactions |
+| Compaction | leveled | leveled, universal, FIFO and customization hooks |
+| Table format | compact block-based SSTable | extended block-based format plus alternative table factories |
+| Reads | block cache and optional filters | richer caches, indexes, filters, checksums and I/O controls |
+| Writes | batches, snapshots, WAL | those plus merge operators, transactions, ingest and many durability controls |
+| Operations | basic repair and benchmarking tools | extensive statistics, listeners, `ldb`, `sst_dump`, backup/checkpoint and tuning surfaces |
+
+A **column family** is an independent logical key space inside one RocksDB instance. Each has its own
+memtables and SSTables, while the WAL can contain writes for several column families. That sharing
+is why an old WAL cannot be removed merely because one family was flushed: every family must have
+persisted past the WAL's live records.
+
+The added machinery buys throughput and control, but also creates more ways to choose badly. Larger
+write buffers reduce flush frequency but use more memory and extend recovery. More Bloom-filter bits
+reduce false positives but consume memory or cache. More background jobs help only until storage or
+CPU saturates. The right settings follow from measured read, write and space amplification—not from
+a universal “best” options file.
+
+## Summary
+
+- A foreground write goes to the WAL for recovery and the sorted memtable for reads; a flush turns
+  that state into an immutable level-0 SSTable.
+- Internal keys append a descending sequence number and value type, which gives snapshots,
+  overwrites and tombstones one ordered representation.
+- An SSTable is a set of prefix-compressed data blocks plus filters, indexes, checksums and a footer
+  of block handles; a point read jumps through those layers instead of scanning the file.
+- Compaction is the deferred cost of fast writes. It trades write bandwidth for fewer read paths,
+  reclaimed space and bounded overlap.
+- The WAL recovers in-memory updates; the manifest recovers the live set of on-disk files. LevelDB
+  supplies this compact core, while RocksDB adds concurrency, column families, formats and controls.
+
+## References
+
+- Google, [LevelDB implementation notes (release 1.23)](https://github.com/google/leveldb/blob/1.23/doc/impl.md),
+  [table format](https://github.com/google/leveldb/blob/1.23/doc/table_format.md), and
+  [log format](https://github.com/google/leveldb/blob/1.23/doc/log_format.md).
+- Google, [LevelDB internal-key comparator and encoding (release 1.23)](https://github.com/google/leveldb/blob/1.23/db/dbformat.h).
+- Meta, [RocksDB overview](https://github.com/facebook/rocksdb/wiki/RocksDB-Overview),
+  [block-based table format](https://github.com/facebook/rocksdb/wiki/Rocksdb-BlockBasedTable-Format), and
+  [WAL file format](https://github.com/facebook/rocksdb/wiki/Write-Ahead-Log-File-Format).
+- Meta, [RocksDB manifest design](https://github.com/facebook/rocksdb/wiki/MANIFEST/6ccdb7670884c5767557e431d5f13cef9a3109bf),
+  [leveled compaction](https://github.com/facebook/rocksdb/wiki/Leveled-Compaction), and
+  [indexing SST files](https://github.com/facebook/rocksdb/wiki/Indexing-SST-Files-for-Better-Lookup-Performance).
+- Patrick O'Neil et al., [The Log-Structured Merge-Tree](https://doi.org/10.1007/s002360050048),
+  *Acta Informatica* 33, 1996.

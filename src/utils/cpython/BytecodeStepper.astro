@@ -1,0 +1,384 @@
+---
+// Interactive step-through visualization of the CPython bytecode evaluation loop
+// executing: def compute(a, b): return a + b * 2 with a=10, b=20
+// Usage in .mdx:
+//   <BytecodeStepper />
+import StepControls from "../compiler/StepControls.astro";
+import { bytecodeSteps, validateSteps } from "./bytecodeExecution";
+
+interface Props {
+	step?: number;
+}
+
+const { step = 0 } = Astro.props;
+const err = validateSteps(bytecodeSteps);
+if (err) throw new Error(`BytecodeStepper: ${err}`);
+
+const at = Math.max(0, Math.min(bytecodeSteps.length - 1, step));
+---
+
+<figure class="bcf" data-step={at} tabindex="-1">
+	<figcaption>CPython Evaluation Stack and Macro Execution Trace (<code>a + b * 2</code>)</figcaption>
+	<StepControls labels={bytecodeSteps.map((s) => s.label)} step={at} />
+
+	<div class="bc-layout">
+		<!-- Left: Bytecode instruction sequence -->
+		<div class="bc-column bc-code-col">
+			<div class="bc-col-header">Instruction Stream (<code>_Py_CODEUNIT</code>)</div>
+			<div class="bc-code-list" role="list">
+				{bytecodeSteps.map((s, idx) => (
+					<div class:list={["bc-instr-row", { active: idx === at }]} data-step-idx={idx}>
+						<span class="bc-offset">{String(s.offset).padStart(2, "0")}</span>
+						<span class="bc-opname">{s.opname}</span>
+						<span class="bc-oparg">{s.oparg}</span>
+						{s.argval && <span class="bc-argval">({s.argval})</span>}
+					</div>
+				))}
+			</div>
+		</div>
+
+		<!-- Center: Stack and localsplus state -->
+		<div class="bc-column bc-state-col">
+			<div class="bc-col-header">Frame Memory (<code>localsplus</code> & Stack)</div>
+			<div class="bc-state-box">
+				<div class="bc-sub-heading">Evaluation Stack (<code>stack_pointer</code>)</div>
+				<div class="bc-stack-view" aria-label="Evaluation Stack">
+					<div class="bc-stack-empty-label" hidden={bytecodeSteps[at].stack.length > 0}>[ empty stack ]</div>
+					<div class="bc-stack-items">
+						{bytecodeSteps[at].stack.map((item, idx) => (
+							<div class="bc-stack-cell" data-tos={idx === bytecodeSteps[at].stack.length - 1}>
+								<span class="bc-cell-val">{item}</span>
+								<span class="bc-cell-meta">{idx === bytecodeSteps[at].stack.length - 1 ? "TOS [-1]" : `[-${bytecodeSteps[at].stack.length - idx}]`}</span>
+							</div>
+						))}
+					</div>
+				</div>
+
+				<div class="bc-sub-heading">Fast Locals (<code>frame-&gt;localsplus</code>)</div>
+				<div class="bc-locals-grid">
+					<div class="bc-local-row">
+						<span class="bc-local-slot">[0] a:</span>
+						<span class="bc-local-val" data-local="a">{bytecodeSteps[at].locals[0].val}</span>
+					</div>
+					<div class="bc-local-row">
+						<span class="bc-local-slot">[1] b:</span>
+						<span class="bc-local-val" data-local="b">{bytecodeSteps[at].locals[1].val}</span>
+					</div>
+				</div>
+			</div>
+		</div>
+
+		<!-- Right: Macro & C Code Execution -->
+		<div class="bc-column bc-macro-col">
+			<div class="bc-col-header">CPython Loop C Implementation</div>
+			<div class="bc-macro-box">
+				<div class="bc-macros-badges">
+					{bytecodeSteps[at].macros.map((m) => (
+						<span class="bc-badge">{m}</span>
+					))}
+				</div>
+				<pre class="bc-c-code"><code>{bytecodeSteps[at].cCode}</code></pre>
+			</div>
+		</div>
+	</div>
+
+	<!-- Step explanation footer -->
+	<div class="bc-explanation">
+		<div class="bc-expl-title">Execution Detail:</div>
+		<p class="bc-expl-text">{bytecodeSteps[at].explanation}</p>
+	</div>
+
+	<script type="application/json" class="bc-data" set:html={JSON.stringify(bytecodeSteps)} />
+</figure>
+
+<script>
+	import { bindStepper } from "../compiler/stepper";
+	import type { BytecodeStep } from "./bytecodeExecution";
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".bcf")) {
+		const stepsData = JSON.parse(fig.querySelector(".bc-data")?.textContent ?? "[]") as BytecodeStep[];
+		const rows = [...fig.querySelectorAll<HTMLElement>(".bc-instr-row")];
+		const stackContainer = fig.querySelector<HTMLElement>(".bc-stack-items");
+		const emptyLabel = fig.querySelector<HTMLElement>(".bc-stack-empty-label");
+		const localA = fig.querySelector<HTMLElement>('[data-local="a"]');
+		const localB = fig.querySelector<HTMLElement>('[data-local="b"]');
+		const badgesContainer = fig.querySelector<HTMLElement>(".bc-macros-badges");
+		const cCodeElem = fig.querySelector<HTMLElement>(".bc-c-code code");
+		const explText = fig.querySelector<HTMLElement>(".bc-expl-text");
+
+		bindStepper(fig, stepsData.length, (i) => {
+			const step = stepsData[i];
+			if (!step) return;
+
+			// Highlight active bytecode instruction
+			rows.forEach((r, idx) => r.classList.toggle("active", idx === i));
+
+			// Update stack items
+			if (stackContainer) {
+				stackContainer.innerHTML = "";
+				if (step.stack.length === 0) {
+					if (emptyLabel) emptyLabel.hidden = false;
+				} else {
+					if (emptyLabel) emptyLabel.hidden = true;
+					step.stack.forEach((val, sIdx) => {
+						const isTos = sIdx === step.stack.length - 1;
+						const cell = document.createElement("div");
+						cell.className = "bc-stack-cell";
+						if (isTos) cell.classList.add("tos");
+						const valSpan = document.createElement("span");
+						valSpan.className = "bc-cell-val";
+						valSpan.textContent = val;
+						const metaSpan = document.createElement("span");
+						metaSpan.className = "bc-cell-meta";
+						metaSpan.textContent = isTos ? "TOS [-1]" : `[-${step.stack.length - sIdx}]`;
+						cell.appendChild(valSpan);
+						cell.appendChild(metaSpan);
+						stackContainer.appendChild(cell);
+					});
+				}
+			}
+
+			// Update fast locals
+			if (localA && step.locals[0]) localA.textContent = step.locals[0].val;
+			if (localB && step.locals[1]) localB.textContent = step.locals[1].val;
+
+			// Update badges
+			if (badgesContainer) {
+				badgesContainer.innerHTML = "";
+				step.macros.forEach((m) => {
+					const badge = document.createElement("span");
+					badge.className = "bc-badge";
+					badge.textContent = m;
+					badgesContainer.appendChild(badge);
+				});
+			}
+
+			// Update C code
+			if (cCodeElem) cCodeElem.textContent = step.cCode;
+
+			// Update explanation
+			if (explText) explText.textContent = step.explanation;
+		});
+	}
+</script>
+
+<style>
+	.bcf {
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+		outline: none;
+	}
+	.bcf figcaption {
+		text-align: center;
+		font-size: 0.9rem;
+		font-weight: 600;
+		margin-bottom: 0.5rem;
+		color: var(--text);
+	}
+	.bc-layout {
+		display: grid;
+		grid-template-columns: 1.1fr 1fr 1.5fr;
+		gap: 0.75rem;
+		padding: 0.85rem;
+		border: 1px solid var(--faint);
+		border-radius: 10px;
+		background: var(--surface);
+	}
+	.bc-column {
+		display: flex;
+		flex-direction: column;
+		background: var(--bg);
+		border: 1px solid var(--faint);
+		border-radius: 8px;
+		padding: 0.65rem;
+		overflow: hidden;
+	}
+	.bc-col-header {
+		font-size: 0.75rem;
+		font-weight: 700;
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+		color: var(--muted);
+		border-bottom: 1px solid var(--faint);
+		padding-bottom: 0.4rem;
+		margin-bottom: 0.5rem;
+	}
+	.bc-code-list {
+		display: flex;
+		flex-direction: column;
+		gap: 0.25rem;
+		font-family: var(--mono);
+		font-size: 0.76rem;
+	}
+	.bc-instr-row {
+		display: flex;
+		align-items: center;
+		gap: 0.45rem;
+		padding: 0.3rem 0.45rem;
+		border-radius: 5px;
+		color: var(--muted);
+		transition: background-color 150ms ease, color 150ms ease;
+	}
+	.bc-instr-row.active {
+		background: var(--accent-soft);
+		color: var(--text);
+		font-weight: 600;
+		border-left: 3px solid var(--accent);
+	}
+	.bc-offset {
+		color: var(--muted);
+		width: 1.3rem;
+		font-size: 0.72rem;
+	}
+	.bc-opname {
+		font-weight: 600;
+		flex: 1;
+	}
+	.bc-oparg {
+		color: var(--accent);
+	}
+	.bc-argval {
+		color: var(--muted);
+		font-size: 0.72rem;
+	}
+	.bc-state-box {
+		display: flex;
+		flex-direction: column;
+		gap: 0.65rem;
+	}
+	.bc-sub-heading {
+		font-size: 0.7rem;
+		font-weight: 600;
+		color: var(--muted);
+	}
+	.bc-stack-view {
+		min-height: 4.8rem;
+		border: 1px dashed var(--faint);
+		border-radius: 6px;
+		padding: 0.4rem;
+		display: flex;
+		flex-direction: column-reverse;
+		justify-content: flex-start;
+		background: var(--surface);
+	}
+	.bc-stack-empty-label {
+		color: var(--muted);
+		font-size: 0.75rem;
+		font-style: italic;
+		text-align: center;
+		margin: auto;
+	}
+	.bc-stack-items {
+		display: flex;
+		flex-direction: column-reverse;
+		gap: 0.3rem;
+	}
+	.bc-stack-cell {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		padding: 0.25rem 0.5rem;
+		background: var(--bg);
+		border: 1px solid var(--faint);
+		border-radius: 4px;
+		font-family: var(--mono);
+		font-size: 0.8rem;
+		transition: transform 120ms ease;
+	}
+	.bc-stack-cell.tos {
+		border-color: var(--accent);
+		background: var(--accent-soft);
+		font-weight: 700;
+	}
+	.bc-cell-val {
+		color: var(--text);
+	}
+	.bc-cell-meta {
+		font-size: 0.68rem;
+		color: var(--muted);
+	}
+	.bc-locals-grid {
+		display: flex;
+		flex-direction: column;
+		gap: 0.25rem;
+		background: var(--surface);
+		padding: 0.4rem;
+		border-radius: 6px;
+		border: 1px solid var(--faint);
+		font-family: var(--mono);
+		font-size: 0.75rem;
+	}
+	.bc-local-row {
+		display: flex;
+		justify-content: space-between;
+		padding: 0.15rem 0.25rem;
+	}
+	.bc-local-slot {
+		color: var(--muted);
+	}
+	.bc-local-val {
+		color: var(--text);
+		font-weight: 600;
+	}
+	.bc-macro-box {
+		display: flex;
+		flex-direction: column;
+		gap: 0.45rem;
+		height: 100%;
+	}
+	.bc-macros-badges {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.3rem;
+	}
+	.bc-badge {
+		font-family: var(--mono);
+		font-size: 0.68rem;
+		padding: 0.15rem 0.4rem;
+		background: var(--accent-soft);
+		color: var(--text);
+		border: 1px solid var(--faint);
+		border-radius: 4px;
+	}
+	.bc-c-code {
+		margin: 0;
+		padding: 0.45rem;
+		background: var(--surface);
+		border: 1px solid var(--faint);
+		border-radius: 6px;
+		font-family: var(--mono);
+		font-size: 0.7rem;
+		line-height: 1.35;
+		color: var(--text);
+		overflow-x: auto;
+		flex: 1;
+		white-space: pre;
+	}
+	.bc-explanation {
+		margin-top: 0.65rem;
+		padding: 0.65rem 0.85rem;
+		background: var(--surface);
+		border-left: 3px solid var(--accent);
+		border-radius: 0 8px 8px 0;
+		font-size: 0.82rem;
+		line-height: 1.5;
+	}
+	.bc-expl-title {
+		font-weight: 700;
+		font-size: 0.75rem;
+		text-transform: uppercase;
+		letter-spacing: 0.03em;
+		color: var(--muted);
+		margin-bottom: 0.2rem;
+	}
+	.bc-expl-text {
+		margin: 0;
+		color: var(--text);
+	}
+
+	@media (max-width: 820px) {
+		.bc-layout {
+			grid-template-columns: 1fr;
+		}
+	}
+</style>

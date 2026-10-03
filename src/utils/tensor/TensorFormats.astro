@@ -1,0 +1,478 @@
+---
+// Schematic of the three main tensor decompositions of a 3-way (CP, Tucker) or d-way (tensor
+// train) tensor, one tab each, in the style of Ballard and Kolda's figures: CP as a sum of
+// rank-1 "sticks", Tucker as a core times one factor matrix per mode, and the tensor train as a
+// chain of 3-way cores in tensor-network notation. With `calculator`, sliders for n, d and r
+// show how many numbers each format stores (computed in tensorFormats.ts).
+// Usage in .mdx:
+//   <TensorFormats initial="tucker" />
+//   <TensorFormats initial="tt" calculator n={10} d={8} r={4} />
+import { type Format, formatCount, storage } from "./tensorFormats";
+
+interface Props {
+	initial?: Format;
+	calculator?: boolean;
+	n?: number;
+	d?: number;
+	r?: number;
+	caption?: string;
+}
+const {
+	initial = "cp",
+	calculator = false,
+	n = 10,
+	d = 6,
+	r = 4,
+	caption,
+} = Astro.props;
+
+const tabs: { kind: Format; name: string; formula: string; note: string }[] = [
+	{
+		kind: "cp",
+		name: "CP",
+		formula: "X ≈ a₁∘b₁∘c₁ + a₂∘b₂∘c₂ + ⋯ + aᵣ∘bᵣ∘cᵣ = ⟦A, B, C⟧",
+		note: "A sum of r rank-1 tensors. Stores r(m + n + p) numbers; factors are usually unique, but r is hard to choose.",
+	},
+	{
+		kind: "tucker",
+		name: "Tucker",
+		formula: "X ≈ G ×₁ U ×₂ V ×₃ W = ⟦G; U, V, W⟧",
+		note: "A small core G mixed by one factor matrix per mode. Stores qrs + mq + nr + ps numbers; computable to any accuracy with SVDs.",
+	},
+	{
+		kind: "tt",
+		name: "Tensor train",
+		formula:
+			"X(i₁, …, i₅) ≈ G₁(i₁, :) · G₂(:, i₂, :) · G₃(:, i₃, :) · G₄(:, i₄, :) · G₅(:, i₅)",
+		note: "A chain of 3-way cores: each entry is a row vector times matrices times a column vector. Storage grows linearly in d, not as rᵈ.",
+	},
+];
+
+// Oblique projection of a box: depth runs up and to the right.
+const proj = (dep: number): [number, number] => [dep * 0.6, -dep * 0.45];
+function box(x: number, y: number, w: number, h: number, dep: number) {
+	const [dx, dy] = proj(dep);
+	return {
+		front: `${x},${y} ${x + w},${y} ${x + w},${y + h} ${x},${y + h}`,
+		top: `${x},${y} ${x + dx},${y + dy} ${x + w + dx},${y + dy} ${x + w},${y}`,
+		side: `${x + w},${y} ${x + w + dx},${y + dy} ${x + w + dx},${y + h + dy} ${x + w},${y + h}`,
+	};
+}
+type Box = ReturnType<typeof box> & { hue: number; cls?: string };
+const B = (
+	x: number,
+	y: number,
+	w: number,
+	h: number,
+	dep: number,
+	hue: number,
+): Box => ({ ...box(x, y, w, h, dep), hue });
+
+// CP: X then three rank-1 terms.
+const X0 = B(12, 70, 86, 86, 56, -1);
+const term = (ox: number, hue: number) => [
+	B(ox, 70, 76, 11, 7, hue), // b along the top
+	B(ox, 70, 11, 11, 56, hue), // c into the page
+	B(ox, 83, 11, 73, 7, hue), // a down the left
+];
+const cpOrigins = [186, 350, 548];
+const cpTerms = cpOrigins.map((ox, i) => term(ox, [250, 150, 30][i]));
+
+// Tucker: X ≈ G, then U, V, W as flat matrices coloured by mode.
+const G0 = B(186, 102, 40, 40, 30, -1);
+const tuckerMats = [
+	{
+		b: B(296, 70, 40, 86, 0, 250),
+		label: "U",
+		size: "m × q",
+		mode: "×₁",
+		cx: 316,
+		cy: 118,
+		opX: 274,
+	},
+	{
+		b: B(410, 70, 40, 86, 0, 150),
+		label: "V",
+		size: "n × r",
+		mode: "×₂",
+		cx: 430,
+		cy: 118,
+		opX: 388,
+	},
+	{
+		b: B(524, 96, 28, 60, 0, 30),
+		label: "W",
+		size: "p × s",
+		mode: "×₃",
+		cx: 538,
+		cy: 131,
+		opX: 502,
+	},
+];
+
+// Tensor train with five cores.
+const ttX = { x: 52, y: 92 };
+const ttCores = [0, 1, 2, 3, 4].map((i) => ({
+	x: 214 + i * 104,
+	y: 92,
+	i: i + 1,
+}));
+const s0 = storage(n, d, r);
+---
+
+<figure class="tensor-formats" data-active={initial}>
+	<div class="tf-tabs" role="tablist" aria-label="Choose a tensor decomposition">
+		{tabs.map((t) => (
+			<button type="button" role="tab" data-kind={t.kind} aria-selected={t.kind === initial}>
+				{t.name}
+			</button>
+		))}
+	</div>
+
+	{tabs.map((t) => (
+		<section class="tf-panel" data-kind={t.kind} hidden={t.kind !== initial}>
+			<svg viewBox="0 0 690 200" role="img" aria-label={`${t.name}: ${t.formula}`}>
+				{t.kind === "cp" && (
+					<g>
+						<g class="tf-box neutral">
+							<polygon points={X0.top} /><polygon points={X0.side} /><polygon points={X0.front} />
+						</g>
+						<text class="tf-name" x={55} y={118}>X</text>
+						<text class="tf-dim" x={4} y={116} text-anchor="end">m</text>
+						<text class="tf-dim" x={55} y={172}>n</text>
+						<text class="tf-dim" x={128} y={50}>p</text>
+						<text class="tf-op" x={150} y={120}>≈</text>
+						{cpTerms.map((parts, idx) => (
+							<g>
+								{parts.map((b) => (
+									<g class="tf-box" style={`--hue:${b.hue}`}>
+										<polygon points={b.top} /><polygon points={b.side} /><polygon points={b.front} />
+									</g>
+								))}
+								<text class="tf-sub" x={cpOrigins[idx] + 44} y={182}>
+									{["a₁ ∘ b₁ ∘ c₁", "a₂ ∘ b₂ ∘ c₂", "aᵣ ∘ bᵣ ∘ cᵣ"][idx]}
+								</text>
+							</g>
+						))}
+						<text class="tf-op" x={318} y={120}>+</text>
+						<text class="tf-op" x={496} y={120}>+ ⋯ +</text>
+					</g>
+				)}
+				{t.kind === "tucker" && (
+					<g>
+						<g class="tf-box neutral">
+							<polygon points={X0.top} /><polygon points={X0.side} /><polygon points={X0.front} />
+						</g>
+						<text class="tf-name" x={55} y={118}>X</text>
+						<text class="tf-dim" x={4} y={116} text-anchor="end">m</text>
+						<text class="tf-dim" x={55} y={172}>n</text>
+						<text class="tf-dim" x={128} y={50}>p</text>
+						<text class="tf-op" x={150} y={120}>≈</text>
+						<g class="tf-box core">
+							<polygon points={G0.top} /><polygon points={G0.side} /><polygon points={G0.front} />
+						</g>
+						<text class="tf-name" x={206} y={126}>G</text>
+						<text class="tf-dim" x={180} y={126} text-anchor="end" style="--hue:250">q</text>
+						<text class="tf-dim" x={206} y={158} style="--hue:150">r</text>
+						<text class="tf-dim" x={244} y={84} style="--hue:30">s</text>
+						{tuckerMats.map((mat) => (
+							<g>
+								<text class="tf-op small" x={mat.opX} y={120}>{mat.mode}</text>
+								<g class="tf-box" style={`--hue:${mat.b.hue}`}>
+									<polygon points={mat.b.front} />
+								</g>
+								<text class="tf-name" x={mat.cx} y={mat.cy}>{mat.label}</text>
+								<text class="tf-sub" x={mat.cx} y={182}>{mat.size}</text>
+							</g>
+						))}
+					</g>
+				)}
+				{t.kind === "tt" && (
+					<g>
+						{[0, 1, 2, 3, 4].map((leg) => (
+							<line class="tf-leg" x1={ttX.x} y1={ttX.y} x2={ttX.x - 44 + leg * 22} y2={ttX.y + 62} />
+						))}
+						<circle class="tf-node neutral" cx={ttX.x} cy={ttX.y} r={22} />
+						<text class="tf-name" x={ttX.x} y={ttX.y + 5}>X</text>
+						<text class="tf-op" x={136} y={98}>≈</text>
+						{ttCores.slice(0, -1).map((c, idx) => (
+							<g>
+								<line class="tf-bond" x1={c.x} y1={c.y} x2={ttCores[idx + 1].x} y2={c.y} />
+								<text class="tf-dim" x={c.x + 52} y={c.y - 10}>r{"₁₂₃₄"[idx]}</text>
+							</g>
+						))}
+						{ttCores.map((c) => (
+							<g>
+								<line class="tf-leg" x1={c.x} y1={c.y} x2={c.x} y2={c.y + 56} />
+								<text class="tf-dim" x={c.x} y={c.y + 72}>n{"₁₂₃₄₅"[c.i - 1]}</text>
+								<circle class="tf-node" style={`--hue:${200 + c.i * 30}`} cx={c.x} cy={c.y} r={20} />
+								<text class="tf-name" x={c.x} y={c.y + 5}>G{"₁₂₃₄₅"[c.i - 1]}</text>
+							</g>
+						))}
+						<text class="tf-sub" x={214} y={186}>n₁ × r₁</text>
+						<text class="tf-sub" x={422} y={186}>r₂ × n₃ × r₃</text>
+						<text class="tf-sub" x={630} y={186}>r₄ × n₅</text>
+					</g>
+				)}
+			</svg>
+			<p class="tf-formula">{t.formula}</p>
+			<p class="tf-note">{t.note}</p>
+		</section>
+	))}
+
+	{calculator && (
+		<div class="tf-calc" data-calc>
+			<div class="tf-sliders">
+				<label>n (mode size) <input type="range" min="2" max="100" value={n} data-k="n" /> <output>{n}</output></label>
+				<label>d (order) <input type="range" min="3" max="12" value={d} data-k="d" /> <output>{d}</output></label>
+				<label>r (every rank) <input type="range" min="1" max="30" value={r} data-k="r" /> <output>{r}</output></label>
+			</div>
+			<table>
+				<tbody>
+					{(["full", "cp", "tucker", "tt"] as const).map((key) => (
+						<tr data-row={key}>
+							<th>{{ full: "Full tensor, nᵈ", cp: "CP, d·n·r", tucker: "Tucker, rᵈ + d·n·r", tt: "TT, (d−2)·n·r² + 2·n·r" }[key]}</th>
+							<td class="num">{formatCount(s0[key])}</td>
+							<td class="bar"><span style={`width:${(100 * Math.log10(Math.max(s0[key], 1))) / Math.log10(Math.max(s0.full, s0.tucker, 10))}%`}></span></td>
+						</tr>
+					))}
+				</tbody>
+			</table>
+			<p class="tf-note">Bars use a log scale. The same r means different things in each format: at equal accuracy the ranks usually differ.</p>
+		</div>
+	)}
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import { formatCount, storage } from "./tensorFormats";
+
+	document.querySelectorAll<HTMLElement>(".tensor-formats").forEach((root) => {
+		const tabs = [...root.querySelectorAll<HTMLButtonElement>("[role=tab]")];
+		const panels = [...root.querySelectorAll<HTMLElement>(".tf-panel")];
+		for (const tab of tabs)
+			tab.addEventListener("click", () => {
+				for (const t of tabs) t.setAttribute("aria-selected", String(t === tab));
+				for (const p of panels) p.hidden = p.dataset.kind !== tab.dataset.kind;
+			});
+
+		const calc = root.querySelector<HTMLElement>("[data-calc]");
+		if (!calc) return;
+		const inputs = [...calc.querySelectorAll<HTMLInputElement>("input[data-k]")];
+		const update = () => {
+			const v = Object.fromEntries(inputs.map((i) => [i.dataset.k, Number(i.value)]));
+			for (const i of inputs) {
+				const out = i.nextElementSibling;
+				if (out) out.textContent = i.value;
+			}
+			const s = storage(v.n, v.d, v.r);
+			const top = Math.log10(Math.max(s.full, s.tucker, 10));
+			for (const key of ["full", "cp", "tucker", "tt"] as const) {
+				const row = calc.querySelector<HTMLElement>(`[data-row=${key}]`);
+				if (!row) continue;
+				const num = row.querySelector(".num");
+				if (num) num.textContent = formatCount(s[key]);
+				const bar = row.querySelector<HTMLElement>(".bar span");
+				if (bar) bar.style.width = `${(100 * Math.log10(Math.max(s[key], 1))) / top}%`;
+			}
+		};
+		for (const i of inputs) i.addEventListener("input", update);
+	});
+</script>
+
+<style>
+	.tensor-formats {
+		margin: 2rem 0;
+		border: 1px solid var(--faint);
+		border-radius: 12px;
+		overflow: hidden;
+		background: var(--surface);
+		font-family: var(--sans);
+	}
+	.tf-tabs {
+		display: grid;
+		grid-template-columns: repeat(3, 1fr);
+		border-bottom: 1px solid var(--faint);
+	}
+	.tf-tabs button {
+		border: 0;
+		border-right: 1px solid var(--faint);
+		padding: 0.65rem 0.4rem;
+		background: transparent;
+		color: var(--muted);
+		font: 600 0.78rem var(--sans);
+		cursor: pointer;
+	}
+	.tf-tabs button:last-child {
+		border-right: 0;
+	}
+	.tf-tabs button[aria-selected="true"] {
+		background: var(--bg);
+		color: var(--accent);
+		box-shadow: inset 0 -2px var(--accent);
+	}
+	.tf-panel {
+		padding: 1rem;
+		background: var(--bg);
+	}
+	.tf-panel[hidden] {
+		display: none;
+	}
+	.tf-panel svg {
+		display: block;
+		width: 100%;
+		height: auto;
+	}
+	.tf-box {
+		--tint: oklch(0.72 0.15 var(--hue, 250));
+	}
+	.tf-box polygon {
+		stroke: color-mix(in oklch, var(--tint) 55%, var(--text));
+		stroke-width: 0.9;
+		stroke-linejoin: round;
+	}
+	.tf-box polygon:nth-child(1) {
+		fill: color-mix(in oklch, var(--tint) 28%, var(--bg));
+	}
+	.tf-box polygon:nth-child(2) {
+		fill: color-mix(in oklch, var(--tint) 70%, var(--text));
+	}
+	.tf-box polygon:last-child {
+		fill: color-mix(in oklch, var(--tint) 50%, var(--bg));
+	}
+	.tf-box.neutral polygon,
+	.tf-box.core polygon {
+		stroke: var(--muted);
+	}
+	.tf-box.neutral polygon:nth-child(1) {
+		fill: color-mix(in oklch, var(--faint) 60%, var(--bg));
+	}
+	.tf-box.neutral polygon:nth-child(2) {
+		fill: color-mix(in oklch, var(--faint) 80%, var(--muted));
+	}
+	.tf-box.neutral polygon:last-child {
+		fill: var(--surface);
+	}
+	.tf-box.core polygon:nth-child(1) {
+		fill: color-mix(in oklch, var(--accent) 25%, var(--bg));
+	}
+	.tf-box.core polygon:nth-child(2) {
+		fill: color-mix(in oklch, var(--accent) 70%, var(--bg));
+	}
+	.tf-box.core polygon:last-child {
+		fill: color-mix(in oklch, var(--accent) 45%, var(--bg));
+	}
+	.tf-name {
+		fill: var(--text);
+		font: italic 700 17px var(--serif);
+		text-anchor: middle;
+	}
+	.tf-dim {
+		fill: color-mix(in oklch, oklch(0.6 0.15 var(--hue, 0)) 60%, var(--muted));
+		font: italic 14px var(--serif);
+		text-anchor: middle;
+	}
+	.tf-sub {
+		fill: var(--muted);
+		font: 13px var(--serif);
+		text-anchor: middle;
+	}
+	.tf-op {
+		fill: var(--text);
+		font: 24px var(--serif);
+		text-anchor: middle;
+	}
+	.tf-op.small {
+		font-size: 18px;
+	}
+	.tf-leg,
+	.tf-bond {
+		stroke: var(--muted);
+		stroke-width: 2;
+	}
+	.tf-node {
+		--tint: oklch(0.72 0.15 var(--hue, 250));
+		fill: color-mix(in oklch, var(--tint) 45%, var(--bg));
+		stroke: color-mix(in oklch, var(--tint) 55%, var(--text));
+		stroke-width: 1.2;
+	}
+	.tf-node.neutral {
+		fill: var(--surface);
+		stroke: var(--muted);
+	}
+	.tf-formula {
+		margin: 0.6rem 0 0;
+		color: var(--text);
+		font: 0.82rem var(--mono);
+		text-align: center;
+		overflow-wrap: anywhere;
+	}
+	.tf-note {
+		margin: 0.4rem 0 0;
+		color: var(--muted);
+		font-size: 0.8rem;
+		line-height: 1.45;
+		text-align: center;
+	}
+	.tf-calc {
+		padding: 1rem;
+		border-top: 1px solid var(--faint);
+	}
+	.tf-sliders {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.5rem 1.4rem;
+		margin-bottom: 0.8rem;
+		font-size: 0.8rem;
+		color: var(--muted);
+	}
+	.tf-sliders label {
+		display: flex;
+		align-items: center;
+		gap: 0.4rem;
+	}
+	.tf-sliders input {
+		width: 7rem;
+		accent-color: var(--accent);
+	}
+	.tf-sliders output {
+		min-width: 1.6rem;
+		color: var(--text);
+		font: 600 0.8rem var(--mono);
+	}
+	.tf-calc table {
+		width: 100%;
+		margin: 0;
+		border-collapse: collapse;
+		font-size: 0.8rem;
+	}
+	.tf-calc th {
+		width: 38%;
+		padding: 0.25rem 0.5rem 0.25rem 0;
+		color: var(--text);
+		font-weight: 500;
+		text-align: left;
+		white-space: nowrap;
+	}
+	.tf-calc th,
+	.tf-calc td {
+		border: 0;
+		border-bottom: 1px solid var(--faint);
+	}
+	.tf-calc td.num {
+		width: 6.5rem;
+		padding: 0.25rem 0.6rem;
+		font: 0.8rem var(--mono);
+		text-align: right;
+	}
+	.tf-calc td.bar span {
+		display: block;
+		height: 0.7rem;
+		border-radius: 3px;
+		background: var(--accent);
+		transition: width 150ms ease;
+	}
+	.tensor-formats figcaption {
+		padding: 0 1rem 0.8rem;
+	}
+</style>

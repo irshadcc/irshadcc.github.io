@@ -84,13 +84,15 @@ export function drawBoxes(
 	const gx = grid.gapX ?? 26;
 	const gy = grid.gapY ?? 30;
 	const m = 6;
+	// A container's label sits 17px above its first row: leave room for it.
+	const top = nodes.some((n) => n.group === -1 && n.row === 0) ? m + 17 : m;
 	const rect = new Map<string, Rect>();
 	for (const n of nodes) {
 		const w = n.w ?? 1;
 		const h = n.h ?? 1;
 		rect.set(n.id, {
 			x: m + n.col * (cw + gx),
-			y: m + n.row * (ch + gy),
+			y: top + n.row * (ch + gy),
 			w: w * cw + (w - 1) * gx,
 			h: h * ch + (h - 1) * gy,
 		});

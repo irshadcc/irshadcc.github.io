@@ -1,0 +1,94 @@
+---
+// Where each token of one request keeps its key and value in a paged KV cache (computed in
+// pagedAddress.ts). Top row: the request's token positions, grouped by logical block. Middle:
+// its block table. Bottom: the physical blocks, each slot labelled with its slot id; the
+// request's slots are filled. Hover or tap a token to follow it through the block table, and
+// read the slot formula with its numbers under the figure.
+// Usage in .mdx:
+//   <PagedAddress blockSize={4} tokens={10} blockTable={[5, 2, 7]} numBlocks={8} selected={6} />
+import {
+	type PagedConfig,
+	addresses,
+	drawPaged,
+	validatePaged,
+} from "./pagedAddress";
+
+interface Props extends PagedConfig {
+	selected?: number;
+	title?: string;
+}
+
+const {
+	blockSize,
+	tokens,
+	blockTable,
+	numBlocks,
+	selected = 0,
+	title,
+} = Astro.props;
+const cfg = { blockSize, tokens, blockTable, numBlocks };
+const err = validatePaged(cfg);
+if (err) throw new Error(`PagedAddress: ${err}`);
+const { svg } = drawPaged(cfg);
+const addr = addresses(cfg);
+const at = Math.max(0, Math.min(tokens - 1, selected));
+---
+
+<figure class="pa" data-addr={JSON.stringify(addr)} data-bs={blockSize} data-sel={at}>
+	{title && <figcaption class="pa-title">{title}</figcaption>}
+	<div class="pa-canvas" set:html={svg} />
+	<p class="pa-formula" aria-live="polite"></p>
+</figure>
+
+<script>
+	interface Addr { pos: number; logical: number; offset: number; physical: number; slot: number }
+	for (const fig of document.querySelectorAll<HTMLElement>(".pa")) {
+		const addr = JSON.parse(fig.dataset.addr ?? "[]") as Addr[];
+		const bs = Number(fig.dataset.bs ?? 1);
+		const out = fig.querySelector<HTMLElement>(".pa-formula");
+		const pick = (p: number) => {
+			const a = addr[p];
+			if (!a) return;
+			for (const el of fig.querySelectorAll<SVGGElement>(".pa-tok"))
+				el.classList.toggle("on", Number(el.dataset.pos) === p);
+			for (const el of fig.querySelectorAll<SVGGElement>(".pa-bt"))
+				el.classList.toggle("on", Number(el.dataset.logical) === a.logical);
+			for (const el of fig.querySelectorAll<SVGGElement>(".pa-slot"))
+				el.classList.toggle("on", Number(el.dataset.slot) === a.slot);
+			if (out)
+				out.innerHTML = bs > 1
+					? `p = ${a.pos}: logical block ${a.pos} / ${bs} = ${a.logical}, offset ${a.pos} % ${bs} = ${a.offset}; slot = block_table[${a.logical}] × ${bs} + ${a.offset} = ${a.physical} × ${bs} + ${a.offset} = <strong>${a.slot}</strong>`
+					: `p = ${a.pos}: slot = req_to_token[req, ${a.pos}] = <strong>${a.slot}</strong>`;
+		};
+		for (const el of fig.querySelectorAll<SVGGElement>(".pa-tok")) {
+			const p = Number(el.dataset.pos);
+			el.addEventListener("mouseenter", () => pick(p));
+			el.addEventListener("click", () => pick(p));
+		}
+		pick(Number(fig.dataset.sel ?? 0));
+	}
+</script>
+
+<style>
+	.pa { margin: 1.75rem 0; font-family: var(--sans); }
+	.pa-title { text-align: center; font-size: 0.9rem; font-weight: 600; margin-bottom: 0.4rem; }
+	.pa-canvas { overflow-x: auto; padding: 0.6rem; border: 1px solid var(--faint); border-radius: 10px; background: var(--surface); }
+	.pa-canvas :global(svg) { display: block; max-width: none; margin: 0 auto; }
+	.pa-canvas :global(.pa-label) { font: 0.68rem var(--sans); fill: var(--muted); }
+	.pa-canvas :global(.pa-bid) { font: 600 0.62rem var(--mono); fill: var(--muted); }
+	.pa-canvas :global(rect) { fill: var(--bg); stroke: var(--faint); }
+	.pa-canvas :global(text) { font: 0.6rem var(--mono); fill: var(--muted); text-anchor: middle; }
+	.pa-canvas :global(.pa-label),
+	.pa-canvas :global(.pa-bid) { text-anchor: start; }
+	.pa-canvas :global(.pa-tok) { cursor: pointer; }
+	.pa-canvas :global(.pa-tok rect),
+	.pa-canvas :global(.pa-slot.mine rect) { fill: #9fc8ef; stroke: color-mix(in oklch, #1a1a1a 25%, transparent); }
+	.pa-canvas :global(.pa-tok text),
+	.pa-canvas :global(.pa-slot.mine text) { fill: #1a1a1a; }
+	.pa-canvas :global(.pa-bt rect) { fill: var(--accent-soft); }
+	.pa-canvas :global(.pa-bt text) { fill: var(--text); font-weight: 600; }
+	.pa-canvas :global(.on rect) { stroke: var(--accent); stroke-width: 2.5; }
+	.pa-canvas :global(.pa-tok.on rect),
+	.pa-canvas :global(.pa-slot.on rect) { fill: #f5d38c; }
+	.pa-formula { margin: 0.5rem 0 0; padding: 0.45rem 0.75rem; border-left: 3px solid var(--accent); background: var(--surface); font: 0.78rem var(--mono); }
+</style>

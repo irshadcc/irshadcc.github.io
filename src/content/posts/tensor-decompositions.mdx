@@ -1,0 +1,787 @@
+---
+title: "Tensor Decompositions: CP, Tucker and Tensor Train"
+description: "How to factor a multiway array into small pieces: fibers, unfoldings and mode products, then the CP, Tucker and tensor-train decompositions, with worked examples, the algorithms that fit them, and when to use each."
+date: 2026-10-03
+tags: [Math, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import LineChart from "../../utils/charts/LineChart.astro";
+import TensorExplorer from "../../utils/tensor/TensorExplorer.astro";
+import TensorFormats from "../../utils/tensor/TensorFormats.astro";
+import {
+	alsErrors,
+	emissionCp,
+	emissionSvd,
+	rankOneValues,
+	runningValues,
+	ttmValues,
+} from "../../utils/tensor/tensorDecompositionsFigures";
+
+## Background
+
+A lot of data has more than two indices. A video is height × width × time. A recommender log is
+user × item × day. A fluorescence experiment measures intensity for every sample × emission
+wavelength × excitation wavelength. Such a **tensor**, a $d$-way array of numbers, is usually
+flattened into a matrix so that the tools we know (PCA, the SVD, low-rank factorizations) can be
+applied. Flattening throws away the fact that two of the indices were separate, and the
+resulting matrix can be enormous: one dimension becomes a product of several.
+
+A **tensor decomposition** writes a tensor as a combination of a few small pieces instead, keeping
+every mode separate. This matters for two reasons. It *compresses*: a $100 \times 100 \times 100$
+tensor has a million entries, but a good decomposition may need a few thousand numbers. And it
+*explains*: under mild conditions the pieces of a CP decomposition are unique, so they often
+correspond to real causes in the data, something a matrix factorization cannot promise.
+
+This post follows Ballard and Kolda's textbook *Tensor Decompositions for Data
+Science*.<Sidenote>The final draft is free to read at [users.wfu.edu/ballard/pdfs/tensor_textbook.pdf](https://users.wfu.edu/ballard/pdfs/tensor_textbook.pdf). Section and example numbers below refer to it.</Sidenote>
+It first builds the vocabulary: fibers, slices and unfoldings, then three operations that every
+algorithm uses. It then covers the three main decompositions in turn: **CP** (a sum of rank-1
+tensors), **Tucker** (a small core tensor times one matrix per mode) and the **tensor train** (a
+chain of small 3-way tensors). Each comes with the algorithm that fits it and a worked example.
+It ends with a guide to choosing between them. If matrix factorizations are rusty, read
+[Matrix Decompositions](/blog/matrix-decompositions/) first; the SVD does much of the work here.
+
+## Tensors, fibers and slices
+
+A $d$-way tensor $\mathcal{X} \in \mathbb{R}^{n_1 \times n_2 \times \cdots \times n_d}$ has $d$
+**modes**, and mode $k$ has size $n_k$. The number of modes $d$ is the **order**. A vector is a
+tensor of order 1 and a matrix one of order 2; "higher-order" means $d \ge 3$. We write
+entries as $x_{ijk}$ or $\mathcal{X}(i, j, k)$, with indices starting from 1.
+
+Most of this post uses one running example, a $3 \times 4 \times 2$ tensor whose entries are
+1 to 24, numbered so that the first index changes fastest:
+
+$$
+\mathcal{X}(:, :, 1) = \begin{bmatrix} 1 & 4 & 7 & 10 \\ 2 & 5 & 8 & 11 \\ 3 & 6 & 9 & 12 \end{bmatrix},
+\qquad
+\mathcal{X}(:, :, 2) = \begin{bmatrix} 13 & 16 & 19 & 22 \\ 14 & 17 & 20 & 23 \\ 15 & 18 & 21 & 24 \end{bmatrix}.
+$$
+
+This **column-major** (or **natural**) order, where $x_{ijk}$ is entry
+$i + 3(j-1) + 12(k-1)$ of the list, is the order the book uses everywhere, and the numbers make it
+visible in every figure below.<Sidenote>It is Fortran's and MATLAB's memory order. NumPy defaults to row-major, so pass `order="F"` to `reshape` to match the formulas here. See [Strided Tensors](/blog/strided-tensors/) for how a linear order becomes strides.</Sidenote>
+
+### Fibers and slices
+
+A **fiber** is what you get by fixing every index but one. It generalizes the rows and columns of
+a matrix. A **mode-$k$ fiber** lets index $k$ run and fixes the rest; for a 3-way tensor the
+mode-1, mode-2 and mode-3 fibers are called **column**, **row** and **tube** fibers. Our
+$3 \times 4 \times 2$ tensor has $4 \cdot 2 = 8$ column fibers of length 3, $3 \cdot 2 = 6$ row
+fibers of length 4 and $3 \cdot 4 = 12$ tube fibers of length 2. Fibers are always treated as
+column vectors.
+
+A **slice** fixes one index instead and keeps the other two, giving a matrix. Fixing $i$ gives a
+**horizontal** slice $\mathcal{X}(i, :, :)$, fixing $j$ a **lateral** slice
+$\mathcal{X}(:, j, :)$ and fixing $k$ a **frontal** slice $\mathcal{X}(:, :, k)$. The two
+matrices above are the frontal slices.
+
+<TensorExplorer
+	dims={[3, 4, 2]}
+	values={runningValues}
+	caption="The running example 𝓧 drawn three ways: as an exploded cube (i down, j right, k into the page), as its two frontal slices, and as its mode-k unfolding. Each colour is one fiber (or one slice)."
+/>
+
+In the figure, each colour is one fiber. With *Mode 1* selected, the eight colours run down the
+cube's columns: one fiber is $\mathcal{X}(:, 2, 1) = (4, 5, 6)$. Switch to *Mode 3* and the
+colours become 12 tubes, each going from the front slice to the back one, such as
+$\mathcal{X}(1, 1, :) = (1, 13)$. Hover any number to see its fiber in all three views.
+
+### Unfolding
+
+Every algorithm in this post works by turning a tensor question into a matrix question. The
+bridge is the **mode-$k$ unfolding** (or **matricization**) $\mathbf{X}_{(k)}$: the matrix
+whose columns are the mode-$k$ fibers. It has $n_k$ rows, one per value of index $k$, and
+$\prod_{\ell \ne k} n_\ell$ columns. The columns are put in natural order: among the remaining
+indices, the lowest mode changes fastest (Definition 2.18 in the book). For the running example:
+
+$$
+\mathbf{X}_{(1)} = \begin{bmatrix}
+1 & 4 & 7 & 10 & 13 & 16 & 19 & 22 \\
+2 & 5 & 8 & 11 & 14 & 17 & 20 & 23 \\
+3 & 6 & 9 & 12 & 15 & 18 & 21 & 24
+\end{bmatrix},
+$$
+
+$$
+\mathbf{X}_{(2)} = \begin{bmatrix}
+1 & 2 & 3 & 13 & 14 & 15 \\
+4 & 5 & 6 & 16 & 17 & 18 \\
+7 & 8 & 9 & 19 & 20 & 21 \\
+10 & 11 & 12 & 22 & 23 & 24
+\end{bmatrix},
+$$
+
+$$
+\mathbf{X}_{(3)} = \begin{bmatrix}
+1 & 2 & 3 & \cdots & 12 \\
+13 & 14 & 15 & \cdots & 24
+\end{bmatrix}.
+$$
+
+$\mathbf{X}_{(1)}$ is just the frontal slices side by side. In $\mathbf{X}_{(2)}$ each column
+is a row fiber: column 1 is $\mathcal{X}(1, :, 1) = (1, 4, 7, 10)$, column 2 is
+$\mathcal{X}(2, :, 1)$, and the index $i$ runs fastest across columns before $k$ moves on. In the
+figure above, the colours in the unfolding match the colours in the cube, which is the whole
+point: *columns of $\mathbf{X}_{(k)}$ are mode-$k$ fibers*. Choose *Slices* and the rows light up
+instead: row $i$ of $\mathbf{X}_{(k)}$ holds the mode-$k$ slice $i$.
+
+In NumPy the unfolding is one line, and it reproduces the unfoldings printed in the book's
+Example 1.6:
+
+```python
+import numpy as np
+
+def unfold(X, k):  # k is 0-based here
+    return np.reshape(np.moveaxis(X, k, 0), (X.shape[k], -1), order="F")
+```
+
+The ranks of the unfoldings already say something about the tensor. Here
+$\operatorname{rank}(\mathbf{X}_{(1)}) = \operatorname{rank}(\mathbf{X}_{(2)}) = \operatorname{rank}(\mathbf{X}_{(3)}) = 2$:
+every fiber of $\mathcal{X}$ lies in a 2-dimensional space. We will meet this triple again as the
+*multilinear rank*.
+
+## Three operations
+
+Three operations do almost all the work in tensor algorithms. Each has a definition on entries
+and an equivalent definition through an unfolding, and the unfolded version is what you compute.
+
+### Outer products and rank-1 tensors
+
+The **outer product** of three vectors $\mathbf{a} \in \mathbb{R}^m$,
+$\mathbf{b} \in \mathbb{R}^n$, $\mathbf{c} \in \mathbb{R}^p$ is the $m \times n \times p$ tensor
+
+$$
+(\mathbf{a} \circ \mathbf{b} \circ \mathbf{c})_{ijk} = a_i\, b_j\, c_k .
+$$
+
+A tensor that can be written this way is **rank 1**. It is the 3-way version of a rank-1 matrix
+$\mathbf{a}\mathbf{b}^\top$. For example, with $\mathbf{a} = (1, 2, 3)$,
+$\mathbf{b} = (2, 1, 0, 1)$ and $\mathbf{c} = (1, 3)$:
+
+$$
+\mathcal{R}(:, :, 1) = 1 \cdot \mathbf{a}\mathbf{b}^\top = \begin{bmatrix} 2 & 1 & 0 & 1 \\ 4 & 2 & 0 & 2 \\ 6 & 3 & 0 & 3 \end{bmatrix},
+\qquad
+\mathcal{R}(:, :, 2) = 3 \cdot \mathbf{a}\mathbf{b}^\top = \begin{bmatrix} 6 & 3 & 0 & 3 \\ 12 & 6 & 0 & 6 \\ 18 & 9 & 0 & 9 \end{bmatrix}.
+$$
+
+Check one entry: $r_{232} = a_2 b_3 c_2 = 2 \cdot 0 \cdot 3 = 0$, and indeed column 3 is zero in
+both slices.
+
+<TensorExplorer
+	dims={[3, 4, 2]}
+	values={rankOneValues}
+	name="R"
+	view="slices"
+	mode={3}
+	caption="R = a ∘ b ∘ c. Every slice in every mode is a multiple of the same matrix, so every unfolding has rank 1. Switch modes to compare."
+/>
+
+In the figure, the two rows of $\mathbf{R}_{(3)}$ are proportional (the second is three times the
+first). That is true in every mode: each unfolding of a rank-1 tensor is a rank-1 matrix,
+
+$$
+\mathbf{R}_{(1)} = \mathbf{a}\,(\mathbf{c} \otimes \mathbf{b})^\top, \qquad
+\mathbf{R}_{(2)} = \mathbf{b}\,(\mathbf{c} \otimes \mathbf{a})^\top, \qquad
+\mathbf{R}_{(3)} = \mathbf{c}\,(\mathbf{b} \otimes \mathbf{a})^\top,
+$$
+
+where $\otimes$ is the Kronecker product (Proposition 3.7). The reversed order
+$\mathbf{c} \otimes \mathbf{b}$ comes from the column-major numbering: the later mode changes
+slower, and the Kronecker product's left factor changes slower.
+
+### The mode-k product
+
+The **mode-$k$ product** (tensor-times-matrix, **TTM**) $\mathcal{Y} = \mathcal{X} \times_k \mathbf{U}$
+multiplies every mode-$k$ fiber of $\mathcal{X}$ by the matrix $\mathbf{U}$. In unfolded form it
+is a single matrix product (Definition 3.14):
+
+$$
+\mathbf{Y}_{(k)} = \mathbf{U}\, \mathbf{X}_{(k)} .
+$$
+
+If $\mathbf{U}$ is $q \times n_k$, mode $k$ of the result has size $q$. As a worked example, take
+the running example and
+
+$$
+\mathbf{U} = \begin{bmatrix} 1 & 1 & 1 \\ 1 & 0 & -1 \end{bmatrix},
+$$
+
+which replaces each column fiber $(x_1, x_2, x_3)$ by its sum and the difference
+$x_1 - x_3$. The result $\mathcal{Y} = \mathcal{X} \times_1 \mathbf{U}$ is $2 \times 4 \times 2$:
+
+$$
+\mathcal{Y}(:, :, 1) = \begin{bmatrix} 6 & 15 & 24 & 33 \\ -2 & -2 & -2 & -2 \end{bmatrix},
+\qquad
+\mathcal{Y}(:, :, 2) = \begin{bmatrix} 42 & 51 & 60 & 69 \\ -2 & -2 & -2 & -2 \end{bmatrix}.
+$$
+
+Check one entry: the fiber $\mathcal{X}(:, 1, 2) = (13, 14, 15)$ maps to
+$(13 + 14 + 15,\ 13 - 15) = (42, -2)$, which is $\mathcal{Y}(:, 1, 2)$.
+
+<TensorExplorer
+	dims={[2, 4, 2]}
+	values={ttmValues}
+	name="Y"
+	lockView
+	caption="Y = X ×₁ U. Each colour is one column fiber of Y; it is U times the column fiber with the same colour in the first figure (set it to Mode 1 to compare)."
+/>
+
+Two facts make TTM easy to use. Products in different modes commute,
+$\mathcal{X} \times_1 \mathbf{U} \times_3 \mathbf{W} = \mathcal{X} \times_3 \mathbf{W} \times_1 \mathbf{U}$,
+and products in the same mode combine,
+$\mathcal{X} \times_k \mathbf{U} \times_k \mathbf{V} = \mathcal{X} \times_k (\mathbf{V}\mathbf{U})$
+(Propositions 3.15 and 3.19). When $\mathbf{U}$ has orthonormal columns,
+$\mathcal{X} \times_k \mathbf{U}^\top$ **compresses** mode $k$ by projecting every fiber onto
+$\mathbf{U}$'s columns. That is the basic step of every Tucker algorithm.
+
+### Khatri–Rao product and MTTKRP
+
+The **Khatri–Rao product** of two matrices with the same number of columns is the column-wise
+Kronecker product: column $\ell$ of $\mathbf{C} \odot \mathbf{B}$ is
+$\mathbf{c}_\ell \otimes \mathbf{b}_\ell$. If $\mathbf{C}$ is $p \times r$ and $\mathbf{B}$ is
+$n \times r$, then $\mathbf{C} \odot \mathbf{B}$ is $np \times r$.
+
+The **matricized tensor times Khatri–Rao product** (**MTTKRP**) is
+
+$$
+\mathbf{M} = \mathbf{X}_{(1)} (\mathbf{C} \odot \mathbf{B}), \qquad
+m_{i\ell} = \sum_{j} \sum_{k} x_{ijk}\, b_{j\ell}\, c_{k\ell} .
+$$
+
+It is the most expensive step of CP algorithms, $O(mnpr)$ for a dense tensor, and is the kernel
+that high-performance tensor libraries optimize. A small example: with
+
+$$
+\mathbf{B} = \begin{bmatrix} 1 & 0 \\ 0 & 1 \\ 1 & 1 \\ 2 & 0 \end{bmatrix}, \quad
+\mathbf{C} = \begin{bmatrix} 1 & 1 \\ 0 & 2 \end{bmatrix}, \quad
+\mathbf{X}_{(1)} (\mathbf{C} \odot \mathbf{B}) = \begin{bmatrix} 28 & 81 \\ 32 & 87 \\ 36 & 93 \end{bmatrix}.
+$$
+
+Check $m_{11}$ by hand. Column 1 of $\mathbf{C}$ is $(1, 0)$, so only the front slice counts, and
+column 1 of $\mathbf{B}$ weights its first row $(1, 4, 7, 10)$ by $(1, 0, 1, 2)$:
+$1 + 7 + 2 \cdot 10 = 28$. The MTTKRP never needs $\mathbf{C} \odot \mathbf{B}$ formed
+explicitly; the double sum is enough.
+
+## CP decomposition
+
+The **CP decomposition** (canonical polyadic, also known as CANDECOMP/PARAFAC) writes a tensor as a
+sum of $r$ rank-1 tensors:
+
+$$
+\mathcal{X} \approx \sum_{\ell = 1}^{r} \mathbf{a}_\ell \circ \mathbf{b}_\ell \circ \mathbf{c}_\ell
+= [\![ \mathbf{A}, \mathbf{B}, \mathbf{C} ]\!],
+\qquad
+x_{ijk} \approx \sum_{\ell=1}^{r} a_{i\ell}\, b_{j\ell}\, c_{k\ell}.
+$$
+
+The vectors are collected as columns of the **factor matrices**
+$\mathbf{A} \in \mathbb{R}^{m \times r}$, $\mathbf{B} \in \mathbb{R}^{n \times r}$ and
+$\mathbf{C} \in \mathbb{R}^{p \times r}$, and the $r$ terms are the **components**. A tensor
+stored this way is a **Kruskal tensor**. It stores $r(m + n + p)$ numbers instead of $mnp$.
+
+<TensorFormats
+	initial="cp"
+	caption="The three decompositions of this post. CP is a sum of rank-1 tensors, each drawn as three vectors along the three modes."
+/>
+
+CP is the natural generalization of writing a matrix as a sum of rank-1 matrices,
+$\mathbf{X} \approx \sum_\ell \mathbf{a}_\ell \mathbf{b}_\ell^\top$. The book calls it a
+higher-order analogue of PCA, with one important difference: CP does not ask the factors to be
+orthogonal.
+
+### Unfolded, CP is a matrix factorization
+
+Adding up the unfoldings of each rank-1 term gives the key identity (Proposition 10.8):
+
+$$
+\mathbf{X}_{(1)} = \mathbf{A}\, (\mathbf{C} \odot \mathbf{B})^\top, \qquad
+\mathbf{X}_{(2)} = \mathbf{B}\, (\mathbf{C} \odot \mathbf{A})^\top, \qquad
+\mathbf{X}_{(3)} = \mathbf{C}\, (\mathbf{B} \odot \mathbf{A})^\top .
+$$
+
+So a CP decomposition is three matrix factorizations at once, one per unfolding, that share
+their factors. Each one alone is underdetermined. Together they pin the factors down, which is
+where CP's uniqueness comes from.
+
+### Tensor rank is strange
+
+The **rank** of a tensor is the smallest $r$ for which an exact CP decomposition exists. For
+matrices, rank is easy: the SVD computes it, and an $m \times n$ matrix has rank at most
+$\min(m, n)$. For tensors, almost all of that breaks.
+
+**Rank can exceed every dimension.** Kruskal's $2 \times 2 \times 2$ example (Example 9.1) is
+
+$$
+\mathcal{X}(:, :, 1) = \begin{bmatrix} 1 & 0 \\ 0 & 1 \end{bmatrix}, \quad
+\mathcal{X}(:, :, 2) = \begin{bmatrix} 0 & 1 \\ -1 & 0 \end{bmatrix},
+$$
+
+with factors
+
+$$
+\mathbf{A} = \begin{bmatrix} 1 & 0 & 1 \\ 0 & 1 & -1 \end{bmatrix}, \
+\mathbf{B} = \begin{bmatrix} 1 & 0 & 1 \\ 0 & 1 & 1 \end{bmatrix}, \
+\mathbf{C} = \begin{bmatrix} 1 & 1 & 0 \\ -1 & 1 & 1 \end{bmatrix}.
+$$
+
+Check one entry: $x_{122} = \sum_\ell a_{1\ell} b_{2\ell} c_{2\ell} = 1 \cdot 0 \cdot (-1) + 0
+\cdot 1 \cdot 1 + 1 \cdot 1 \cdot 1 = 1$, matching $\mathcal{X}(1, 2, 2) = 1$. This tensor has
+rank 3 over the reals, although each mode has size 2 and each unfolding has rank
+2.<Sidenote>The rank also depends on the field. The book's Example 16.1 is a $2 \times 2 \times 2$ tensor with rank 3 over $\mathbb{R}$ but rank 2 over $\mathbb{C}$.</Sidenote>
+In general the only easy bound is that the rank is at most the product of all dimensions except
+the largest. The maximum rank is known only for a handful of sizes: 3 for
+$2 \times 2 \times 2$, 5 for $3 \times 3 \times 3$ (Table 16.1).
+
+**Rank is NP-hard to compute.** Deciding whether $\operatorname{rank}(\mathcal{X}) \le r$ is
+NP-hard (Håstad 1990; Hillar and Lim 2013). A famous case is matrix multiplication. Multiplying
+two $n \times n$ matrices is a fixed $n^2 \times n^2 \times n^2$ tensor, and a rank-$r$ CP
+decomposition of it is an algorithm that uses $r$ scalar multiplications. Strassen's algorithm is
+a rank-7 decomposition of the $2 \times 2$ case (instead of the obvious 8). For $3 \times 3$
+the rank is known only to lie between 19 and 23.
+
+**A best rank-$r$ approximation may not exist.** For matrices, truncating the SVD gives the best
+rank-$r$ approximation. For tensors, the set of rank-$r$ tensors is not closed: a sequence of
+rank-2 tensors can converge to a rank-3 tensor. Take the book's Example 16.2 with unit vectors
+$\mathbf{e}_1, \mathbf{e}_2$:
+
+$$
+\mathcal{X} = \mathbf{e}_1 \circ \mathbf{e}_1 \circ \mathbf{e}_2 + \mathbf{e}_1 \circ \mathbf{e}_2 \circ \mathbf{e}_1 + \mathbf{e}_2 \circ \mathbf{e}_1 \circ \mathbf{e}_1
+\quad (\text{rank } 3),
+$$
+
+$$
+\mathcal{Y}_\alpha = \alpha \left(\mathbf{e}_1 + \tfrac{1}{\alpha}\mathbf{e}_2\right)^{\circ 3} - \alpha\, \mathbf{e}_1^{\circ 3}
+\quad (\text{rank } 2).
+$$
+
+Expanding the cube, $\mathcal{Y}_\alpha = \mathcal{X} + O(1/\alpha)$, so the error goes to 0. But the
+two rank-1 terms grow like $\alpha$ and cancel each other:
+
+| $\alpha$ | $\lVert \mathcal{X} - \mathcal{Y}_\alpha \rVert / \lVert \mathcal{X} \rVert$ | norm of each rank-1 term |
+| -------: | -------------------------------------------------: | -----------------------: |
+|        1 |                                             1.1547 |                     2.83 |
+|        5 |                                             0.2013 |                     5.30 |
+|       10 |                                             0.1002 |                    10.15 |
+|       50 |                                             0.0200 |                    50.03 |
+|     1000 |                                             0.0010 |                  1000.00 |
+
+So $\mathcal{X}$ has no best rank-2 approximation: every rank-2 candidate can be beaten by a
+larger $\alpha$. The smallest rank that approximates a tensor arbitrarily well is its **border
+rank**, here 2. In practice this shows up as **degeneracy**: an algorithm fitting too many
+components finds two that grow huge and nearly cancel. The book notes it is uncommon on real data
+and can be prevented by a small penalty on the factor norms (Section 9.4.2).
+
+### Uniqueness
+
+A matrix factorization $\mathbf{X} = \mathbf{A}\mathbf{B}^\top$ is never unique: for any invertible
+$\mathbf{M}$, $(\mathbf{A}\mathbf{M})(\mathbf{B}\mathbf{M}^{-\top})^\top$ is another one. PCA
+picks one by demanding orthogonal factors, which is a convention, not a fact about the data.
+
+CP has only two unavoidable ambiguities. The components can be listed in any order
+(**permutation**), and within a component the vectors can be rescaled as long as the scales
+multiply to 1, for example $(4\mathbf{a}) \circ (\tfrac12\mathbf{b}) \circ (\tfrac12\mathbf{c})$
+(**scaling**). If those are the only freedoms, the decomposition is **essentially unique**.
+
+**Kruskal's theorem** (Theorem 16.14) gives a sufficient condition. The **k-rank** of a matrix is
+the largest $k$ such that *every* set of $k$ columns is linearly independent. An $r$-component
+decomposition $[\![\mathbf{A}, \mathbf{B}, \mathbf{C}]\!]$ is essentially unique if
+
+$$
+\operatorname{k-rank}(\mathbf{A}) + \operatorname{k-rank}(\mathbf{B}) + \operatorname{k-rank}(\mathbf{C}) \ge 2r + 2 .
+$$
+
+If $r$ is no larger than any dimension and the factors are random, each k-rank is $r$, the sum
+is $3r$, and the condition holds for every $r \ge 2$. This is why CP is used to *find* things: if
+the data really is a sum of a few rank-1 effects, CP recovers those effects, not just a subspace
+that contains them.
+
+### Fitting CP with alternating least squares
+
+Fitting a rank-$r$ CP model means solving
+
+$$
+\min_{\mathbf{A}, \mathbf{B}, \mathbf{C}} \ \lVert \mathcal{X} - [\![\mathbf{A}, \mathbf{B}, \mathbf{C}]\!] \rVert^2 ,
+$$
+
+a nonconvex problem. But fix $\mathbf{B}$ and $\mathbf{C}$, and the unfolded identity turns it
+into a linear least-squares problem in $\mathbf{A}$:
+$\lVert \mathbf{X}_{(1)} - \mathbf{A}(\mathbf{C} \odot \mathbf{B})^\top \rVert_F^2$. **CP-ALS**
+(alternating least squares) solves for $\mathbf{A}$, then $\mathbf{B}$, then $\mathbf{C}$, and
+repeats. Each solve uses the normal equations, which simplify because
+$(\mathbf{C} \odot \mathbf{B})^\top(\mathbf{C} \odot \mathbf{B}) = \mathbf{C}^\top\mathbf{C} \ast \mathbf{B}^\top\mathbf{B}$,
+where $\ast$ is the elementwise (Hadamard) product:
+
+$$
+\mathbf{A} \left(\mathbf{C}^\top\mathbf{C} \ast \mathbf{B}^\top\mathbf{B}\right) = \mathbf{X}_{(1)}(\mathbf{C} \odot \mathbf{B}) .
+$$
+
+The left matrix is only $r \times r$, so the cost is dominated by the MTTKRP on the right. A full
+iteration in NumPy, using the `unfold` above:
+
+```python
+def khatri_rao(C, B):
+    return np.einsum("kr,jr->kjr", C, B).reshape(-1, C.shape[1])
+
+def cp_als_step(X, A, B, C):
+    A = np.linalg.solve((C.T @ C) * (B.T @ B), (unfold(X, 0) @ khatri_rao(C, B)).T).T
+    B = np.linalg.solve((C.T @ C) * (A.T @ A), (unfold(X, 1) @ khatri_rao(C, A)).T).T
+    C = np.linalg.solve((B.T @ B) * (A.T @ A), (unfold(X, 2) @ khatri_rao(B, A)).T).T
+    return A, B, C
+```
+
+Each step can only lower the error, since it solves its subproblem exactly. The book's
+Algorithm 11.1 adds column normalization, which keeps the scaling ambiguity from drifting, and
+computes the error from small $r \times r$ matrices instead of forming the model.
+
+### Worked example: unmixing three signals
+
+The book's flagship CP example is fluorescence spectroscopy: 18 samples, each a mixture of three
+chemicals, measured at 251 emission and 21 excitation wavelengths (Section 9.6). Each chemical
+contributes (its concentration) × (its emission profile) × (its excitation profile), so the
+noise-free tensor is exactly rank 3.
+
+The example here is a scaled-down synthetic version: 10 samples × 30 emission × 15 excitation
+points, three chemicals with Gaussian-shaped profiles, random concentrations, and Gaussian noise
+of 2% of the tensor's norm.<Sidenote>Every number in this section comes from a NumPy script. The true factors have k-ranks 3, 3 and 3, so Kruskal's condition $9 \ge 2 \cdot 3 + 2$ holds and the exact decomposition is essentially unique.</Sidenote>
+We run CP-ALS with $r = 3$ from a random start.
+
+<LineChart
+	x={() => Array.from({ length: 50 }, (_, i) => i + 1)}
+	series={[{ name: "CP-ALS", fn: (t) => alsErrors[t - 1] }]}
+	xLabel="Iteration"
+	yLabel="Relative error"
+	title="CP-ALS on the 10 × 30 × 15 toy tensor (rank 3)"
+	height={260}
+/>
+
+Look at iterations 4 to 25. The error falls quickly to $0.289$ at iteration 4, then barely moves:
+it is still $0.270$ at iteration 21. Then it drops to $0.021$ by iteration 33. Such a
+plateau is called a **swamp**. Swamps are a known behaviour of ALS, typically seen while two
+components are close to collinear: each least-squares step can then only move them a little. The final error, $0.0197$, matches the 2% noise
+that was added, so the model explains everything except the noise.
+
+Choosing $r$ is a judgment call, because there is no SVD to read the rank off. A common heuristic
+is to fit several ranks and look for the elbow. The best error over five random starts:
+
+| Rank $r$ | Relative error |
+| -------: | -------------: |
+|        1 |         0.5256 |
+|        2 |         0.3330 |
+|        3 |         0.0197 |
+|        4 |         0.0196 |
+|        5 |         0.0195 |
+
+Going from 2 to 3 components removes almost all of the error; a fourth fits only noise.
+
+The real payoff is in the factors. Here are the three emission profiles, the columns of
+$\mathbf{B}$, each scaled to a peak of 1:
+
+<LineChart
+	x={() => Array.from({ length: 30 }, (_, i) => i + 1)}
+	series={[
+		{ name: "Component 1", fn: (j) => emissionCp[0][j - 1] },
+		{ name: "Component 2", fn: (j) => emissionCp[1][j - 1] },
+		{ name: "Component 3", fn: (j) => emissionCp[2][j - 1] },
+	]}
+	xLabel="Emission wavelength index"
+	yLabel="CP factor (scaled)"
+	title="Emission profiles recovered by CP"
+	height={260}
+/>
+
+They are three clean single peaks, at the positions of the three chemicals. The cosine
+similarity between each recovered column and the true profile is above $0.99999$. Compare the
+matrix approach: take the SVD of the emission unfolding $\mathbf{X}_{(2)}$
+($30 \times 150$), whose top three left singular vectors span the same space:
+
+<LineChart
+	x={() => Array.from({ length: 30 }, (_, i) => i + 1)}
+	series={[
+		{ name: "Singular vector 1", fn: (j) => emissionSvd[0][j - 1] },
+		{ name: "Singular vector 2", fn: (j) => emissionSvd[1][j - 1] },
+		{ name: "Singular vector 3", fn: (j) => emissionSvd[2][j - 1] },
+	]}
+	xLabel="Emission wavelength index"
+	yLabel="Singular vector (scaled)"
+	title="Top three left singular vectors of the emission unfolding"
+	height={260}
+/>
+
+These are forced to be orthogonal, so they must take negative values and mix the peaks. Their
+best cosine similarities with the true profiles are only $0.94$, $0.77$ and $0.48$. The SVD finds
+the right *subspace*, but only CP, because it is unique, finds the right *vectors*.
+
+## Tucker decomposition
+
+CP restricts every component to be one $\mathbf{a}_\ell \circ \mathbf{b}_\ell \circ \mathbf{c}_\ell$
+combination. The **Tucker decomposition** relaxes this: each mode gets its own basis, and a small
+**core tensor** $\mathcal{G}$ says how much every combination of basis vectors contributes.
+
+$$
+\mathcal{X} \approx \mathcal{G} \times_1 \mathbf{U} \times_2 \mathbf{V} \times_3 \mathbf{W}
+= [\![\mathcal{G}; \mathbf{U}, \mathbf{V}, \mathbf{W}]\!],
+\qquad
+x_{ijk} \approx \sum_{\alpha=1}^{q} \sum_{\beta=1}^{r} \sum_{\gamma=1}^{s} g_{\alpha\beta\gamma}\, u_{i\alpha}\, v_{j\beta}\, w_{k\gamma} .
+$$
+
+Here $\mathcal{G}$ is $q \times r \times s$ and $\mathbf{U} \in \mathbb{R}^{m \times q}$,
+$\mathbf{V} \in \mathbb{R}^{n \times r}$, $\mathbf{W} \in \mathbb{R}^{p \times s}$. This is a
+**rank-$(q, r, s)$** Tucker decomposition. CP is the special case where the core is
+$r \times r \times r$ and diagonal.
+
+<TensorFormats
+	initial="tucker"
+	caption="Tucker: a small core G, multiplied in each mode by a factor matrix. The colours match each factor to the core dimension it expands."
+/>
+
+Tucker stores $qrs + mq + nr + ps$ numbers. The **compression ratio** is
+$mnp / (qrs + mq + nr + ps)$: for a $100 \times 100 \times 100$ tensor and a $25 \times 25 \times 25$
+core it is $10^6 / (15625 + 7500) = 43.2$ (Example 4.2).
+
+### Multilinear rank and an exact example
+
+The **multilinear rank** of a tensor is the triple of its unfolding ranks,
+$(\operatorname{rank}\mathbf{X}_{(1)}, \operatorname{rank}\mathbf{X}_{(2)}, \operatorname{rank}\mathbf{X}_{(3)})$.
+Unlike tensor rank, it is cheap to compute: three matrix ranks. And a Tucker decomposition with
+exactly the multilinear rank reproduces the tensor with zero error. Our running example has
+multilinear rank $(2, 2, 2)$, so it is exactly a $2 \times 2 \times 2$ core with three
+two-column factors.
+
+The book's Example 4.1 shows an exact rank-$(2, 2, 2)$ decomposition of a $3 \times 3 \times 3$
+tensor:
+
+$$
+\mathcal{G}(:, :, 1) = \begin{bmatrix} 1 & 0 \\ 1 & 1 \end{bmatrix}, \
+\mathcal{G}(:, :, 2) = \begin{bmatrix} 1 & 0 \\ 0 & 1 \end{bmatrix}, \
+\mathbf{U} = \begin{bmatrix} 1 & 0 \\ 0 & -1 \\ 1 & 1 \end{bmatrix}, \
+\mathbf{V} = \begin{bmatrix} 1 & -1 \\ 1 & 1 \\ 0 & 1 \end{bmatrix}, \
+\mathbf{W} = \begin{bmatrix} 0 & 1 \\ 1 & 1 \\ 1 & 0 \end{bmatrix}.
+$$
+
+Check $x_{111}$ by hand. Since $w_{11} = 0$ and $u_{12} = 0$, only terms with $\gamma = 2$ and
+$\alpha = 1$ survive: $g_{112} u_{11} v_{11} w_{12} + g_{122} u_{11} v_{12} w_{12} =
+1 \cdot 1 \cdot 1 \cdot 1 + 0 = 1$, which is the book's $x_{111}$.
+
+Tucker is **never unique**. For any invertible $\mathbf{M}$,
+$\mathcal{G} \times_1 \mathbf{M}^{-1}$ with $\mathbf{U}\mathbf{M}$ gives the same tensor. Only the
+*subspaces* spanned by the factor columns are determined. So Tucker is used for compression and
+for finding subspaces, not for reading meaning off individual factor columns. The freedom can be
+used to make every factor orthonormal, which is what the algorithms below do.
+
+### HOSVD and ST-HOSVD
+
+If the factors are orthonormal, the best core for given factors is just the projection
+$\mathcal{G} = \mathcal{X} \times_1 \mathbf{U}^\top \times_2 \mathbf{V}^\top \times_3 \mathbf{W}^\top$.
+So the question is how to pick the factors. The **higher-order SVD** (**HOSVD**) picks each one
+independently: $\mathbf{U}$ is the top $q$ left singular vectors of $\mathbf{X}_{(1)}$, the best
+$q$-dimensional basis for the mode-1 fibers, and likewise for $\mathbf{V}$ and $\mathbf{W}$.
+
+```text
+HOSVD(X, (q, r, s))
+  U ← top q left singular vectors of X(1)
+  V ← top r left singular vectors of X(2)
+  W ← top s left singular vectors of X(3)
+  G ← X ×1 Uᵀ ×2 Vᵀ ×3 Wᵀ
+```
+
+Running it on Example 4.1's tensor gives $\mathcal{G}(:, :, 1) = \begin{bmatrix} 8.3325 & -0.0960 \\ 0.1117 & 3.0290 \end{bmatrix}$
+up to signs, the same core the book prints in Example 4.4, and an exact
+reconstruction.<Sidenote>Singular vectors are only defined up to sign, so our factors and core differ from the book's by sign flips. The reconstruction matches the tensor to $10^{-15}$.</Sidenote>
+It is a different exact decomposition from the one above, which illustrates the non-uniqueness.
+
+The HOSVD error has a clean bound (Theorem 7.3): the squared error is at most the sum, over the
+three modes, of the squared singular values that were thrown away,
+
+$$
+\lVert \mathcal{X} - \hat{\mathcal{X}} \rVert^2 \le
+\sum_{i > q} \sigma_i(\mathbf{X}_{(1)})^2 + \sum_{j > r} \sigma_j(\mathbf{X}_{(2)})^2 + \sum_{k > s} \sigma_k(\mathbf{X}_{(3)})^2 .
+$$
+
+Each mode's discarded energy is at most the optimal error, so HOSVD is **quasi-optimal**: its
+error is within a factor $\sqrt{d}$ of the best possible Tucker approximation of the same size.
+The bound also gives a way to hit a target accuracy $\varepsilon$: truncate each mode's SVD so
+that it discards at most $\varepsilon^2 \lVert \mathcal{X} \rVert^2 / d$.
+
+The **sequentially truncated HOSVD** (**ST-HOSVD**) is the variant to use in practice. It
+compresses each mode as soon as its factor is found, so later SVDs run on a smaller tensor:
+
+```text
+ST-HOSVD(X, (q, r, s))
+  U ← top q left singular vectors of X(1);  G ← X ×1 Uᵀ    (now q × n × p)
+  V ← top r left singular vectors of G(2);  G ← G ×2 Vᵀ    (now q × r × p)
+  W ← top s left singular vectors of G(3);  G ← G ×3 Wᵀ    (now q × r × s)
+```
+
+It has the same $\sqrt{d}$ guarantee. For a $d$-way $n \times \cdots \times n$ tensor it costs
+$O(n^{d+1})$ against HOSVD's $O(d\, n^{d+1})$, and it often gives a slightly smaller error.
+
+### HOOI
+
+The **higher-order orthogonal iteration** (**HOOI**) improves the factors iteratively. It
+compresses the tensor with the current factors in every mode but one, then recomputes that mode's
+factor from the SVD of the small result:
+
+```text
+HOOI(X, (q, r, s)), starting from any orthonormal V, W
+  repeat
+    U ← top q left singular vectors of (X ×2 Vᵀ ×3 Wᵀ)(1)
+    V ← top r left singular vectors of (X ×1 Uᵀ ×3 Wᵀ)(2)
+    W ← top s left singular vectors of (X ×1 Uᵀ ×2 Vᵀ)(3)
+  G ← X ×1 Uᵀ ×2 Vᵀ ×3 Wᵀ
+```
+
+For an $n \times \cdots \times n$ tensor one HOOI iteration costs $O(n^d r)$, because its SVDs
+are of small, already-compressed unfoldings. That is cheaper than ST-HOSVD's $O(n^{d+1})$ by a
+factor of about $n / r$. The book reports that from a random start it typically
+matches ST-HOSVD's error within a couple of iterations. It cannot choose ranks from an error
+target, though, since it needs the ranks up front.
+
+### Worked example: compressing a smooth tensor
+
+Tucker shines on data that varies smoothly along each mode. Take the function tensor the book
+uses in Section 8.3, in three modes:
+
+$$
+x_{ijk} = \frac{1}{t_i + t_j + t_k}, \qquad t_i = 1 + \tfrac{9(i - 1)}{n - 1}, \qquad n = 50 .
+$$
+
+It has $50^3 = 125{,}000$ entries. The singular values of its mode-1 unfolding fall by about a
+factor of 15 each: relative to the largest, they are $1$, $0.064$, $0.0043$, $0.00029$,
+$0.0000196$. Truncating all three modes to rank $r$:
+
+| $r$ | HOSVD error | ST-HOSVD error | HOOI (3 iterations) | Bound (Theorem 7.3) | Compression |
+| --: | ----------: | -------------: | ------------------: | ------------------: | ----------: |
+|   1 |   $7.74 \times 10^{-2}$ |   $7.74 \times 10^{-2}$ |   $7.74 \times 10^{-2}$ |   $1.11 \times 10^{-1}$ |        828× |
+|   2 |   $6.37 \times 10^{-3}$ |   $6.37 \times 10^{-3}$ |   $6.37 \times 10^{-3}$ |   $7.41 \times 10^{-3}$ |        406× |
+|   3 |   $4.67 \times 10^{-4}$ |   $4.67 \times 10^{-4}$ |   $4.67 \times 10^{-4}$ |   $5.04 \times 10^{-4}$ |        262× |
+|   4 |   $3.25 \times 10^{-5}$ |   $3.25 \times 10^{-5}$ |   $3.25 \times 10^{-5}$ |   $3.39 \times 10^{-5}$ |        188× |
+|   6 |   $1.46 \times 10^{-7}$ |   $1.46 \times 10^{-7}$ |   $1.46 \times 10^{-7}$ |   $1.48 \times 10^{-7}$ |        112× |
+
+Errors are relative, $\lVert \mathcal{X} - \hat{\mathcal{X}} \rVert / \lVert \mathcal{X} \rVert$.
+A $4 \times 4 \times 4$ core plus three $50 \times 4$ factors, 664 numbers, reproduces all 125,000
+entries with a relative error of $3 \times 10^{-5}$. The three algorithms agree to three significant figures here (they differ
+in the fourth), which matches the book's observation that the choice of Tucker algorithm is
+mostly about speed, not accuracy.
+
+## Tensor train
+
+Tucker has one weakness: the core has $r^d$ entries. For a $d$-way tensor that is still
+exponential in $d$, the **curse of dimensionality**, just with a smaller base. For $d = 3$ this
+does not matter; for $d = 10$ it does.
+
+The **tensor train** (**TT**) decomposition, also known as a **matrix product state** in quantum
+physics, avoids the $r^d$ core. It writes the tensor as a chain of 3-way **cores**
+$\mathcal{G}_k$ of size $r_{k-1} \times n_k \times r_k$, with $r_0 = r_d = 1$, so that each entry
+is a product of matrices:
+
+$$
+x_{i_1 i_2 \cdots i_d} \approx
+\underbrace{\mathcal{G}_1(i_1, :)}_{1 \times r_1}\,
+\underbrace{\mathcal{G}_2(:, i_2, :)}_{r_1 \times r_2} \cdots
+\underbrace{\mathcal{G}_d(:, i_d)}_{r_{d-1} \times 1} .
+$$
+
+<TensorFormats
+	initial="tt"
+	caption="Tensor train for d = 5 in tensor-network notation: each circle is a core, each line an index. Lines between cores (labelled r) are summed over; the dangling lines (labelled n) are the tensor's own indices."
+/>
+
+With every $r_k = r$, TT stores $(d - 2)\,n r^2 + 2nr$ numbers: linear in $d$. It is computed by
+**TT-SVD** (Algorithm 8.2), which peels off one mode at a time. Reshape the tensor to an
+$n_1 \times (n_2 \cdots n_d)$ matrix, keep the top $r_1$ left singular vectors as $\mathcal{G}_1$,
+reshape the remaining $r_1 \times (n_2 \cdots n_d)$ factor to $(r_1 n_2) \times (n_3 \cdots n_d)$,
+and repeat. Truncating each SVD to discard at most $\varepsilon^2 \lVert\mathcal{X}\rVert^2/(d-1)$
+guarantees relative error $\varepsilon$, and the result is quasi-optimal within $\sqrt{d - 1}$
+(Theorem 8.7).
+
+The same function tensor in more modes shows the difference. Both methods were asked for the
+same relative error $\varepsilon$, choosing their ranks automatically:
+
+| Tensor | $\varepsilon$ | Full size | ST-HOSVD ranks | Tucker size | TT ranks $r_1, \dots, r_{d-1}$ | TT size |
+| ------ | ------------: | --------: | -------------- | ----------: | ------------------------------ | ------: |
+| $d = 5$, $n = 10$ | $10^{-2}$ | 100,000 | 2 in each mode | 132 | 2, 2, 2, 2 | 160 |
+| $d = 5$, $n = 10$ | $10^{-6}$ | 100,000 | 5 in each mode | 3,375 | 5, 6, 6, 5 | 1,060 |
+| $d = 8$, $n = 6$ | $10^{-2}$ | 1,679,616 | 2 in each mode | 352 | 2, 2, 2, 2, 2, 2, 2 | 168 |
+| $d = 8$, $n = 6$ | $10^{-6}$ | 1,679,616 | 5 in each mode | 390,865 | 5, 5, 6, 6, 6, 5, 5 | 1,152 |
+
+For 5 modes at low accuracy, Tucker is slightly smaller. For 8 modes at $10^{-6}$, Tucker's
+$5^8 = 390{,}625$-entry core makes it 340 times larger than the tensor train. The book warns
+that TT ranks and Tucker ranks are not comparable, and that for a 3-way tensor TT is just Tucker
+compressed in two modes; which one wins depends on the data and on $d$.
+
+## Choosing a decomposition
+
+The book's closing chapter compares the decompositions on five traits (Table 17.1), adding the
+truncated SVD of a "square" unfolding for reference:
+
+| Trait | Tucker | Tensor train | CP | SVD of an unfolding |
+| ----- | :----: | :----------: | :-: | :-----------------: |
+| Size, $n \times \cdots \times n$ tensor | $r^d + dnr$ | $\approx d n r^2$ | $d n r$ | $\approx 2 r\, n^{d/2}$ |
+| Rank computable for a given error | yes | yes | no (NP-hard) | yes |
+| Quasi-optimal algorithm | yes ($\sqrt{d}$) | yes ($\sqrt{d-1}$) | no | yes (optimal) |
+| Orthonormal factors | yes | yes | no | yes |
+| Essentially unique | no | no | yes, under mild conditions | only with orthogonality imposed |
+
+Use the sliders to see how the storage formulas scale with $n$, $d$ and $r$:
+
+<TensorFormats
+	initial="tucker"
+	calculator
+	n={10}
+	d={8}
+	r={4}
+	caption="Numbers stored by each format for a d-way tensor with every mode of size n and every rank equal to r."
+/>
+
+The rules of thumb that follow:
+
+- **To find interpretable structure, use CP.** It is the only one with unique factors, so each
+  component can be read as a real effect (a chemical, a neuron's response, a crime pattern). Pay
+  for it by choosing $r$ by experiment and running ALS from several starts.
+- **To compress a 3-, 4- or 5-way tensor to a guaranteed accuracy, use Tucker via ST-HOSVD.** It
+  needs only SVDs, chooses its own ranks from $\varepsilon$, and allows cheap partial
+  reconstruction: rebuilding one slice only needs the matching rows of the factors.
+- **For many modes, use the tensor train.** It keeps storage linear in $d$ with the same kind of
+  accuracy guarantee.
+- **They combine.** CP can be run on a Tucker core instead of the full tensor, which is much
+  cheaper (the book's CANDELINC, Section 17.2), and a CP model is a Tucker model with a diagonal
+  core.
+
+## Summary
+
+- Fibers generalize rows and columns, and the mode-$k$ unfolding lines up the mode-$k$ fibers as
+  columns. Every tensor algorithm here is a sequence of matrix operations on unfoldings: mode
+  products $\mathbf{U}\mathbf{X}_{(k)}$, MTTKRPs and SVDs.
+- CP writes a tensor as a sum of $r$ rank-1 tensors. It is compact and, unlike any matrix
+  factorization, essentially unique under mild conditions (Kruskal's k-rank condition), so its
+  factors can recover real underlying signals. But tensor rank is NP-hard, can exceed every
+  dimension, and a best low-rank approximation may not exist.
+- CP-ALS fits CP by solving one linear least-squares problem per factor in turn. It never
+  increases the error, but it can stall in swamps.
+- Tucker uses a core tensor and one orthonormal basis per mode. It is not unique, but
+  HOSVD/ST-HOSVD compute it from SVDs with an error within $\sqrt{d}$ of optimal, at any requested
+  accuracy.
+- The tensor train replaces Tucker's $r^d$ core by a chain of small 3-way cores, so storage grows
+  linearly with the number of modes.
+
+## References
+
+- G. Ballard and T. G. Kolda, *Tensor Decompositions for Data Science*, Cambridge University
+  Press, final draft of March 25, 2025.
+  [PDF](https://users.wfu.edu/ballard/pdfs/tensor_textbook.pdf). Chapters 1–3 (unfoldings,
+  TTM, MTTKRP), 4–7 (Tucker, HOSVD, ST-HOSVD, HOOI, error bounds), 8 (tensor train), 9–11
+  (CP, Kruskal tensors, CP-ALS), 16 (tensor rank, border rank, uniqueness) and 17 (comparison).
+- T. G. Kolda and B. W. Bader, "Tensor Decompositions and Applications", *SIAM Review* 51(3),
+  455–500, 2009. The standard survey; uses the same notation.
+- J. B. Kruskal, "Three-way arrays: rank and uniqueness of trilinear decompositions",
+  *Linear Algebra and its Applications* 18(2), 95–138, 1977.
+- L. De Lathauwer, B. De Moor and J. Vandewalle, "A Multilinear Singular Value Decomposition",
+  *SIAM Journal on Matrix Analysis and Applications* 21(4), 1253–1278, 2000.
+- N. Vannieuwenhoven, R. Vandebril and K. Meerbergen, "A New Truncation Strategy for the
+  Higher-Order Singular Value Decomposition", *SIAM Journal on Scientific Computing* 34(2),
+  A1027–A1052, 2012.
+- I. V. Oseledets, "Tensor-Train Decomposition", *SIAM Journal on Scientific Computing* 33(5),
+  2295–2317, 2011.
+- V. de Silva and L.-H. Lim, "Tensor Rank and the Ill-Posedness of the Best Low-Rank
+  Approximation Problem", *SIAM Journal on Matrix Analysis and Applications* 30(3), 1084–1127, 2008.

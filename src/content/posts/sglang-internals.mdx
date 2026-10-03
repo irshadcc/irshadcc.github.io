@@ -1,0 +1,691 @@
+---
+title: "Inside SGLang: Radix Trees, Overlapped Scheduling and Disaggregated Serving"
+description: "How SGLang serves a language model: its processes, the path of one request through the TokenizerManager, scheduler and model runner, the token-level KV pool and the radix tree that shares prefixes, the CUDA kernels that store and move KV, and prefill/decode disaggregation over Mooncake."
+date: 2026-10-03
+tags: [Inference, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import BoxDiagram from "../../utils/payments/BoxDiagram.astro";
+import SequenceSteps from "../../utils/payments/SequenceSteps.astro";
+import BatchTimeline from "../../utils/inference/BatchTimeline.astro";
+import OverlapTimeline from "../../utils/inference/OverlapTimeline.astro";
+import PagedAddress from "../../utils/inference/PagedAddress.astro";
+import RadixTreeSteps from "../../utils/inference/RadixTreeSteps.astro";
+import {
+	sglangNodes,
+	sglangEdges,
+	sglangParticipants,
+	sglangLifecycle,
+	sglangPdParticipants,
+	sglangPdFlow,
+} from "../../utils/inference/servingFigures";
+
+## Background
+
+SGLang and vLLM solve the same problem: keep a GPU busy generating tokens for many concurrent
+requests, each with its own growing **KV cache** (the key and value vectors of every token, per
+layer, that later tokens attend to). [Inside vLLM](/blog/vllm-internals/) follows vLLM's answer
+through its code; this post does the same for SGLang, and points out where the two differ.
+
+The differences are design choices with visible effects. SGLang keeps the KV cache as a pool of
+single-token slots and indexes it with a **radix tree**, so any shared prefix, not only whole
+blocks, is reused across requests. Its scheduler runs prefills and decodes as separate batches,
+which gives new requests their first token sooner at some cost to the inter-token latency of
+running ones. And it runs the model in the scheduler's own process, overlapping the CPU work of one
+step with the GPU work of the previous one.
+
+We start with SGLang's processes and features, then follow one request: the TokenizerManager, the
+scheduler loop, how the next batch is chosen, the overlap scheduler and the model runner. Then the
+KV cache: its three memory pools, the radix tree and how entries are inserted, shared and evicted.
+Then the CUDA code that stores keys and values, builds the indices attention reads through, and
+moves KV between GPU and host. Last, prefill/decode disaggregation, where a router sends each
+request to a prefill server and a decode server at once and the prefill server writes the KV
+straight into the decode server's memory.<Sidenote>All code links point to SGLang commit
+[`00bcc25`](https://github.com/sgl-project/sglang/tree/00bcc25f6c857dc7cfb9e624ee38269d4c3735f6)
+(October 2026). SGLang moves fast; names and defaults may have changed since.</Sidenote>
+
+## The architecture
+
+### Processes
+
+An SGLang server is three kinds of process connected by ZMQ sockets. Click a box to read what it
+does.
+
+<BoxDiagram
+	nodes={sglangNodes}
+	edges={sglangEdges}
+	selected="sched"
+	title="The processes of an SGLang server"
+/>
+
+- The **main process** runs the HTTP server and the **TokenizerManager**, which tokenizes requests
+  and tracks the state of each one until it finishes.
+- One **scheduler process** per tensor-parallel rank runs the event loop, the radix cache, the
+  memory pools and, in the same process, the **TpModelWorker** and its **ModelRunner**.
+- The **DetokenizerManager** process turns token ids back into text.
+
+Compared with vLLM, SGLang puts the model runner in the scheduler's process: scheduling a batch and
+launching its forward pass is a function call, not a message to another process. Each
+tensor-parallel rank runs its own copy of the scheduler and makes the same decisions; rank 0
+receives requests and broadcasts them to the others. The detokenizer gets its own process so that
+turning ids into text never delays the next step.<Sidenote>The process layout is described in the
+docstring of `Engine` in
+[`entrypoints/engine.py`](https://github.com/sgl-project/sglang/blob/00bcc25f6c857dc7cfb9e624ee38269d4c3735f6/python/sglang/srt/entrypoints/engine.py).
+With data parallelism, a `DataParallelController` process sits between the TokenizerManager and
+several such scheduler groups.</Sidenote>
+
+### What SGLang provides
+
+| Feature | What it does | Where it lives |
+| --- | --- | --- |
+| RadixAttention | Prefix sharing at token granularity through a radix tree | `mem_cache/radix_cache.py` |
+| Overlap scheduler | Schedules batch $k+1$ on the CPU while batch $k$ runs on the GPU | `Scheduler.event_loop_overlap()` |
+| Chunked prefill | Long prompts are split into chunks of `chunked_prefill_size` tokens | `PrefillAdder` |
+| Cache-aware policies | Order the waiting queue by prefix match (`lpm`) and others | `managers/schedule_policy.py` |
+| HiCache | Extends the radix tree to host memory and storage | `mem_cache/unified_radix_cache.py`, `kvcacheio` kernels |
+| Structured outputs | Grammar-constrained decoding (xgrammar and others) | `constrained/` |
+| Speculative decoding | EAGLE, n-gram and other drafters | `speculative/` |
+| Parallelism | Tensor, pipeline, expert, data, and data-parallel attention | `distributed/`, `managers/` |
+| PD disaggregation | Separate prefill and decode servers, KV over Mooncake, NIXL and others | `disaggregation/` |
+
+SGLang also started as a frontend language for programs that call a model many times
+(`sglang.lang`); the runtime described here serves it and plain API traffic alike.
+
+## Following one request
+
+Step through one request from the HTTP call to the first streamed token, then read the sections
+below for the code behind each step.
+
+<SequenceSteps
+	participants={sglangParticipants}
+	messages={sglangLifecycle}
+	title="One request through SGLang"
+	colWidth={128}
+/>
+
+### The TokenizerManager
+
+The HTTP handler calls
+[`TokenizerManager.generate_request()`](https://github.com/sgl-project/sglang/blob/00bcc25f6c857dc7cfb9e624ee38269d4c3735f6/python/sglang/srt/managers/tokenizer_manager.py#L859),
+an async generator. It normalises the request, creates a `ReqState` (an event and an output list,
+keyed by request id), tokenizes the prompt, sends the tokenized request to the scheduler and waits:
+
+```python
+async def generate_request(self, obj, request=None):
+    self.auto_create_handle_loop()
+    obj.normalize_batch_and_arguments()
+    self._init_req_state(obj, request)
+    ...
+    if obj.is_single:
+        tokenized_obj = await self._tokenize_one_request(obj)
+        await self._send_one_request(tokenized_obj)
+        async for response in self._wait_one_response(obj, request):
+            yield response
+```
+
+A background coroutine, `handle_loop`, receives batches of detokenized output from the
+DetokenizerManager, appends each request's new text to its `ReqState` and sets its event, which
+wakes `_wait_one_response`.
+
+### The scheduler loop
+
+The scheduler process runs one of two loops. The simple one,
+[`event_loop_normal()`](https://github.com/sgl-project/sglang/blob/00bcc25f6c857dc7cfb9e624ee38269d4c3735f6/python/sglang/srt/managers/scheduler.py#L1907),
+shows the structure:
+
+```python
+def event_loop_normal(self):
+    """A normal scheduler loop."""
+    while True:
+        # Receive requests
+        self.ingest_requests()
+        # Get the next batch to run
+        plan = self.get_next_batch_to_run(
+            running_batch=self.running_batch, last_batch=self.last_batch
+        )
+        self.running_batch = plan.running_batch
+        batch = plan.batch_to_run
+        # Launch the current batch
+        if batch:
+            result = self.run_batch(batch)
+            self.process_batch_result(batch, result)
+        else:
+            self.on_idle()
+        self.last_batch = batch
+```
+
+`ingest_requests()` polls the socket without blocking and turns each new request into a `Req` on
+the waiting queue. `run_batch()` runs the forward pass and sampling. `process_batch_result()`
+appends the new tokens, checks stop conditions, frees finished requests (inserting their KV into
+the radix tree) and sends the new token ids to the DetokenizerManager.
+
+### Picking the next batch: prefill first
+
+[`get_next_batch_to_run()`](https://github.com/sgl-project/sglang/blob/00bcc25f6c857dc7cfb9e624ee38269d4c3735f6/python/sglang/srt/managers/scheduler.py#L3646)
+keeps two batches: the **running batch** of decoding requests, and the batch it is about to run. Its
+core is short:
+
+```python
+# merge the last prefill batch into the running batch
+if last_batch and last_batch.forward_mode.is_extend():
+    last_batch.filter_batch(chunked_req_to_exclude=...)
+    running_batch.merge_batch(last_batch)
+
+prefill_plan = self.get_new_batch_prefill(running_batch)
+new_batch = prefill_plan.batch_to_run
+
+if new_batch is not None:
+    ret = new_batch                      # run a prefill batch
+else:
+    running_batch = self.update_running_batch(running_batch)
+    ret = running_batch                  # otherwise decode everyone
+```
+
+If any prefill work can be scheduled, the step is a **prefill batch** (SGLang calls it an
+"extend" batch, because with a prefix cache hit the request extends cached KV rather than filling
+it from scratch). Only when there is no prefill work does the step decode every running request.
+[`get_new_batch_prefill()`](https://github.com/sgl-project/sglang/blob/00bcc25f6c857dc7cfb9e624ee38269d4c3735f6/python/sglang/srt/managers/scheduler.py#L3809)
+builds the batch:
+
+1. The **schedule policy** orders the waiting queue: first come, first served by default; `lpm`
+   (longest prefix match) puts requests with the most cached tokens first, so a burst of requests
+   with the same system prompt runs together while the prefix is still in the cache. With more
+   than 128 waiting requests, cache-aware policies fall back to FCFS because matching every
+   request against the tree costs too much.
+2. If a **chunked request** (a prompt cut at the previous step) exists, its next chunk goes in
+   first.
+3. A `PrefillAdder` takes waiting requests in order. For each it matches the prompt in the radix
+   tree, then admits it if the token budget (`chunked_prefill_size`) and memory allow. The first
+   request that does not fit in the budget is cut, and becomes the chunked request.
+
+The same workload as in the vLLM post (budget 8 tokens, prompts of 5, 3, 14 and 4 tokens, C arriving
+at step 2 and D at step 3) runs like this:
+
+<BatchTimeline policy="sglang" />
+
+Compare with vLLM's schedule for the same input:
+
+<BatchTimeline policy="vllm" title="vLLM on the same workload, for comparison" />
+
+Check step 3 of the SGLang schedule by hand. C was cut after 8 tokens at step 2, so its remaining
+6 tokens go in first; 2 tokens of budget are left, and D, which arrived this step, gets them as its
+first chunk. A and B, which are decoding, are not in the batch. Step 4 is D's last 2 tokens alone.
+The result: C gets its first token at step 3, one step earlier than in vLLM, but A and B wait three
+steps (2, 3 and 4) for their next token, and the whole workload takes 9 steps instead of 7.
+
+That is the trade-off of prefill-first scheduling: lower time to first token for new requests,
+higher and burstier inter-token latency for running ones. SGLang's real `chunked_prefill_size` is
+a few thousand tokens, so the stall per prefill step is short, and `--enable-mixed-chunk` lets a
+prefill batch also carry the running decodes, much like vLLM.<Sidenote>The simulation
+(`batching.ts`) follows `get_next_batch_to_run()` with mixed chunks off. It leaves out memory
+limits, `max_prefill_tokens` and the policies other than FCFS. The workload is scaled down from
+real budgets of thousands of tokens.</Sidenote>
+
+### Memory: reserving for decodes, and retraction
+
+SGLang admits a prefill only if the KV pool can also hold the tokens that running requests are
+still expected to generate. The `PrefillAdder` reserves, for each running request,
+
+$$
+\min(\text{max\_new\_tokens} - \text{generated},\ 4096) \times r
+$$
+
+tokens, where $r$, the **new-token ratio**, starts at 0.7 and decays step by step towards a
+minimum while nothing goes wrong. A request that asks for up to 1,000 tokens and has generated 200
+reserves $800 \times 0.7 = 560$ slots at first.
+
+The estimate can be too low. When a decode step finds too few free slots,
+`update_running_batch()` **retracts** requests: it frees their KV, puts them back on the waiting
+queue, and raises $r$ again so the scheduler admits less from then on. The request with the
+fewest generated tokens goes first, since it loses the least work. Its prompt prefix stays in the
+radix tree if it was shared, so re-running it usually starts with a cache hit.
+
+### The overlap scheduler
+
+Each step needs CPU time before the forward pass (pick the batch, build its metadata) and after it
+(append tokens, check stop conditions, send outputs). In `event_loop_normal` the GPU idles during
+both. The default loop,
+[`event_loop_overlap()`](https://github.com/sgl-project/sglang/blob/00bcc25f6c857dc7cfb9e624ee38269d4c3735f6/python/sglang/srt/managers/scheduler.py#L1942),
+runs the CPU work of one step while the GPU computes the previous one:
+
+```python
+while True:
+    self.ingest_requests()
+    plan = self.get_next_batch_to_run(...)
+    batch = plan.batch_to_run
+    if batch:
+        batch_result = self.run_batch(batch)          # launch on the forward stream
+        self.result_queue.append((batch.copy(), batch_result))
+    if self.last_batch:
+        pop_and_process()                              # finish the previous batch
+    self.launch_batch_sample_if_needed(batch_result, batch)
+    self.last_batch = batch
+```
+
+The catch is that batch $k$'s inputs include the tokens batch $k-1$ is still producing. SGLang
+gives those tokens placeholder ids, and a **future map** on the GPU replaces them with the real ids
+when the earlier forward pass finishes, on the GPU's own stream, without the CPU waiting. With
+schedule, forward and process times of 1, 3 and 1 units:
+
+<OverlapTimeline />
+
+In the normal loop each batch costs $1 + 3 + 1 = 5$ units and the GPU is busy 60% of the time.
+With overlap, once the pipeline is full a batch finishes every 3 units, the forward time, as long
+as scheduling plus processing (2 units) is shorter than the forward pass. Overlap costs each batch
+a little latency, since its results are processed one step later; the environment variable
+`SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP` turns it off between two consecutive prefill batches
+to protect time to first token.
+
+### From ScheduleBatch to ForwardBatch
+
+The scheduler's batch is a `ScheduleBatch`: a list of `Req` objects and mostly CPU data. `run_batch`
+converts it into a `ForwardBatch`
+([`forward_batch_info.py`](https://github.com/sgl-project/sglang/blob/00bcc25f6c857dc7cfb9e624ee38269d4c3735f6/python/sglang/srt/model_executor/forward_batch_info.py#L15)),
+the GPU tensors the model needs:
+
+- `input_ids` and `positions` of the tokens to compute;
+- `req_pool_indices`: each request's row in the request-to-token table (next section);
+- `seq_lens` and `extend_prefix_lens`: total and cached lengths;
+- `out_cache_loc`: the KV slot of every new token.
+
+The ModelRunner asks the attention backend to build its metadata from these, then runs the model.
+Decode batches of the sizes captured at start-up replay a CUDA graph.
+
+## The KV cache
+
+### Three pools, one slot per token
+
+SGLang's memory has two levels of indirection, described in the docstring of
+[`memory_pool.py`](https://github.com/sgl-project/sglang/blob/00bcc25f6c857dc7cfb9e624ee38269d4c3735f6/python/sglang/srt/mem_cache/memory_pool.py):
+
+> ReqToTokenPool maps a request to its token locations. TokenToKVPoolAllocator manages the
+> indices to kv cache data. KVCache actually holds the physical kv cache.
+
+- [`ReqToTokenPool`](https://github.com/sgl-project/sglang/blob/00bcc25f6c857dc7cfb9e624ee38269d4c3735f6/python/sglang/srt/mem_cache/memory_pool.py#L274)
+  is an `int32` tensor of shape `[max_running_requests + 1, max_context_len]` on the GPU. Row $r$
+  holds, for each token position of the request in row $r$, the slot of its KV.
+- [`TokenToKVPoolAllocator`](https://github.com/sgl-project/sglang/blob/00bcc25f6c857dc7cfb9e624ee38269d4c3735f6/python/sglang/srt/mem_cache/allocator/token.py#L28)
+  is a free list of slots: a GPU tensor of slot ids. `alloc(n)` takes the first $n$; `free()`
+  appends.
+- [`MHATokenToKVPool`](https://github.com/sgl-project/sglang/blob/00bcc25f6c857dc7cfb9e624ee38269d4c3735f6/python/sglang/srt/mem_cache/memory_pool.py#L2060)
+  holds the data: per layer, a key buffer and a value buffer of shape
+  `[size + page_size, num_kv_heads, head_dim]`. Slot 0 is reserved: padded tokens in CUDA-graph
+  batches write there harmlessly.
+
+On CUDA the default **page size** is 1, so a slot is one token and a request's `req_to_token` row
+is directly the list of its slots. That is what makes token-level prefix sharing simple: two
+requests that share 1,001 tokens share 1,001 slots, not 62 full blocks of 16 and a partial one.
+The attention kernel reads keys through the row, one token at a time:
+
+<PagedAddress
+	blockSize={1}
+	tokens={7}
+	blockTable={[1, 2, 3, 4, 5, 9, 10]}
+	numBlocks={12}
+	selected={5}
+	title="One request's req_to_token row (page size 1): position → slot"
+/>
+
+This is request B from the radix-tree figure below: its first five tokens reuse slots 1 to 5,
+which an earlier request computed, and its own tokens got slots 9 and 10. Check token 5: its slot
+is `req_to_token[B, 5]` = 9, and its keys live in row 9 of every layer's key buffer.
+
+The pool is sized like vLLM's. `mem_fraction_static` is the share of GPU memory for weights plus
+KV pool; by default it is derived from the GPU's memory minus a reserve for activations (which
+grows with `chunked_prefill_size`) and CUDA-graph buffers. The pool gets what is left after the
+weights, divided by the **cell size**, the bytes of KV per token across all layers:
+$2 \times 32 \times 8 \times 128 \times 2 = 128$ KiB for Llama-3.1-8B in bf16. With the same 56.6
+GiB as in the vLLM example, that is 464,019 slots, three more than vLLM's 464,016 because the pool
+is not rounded to whole blocks.
+
+Within one layer, a token's keys for all 8 heads are one contiguous 2 KiB row and its values
+another, in a separate buffer. Two tokens' rows are adjacent only if their slots are, which matters
+for the transfer kernels below.
+
+### The radix tree
+
+A **radix tree** is a trie in which each node holds a run of tokens rather than one, so a long
+shared prompt is one node, not thousands. SGLang's
+[`TreeNode`](https://github.com/sgl-project/sglang/blob/00bcc25f6c857dc7cfb9e624ee38269d4c3735f6/python/sglang/srt/mem_cache/radix_cache.py#L250)
+keeps its tokens as the `key`, the slots holding their KV as the `value`, its children keyed by
+their first token, a `lock_ref` count of running requests that use it, and a `last_access_time`.
+
+Step through three requests in a pool of 24 slots. A and B share a 5-token system prompt; C shares
+only its first token.
+
+<RadixTreeSteps />
+
+Four operations produce what you see.
+
+**Match.** When a request is scheduled,
+[`match_prefix()`](https://github.com/sgl-project/sglang/blob/00bcc25f6c857dc7cfb9e624ee38269d4c3735f6/python/sglang/srt/mem_cache/radix_cache.py#L355)
+walks down from the root, comparing the prompt with each child's key, and returns the
+concatenated slots of the matched path. The request copies them into its `req_to_token` row and
+computes only the rest. At most the prompt length minus one is matched
+([`_compute_max_prefix_len()`](https://github.com/sgl-project/sglang/blob/00bcc25f6c857dc7cfb9e624ee38269d4c3735f6/python/sglang/srt/managers/schedule_batch.py#L1715)),
+because the last prompt token must run through the model to produce logits.
+
+```python
+def _match_prefix_helper(self, node, key):
+    access_time = time.monotonic()
+    node.last_access_time = access_time
+    child_key = key.child_key(self.page_size)
+    value = []
+    while len(key) > 0 and child_key in node.children.keys():
+        child = node.children[child_key]
+        child.last_access_time = access_time
+        prefix_len = child.key.match(key, page_size=self.page_size)
+        if prefix_len < len(child.key):
+            new_node = self._split_node(child.key, child, prefix_len)
+            value.append(new_node.value)
+            node = new_node
+            break
+        else:
+            value.append(child.value)
+            node = child
+            key = key[prefix_len:]
+            if len(key):
+                child_key = key.child_key(self.page_size)
+    return value, node
+```
+
+**Split.** If the match ends inside a node,
+[`_split_node()`](https://github.com/sgl-project/sglang/blob/00bcc25f6c857dc7cfb9e624ee38269d4c3735f6/python/sglang/srt/mem_cache/radix_cache.py#L663)
+cuts it in two: a new parent with the matched part and the old node, shortened, as its child.
+No KV is copied; only the slot list is divided. That is the "B matches" step: A's prompt node
+becomes "&lt;s&gt; You are terse ." and "Hi ?".
+
+**Lock.** The matched node and all its ancestors get `lock_ref + 1`
+([`inc_lock_ref()`](https://github.com/sgl-project/sglang/blob/00bcc25f6c857dc7cfb9e624ee38269d4c3735f6/python/sglang/srt/mem_cache/radix_cache.py#L581)),
+and lose it when the request ends. A locked node cannot be evicted, so the KV a running request
+reads cannot disappear under it.
+
+**Insert.** When a request finishes,
+[`release_kv_cache()`](https://github.com/sgl-project/sglang/blob/00bcc25f6c857dc7cfb9e624ee38269d4c3735f6/python/sglang/srt/mem_cache/common.py#L297)
+calls the tree's
+[`checkpoint()`](https://github.com/sgl-project/sglang/blob/00bcc25f6c857dc7cfb9e624ee38269d4c3735f6/python/sglang/srt/mem_cache/radix_cache.py#L497),
+which inserts the request's tokens and slots: prompt plus outputs, except the last sampled token,
+which has no KV yet. It inserts twice, the second time with only the prompt, so the output tokens
+end up in their own leaf, which LRU eviction can drop while the prompt stays. Where the tree
+already has the tokens, it keeps its own slots and the request's duplicates are freed:
+
+```python
+result = self.insert(InsertParams(key=radix_key, value=values, ...))
+...
+self.token_to_kv_pool_allocator.free_segment(
+    kv_indices[req.kv.cache_protected_len : result.prefix_len],
+    start_pos=req.kv.cache_protected_len,
+)
+```
+
+Requests in the middle of a chunked prefill are checkpointed the same way after each chunk, so a
+second request with the same long prompt can reuse the chunks already computed.
+
+**Evict.** When the allocator runs out of slots,
+[`evict()`](https://github.com/sgl-project/sglang/blob/00bcc25f6c857dc7cfb9e624ee38269d4c3735f6/python/sglang/srt/mem_cache/radix_cache.py#L551)
+puts all unlocked leaves in a heap ordered by the eviction policy (least recently used by default),
+frees the smallest-priority leaf's slots, removes it, and pushes its parent if that became an
+unlocked leaf:
+
+```python
+leaves = list(self.evictable_leaves)
+eviction_heap = [
+    (self.eviction_strategy.get_priority(node), node) for node in leaves
+]
+heapq.heapify(eviction_heap)
+num_evicted = 0
+while num_evicted < num_tokens and len(eviction_heap):
+    _priority, x = heapq.heappop(eviction_heap)
+    self.token_to_kv_pool_allocator.free_segment(x.value, start_pos=0)
+    num_evicted += len(x.value)
+    self._delete_leaf(x)
+    if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
+        new_priority = self.eviction_strategy.get_priority(x.parent)
+        heapq.heappush(eviction_heap, (new_priority, x.parent))
+```
+
+In the "C evicts" step, C needs 13 slots and 12 are free. The least recently used unlocked leaf is
+A's output "Hello", last touched when A finished, before B did anything. Evicting its one slot is
+enough. The freed slot goes to the end of the free list, so C's slots are 12 to 23 and then 8:
+with one-token pages, a request's slots need not be contiguous at all.
+
+Compare this with vLLM's prefix cache. vLLM hashes full blocks and finds hits by looking up a
+chain of hashes; a partial last block is never shared, and eviction is per block. SGLang's tree
+shares any common prefix to the token and evicts whole leaves, but every match is a walk through
+Python objects, and every token has its own slot index in every attention metadata structure.
+
+### Beyond the GPU: HiCache
+
+With `--enable-hierarchical-cache`, the radix tree spans more memory than the GPU has. A host
+memory pool (by default twice the size of the GPU pool) holds a copy of tree nodes; evicting a node
+from the GPU then only drops the GPU copy, and a later match can load it back from host memory
+instead of recomputing it. A storage backend (file, Mooncake, 3FS, NIXL and others) can add a third
+tier shared by many servers. The default write policy, `write_through`, backs a node up to host
+memory on its first hit; `write_through_selective` waits for a second one.
+
+## The CUDA code
+
+As in vLLM, the matrix multiplications and the attention kernels come from libraries: FlashInfer,
+FlashAttention 3 (the default for models with standard attention on Hopper), TensorRT-LLM kernels on
+Blackwell, and SGLang's own Triton kernels. SGLang's own CUDA code lives in
+`python/sglang/kernels/`, partly compiled ahead of time (`aot/csrc`) and partly just in time when
+first used (`jit/csrc`), and the code specific to serving is again about the KV cache.
+
+### Storing keys and values: store_kvcache_kernel
+
+Each attention layer writes the new tokens' keys and values at `out_cache_loc` through
+`set_kv_buffer()`, which calls
+[`store_kvcache_kernel`](https://github.com/sgl-project/sglang/blob/00bcc25f6c857dc7cfb9e624ee38269d4c3735f6/python/sglang/kernels/jit/csrc/elementwise/kvcache.cuh#L45).
+Because the destination is just "row `index` of the key buffer", the kernel is a row scatter, with
+one or more warps per token:
+
+```cpp
+template <int64_t kKBytes, int64_t kVBytes, uint32_t kNumThreads, bool kUsePDL, typename TLoc>
+__global__ void store_kvcache_kernel(const __grid_constant__ StoreKVCacheParams params) {
+  constexpr uint32_t kNumSplit = kNumThreads / kWarpThreads;
+  constexpr uint32_t kKSplitBytes = static_cast<uint32_t>(kKBytes) / kNumSplit;
+  constexpr uint32_t kVSplitBytes = static_cast<uint32_t>(kVBytes) / kNumSplit;
+
+  const auto warp_id = blockIdx.x * blockDim.y + threadIdx.y;
+  const auto item_id = warp_id / kNumSplit;
+  const auto split_id = warp_id % kNumSplit;
+  ...
+  if (item_id >= batch_size) return;
+
+  PDLWaitPrimary<kUsePDL>();
+  const auto index = static_cast<const TLoc*>(indices)[item_id * stride_indices];
+  const auto k_src = pointer::offset(k_input, item_id * stride_k, split_id * kKSplitBytes);
+  const auto v_src = pointer::offset(v_input, item_id * stride_v, split_id * kVSplitBytes);
+  const auto k = warp::load_bytes<kKSplitBytes, WARP_UNIFORM_16B>(k_src);
+  const auto v = warp::load_bytes<kVSplitBytes, WARP_UNIFORM_16B>(v_src);
+
+  PDLTriggerSecondary<kUsePDL>();
+  if (index != reserved_skip_index) {
+    const auto k_dst = pointer::offset(k_cache, index * stride_k_cache, split_id * kKSplitBytes);
+    const auto v_dst = pointer::offset(v_cache, index * stride_v_cache, split_id * kVSplitBytes);
+    warp::store_bytes<kKSplitBytes, WARP_UNIFORM_16B>(k_dst, k);
+    warp::store_bytes<kVSplitBytes, WARP_UNIFORM_16B>(v_dst, v);
+  }
+}
+```
+
+The row sizes are template parameters, so each model gets a kernel compiled for its exact sizes,
+with fully unrolled 16-byte loads and stores. `PDLWaitPrimary` and `PDLTriggerSecondary` use
+**programmatic dependent launch** on Hopper and newer: this kernel can be launched before the
+previous kernel (the one producing K and V) has finished, waits only at the point where it reads
+its input, and lets the next kernel start launching once its own loads are issued. Writes to slot
+0, the padding slot, are skipped.
+
+Work through the launch for Llama-3.1-8B on one GPU. A key row is $8 \times 128 \times 2 = 2048$
+bytes, and so is a value row. The Python wrapper starts from one warp per token and doubles the
+number of warps while each lane would still copy at least 64 bytes of key and value together:
+32 threads give each lane 64 + 64 bytes, 64 threads 32 + 32, 128 threads 16 + 16, where it stops.
+So each token gets four warps, each warp 512 bytes of the key and 512 of the value, each lane one
+16-byte vector of each. The launcher then packs warps into blocks of 1, 2 or 4, the fewest that
+keep the grid to at most one block per SM, or 8 if even 4 do not: a decode batch of 64 tokens is
+256 warps, which on a 132-SM H100 becomes 128 blocks of 2 warps; a prefill of 2,048 tokens is 8,192
+warps in 1,024 blocks of 8.
+
+### Building the indices attention reads
+
+The attention kernels need each request's KV slots in their own format, built every step from
+`req_to_token`. For FlashAttention 3, the backend slices the table
+([`flashattention_backend.py`](https://github.com/sgl-project/sglang/blob/00bcc25f6c857dc7cfb9e624ee38269d4c3735f6/python/sglang/srt/layers/attention/flashattention_backend.py#L853)):
+
+```python
+metadata.page_table = self.req_to_token_pool.req_to_token[
+    forward_batch.req_pool_indices, : metadata.max_seq_len_k
+]
+```
+
+With a page size of 1, this "page table" holds one entry per token, and FA3's paged loads gather
+key rows one by one. FlashInfer wants a flat list instead: all requests' slot indices concatenated,
+plus an offset array (the CSR format). A Triton kernel,
+[`create_flashinfer_kv_indices_triton`](https://github.com/sgl-project/sglang/blob/00bcc25f6c857dc7cfb9e624ee38269d4c3735f6/python/sglang/kernels/ops/kvcache/kv_indices.py#L22),
+copies each request's row segment into that list, one program per request. Either way the
+per-step cost is a gather of one 4-byte index per cached token, small next to reading that token's
+2 KiB of keys per layer.
+
+### Moving KV between GPU and host
+
+HiCache copies KV between the GPU pool and the host pool. Both pools are indexed by slot, and the
+slots to copy are scattered, so with the default `--hicache-io-backend kernel` the copy is again an
+indexed gather and scatter,
+[`hicache_transfer_per_layer`](https://github.com/sgl-project/sglang/blob/00bcc25f6c857dc7cfb9e624ee38269d4c3735f6/python/sglang/kernels/jit/csrc/kvcacheio/hicache.cuh#L243):
+
+```cpp
+const uint32_t work_id = blockIdx.x * kWorkersPerBlock + threadIdx.x / kLanesPerWorker;
+for (uint32_t i = work_id; i < length; i += kNumWorkers) {
+  const auto pos_src = static_cast<const T*>(indices_src)[i];
+  const auto pos_dst = static_cast<const T*>(indices_dst)[i];
+  const auto src_k = pointer::offset(k_cache_src, pos_src * kv_cache_src_stride);
+  const auto dst_k = pointer::offset(k_cache_dst, pos_dst * kv_cache_dst_stride);
+  const auto vec_k = load_vec<kElementSize, kLanesPerWorker>(src_k);
+  // Both loads are issued before either store
+  std::decay_t<decltype(vec_k)> vec_v;
+  if constexpr (!kIsMLA) {
+    const auto src_v = pointer::offset(v_cache_src, pos_src * kv_cache_src_stride);
+    vec_v = load_vec<kElementSize, kLanesPerWorker>(src_v);
+  }
+  store_vec<kElementSize, kLanesPerWorker>(dst_k, vec_k);
+  ...
+}
+```
+
+The host buffer is pinned memory mapped into the GPU's address space, so the kernel reads and
+writes it directly over PCIe or NVLink-C2C instead of calling `cudaMemcpy` once per scattered row.
+`load_vec` and `store_vec` use non-temporal PTX instructions
+(`ld.global.L1::no_allocate`, `st.global.L1::no_allocate`): this data is touched once, so it should
+not push the running batch's data out of the L1 cache. Loading the key and the value before storing
+either keeps two memory requests in flight per worker.
+
+## Prefill/decode disaggregation
+
+### Roles and queues
+
+Prefill-first scheduling makes the case for disaggregation even stronger than in vLLM: every
+prefill batch on a shared server delays every decoding request. With
+`--disaggregation-mode prefill` or `decode`, a server takes one role, and its scheduler gets extra
+queues around the normal ones, listed in the docstrings of
+[`prefill.py`](https://github.com/sgl-project/sglang/blob/00bcc25f6c857dc7cfb9e624ee38269d4c3735f6/python/sglang/srt/disaggregation/prefill.py)
+and
+[`decode.py`](https://github.com/sgl-project/sglang/blob/00bcc25f6c857dc7cfb9e624ee38269d4c3735f6/python/sglang/srt/disaggregation/decode.py):
+
+| Server | Queue | What waits there |
+| --- | --- | --- |
+| prefill | bootstrap | requests whose handshake with the decode server is not done |
+| prefill | waiting | ready requests, scheduled by the normal `PrefillAdder` |
+| prefill | inflight | prefilled requests whose KV is still being sent |
+| decode | prealloc | requests waiting for KV memory to be reserved |
+| decode | transfer | requests whose KV is arriving |
+| decode | waiting | requests with all their KV, turned into a batch without a prefill forward |
+| decode | running | the normal decode batch |
+
+### One request through PD mode
+
+The router (sgl-model-gateway) sends each request to a prefill server and a decode server **at the
+same time**, tagged with a `bootstrap_room`, a random id for this transfer:
+
+<SequenceSteps
+	participants={sglangPdParticipants}
+	messages={sglangPdFlow}
+	title="Prefill/decode disaggregation in SGLang (Mooncake backend)"
+	colWidth={150}
+/>
+
+Sending to both at once is the main difference from vLLM's pull flow. The decode server reserves
+memory and tells the prefill server where to write before the prefill even starts, so the prefill
+server can push each chunk's KV as soon as it is computed, and the transfer overlaps the rest of
+the prefill. The prefill server also writes the first output token into a small metadata buffer on
+the decode server
+([`MetadataBuffers`](https://github.com/sgl-project/sglang/blob/00bcc25f6c857dc7cfb9e624ee38269d4c3735f6/python/sglang/srt/disaggregation/utils.py#L293)),
+so the decode server does not recompute the last prompt token as vLLM's does.
+
+### Moving the bytes with Mooncake
+
+The default transfer backend is Mooncake's transfer engine, which does one-sided RDMA writes from
+registered GPU memory on one machine to registered GPU memory on another. After each chunk,
+[`_send_kv_chunk()`](https://github.com/sgl-project/sglang/blob/00bcc25f6c857dc7cfb9e624ee38269d4c3735f6/python/sglang/srt/disaggregation/prefill.py#L1351)
+reads the chunk's slots from `req_to_token` and hands them to the sender. The sender pairs them
+with the decode server's slots and groups the pairs into runs that are consecutive on both sides
+([`group_concurrent_contiguous()`](https://github.com/sgl-project/sglang/blob/00bcc25f6c857dc7cfb9e624ee38269d4c3735f6/python/sglang/srt/disaggregation/common/utils.py#L111)):
+
+```python
+brk = np.where((np.diff(src_indices) != 1) | (np.diff(dst_indices) != 1))[0] + 1
+src_groups = np.split(src_indices, brk)
+dst_groups = np.split(dst_indices, brk)
+```
+
+Each run becomes one RDMA write per layer for keys and one for values: source address
+`k_buffer[layer] + first_src_slot * row_bytes`, destination likewise, length
+`run_length * row_bytes`. Take request C from the radix-tree example, with slots
+`[1, 12, 13, ..., 23, 8]` on the prefill server, and suppose the decode server reserved slots 40 to
+53. The breaks fall where the source jumps (1 → 12 and 23 → 8), giving three runs: `[1] → [40]`,
+`[12..23] → [41..52]` and `[8] → [53]`. For Llama-3.1-8B that is $3 \times 2 \times 32 = 192$
+writes, the middle ones $12 \times 2048 = 24$ KiB each.
+
+Fewer, longer runs mean fewer RDMA operations, which is why PD servers create their slot allocator
+with `need_sort = True`: freed slots are collected and sorted before reuse, so new requests tend to
+get consecutive slots. Larger pages help the same way; with `--page-size 64` every run is at least
+one 64-token page.
+
+### SGLang and vLLM side by side
+
+| | vLLM | SGLang |
+| --- | --- | --- |
+| Model runner | separate process per GPU | inside the scheduler process |
+| Batch composition | one token budget, prefills and decodes mixed | prefill batch or decode batch (mixing optional) |
+| CPU/GPU overlap | async scheduling, batch queue | overlap event loop, future map |
+| KV unit | block of 16 tokens | slot of 1 token (page size 1) |
+| Prefix sharing | hash chain over full blocks | radix tree over tokens |
+| Eviction | free-queue order (LRU), per block | heap of leaves (LRU by default), per node |
+| Out of memory | preempt, recompute | retract, recompute (or offload in PD decode) |
+| PD flow | proxy: prefill first, then decode pulls (NIXL READ) | router: both at once, prefill pushes (RDMA WRITE) |
+| First decode token | decode recomputes the last prompt token | sent by prefill in a metadata buffer |
+
+## Summary
+
+- SGLang runs a **TokenizerManager** and HTTP server in the main process, one **scheduler process**
+  per tensor-parallel rank that also runs the model, and a **DetokenizerManager** process, joined by
+  ZMQ.
+- The scheduler runs **prefill batches first** and decodes only when no prefill can be scheduled,
+  trading inter-token latency of running requests for time to first token of new ones; the
+  **overlap loop** hides the CPU work of each step behind the GPU work of the previous one.
+- The KV cache is a pool of **one-token slots**. Each request's `req_to_token` row lists its slots,
+  and attention reads keys through that row.
+- A **radix tree** maps token sequences to slots: requests match and lock prefixes, finished
+  requests insert their tokens (prompt and output in separate nodes), and unlocked leaves are
+  evicted least recently used first, to the token.
+- In **PD mode** the router sends a request to a prefill and a decode server at once; the decode
+  server reserves slots up front and the prefill server writes the KV into them over RDMA, chunk by
+  chunk, grouping consecutive slots into single writes.
+
+## References
+
+- L. Zheng et al., [SGLang: Efficient Execution of Structured Language Model Programs](https://arxiv.org/abs/2312.07104), NeurIPS 2024 (RadixAttention).
+- SGLang source at commit [`00bcc25`](https://github.com/sgl-project/sglang/tree/00bcc25f6c857dc7cfb9e624ee38269d4c3735f6): `python/sglang/srt/managers/`, `mem_cache/`, `disaggregation/`, `layers/attention/`, and `python/sglang/kernels/`.
+- SGLang documentation, [PD disaggregation](https://docs.sglang.io/docs/advanced_features/pd_disaggregation) and [HiCache](https://docs.sglang.io/docs/advanced_features/hicache).
+- R. Qin et al., [Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving](https://arxiv.org/abs/2407.00079), FAST 2025.
+- Y. Zhong et al., [DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving](https://arxiv.org/abs/2401.09670), OSDI 2024.
+- [Inside vLLM](/blog/vllm-internals/) on this blog, for the comparison.

@@ -1,0 +1,400 @@
+---
+// Draws a small 3-way tensor three ways at once: an exploded isometric cube, its frontal slices,
+// and its mode-k unfolding. Buttons pick fibers or slices and the mode; colour groups the
+// entries (one colour per fiber, or per slice) in all three views, so a reader can see that the
+// columns of X_(k) are the mode-k fibers and the rows are the mode-k slices. Hovering any entry
+// highlights its fiber or slice everywhere. Values are given in column-major order (vec(X)).
+// Usage in .mdx:
+//   <TensorExplorer
+//     dims={[3, 4, 2]}
+//     values={Array.from({ length: 24 }, (_, i) => i + 1)}
+//     view="fibers"
+//     mode={1}
+//     caption="X is 3 × 4 × 2 with entries 1 to 24 in column-major order."
+//   />
+import {
+	type Dims,
+	type Mode,
+	type View,
+	isometricCubes,
+	linear,
+	unfoldingEntries,
+	unfoldingShape,
+} from "./tensorLayout";
+
+interface Props {
+	dims: Dims;
+	/** Entries in column-major order: values[i + m*j + m*n*k] = X(i+1, j+1, k+1). */
+	values: number[];
+	/** Name used in labels, e.g. "X" or "Y". */
+	name?: string;
+	view?: View;
+	mode?: Mode;
+	/** Hide the fibers/slices toggle and show only the initial view. */
+	lockView?: boolean;
+	caption?: string;
+}
+
+const {
+	dims,
+	values,
+	name = "X",
+	view = "fibers",
+	mode = 1,
+	lockView = false,
+	caption,
+} = Astro.props;
+if (values.length !== dims[0] * dims[1] * dims[2])
+	throw new Error(
+		`TensorExplorer: ${values.length} values for a ${dims.join("×")} tensor`,
+	);
+
+const fmt = (x: number) =>
+	Number.isInteger(x)
+		? String(x)
+		: x.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
+const modes = [1, 2, 3] as const;
+
+// Isometric cube geometry (SVG units).
+const cell = 24;
+const gap = 7;
+const cubeDepth: [number, number] = [11, 8];
+const layer: [number, number] = [26, 19];
+const cubes = isometricCubes(dims, cell, gap, layer);
+const pad = 26;
+const step = cell + gap;
+const svgW =
+	pad + dims[1] * step + (dims[2] - 1) * layer[0] + cubeDepth[0] + 34;
+const top = pad + (dims[2] - 1) * layer[1] + cubeDepth[1];
+const svgH = top + dims[0] * step + 6;
+const face = (x: number, y: number) => ({
+	front: `${x},${y} ${x + cell},${y} ${x + cell},${y + cell} ${x},${y + cell}`,
+	top: `${x},${y} ${x + cubeDepth[0]},${y - cubeDepth[1]} ${x + cell + cubeDepth[0]},${y - cubeDepth[1]} ${x + cell},${y}`,
+	side: `${x + cell},${y} ${x + cell + cubeDepth[0]},${y - cubeDepth[1]} ${x + cell + cubeDepth[0]},${y + cell - cubeDepth[1]} ${x + cell},${y + cell}`,
+});
+const label = `${name} ∈ ℝ${dims.join("×")}`;
+---
+
+<figure
+	class="tensor-explorer"
+	data-dims={dims.join(",")}
+	data-view={view}
+	data-mode={mode}
+	data-name={name}
+>
+	<div class="tx-bar">
+		{!lockView && (
+			<div class="tx-seg" role="group" aria-label="What to colour">
+				<button type="button" data-set-view="fibers" aria-pressed={view === "fibers"}>Fibers</button>
+				<button type="button" data-set-view="slices" aria-pressed={view === "slices"}>Slices</button>
+			</div>
+		)}
+		<div class="tx-seg" role="group" aria-label="Mode">
+			{modes.map((m) => (
+				<button type="button" data-set-mode={m} aria-pressed={m === mode}>Mode {m}</button>
+			))}
+		</div>
+	</div>
+
+	<div class="tx-top">
+		<svg class="tx-cube" viewBox={`0 0 ${svgW} ${svgH}`} width={svgW} role="img" aria-label={`Exploded view of ${label}`}>
+			<g transform={`translate(${pad}, ${top})`}>
+				{cubes.map((c) => {
+					const f = face(c.x, c.y);
+					return (
+						<g class="tx-c" data-lin={c.lin}>
+							<polygon class="f-top" points={f.top} />
+							<polygon class="f-side" points={f.side} />
+							<polygon class="f-front" points={f.front} />
+						</g>
+					);
+				})}
+				<g class="tx-axes">
+					<text x={-8} y={(dims[0] * step) / 2} text-anchor="end" dominant-baseline="middle">i</text>
+					<text x={(dims[1] * step) / 2} y={-cubeDepth[1] - 6 - (dims[2] - 1) * layer[1]} text-anchor="middle" dx={(dims[2] - 1) * layer[0] * 0.5}>j</text>
+					<text x={dims[1] * step + (dims[2] - 1) * layer[0] * 0.5 + 18} y={-(dims[2] - 1) * layer[1] * 0.5 + 4}>k</text>
+				</g>
+			</g>
+		</svg>
+
+		<div class="tx-slices">
+			{Array.from({ length: dims[2] }, (_, k) => (
+				<div class="tx-block">
+					<span class="tx-label">{name}(:, :, {k + 1})</span>
+					<div class="tx-grid" style={`grid-template-columns: repeat(${dims[1]}, auto)`}>
+						{Array.from({ length: dims[0] }, (_, i) =>
+							Array.from({ length: dims[1] }, (_, j) => {
+								const lin = linear(dims, i, j, k);
+								return <span class="tx-v" data-lin={lin}>{fmt(values[lin])}</span>;
+							}),
+						)}
+					</div>
+				</div>
+			))}
+		</div>
+	</div>
+
+	<div class="tx-unfoldings">
+		{modes.map((m) => {
+			const [rows, cols] = unfoldingShape(dims, m);
+			return (
+				<div class="tx-block tx-unf" data-unf={m} hidden={m !== mode}>
+					<span class="tx-label">
+						{name}<sub>({m})</sub> — mode-{m} unfolding, {rows} × {cols}
+					</span>
+					<div class="tx-scroll">
+						<div class="tx-grid" style={`grid-template-columns: repeat(${cols}, auto)`}>
+							{unfoldingEntries(dims, m).flatMap((row) =>
+								row.map((lin) => <span class="tx-v" data-lin={lin}>{fmt(values[lin])}</span>),
+							)}
+						</div>
+					</div>
+				</div>
+			);
+		})}
+	</div>
+
+	<p class="tx-note" aria-live="polite"></p>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import {
+		type Dims,
+		group,
+		groupCount,
+		type Mode,
+		subscripts,
+		unfoldingPosition,
+		unfoldingShape,
+		type View,
+	} from "./tensorLayout";
+
+	const fiberNames = ["column", "row", "tube"];
+	const sliceNames = ["horizontal", "lateral", "frontal"];
+
+	/** "X(:, 2, 1)" for a fiber, "X(:, 2, :)" for a slice; 1-based. */
+	function pattern(name: string, mode: Mode, view: View, s: number[]) {
+		const parts = s.map((v, m) => {
+			if (view === "fibers") return m === mode - 1 ? ":" : String(v + 1);
+			return m === mode - 1 ? String(v + 1) : ":";
+		});
+		return `${name}(${parts.join(", ")})`;
+	}
+
+	document.querySelectorAll<HTMLElement>(".tensor-explorer").forEach((root) => {
+		const dims = root.dataset.dims?.split(",").map(Number) as Dims;
+		const name = root.dataset.name ?? "X";
+		const items = [...root.querySelectorAll<SVGElement | HTMLElement>("[data-lin]")];
+		const note = root.querySelector<HTMLElement>(".tx-note");
+		let view = root.dataset.view as View;
+		let mode = Number(root.dataset.mode) as Mode;
+
+		function describe(lin?: number) {
+			if (!note) return;
+			const count = groupCount(dims, view, mode);
+			const [rows, cols] = unfoldingShape(dims, mode);
+			const unf = `${name}(${mode})`;
+			if (lin === undefined) {
+				note.textContent =
+					view === "fibers"
+						? `Mode-${mode} (${fiberNames[mode - 1]}) fibers: ${count} vectors of length ${rows}, one colour each. They are the ${cols} columns of ${unf}.`
+						: `Mode-${mode} (${sliceNames[mode - 1]}) slices: ${count} matrices, one colour each. Slice i, read in column-major order, is row i of ${unf}.`;
+				return;
+			}
+			const s = subscripts(dims, lin);
+			const [r, c] = unfoldingPosition(dims, mode, s[0], s[1], s[2]);
+			note.textContent =
+				view === "fibers"
+					? `Fiber ${pattern(name, mode, view, s)} is column ${c + 1} of ${unf}.`
+					: `Slice ${pattern(name, mode, view, s)} is row ${r + 1} of ${unf}.`;
+		}
+
+		function paint() {
+			const count = groupCount(dims, view, mode);
+			for (const el of items) {
+				const g = group(dims, view, mode, Number(el.dataset.lin));
+				el.dataset.g = String(g);
+				const hue = count <= 4 ? 25 + (g * 360) / Math.max(count, 3) : (20 + g * 137.508) % 360;
+				el.style.setProperty("--hue", hue.toFixed(1));
+			}
+			root.querySelectorAll<HTMLElement>("[data-unf]").forEach((u) => {
+				u.hidden = Number(u.dataset.unf) !== mode;
+			});
+			root.querySelectorAll<HTMLButtonElement>("[data-set-view]").forEach((b) => {
+				b.setAttribute("aria-pressed", String(b.dataset.setView === view));
+			});
+			root.querySelectorAll<HTMLButtonElement>("[data-set-mode]").forEach((b) => {
+				b.setAttribute("aria-pressed", String(Number(b.dataset.setMode) === mode));
+			});
+			describe();
+		}
+
+		function focus(lin?: number) {
+			const g = lin === undefined ? undefined : group(dims, view, mode, lin);
+			for (const el of items) {
+				el.classList.toggle("dim", g !== undefined && Number(el.dataset.g) !== g);
+				el.classList.toggle("hit", lin !== undefined && Number(el.dataset.lin) === lin);
+			}
+			describe(lin);
+		}
+
+		for (const el of items) {
+			el.addEventListener("mouseenter", () => focus(Number(el.dataset.lin)));
+			el.addEventListener("mouseleave", () => focus());
+		}
+		root.querySelectorAll<HTMLButtonElement>("[data-set-view]").forEach((b) => {
+			b.addEventListener("click", () => {
+				view = b.dataset.setView as View;
+				paint();
+			});
+		});
+		root.querySelectorAll<HTMLButtonElement>("[data-set-mode]").forEach((b) => {
+			b.addEventListener("click", () => {
+				mode = Number(b.dataset.setMode) as Mode;
+				paint();
+			});
+		});
+		paint();
+	});
+</script>
+
+<style>
+	.tensor-explorer {
+		margin: 2rem 0;
+		padding: 1rem;
+		border: 1px solid var(--faint);
+		border-radius: 12px;
+		background: var(--surface);
+		font-family: var(--sans);
+	}
+	.tx-bar {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.6rem;
+		margin-bottom: 0.9rem;
+	}
+	.tx-seg {
+		display: inline-flex;
+		border: 1px solid var(--faint);
+		border-radius: 8px;
+		overflow: hidden;
+	}
+	.tx-seg button {
+		border: 0;
+		border-right: 1px solid var(--faint);
+		padding: 0.35rem 0.7rem;
+		background: var(--bg);
+		color: var(--muted);
+		font: 600 0.75rem var(--sans);
+		cursor: pointer;
+	}
+	.tx-seg button:last-child {
+		border-right: 0;
+	}
+	.tx-seg button[aria-pressed="true"] {
+		background: var(--accent);
+		color: var(--bg);
+	}
+	.tx-top {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 1.2rem 2rem;
+	}
+	.tx-cube {
+		max-width: 100%;
+		height: auto;
+		flex: none;
+	}
+	.tx-c {
+		--tint: oklch(0.72 0.15 var(--hue, 250));
+		transition: opacity 120ms ease;
+	}
+	.tx-c polygon {
+		stroke: color-mix(in oklch, var(--tint) 55%, var(--text));
+		stroke-width: 0.8;
+		stroke-linejoin: round;
+	}
+	.tx-c .f-front {
+		fill: color-mix(in oklch, var(--tint) 55%, var(--bg));
+	}
+	.tx-c .f-top {
+		fill: color-mix(in oklch, var(--tint) 30%, var(--bg));
+	}
+	.tx-c .f-side {
+		fill: color-mix(in oklch, var(--tint) 75%, var(--text));
+	}
+	.tx-c.dim {
+		opacity: 0.15;
+	}
+	.tx-c.hit polygon {
+		stroke: var(--text);
+		stroke-width: 2;
+	}
+	.tx-axes text {
+		fill: var(--muted);
+		font: italic 600 13px var(--serif);
+	}
+	.tx-slices {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 1rem;
+	}
+	.tx-block {
+		display: flex;
+		flex-direction: column;
+		gap: 0.3rem;
+	}
+	.tx-block[hidden] {
+		display: none;
+	}
+	.tx-label {
+		color: var(--muted);
+		font: 0.75rem var(--mono);
+	}
+	.tx-grid {
+		display: grid;
+		gap: 3px;
+		width: max-content;
+	}
+	.tx-v {
+		--tint: oklch(0.72 0.15 var(--hue, 250));
+		min-width: 1.9rem;
+		padding: 0.2rem 0.3rem;
+		border: 1px solid color-mix(in oklch, var(--tint) 60%, var(--bg));
+		border-radius: 5px;
+		background: color-mix(in oklch, var(--tint) 32%, var(--bg));
+		color: var(--text);
+		font: 0.78rem var(--mono);
+		text-align: right;
+		font-variant-numeric: tabular-nums;
+		cursor: default;
+		transition: opacity 120ms ease;
+	}
+	.tx-v.dim {
+		opacity: 0.25;
+	}
+	.tx-v.hit {
+		outline: 2px solid var(--text);
+		outline-offset: 1px;
+	}
+	.tx-unfoldings {
+		margin-top: 1rem;
+	}
+	.tx-scroll {
+		max-width: 100%;
+		overflow-x: auto;
+		padding-bottom: 2px;
+	}
+	.tx-note {
+		min-height: 2.6em;
+		margin: 0.8rem 0 0;
+		color: var(--text);
+		font-size: 0.82rem;
+		line-height: 1.45;
+	}
+	.tensor-explorer figcaption {
+		margin-top: 0.4rem;
+	}
+</style>

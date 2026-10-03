@@ -1,0 +1,29 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import TensorExplorer from "../../utils/tensor/TensorExplorer.astro";
+import TensorFormats from "../../utils/tensor/TensorFormats.astro";
+---
+
+<Layout title="Tensor Explorer and Tensor Formats">
+	<h1>Tensor Explorer and Tensor Formats</h1>
+	<p>A 3 × 4 × 2 tensor with entries 1 to 24, starting on mode-1 fibers.</p>
+	<TensorExplorer dims={[3, 4, 2]} values={Array.from({ length: 24 }, (_, i) => i + 1)} />
+	<p>The book's 3 × 3 × 2 example (Ballard and Kolda, Example 1.2), starting on mode-3 slices.</p>
+	<TensorExplorer
+		dims={[3, 3, 2]}
+		values={[3, 8, 4, 9, 2, 3, 1, 1, 9, 6, 5, 1, 9, 6, 4, 5, 4, 1]}
+		view="slices"
+		mode={3}
+	/>
+	<p>Edge case: a 1 × 5 × 3 tensor with fractional and negative values, view locked to fibers.</p>
+	<TensorExplorer
+		dims={[1, 5, 3]}
+		values={Array.from({ length: 15 }, (_, i) => (i - 7) / 4)}
+		name="Y"
+		mode={2}
+		lockView
+	/>
+	<p>The three formats, without and with the storage calculator.</p>
+	<TensorFormats initial="cp" />
+	<TensorFormats initial="tt" calculator n={10} d={8} r={4} caption="Storage for an 8-way tensor with n = 10." />
+</Layout>

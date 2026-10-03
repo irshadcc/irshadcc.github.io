@@ -1,0 +1,226 @@
+---
+// Diagram showing the contiguous memory layout of _PyInterpreterFrame in Python 3.11+
+// Usage in .mdx:
+//   <FrameMemoryDiagram />
+
+interface Props {
+	highlight?: "specials" | "locals" | "stack" | "all";
+}
+
+const { highlight = "all" } = Astro.props;
+---
+
+<figure class="fmf" tabindex="-1">
+	<figcaption>Memory Layout of <code>_PyInterpreterFrame</code> in the Thread Data Stack</figcaption>
+
+	<div class="fm-container">
+		<!-- Section 1: Linkage & Header -->
+		<div class:list={["fm-block", "fm-linkage", { dim: highlight !== "all" && highlight !== "specials" }]}>
+			<div class="fm-block-header">
+				<span class="fm-sec-title">1. Linkage & Control</span>
+				<span class="fm-sec-size">Fixed struct header</span>
+			</div>
+			<div class="fm-cells-grid">
+				<div class="fm-cell">
+					<code>previous</code>
+					<span class="fm-cell-sub">Pointer to caller's _PyInterpreterFrame</span>
+				</div>
+				<div class="fm-cell">
+					<code>prev_instr</code>
+					<span class="fm-cell-sub">Pointer to last _Py_CODEUNIT executed</span>
+				</div>
+				<div class="fm-cell">
+					<code>stacktop & return_offset</code>
+					<span class="fm-cell-sub">Stack depth offset and return bytecode jump</span>
+				</div>
+				<div class="fm-cell">
+					<code>owner</code>
+					<span class="fm-cell-sub">FRAME_OWNED_BY_THREAD (0)</span>
+				</div>
+			</div>
+		</div>
+
+		<!-- Section 2: Specials -->
+		<div class:list={["fm-block", "fm-specials", { dim: highlight !== "all" && highlight !== "specials" }]}>
+			<div class="fm-block-header">
+				<span class="fm-sec-title">2. Execution Specials</span>
+				<span class="fm-sec-size">Runtime VM pointers</span>
+			</div>
+			<div class="fm-cells-grid">
+				<div class="fm-cell">
+					<code>f_code</code>
+					<span class="fm-cell-sub">PyCodeObject* (co_code, co_consts)</span>
+				</div>
+				<div class="fm-cell">
+					<code>f_funcobj</code>
+					<span class="fm-cell-sub">PyFunctionObject* (qualname, defaults)</span>
+				</div>
+				<div class="fm-cell">
+					<code>f_globals & f_builtins</code>
+					<span class="fm-cell-sub">Borrowed pointers to module & builtins dicts</span>
+				</div>
+				<div class="fm-cell">
+					<code>frame_obj</code>
+					<span class="fm-cell-sub">NULL (lazily materialized on sys._getframe)</span>
+				</div>
+			</div>
+		</div>
+
+		<!-- Section 3: Fast Locals -->
+		<div class:list={["fm-block", "fm-locals", { dim: highlight !== "all" && highlight !== "locals" }]}>
+			<div class="fm-block-header">
+				<span class="fm-sec-title">3. Fast Locals Array (<code>localsplus[0 .. n-1]</code>)</span>
+				<span class="fm-sec-size">Indexed by oparg (O(1) direct offset)</span>
+			</div>
+			<div class="fm-cells-grid">
+				<div class="fm-cell active-var">
+					<code>localsplus[0]</code>
+					<span class="fm-cell-sub">Parameter <code>a</code> (e.g. <code>10</code>)</span>
+				</div>
+				<div class="fm-cell active-var">
+					<code>localsplus[1]</code>
+					<span class="fm-cell-sub">Parameter <code>b</code> (e.g. <code>20</code>)</span>
+				</div>
+				<div class="fm-cell muted-var">
+					<code>localsplus[2 .. n-1]</code>
+					<span class="fm-cell-sub">Cell variables & free variables (if any)</span>
+				</div>
+			</div>
+		</div>
+
+		<!-- Section 4: Evaluation Stack -->
+		<div class:list={["fm-block", "fm-stack", { dim: highlight !== "all" && highlight !== "stack" }]}>
+			<div class="fm-block-header">
+				<span class="fm-sec-title">4. Operand Evaluation Stack</span>
+				<span class="fm-sec-size">Dynamic contiguous region above locals</span>
+			</div>
+			<div class="fm-cells-grid">
+				<div class="fm-cell stack-base">
+					<code>localsplus[n]</code>
+					<span class="fm-cell-sub">Stack base (first pushed value)</span>
+				</div>
+				<div class="fm-cell stack-mid">
+					<code>localsplus[n + 1]</code>
+					<span class="fm-cell-sub">Operand (e.g. intermediate <code>prod = 40</code>)</span>
+				</div>
+				<div class="fm-cell stack-tos">
+					<div class="fm-tos-badge">&larr; stack_pointer[-1] (TOS)</div>
+					<code>localsplus[n + stacktop - 1]</code>
+					<span class="fm-cell-sub">Top of Stack (evaluated result)</span>
+				</div>
+			</div>
+		</div>
+	</div>
+
+	<div class="fm-footer-note">
+		<strong>Contiguous Thread Stack:</strong> Unlike pre-3.11 Python where every function call allocated an isolated heap <code>PyFrameObject</code> (triggering heap fragmentation), modern CPython pushes <code>_PyInterpreterFrame</code> into <code>tstate-&gt;datastack_chunk</code>. Memory is linear and cache-friendly; popping a frame simply resets the chunk pointer.
+	</div>
+</figure>
+
+<style>
+	.fmf {
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+		outline: none;
+	}
+	.fmf figcaption {
+		text-align: center;
+		font-size: 0.9rem;
+		font-weight: 600;
+		margin-bottom: 0.6rem;
+		color: var(--text);
+	}
+	.fm-container {
+		display: flex;
+		flex-direction: column;
+		gap: 0.55rem;
+		padding: 0.85rem;
+		border: 1px solid var(--faint);
+		border-radius: 10px;
+		background: var(--surface);
+	}
+	.fm-block {
+		background: var(--bg);
+		border: 1px solid var(--faint);
+		border-radius: 7px;
+		padding: 0.65rem 0.75rem;
+		transition: opacity 160ms ease;
+	}
+	.fm-block.dim {
+		opacity: 0.45;
+	}
+	.fm-block-header {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		margin-bottom: 0.45rem;
+		border-bottom: 1px solid var(--faint);
+		padding-bottom: 0.3rem;
+	}
+	.fm-sec-title {
+		font-size: 0.78rem;
+		font-weight: 700;
+		color: var(--text);
+	}
+	.fm-sec-size {
+		font-size: 0.7rem;
+		color: var(--muted);
+		font-family: var(--mono);
+	}
+	.fm-cells-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+		gap: 0.45rem;
+	}
+	.fm-cell {
+		background: var(--surface);
+		border: 1px solid var(--faint);
+		border-radius: 5px;
+		padding: 0.4rem 0.5rem;
+		display: flex;
+		flex-direction: column;
+		gap: 0.15rem;
+		font-size: 0.75rem;
+	}
+	.fm-cell code {
+		font-family: var(--mono);
+		font-size: 0.74rem;
+		color: var(--accent);
+		font-weight: 600;
+	}
+	.fm-cell-sub {
+		font-size: 0.68rem;
+		color: var(--muted);
+		line-height: 1.25;
+	}
+	.fm-locals .active-var {
+		border-color: var(--accent);
+		background: var(--accent-soft);
+	}
+	.fm-stack .stack-tos {
+		border-color: var(--accent);
+		background: var(--accent-soft);
+		position: relative;
+	}
+	.fm-tos-badge {
+		font-size: 0.65rem;
+		font-weight: 700;
+		color: var(--accent);
+		text-transform: uppercase;
+		letter-spacing: 0.03em;
+		margin-bottom: 0.1rem;
+	}
+	.fm-footer-note {
+		margin-top: 0.55rem;
+		padding: 0.55rem 0.75rem;
+		background: var(--surface);
+		border-left: 3px solid var(--accent);
+		border-radius: 0 6px 6px 0;
+		font-size: 0.78rem;
+		line-height: 1.45;
+		color: var(--text);
+	}
+	.fm-footer-note strong {
+		color: var(--text);
+	}
+</style>
