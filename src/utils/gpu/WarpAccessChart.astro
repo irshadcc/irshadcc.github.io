@@ -1,0 +1,47 @@
+---
+import LineChart from "../charts/LineChart.astro";
+import { globalAccess, sharedAccess, threadAddresses } from "./warpAccess";
+
+interface Props {
+	bytes?: number;
+	type?: "global" | "shared";
+}
+const { bytes = 4, type = "global" } = Astro.props;
+const strides = Array.from({ length: 32 }, (_, i) => i + 1);
+
+const series =
+	type === "global"
+		? [
+				{
+					name: "Sectors / Request",
+					fn: (stride: number) =>
+						globalAccess(threadAddresses(stride, bytes), bytes)
+							.sectorsPerRequest,
+				},
+				{
+					name: "Ideal Sectors",
+					fn: (stride: number) =>
+						globalAccess(threadAddresses(stride, bytes), bytes).ideal,
+				},
+			]
+		: [
+				{
+					name: "Wavefronts",
+					fn: (stride: number) =>
+						sharedAccess(threadAddresses(stride, bytes), bytes).wavefronts,
+				},
+				{
+					name: "Ideal Wavefronts",
+					fn: (stride: number) =>
+						sharedAccess(threadAddresses(stride, bytes), bytes).ideal,
+				},
+			];
+---
+
+<LineChart
+	x={() => strides}
+	series={series}
+	xLabel="Stride (Elements)"
+	yLabel={type === "global" ? "Sectors" : "Wavefronts"}
+	title={`${type === "global" ? "Global Memory Sectors" : "Shared Memory Wavefronts"} vs Stride (${bytes}B Elements)`}
+/>

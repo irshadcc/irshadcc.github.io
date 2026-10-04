@@ -1,0 +1,24 @@
+---
+import LineChart from "../charts/LineChart.astro";
+import { expectedIssueActive } from "./issueSim";
+
+interface Props {
+	ilp: number;
+}
+
+const { ilp } = Astro.props;
+// Latency from 1 to 50 cycles
+const latencies = Array.from({ length: 50 }, (_, i) => i + 1);
+const series = [4, 8, 16, 32].map((warps) => ({
+	name: `${warps} warps`,
+	fn: (latency: number) => expectedIssueActive(warps, ilp, latency),
+}));
+---
+
+<LineChart
+	x={() => latencies}
+	series={series}
+	xLabel="Latency (cycles)"
+	yLabel="Issue Active"
+	title={`Issue Active vs Latency (ILP = ${ilp})`}
+/>

@@ -1,0 +1,93 @@
+---
+title: "Understanding Nvidia Nsight Compute (NCU) Metrics"
+description: "A guide to Nvidia Nsight Compute sections, metrics, and how to triage performance bottlenecks."
+date: 2026-10-04
+tags: [CUDA, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import IssueEfficiencyChart from "../../utils/gpu/IssueEfficiencyChart.astro";
+import OccupancyChart from "../../utils/gpu/OccupancyChart.astro";
+import WarpAccessChart from "../../utils/gpu/WarpAccessChart.astro";
+
+## Background
+
+When writing CUDA kernels, you eventually hit a wall where the kernel is slow, but it isn't obvious why. Is it bounded by memory bandwidth? Compute latency? Poor occupancy? Nvidia Nsight Compute (NCU) is the standard profiler for answering these questions.
+
+Profiling matters because hardware capabilities and theoretical costs often differ from achieved performance. Understanding where a kernel spends its time prevents aimless optimization and points you directly to the limiting factor.
+
+This post covers how to use Nsight Compute to profile a kernel, the key sections it provides, what the most important metrics mean, and how to improve them using the NCU triage flow.
+
+## The Triage Flow
+
+Nsight Compute presents many metrics, but the **SpeedOfLight** and **ComputeWorkloadAnalysis** sections form a straightforward triage flow.
+
+The first step is to look at `sm__throughput` (compute) and `dram__throughput` (memory).
+- If `dram__throughput` is high (e.g., >80%), the kernel is **Memory Bound**. You need to reduce memory accesses or improve their efficiency.
+- If `sm__throughput` is high, the kernel is **Compute Bound**. You need to reduce instructions or improve instruction-level parallelism.
+- If both are low, the kernel suffers from **Latency Bound** execution or **Poor Occupancy**.
+
+<Sidenote>
+Nsight Compute groups metrics into rules. The "Compute Triage" rule typically automates this initial check, highlighting whether you are memory or compute bound.
+</Sidenote>
+
+## Memory Bound: Sectors and Wavefronts
+
+When `dram__throughput` is high, we inspect the **MemoryWorkloadAnalysis** section. A common issue here is uncoalesced memory access. 
+
+Global memory is accessed in 32-byte sectors. If a **warp** (32 threads) reads scattered addresses, it might touch many sectors for a single request. NCU reports this as "Sectors/Req" (`l1tex__data_pipe_lsu_wavefronts_mac_shared_cmd_read`).
+
+<WarpAccessChart type="global" bytes={4} />
+
+To improve this metric:
+- **Coalesce Accesses**: Ensure adjacent threads access adjacent memory elements.
+- **Use Shared Memory**: Load scattered data into shared memory using a coalesced pattern, then access it locally.
+
+Shared memory has its own bottleneck: bank conflicts. Shared memory is divided into 32 banks. If multiple threads in a warp access different addresses in the same bank, the request is split into multiple **wavefronts**. 
+
+<WarpAccessChart type="shared" bytes={4} />
+
+To resolve bank conflicts:
+- **Pad memory allocations** to break stride patterns.
+- **Swizzle layouts** to distribute accesses evenly across banks.
+
+## Latency Bound: Issue Efficiency
+
+If neither compute nor memory throughput is high, your warps might be waiting on dependencies (latency bound). We look at the **Scheduler Statistics** section, specifically `smsp__issue_active` (Issue Active).
+
+The scheduler picks an eligible warp every cycle. If warps are waiting for memory or math results, they are not eligible. The chart below shows how issue efficiency drops as instruction latency increases, unless you have enough resident warps to hide it.
+
+<IssueEfficiencyChart ilp={1} />
+
+To improve issue efficiency:
+- **Increase Occupancy**: More resident warps give the scheduler more options.
+- **Increase ILP**: Instruction-Level Parallelism gives each warp more independent instructions to run before waiting.
+- **Resolve Stalls**: Look at the `stall_reasons` metrics. For example, `long_scoreboard` means waiting on global memory, and `math_pipe_throttle` means waiting on the math units.
+
+## Occupancy
+
+Occupancy is the ratio of active warps per SM to the theoretical maximum. The **Occupancy** section shows limits dictated by registers and shared memory.
+
+For an A100 GPU (Compute Capability 8.0), an SM can hold up to 64 warps. However, if each thread uses too many registers, or each block uses too much shared memory, fewer warps can fit.
+
+<OccupancyChart blockThreads={256} smemPerBlock={0} />
+
+To improve occupancy:
+- **Limit Registers**: Use `__launch_bounds__` or `-maxrregcount` to force the compiler to spill to local memory or recompute values.
+- **Tune Shared Memory**: Reduce shared memory allocations, or dynamically allocate it if possible.
+
+<Sidenote>
+Occupancy isn't always good. Sometimes a kernel runs faster with fewer warps if they use more registers to keep data locally (register blocking) instead of spilling to global memory.
+</Sidenote>
+
+## Summary
+
+- **SpeedOfLight**: Start here to determine if you are memory, compute, or latency bound.
+- **MemoryWorkloadAnalysis**: Check sectors per request for global memory and wavefronts for shared memory conflicts.
+- **Scheduler Statistics**: Use `smsp__issue_active` to see if warps are stalling, and `stall_reasons` to see why.
+- **Occupancy**: Understand your register and shared memory limits, but don't blindly maximize occupancy.
+
+## References
+
+- [Nsight Compute Profiling Guide](https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html)
+- [Nsight Compute Triage Flow](https://docs.nvidia.com/nsight-compute/CustomizationGuide/index.html)

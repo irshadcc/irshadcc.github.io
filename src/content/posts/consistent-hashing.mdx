@@ -1,0 +1,859 @@
+---
+title: "Consistent Hashing"
+description: "Why hash mod N reshuffles almost every key when a server joins, how a hash ring moves only the keys the new server takes over, why virtual nodes are needed to balance the load, and a small C++ implementation with a worked example."
+date: 2026-10-04
+tags: [Distributed systems, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import ShardRouting from "../../utils/payments/ShardRouting.astro";
+import HashRing from "../../utils/hashing/HashRing.astro";
+import ChordSteps from "../../utils/hashing/ChordSteps.astro";
+
+## Background
+
+A cache cluster, a sharded database or a key-value store spreads its keys over $N$ servers. The
+obvious way to pick a server for a key is to hash the key and take the remainder:
+$\text{server} = h(\text{key}) \bmod N$. Every client computes the same answer without asking
+anyone, and the keys spread evenly.
+
+The trouble starts when $N$ changes. Add one server and $h \bmod N$ becomes $h \bmod (N+1)$,
+which is a different number for almost every key. A cache cluster that grows from 10 to 11
+servers loses about 91% of its hits at once, and a database has to copy 91% of its rows. A
+server that crashes causes the same reshuffle in reverse.
+
+**Consistent hashing** fixes this: when a server joins or leaves, only about $1/N$ of the keys
+move, and they move only to or from that server. This post covers:
+
+1. why $h \bmod N$ moves almost every key, with the exact fraction;
+2. the **hash ring**, how a key finds its server, and what moves when a server joins;
+3. why one point per server balances the load badly, and how **virtual nodes** fix it;
+4. a C++ implementation in about 60 lines, with a worked example run through it;
+5. replication on the ring;
+6. **Chord**, the SIGCOMM 2001 paper that runs the ring with no global membership list: finger
+   tables, $O(\log N)$-hop lookups, joins by stabilization, failures, and a C++ simulation;
+7. three variants: jump consistent hash, rendezvous hashing and consistent hashing with bounded
+   loads.
+
+The [payment gateway sharding post](/blog/payment-gateway-mysql-sharding/) solves the same
+problem with a fixed table of buckets. This post is about the approach that needs no table.
+
+## Why hash mod N breaks
+
+Pick $N = 4$ servers in the figure below, then $N = 5$. Keys with a dashed outline changed
+server, and the label after the arrow is the server they came from. Going from 4 to 5 servers,
+most of the 32 keys move, not just the ones the new server needs.
+
+<ShardRouting strategies={["mod"]} shards={5} keys={32} title="32 keys placed by hash mod N" />
+
+The fraction that stays is exact. A key stays put when $h \bmod N = h \bmod (N+1)$. Both
+remainders repeat with period $N(N+1)$, and in each period they agree only for
+$h = 0, 1, \dots, N-1$.<Sidenote>Write $r = h \bmod N(N+1)$ as $r = a(N+1) + b$ with $0 \le b \le N$. If also $r \bmod N = b$, then $a(N+1) = cN$ for some integer $c$, so $N$ divides $a$. Since $a < N$, $a = 0$ and $r = b < N$.</Sidenote>
+That is $N$ values out of $N(N+1)$, so a fraction $1/(N+1)$ of keys stays and $N/(N+1)$ moves.
+The ideal is the opposite: the new server should take its fair share, $1/(N+1)$, and nothing
+else should move.
+
+| Servers | Moved by $h \bmod N$ | Ideal: new server's fair share | Measured, 100,000 keys |
+| ------- | -------------------: | -----------------------------: | ---------------------: |
+| 4 → 5   |                80.0% |                          20.0% |                  79.7% |
+| 10 → 11 |                90.9% |                           9.1% |                  90.9% |
+
+## The hash ring
+
+### Placing servers and keys
+
+Take the hash's output range, $0$ to $2^{32} - 1$ for a 32-bit hash, and bend it into a circle
+so that $2^{32} - 1$ is followed by $0$. This circle is the **hash ring**. Hash each server's
+name to get its **point** on the ring, and hash each key to get the key's position.
+
+A key belongs to the **first server point at or clockwise after the key's position**. If no
+point follows the key before $2^{32}$, it wraps around to the first point after $0$. So each
+server owns the **arc** that ends at its point and starts just after the previous server's
+point.
+
+In the figure, position $0 = 2^{32}$ is the tick at the top and positions grow clockwise. Each coloured arc is
+owned by the server at its clockwise end, and each dot inside the ring is a key in its owner's
+colour. Hover a key to draw its clockwise walk to its server.
+
+<HashRing nodes={4} nodeChoices={[4]} keys={12} showMoves={false} title="Four servers and twelve keys on the ring" />
+
+Here are the numbers behind the figure. Positions are $h / 2^{32}$, the fraction of the way
+round the ring.<Sidenote>The hash is 32-bit FNV-1a followed by MurmurHash3's finalizer; see [Choosing the hash function](#choosing-the-hash-function). All numbers in this post come from the C++ program below, and were cross-checked against an independent TypeScript implementation that also draws the figures.</Sidenote>
+
+| Server | Point (hash)  | Position | Owns the arc   | Share of ring |
+| ------ | ------------: | -------: | -------------- | ------------: |
+| node-C |   909,533,779 |    0.212 | 0.965 → 0.212  |         24.7% |
+| node-B | 2,121,558,540 |    0.494 | 0.212 → 0.494  |         28.2% |
+| node-D | 3,429,924,769 |    0.799 | 0.494 → 0.799  |         30.5% |
+| node-A | 4,144,180,403 |    0.965 | 0.799 → 0.965  |         16.6% |
+
+node-C's arc wraps through $0$: it runs from just after node-A at 0.965, over the top, to 0.212.
+
+### Looking up a key
+
+Check one key: `acct_1001` hashes to 882,598,704, position 0.205. The first server point at or
+after 0.205 is node-C at 0.212, so `acct_1001` lives on node-C. `acct_1003`, at 0.863, walks
+clockwise past nothing until node-A at 0.965.
+
+In code, the server points are kept sorted, and the lookup is a binary search for the first
+point $\ge h(\text{key})$, wrapping to the first point if the search runs off the end. With $M$
+points on the ring, that is $O(\log M)$ per key, and every client that knows the list of
+servers computes the same answer.
+
+### Adding and removing a server
+
+Now add node-E. Its point lands at 0.141, inside node-C's arc. The keys between node-A's point
+(0.965) and 0.141 now meet node-E first, so they move to node-E. Every other key still meets the
+same server as before. Switch between 4 and 5 servers in the figure: the outlined keys are the
+ones that moved.
+
+<HashRing nodes={5} nodeChoices={[4, 5]} keys={12} title="Adding node-E at position 0.141" />
+
+| Key       | Position | 4 servers | 5 servers |
+| --------- | -------: | --------- | --------- |
+| acct_1004 |    0.001 | node-C    | **node-E** |
+| acct_1007 |    0.047 | node-C    | **node-E** |
+| acct_1012 |    0.104 | node-C    | **node-E** |
+| acct_1001 |    0.205 | node-C    | node-C    |
+| acct_1011 |    0.216 | node-B    | node-B    |
+| acct_1002 |    0.421 | node-B    | node-B    |
+| acct_1006 |    0.463 | node-B    | node-B    |
+| acct_1008 |    0.485 | node-B    | node-B    |
+| acct_1009 |    0.536 | node-D    | node-D    |
+| acct_1005 |    0.611 | node-D    | node-D    |
+| acct_1010 |    0.643 | node-D    | node-D    |
+| acct_1003 |    0.863 | node-A    | node-A    |
+
+Three of twelve keys moved, all from node-C to node-E. Two properties make this work:
+
+- **Only the new server gains keys.** A key moves only if node-E is now the first point
+  clockwise from it, so every moved key moves *to* node-E.
+- **Only one neighbour loses keys.** The moved keys all sat in the arc node-E split, which
+  belonged to its clockwise neighbour, node-C.
+
+Removing a server is the same in reverse: its keys go to its clockwise neighbour and nothing
+else moves. The fraction that moves is the new server's share of the ring. Here node-E took
+17.6% of the ring, close to the fair 20%. With 100,000 keys, going from 10 to 11 servers moves
+2.6% of the keys, because the new server happened to land on a short arc. That is the next
+problem.
+
+## Balancing the load
+
+### One point per server is uneven
+
+Server points land at random positions, so the arcs between them have random lengths. In the
+example above, node-D owns 30.5% of the ring and node-A owns 16.6%, nearly a factor of two,
+with only four servers.
+
+It gets worse as $N$ grows. $N$ random points cut the ring into $N$ arcs whose lengths follow a
+Dirichlet distribution, and a single arc's length has a standard deviation about equal to its
+mean, $1/N$.<Sidenote>The arc lengths between $M$ uniform random points on a circle are distributed as $\text{Dirichlet}(1, \dots, 1)$. Each arc is $\text{Beta}(1, M-1)$, with mean $1/M$ and standard deviation $\sqrt{(M-1)/(M^2(M+1))} \approx 1/M$.</Sidenote>
+The longest arc is on average $H_N = 1 + \tfrac12 + \dots + \tfrac1N \approx \ln N + 0.58$ times the fair share, 2.93 for $N = 10$. In C++ runs with 10 servers and 100,000
+keys, the busiest server held 19,960 keys and the idlest 1,053: a factor of 19.
+
+### Virtual nodes
+
+The fix is to give each server many points. Server node-A gets points at
+$h(\texttt{node-A\#0}), h(\texttt{node-A\#1}), \dots, h(\texttt{node-A\#}(V-1))$. Each point is a
+**virtual node**: it owns an arc like before, and all its keys go to its server. A server's
+load is now the sum of $V$ random arcs, and a sum of $V$ independent pieces varies much less,
+relative to its mean, than one piece.
+
+How much less? With $N$ servers and $V$ virtual nodes each, a server's share of the ring is a
+sum of $V$ of the $NV$ arcs, which is $\text{Beta}(V, (N-1)V)$. Measured in units of the fair
+share $1/N$, its standard deviation is
+
+$$
+\sqrt{\frac{N-1}{NV + 1}} \approx \frac{1}{\sqrt{V}}.
+$$
+
+Try it below. With 1 virtual node per server, the shares in the table are far apart. Switch to 4
+and then 16: the arcs become a fine mix of colours and the shares close in on the fair share.
+
+<HashRing nodes={4} keys={24} vnodeChoices={[1, 4, 16]} title="Virtual nodes per server" />
+
+The table below measures this on 100 different clusters of $N = 10$ servers (each cluster names
+its servers differently, so its points land elsewhere). Shares are exact arc lengths, in units
+of the fair share, so 1.00 is perfect.
+
+| Virtual nodes $V$ | Largest share, mean | Smallest share, mean | Std. dev., measured | $\sqrt{(N-1)/(NV+1)}$ |
+| ----------------: | ------------------: | -------------------: | ------------------: | --------------------: |
+|                 1 |                2.87 |                 0.08 |               0.893 |                 0.905 |
+|                10 |                1.50 |                 0.57 |               0.289 |                 0.299 |
+|               100 |                1.15 |                 0.85 |               0.093 |                 0.095 |
+|             1,000 |                1.05 |                 0.95 |               0.031 |                 0.030 |
+
+At $V = 100$ the busiest of 10 servers carries about 15% more than its share. That is why
+systems use tens to hundreds of virtual nodes per server: the ring grows to $NV$ points, but a
+lookup is still a binary search, $O(\log NV)$.
+
+Virtual nodes help in two more ways:
+
+- **A joining server takes keys from many servers**, one small arc from each, instead of one
+  large arc from a single neighbour. With $V = 100$, going from 10 to 11 servers moved 9.3% of
+  keys, against an ideal of 9.1%. When a server dies, its load spreads over all the survivors
+  instead of doubling the load on one neighbour.
+- **Servers of different sizes** get different numbers of virtual nodes. A server with twice
+  the memory gets twice the points and so, on average, twice the keys.
+
+### Choosing the hash function
+
+The ring needs a hash that spreads *similar* inputs far apart, because virtual node names
+differ only in their last characters. 32-bit FNV-1a, a common choice for hash tables, fails
+here. It ends each byte with a multiply by $16{,}777{,}619 \approx 2^{24}$, so changing the last
+byte by 1 moves the hash by a small multiple of $2^{24}$, which is $1/256$ of the ring. With plain FNV-1a, the eight
+points `node-A#0` to `node-A#7` all land between 0.939 and 0.967 on the ring, one clump, which
+is no better than a single point.
+
+The code below therefore follows FNV-1a with **MurmurHash3's finalizer** (`fmix32`), a few shifts
+and multiplies that make every output bit depend on every input bit. The same eight points then
+land at 0.965, 0.594, 0.121, 0.807, 0.384, 0.773, 0.574 and 0.586. Any well-mixed hash works:
+MurmurHash3, xxHash, or a slice of MD5 or SHA-1 when speed does not matter.<Sidenote>For ordinary workloads the hash need not be secret. If clients can choose keys to attack the system, they can pile keys onto one arc; a keyed hash such as SipHash prevents that.</Sidenote>
+
+## A C++ implementation
+
+The ring is a `std::map` from a 32-bit position to a server name. A `std::map` is a sorted
+balanced tree, so `lower_bound(h)` is exactly "the first point at or after $h$", in
+$O(\log M)$.
+
+```cpp
+#include <cstdint>
+#include <iostream>
+#include <map>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+// 32-bit FNV-1a, followed by MurmurHash3's finalizer so that similar strings
+// ("node-A#0", "node-A#1") land far apart on the ring.
+uint32_t hash32(const std::string& s) {
+  uint32_t h = 0x811c9dc5u;
+  for (unsigned char c : s) {
+    h ^= c;
+    h *= 0x01000193u;
+  }
+  h ^= h >> 16;
+  h *= 0x85ebca6bu;
+  h ^= h >> 13;
+  h *= 0xc2b2ae35u;
+  h ^= h >> 16;
+  return h;
+}
+
+class ConsistentHashRing {
+ public:
+  explicit ConsistentHashRing(int vnodes) : vnodes_(vnodes) {}
+
+  void addNode(const std::string& node) {
+    for (int i = 0; i < vnodes_; ++i)
+      ring_.emplace(hash32(vnodeName(node, i)), node);  // no-op on a collision
+  }
+
+  void removeNode(const std::string& node) {
+    for (int i = 0; i < vnodes_; ++i) {
+      auto it = ring_.find(hash32(vnodeName(node, i)));
+      if (it != ring_.end() && it->second == node) ring_.erase(it);
+    }
+  }
+
+  // The first point at or after hash(key), wrapping past 2^32 - 1 back to 0.
+  const std::string& nodeFor(const std::string& key) const {
+    if (ring_.empty()) throw std::runtime_error("empty ring");
+    auto it = ring_.lower_bound(hash32(key));
+    if (it == ring_.end()) it = ring_.begin();
+    return it->second;
+  }
+
+  // The first n distinct servers clockwise from the key: its replicas.
+  std::vector<std::string> nodesFor(const std::string& key, size_t n) const {
+    std::vector<std::string> out;
+    if (ring_.empty()) return out;
+    auto it = ring_.lower_bound(hash32(key));
+    for (size_t seen = 0; seen < ring_.size() && out.size() < n; ++seen, ++it) {
+      if (it == ring_.end()) it = ring_.begin();
+      bool dup = false;
+      for (const auto& s : out) dup = dup || s == it->second;
+      if (!dup) out.push_back(it->second);
+    }
+    return out;
+  }
+
+  const std::map<uint32_t, std::string>& points() const { return ring_; }
+
+ private:
+  static std::string vnodeName(const std::string& node, int i) {
+    return node + "#" + std::to_string(i);
+  }
+
+  int vnodes_;
+  std::map<uint32_t, std::string> ring_;  // ring position -> server
+};
+```
+
+What each part does:
+
+- **`hash32`** is FNV-1a over the bytes, then the `fmix32` finalizer. Unsigned 32-bit
+  arithmetic wraps modulo $2^{32}$, which is exactly the ring.
+- **`addNode`** inserts $V$ points named `node#0` to `node#V-1`. If two points collide on the
+  same position, `emplace` keeps the first one, so that position belongs to one server
+  only.<Sidenote>With $M$ points on a $2^{32}$ ring, a collision is likely once $M$ is near $\sqrt{2^{32}} = 65{,}536$ (the birthday bound). A production ring would use a 64-bit hash.</Sidenote>
+- **`removeNode`** recomputes the same $V$ positions and erases them, but only if they belong to
+  this server, so a collision never removes someone else's point.
+- **`nodeFor`** is the lookup: `lower_bound` finds the first point $\ge h$, and running off the
+  end wraps to `begin()`.
+- **`nodesFor`** walks on clockwise to collect replicas; see [Replication](#replication).
+
+`std::map` is the simplest correct choice. A faster ring keeps the points in a sorted
+`std::vector` and uses `std::lower_bound`: the same binary search over contiguous memory, at the
+cost of re-sorting on every membership change, which is rare.
+
+#### Running the worked example
+
+This `main` builds the four-server ring from the figures, places 12 keys, adds node-E, and then
+measures load with 100,000 keys on 10 servers for several virtual-node counts.
+
+```cpp
+int main() {
+  ConsistentHashRing ring(/*vnodes=*/1);
+  for (const char* n : {"node-A", "node-B", "node-C", "node-D"}) ring.addNode(n);
+  for (const auto& [pos, node] : ring.points())
+    std::cout << node << " at " << pos << "\n";
+
+  std::vector<std::string> keys;
+  for (int i = 1001; i <= 1012; ++i) keys.push_back("acct_" + std::to_string(i));
+
+  std::unordered_map<std::string, std::string> before;
+  for (const auto& k : keys) {
+    before[k] = ring.nodeFor(k);
+    std::cout << k << " hash " << hash32(k) << " -> " << before[k] << "\n";
+  }
+
+  ring.addNode("node-E");
+  std::cout << "added node-E at " << hash32("node-E#0") << "\n";
+  for (const auto& k : keys)
+    if (ring.nodeFor(k) != before[k])
+      std::cout << k << " moved " << before[k] << " -> " << ring.nodeFor(k) << "\n";
+
+  std::cout << "replicas of acct_1001:";
+  for (const auto& r : ring.nodesFor("acct_1001", 3)) std::cout << " " << r;
+  std::cout << "\n";
+
+  // Keys per server: 100,000 keys on 10 servers.
+  for (int v : {1, 10, 100, 1000}) {
+    ConsistentHashRing r(v);
+    for (int s = 0; s < 10; ++s) r.addNode("server-" + std::to_string(s));
+    std::unordered_map<std::string, int> load;
+    for (int i = 0; i < 100000; ++i) ++load[r.nodeFor("key-" + std::to_string(i))];
+    int lo = 100000, hi = 0;
+    for (const auto& [node, n] : load) lo = std::min(lo, n), hi = std::max(hi, n);
+    std::cout << "vnodes " << v << ": fewest " << lo << ", most " << hi << "\n";
+  }
+}
+```
+
+Compiled with `clang++ -std=c++17 -O2 -Wall -Wextra ring.cpp`, it prints:
+
+```text
+node-C at 909533779
+node-B at 2121558540
+node-D at 3429924769
+node-A at 4144180403
+acct_1001 hash 882598704 -> node-C
+acct_1002 hash 1808468062 -> node-B
+acct_1003 hash 3707824746 -> node-A
+acct_1004 hash 3053578 -> node-C
+acct_1005 hash 2622731948 -> node-D
+acct_1006 hash 1989177287 -> node-B
+acct_1007 hash 200803279 -> node-C
+acct_1008 hash 2083521834 -> node-B
+acct_1009 hash 2300569593 -> node-D
+acct_1010 hash 2760622263 -> node-D
+acct_1011 hash 926342498 -> node-B
+acct_1012 hash 447880053 -> node-C
+added node-E at 605543080
+acct_1004 moved node-C -> node-E
+acct_1007 moved node-C -> node-E
+acct_1012 moved node-C -> node-E
+replicas of acct_1001: node-C node-B node-D
+vnodes 1: fewest 1053, most 19960
+vnodes 10: fewest 7693, most 13613
+vnodes 100: fewest 8537, most 11027
+vnodes 1000: fewest 9741, most 10515
+```
+
+The points print in ring order because `std::map` iterates in key order, and they match the
+table in [Placing servers and keys](#placing-servers-and-keys). Check one move by hand:
+`acct_1004` hashes to 3,053,578, just past $0$. Before, the first point at or after it was node-C
+at 909,533,779. node-E's point, 605,543,080, is smaller than that and still $\ge$ 3,053,578, so
+`lower_bound` now stops at node-E.
+
+The last four lines are the load experiment. With 10,000 keys per server as the fair share, one
+point per server gives a spread of 1,053 to 19,960; 1,000 virtual nodes narrow it to 9,741 to
+10,515.
+
+## Replication
+
+Stores that keep several copies of each key use the ring for that too. Amazon's Dynamo stores a
+key on its owner and on the next distinct servers clockwise, a list it calls the key's
+**preference list**.<Sidenote>DeCandia et al., *Dynamo: Amazon's Highly Available Key-value Store*, SOSP 2007, section 4.3. The paper notes that the list skips positions so that it contains only distinct physical nodes.</Sidenote>
+`nodesFor` does exactly this. It keeps walking clockwise from the key and skips points of
+servers already chosen. Skipping matters with virtual nodes: the next point clockwise may be
+another virtual node of the same server, and two copies on one machine protect against nothing.
+
+For `acct_1001`, the walk starts at node-C's point (0.212), then meets node-B (0.494) and node-D
+(0.799), so its three replicas are node-C, node-B and node-D. When a server joins or leaves, only
+the preference lists of keys near its points change, so replication inherits the ring's small
+moves.
+
+## Chord: a ring without a global view
+
+Everything so far assumes that every client knows every server, so it can binary-search a sorted
+list of points. That is fine for 10 cache servers. It fails for a **peer-to-peer** system, where
+millions of machines come and go and no one holds the full list.
+
+**Chord** (Stoica, Morris, Karger, Kaashoek and Balakrishnan, SIGCOMM 2001) keeps the same ring
+and the same rule, *a key belongs to the first node clockwise from it*, but spreads the lookup
+over the nodes themselves. Each node knows only $O(\log N)$ other nodes, and a lookup takes
+$O(\log N)$ messages. Chord provides one operation, `lookup(key)`, which returns the node
+responsible for the key. Storage, replication and caching are left to the application built on
+top.<Sidenote>Section 3 of the paper. The application is also told when the set of keys a node is responsible for changes, so it can move the values.</Sidenote>
+
+### The identifier circle
+
+Chord gives every node and key an $m$-bit **identifier**: a node's is the SHA-1 hash of its IP
+address, and a key's is the SHA-1 hash of the key. Identifiers sit on a circle modulo $2^m$, and
+key $k$ is stored at **successor($k$)**, the first node whose identifier is equal to or follows
+$k$. That is exactly the ring from [The hash ring](#the-hash-ring), with $2^m$ in place of
+$2^{32}$. The deployed prototype used 160-bit identifiers, all of SHA-1.
+
+The figures below use $m = 6$, so identifiers run from 0 to 63, and ten nodes N1, N8, N14, N21,
+N32, N38, N42, N48, N51 and N56. The identifiers are picked by hand so they are easy to read;
+in real Chord they would be hashes.
+
+### Finger tables
+
+The minimum each node needs is its **successor**, the next node clockwise. A lookup could then
+walk the ring one node at a time, which is correct but takes up to $N$ messages.
+
+To go faster, node $n$ keeps a **finger table** of $m$ entries. Entry $i$, for
+$1 \le i \le m$, points to the first node at least $2^{i-1}$ past $n$:
+
+$$
+n.\text{finger}[i] = \text{successor}\left((n + 2^{i-1}) \bmod 2^m\right).
+$$
+
+Finger 1 is the successor. The fingers reach $1, 2, 4, \dots, 2^{m-1}$ identifiers ahead, so a
+node knows its neighbourhood in detail and the far side of the ring coarsely. For N8:
+
+| $i$ | start $= 8 + 2^{i-1}$ | finger[$i$] |
+| --: | --------------------: | ----------- |
+|   1 |                     9 | N14         |
+|   2 |                    10 | N14         |
+|   3 |                    12 | N14         |
+|   4 |                    16 | N21         |
+|   5 |                    24 | N32         |
+|   6 |                    40 | N42         |
+
+Check one entry: finger 5 starts at $8 + 16 = 24$, and the first node at or after 24 is N32.
+Six entries but only four distinct nodes: with $N$ nodes, the first $\approx m - \log_2 N$
+fingers all land on the successor, so a node knows $O(\log N)$ distinct nodes.
+
+### Routing a lookup in O(log N) hops
+
+To find successor($k$), a node first finds $k$'s **predecessor**, the node $p$ with $k$ in
+$(p, p.\text{successor}]$, and then returns $p$'s successor. Here is the paper's Figure 4,
+where `n.f()` means "call `f` on node `n`", a remote call:
+
+```text
+n.find_successor(id)
+  n' = find_predecessor(id)
+  return n'.successor
+
+n.find_predecessor(id)
+  n' = n
+  while id ∉ (n', n'.successor]
+    n' = n'.closest_preceding_finger(id)
+  return n'
+
+n.closest_preceding_finger(id)
+  for i = m downto 1
+    if finger[i].node ∈ (n, id)
+      return finger[i].node
+  return n
+```
+
+`closest_preceding_finger` scans the fingers from the farthest down and forwards the query to
+the farthest finger that does not overshoot the key. Step through a lookup of key 54 started at
+N8. The curves in the ring are N8's fingers; the arrows are the hops taken.
+
+<ChordSteps m={6} nodes={[1, 8, 14, 21, 32, 38, 42, 48, 51, 56]} lookup={{ from: 8, key: 54 }} title="find_successor(54), started at N8" />
+
+N8 jumps to N42 with its largest finger, N42 jumps to N51 with finger 4 (start $42 + 8 = 50$),
+and N51 sees that 54 lies in $(51, 56]$, so N56 stores the key. Two hops cover most of the ring.
+
+**Why $O(\log N)$.** Say the query is at node $n$ and the key's predecessor $p$ lies in $n$'s
+$i$-th finger interval, $[n + 2^{i-1}, n + 2^i)$. Then the $i$-th finger $f$ is in that interval
+too, at least $2^{i-1}$ past $n$, while the whole interval is only $2^{i-1}$ wide. So the hop to
+$f$ at least halves the remaining distance to $p$. After $\log N$ hops the remaining distance is
+about $2^m / N$, which holds $O(\log N)$ nodes with high probability, so another $O(\log N)$ hops
+finish the job (Theorem 2 of the paper).
+
+In practice it is about $\frac12 \log_2 N$. The distance to the target has $\log_2 N$
+significant bits; each hop clears one 1-bit, and a random distance has 1s in about half of them.
+The C++ simulation below measured this over 10,000 random lookups per size:
+
+| Nodes $N$ | $\frac12 \log_2 N$ | Mean hops, simulated |
+| --------: | -----------------: | -------------------: |
+|    $2^4$  |                  2 |                 1.78 |
+|    $2^6$  |                  3 |                 2.90 |
+|    $2^8$  |                  4 |                 3.91 |
+|   $2^{10}$|                  5 |                 4.87 |
+|   $2^{12}$|                  6 |                 5.86 |
+|   $2^{14}$|                  7 |                 6.87 |
+
+These match the paper's Figure 10(a), which reports about 5.9 hops for $2^{12}$ nodes. For a
+million nodes that is about 10 hops, each a network round trip.
+
+### Joining with stabilize and notify
+
+A new node $n$ must end up in its neighbours' pointers without breaking lookups that are in
+flight, and many nodes may join at once. Chord separates correctness from speed. Lookups are
+**correct** as long as every successor pointer is right, because `find_predecessor` can always
+fall back to walking successors. Fingers only make lookups **fast**, so they can be repaired
+lazily.
+
+The join protocol (the paper's Figure 7) has four small functions. Every node runs `stabilize`
+and `fix_fingers` periodically:
+
+```text
+n.join(n')               // n' is any node already in the ring
+  predecessor = nil
+  successor = n'.find_successor(n)
+
+n.stabilize()            // periodically: check my successor, tell it about me
+  x = successor.predecessor
+  if x ∈ (n, successor)
+    successor = x
+  successor.notify(n)
+
+n.notify(n')             // n' thinks it might be my predecessor
+  if predecessor is nil or n' ∈ (predecessor, n)
+    predecessor = n'
+
+n.fix_fingers()          // periodically: refresh one finger
+  i = random index > 1 into finger[]
+  finger[i].node = find_successor(finger[i].start)
+```
+
+Step through N26 joining through N8. It lands between N21 and N32. Outside arrows are successor
+pointers, dashed inside arrows are predecessor pointers.
+
+<ChordSteps m={6} nodes={[1, 8, 14, 21, 32, 38, 42, 48, 51, 56]} join={{ node: 26, via: 8 }} title="N26 joins between N21 and N32" />
+
+After `join`, N26 points at N32 but nobody points at N26. One `stabilize` by N26 makes N32 adopt
+it as predecessor; one `stabilize` by N21 makes N21 adopt it as successor, and N21's `notify`
+gives N26 its predecessor. Only now do keys in $(21, 26]$ move from N32 to N26, the same single
+arc as in [Adding and removing a server](#adding-and-removing-a-server). Last, `fix_fingers` lets
+four other nodes point a finger at N26.
+
+The paper proves that once a node can resolve a query it always can (Theorem 4), and that some
+time after the last join every successor pointer is correct (Theorem 5). Re-establishing all
+fingers after one join or leave takes $O(\log^2 N)$ messages (Theorem 3). In the TypeScript
+version of this code, 30 trials of 40 nodes joining through one node, with only `stabilize`
+rounds in between, all ended in exactly the stable ring, with every test lookup correct.
+
+### Failures and replication
+
+A failed successor would break the one pointer that correctness depends on. So each node keeps a
+**successor list** of its $r$ nearest successors, maintained by a variant of `stabilize`. When
+its successor fails, a node switches to the first live entry.
+
+The paper chooses $r = O(\log N)$. If every node fails independently with probability $1/2$,
+all $r$ successors of a node are dead with probability $2^{-r}$, which is $1/N$ for
+$r = \log_2 N$. So with high probability every node still reaches its closest living successor,
+and lookups still take $O(\log N)$ expected time (Theorems 7 and 8). In the paper's simulation
+of $10^4$ nodes, the fraction of failed lookups after a mass failure was almost exactly the
+fraction of failed nodes: only keys whose node died were lost, and routing itself did not fail.
+
+The successor list is also where replicas go. An application can store a key's value on the $k$
+nodes that follow the key, as `nodesFor` does above, and Chord tells it when those successors
+change so it can copy the data again.
+
+### Load balance in Chord
+
+Chord's paper measured the imbalance from [One point per server is uneven](#one-point-per-server-is-uneven)
+on a real scale. With $10^4$ nodes and $5 \times 10^5$ keys, one node per point, the busiest
+node held 457 keys, 9.1 times the mean of 50, and the 99th percentile was 4.6 times the mean.
+Some nodes held no keys at all.
+
+With $r$ virtual nodes per real node ($10^4$ nodes, $10^6$ keys), the 99th percentile dropped
+from 4.8 to 1.6 times the mean as $r$ went from 1 to 20, and the 1st percentile rose from 0 to
+0.5 times the mean. The price is routing state: each real node now keeps $r$ finger tables.
+With $N = 10^6$ and $r = \log_2 N \approx 20$, that is about $\log^2 N \approx 400$ entries, which
+the authors considered acceptable.<Sidenote>Section 6.2. The base protocol in the paper leaves virtual nodes out for simplicity; Section 4.2 notes that 32 virtual nodes per physical node would balance load well if one assumes at most one Chord server per IPv4 address.</Sidenote>
+
+#### A C++ simulation
+
+The code below follows the paper's Figures 4 and 7 with the remote calls replaced by method calls
+on in-memory nodes, one `Node` per Chord node. `Ring` owns the nodes, joins them one at a time,
+and has a shortcut that sets every pointer to its stable value for the large experiment.
+
+```cpp
+#include <cstdint>
+#include <iostream>
+#include <iterator>
+#include <map>
+#include <memory>
+#include <random>
+#include <vector>
+
+// One Chord node. Remote calls in the paper (n'.find_successor(id)) are plain
+// method calls here; a real node would send an RPC to n' instead.
+struct Node {
+  uint64_t id;
+  int m;                       // identifier bits; the circle has 2^m points
+  Node* successor = this;
+  Node* predecessor = nullptr;
+  std::vector<Node*> finger;   // finger[i - 1] = successor(id + 2^(i-1))
+
+  Node(uint64_t id, int m) : id(id), m(m), finger(m, this) {}
+
+  uint64_t start(int i) const { return (id + (1ULL << (i - 1))) & ((1ULL << m) - 1); }
+
+  // x in the circular interval (a, b); with a == b, everything except a.
+  static bool inOpen(uint64_t x, uint64_t a, uint64_t b) {
+    return a < b ? a < x && x < b : x != a && (x > a || x < b);
+  }
+  static bool inHalf(uint64_t x, uint64_t a, uint64_t b) { return x == b || inOpen(x, a, b); }
+
+  // Figure 4 of the paper.
+  Node* findSuccessor(uint64_t key, int* hops = nullptr) {
+    return findPredecessor(key, hops)->successor;
+  }
+  Node* findPredecessor(uint64_t key, int* hops) {
+    Node* n = this;
+    if (hops) *hops = 0;
+    while (!inHalf(key, n->id, n->successor->id)) {
+      n = n->closestPrecedingFinger(key);
+      if (hops) ++*hops;
+    }
+    return n;
+  }
+  Node* closestPrecedingFinger(uint64_t key) {
+    for (int i = m; i >= 1; --i)
+      if (inOpen(finger[i - 1]->id, id, key)) return finger[i - 1];
+    return this;
+  }
+
+  // Figure 7 of the paper.
+  void join(Node* known) {
+    predecessor = nullptr;
+    successor = finger[0] = known->findSuccessor(id);
+  }
+  void stabilize() {
+    Node* x = successor->predecessor;
+    if (x && inOpen(x->id, id, successor->id)) successor = finger[0] = x;
+    successor->notify(this);
+  }
+  void notify(Node* n) {
+    if (!predecessor || inOpen(n->id, predecessor->id, id)) predecessor = n;
+  }
+  void fixFingers() {  // all entries at once, as in the paper's simulator
+    for (int i = 2; i <= m; ++i) finger[i - 1] = findSuccessor(start(i));
+  }
+};
+```
+
+The harness builds the ten-node example by real joins and stabilization, repeats the lookup and
+the N26 join from the figures, and then measures hops on large rings:
+
+```cpp
+// The nodes of one simulated network, by identifier.
+struct Ring {
+  int m;
+  std::map<uint64_t, std::unique_ptr<Node>> nodes;
+
+  Node* operator[](uint64_t id) { return nodes.at(id).get(); }
+  Node* add(uint64_t id) { return (nodes[id] = std::make_unique<Node>(id, m)).get(); }
+
+  // Each node joins through the first one; after every join, `rounds` of stabilize.
+  void joinAll(const std::vector<uint64_t>& ids, int rounds) {
+    for (uint64_t id : ids) {
+      Node* first = nodes.empty() ? nullptr : nodes.begin()->second.get();
+      Node* n = add(id);
+      if (first) n->join(first);
+      for (int r = 0; r < rounds; ++r)
+        for (auto& [_, x] : nodes) x->stabilize();
+    }
+    for (auto& [_, x] : nodes) x->fixFingers();
+  }
+
+  // Shortcut for large experiments: set every pointer directly to its stable value.
+  void buildStable(const std::vector<uint64_t>& ids) {
+    for (uint64_t id : ids) add(id);
+    Node* prev = std::prev(nodes.end())->second.get();
+    for (auto& [_, x] : nodes) {
+      x->predecessor = prev;
+      prev->successor = prev->finger[0] = x.get();
+      prev = x.get();
+    }
+    for (auto& [_, x] : nodes) x->fixFingers();
+  }
+};
+
+int main() {
+  // The ten-node example: m = 6, identifiers 0..63.
+  Ring ring{6, {}};
+  ring.joinAll({1, 8, 14, 21, 32, 38, 42, 48, 51, 56}, /*rounds=*/2);
+  Node* n8 = ring[8];
+  std::cout << "N8 fingers:";
+  for (int i = 1; i <= 6; ++i) std::cout << " " << n8->start(i) << "->N" << n8->finger[i - 1]->id;
+  std::cout << "\n";
+
+  int hops = 0;
+  Node* owner = n8->findSuccessor(54, &hops);
+  std::cout << "successor(54) from N8 = N" << owner->id << " in " << hops << " hops\n";
+
+  // N26 joins through N8; follow the pointers through two stabilize calls.
+  Node* n26 = ring.add(26);
+  n26->join(n8);
+  std::cout << "after join:     N26.succ=N" << n26->successor->id
+            << " N32.pred=N" << ring[32]->predecessor->id
+            << " N21.succ=N" << ring[21]->successor->id << "\n";
+  n26->stabilize();
+  std::cout << "after N26.stab: N32.pred=N" << ring[32]->predecessor->id << "\n";
+  ring[21]->stabilize();
+  std::cout << "after N21.stab: N21.succ=N" << ring[21]->successor->id
+            << " N26.pred=N" << n26->predecessor->id << "\n";
+
+  // Mean hops on N = 2^k random nodes in a 32-bit circle, 10,000 random lookups each.
+  std::mt19937_64 rng(1);
+  for (int k = 4; k <= 14; k += 2) {
+    std::map<uint64_t, bool> seen;
+    std::vector<uint64_t> ids;
+    while (ids.size() < (1u << k)) {
+      uint64_t id = rng() & 0xffffffffULL;
+      if (!seen[id]) seen[id] = true, ids.push_back(id);
+    }
+    Ring big{32, {}};
+    big.buildStable(ids);
+    double total = 0;
+    for (int q = 0; q < 10000; ++q) {
+      Node* from = big[ids[rng() % ids.size()]];
+      from->findSuccessor(rng() & 0xffffffffULL, &hops);
+      total += hops;
+    }
+    std::cout << "N = 2^" << k << ": mean hops " << total / 10000 << "\n";
+  }
+}
+```
+
+Output, compiled with `clang++ -std=c++17 -O2 -Wall -Wextra chord.cpp`:
+
+```text
+N8 fingers: 9->N14 10->N14 12->N14 16->N21 24->N32 40->N42
+successor(54) from N8 = N56 in 2 hops
+after join:     N26.succ=N32 N32.pred=N21 N21.succ=N32
+after N26.stab: N32.pred=N26
+after N21.stab: N21.succ=N26 N26.pred=N21
+N = 2^4: mean hops 1.7827
+N = 2^6: mean hops 2.9014
+N = 2^8: mean hops 3.9138
+N = 2^10: mean hops 4.8692
+N = 2^12: mean hops 5.8648
+N = 2^14: mean hops 6.8666
+```
+
+N8's fingers and the 2-hop lookup match the finger table and the figure above, and the three
+pointer lines match the three join steps. One difference from the pseudocode: `fixFingers`
+refreshes every finger at once rather than one random finger, as the paper's own simulator did.
+
+## Variants
+
+The ring is the classic design but not the only one. Each of these keeps the "only about $1/N$ of
+keys move" property and trades something else.
+
+### Jump consistent hash
+
+Lamping and Veach's **jump consistent hash** (Google, 2014) needs no ring and no memory at all. It
+maps a 64-bit key to a bucket in $[0, N)$:
+
+```cpp
+// Lamping & Veach, "A Fast, Minimal Memory, Consistent Hash Algorithm", Figure 1.
+int32_t JumpConsistentHash(uint64_t key, int32_t num_buckets) {
+  int64_t b = -1, j = 0;
+  while (j < num_buckets) {
+    b = j;
+    key = key * 2862933555777941757ULL + 1;
+    j = (b + 1) * (double(1LL << 31) / double((key >> 33) + 1));
+  }
+  return b;
+}
+```
+
+The loop simulates the key's history as buckets are added one at a time. When going from $j$ to
+$j+1$ buckets, a key jumps to the new bucket with probability $1/(j+1)$; the random generator
+skips straight to the next jump instead of testing every bucket, so the loop runs $O(\ln N)$
+times. The balance is near perfect without virtual nodes. In a test with $10^6$ keys, going from 4
+to 5 buckets moved 20.0% of keys, from 10 to 11 moved 9.10%, and every moved key went to
+the new bucket.
+
+The catch: buckets are numbers $0$ to $N-1$, and you can only add or remove the *last* one. That
+suits shards of a storage system, which are numbered and rarely removed, but not a cache cluster
+where any machine can fail.
+
+### Rendezvous hashing
+
+**Rendezvous hashing**, or highest random weight (HRW) hashing (Thaler and Ravishankar, 1998),
+scores every server for each key and picks the highest: the owner is the server $s$ that
+maximises $h(s, \text{key})$. Adding a server moves only the keys for which the new server scores
+highest, about $1/(N+1)$ of them. Removing one moves only its own keys, each to its runner-up.
+
+Balance is good without virtual nodes, since each key's winner is a fair draw among $N$ servers.
+Using `hash32` on `"server/key"` strings, 10 servers each held between 9,846 and 10,167 of 100,000
+keys, and going from 10 to 11 servers moved 9.2%. The cost is a lookup of $O(N)$ hashes instead
+of $O(\log NV)$, which is fine for tens of servers and slow for thousands.
+
+### Bounded loads
+
+Even with virtual nodes, a *popular key* can overload its server: balancing the number of keys
+does not balance the requests. **Consistent hashing with bounded loads** (Mirrokni, Thorup and
+Zadimoghaddam, 2018) gives every server a capacity of $\lceil (1 + \varepsilon) \cdot m / N \rceil$
+for $m$ keys (or active requests). A key walks clockwise from its position as usual, but skips
+servers that are full. With $\varepsilon = 0.25$, no server carries more than 125% of the
+average, and the paper shows that the number of keys that move on a change is still bounded,
+growing as $\varepsilon$ shrinks.
+
+## Summary
+
+- $h \bmod N$ moves a fraction $N/(N+1)$ of all keys when one server is added: 91% when going
+  from 10 to 11 servers.
+- On a **hash ring**, a key belongs to the first server point clockwise from its hash. Adding a
+  server moves only the keys in the arc it splits, and they all move to the new server.
+- One point per server gives arcs as uneven as the servers themselves are many: the busiest of 10
+  servers can hold 19 times the keys of the idlest. **Virtual nodes** shrink the spread to about
+  $1/\sqrt{V}$ of the fair share, and let a bigger server take more points.
+- The hash must spread similar names far apart; plain FNV-1a clumps virtual nodes, so mix its
+  output with a finalizer or use a stronger hash.
+- **Chord** runs the same ring when no node knows the full membership: $m$ fingers at
+  power-of-two distances route a lookup in about $\frac12 \log_2 N$ hops, and periodic
+  `stabilize` / `notify` calls link joining nodes in while lookups stay correct.
+- A sorted map and `lower_bound` are all the code a ring needs. Jump hash, rendezvous hashing and
+  bounded loads trade memory, lookup cost or flexibility for better balance.
+
+## References
+
+- D. Karger, E. Lehman, T. Leighton, R. Panigrahy, M. Levine, D. Lewin. *Consistent Hashing and
+  Random Trees: Distributed Caching Protocols for Relieving Hot Spots on the World Wide Web*.
+  STOC 1997.
+- I. Stoica, R. Morris, D. Karger, M. F. Kaashoek, H. Balakrishnan. *Chord: A Scalable
+  Peer-to-peer Lookup Service for Internet Applications*. SIGCOMM 2001.
+  [PDF](https://pdos.csail.mit.edu/papers/chord:sigcomm01/chord_sigcomm.pdf).
+- G. DeCandia et al. *Dynamo: Amazon's Highly Available Key-value Store*. SOSP 2007.
+- J. Lamping, E. Veach. *A Fast, Minimal Memory, Consistent Hash Algorithm*.
+  [arXiv:1406.2294](https://arxiv.org/abs/1406.2294), 2014.
+- D. Thaler, C. Ravishankar. *Using Name-Based Mappings to Increase Hit Rates*. IEEE/ACM
+  Transactions on Networking 6(1), 1998.
+- V. Mirrokni, M. Thorup, M. Zadimoghaddam. *Consistent Hashing with Bounded Loads*. SODA 2018.
+  [arXiv:1608.01350](https://arxiv.org/abs/1608.01350).

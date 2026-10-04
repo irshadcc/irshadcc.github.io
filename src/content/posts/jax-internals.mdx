@@ -49,6 +49,8 @@ This post follows one small loss function through JAX's source, in order:
 5. **Automatic differentiation**: forward mode with `JVPTrace`, then reverse mode as
    **linearize** followed by **transpose**, with the real values at every step, and how `grad`
    composes with `jit`.
+6. **Writing a primitive from scratch**: two new primitives with impl, shape, JVP, transpose and
+   lowering rules, used under `jit`, `grad` and `jvp`.
 
 If you know PyTorch's compiler stack, the closest parallels are [Torch FX](/blog/torch-fx-graph/)
 (graph capture) and [AOTAutograd](/blog/aot-autograd/) (tracing the backward ahead of time); the
@@ -263,6 +265,54 @@ another trace, `inline=JAX_EARLY` makes
 [`pjit_staging_rule`](https://github.com/jax-ml/jax/blob/32544801e26115ac1794926d027148abf3baf009/jax/_src/pjit.py#L1250)
 paste their equations into the outer jaxpr instead of leaving a nested `jit` call.</Sidenote>
 
+#### What `impl` actually is
+
+For most `lax` primitives, `impl` does not compute anything in Python either. They are created
+by
+[`standard_primitive`](https://github.com/jax-ml/jax/blob/32544801e26115ac1794926d027148abf3baf009/jax/_src/lax/utils.py#L47),
+which installs
+[`dispatch.apply_primitive`](https://github.com/jax-ml/jax/blob/32544801e26115ac1794926d027148abf3baf009/jax/_src/dispatch.py#L81)
+as the implementation:
+
+```python
+def apply_primitive(prim, *args, **params):
+    fun = xla_primitive_callable(prim, **params)
+    ...
+    outs = fun(*args)
+    ...
+    return outs
+
+@util.cache()
+def xla_primitive_callable(prim: core.Primitive, **params):
+    def prim_fun(*args):
+        with config.eager_constant_folding(False):
+            return prim.bind(*args, **params)
+    prim_fun.__name__ = prim.name
+    ...
+    return api.jit(prim_fun)
+```
+
+- `xla_primitive_callable` builds a one-line function that binds the primitive, and wraps it in
+  `jit`. `@util.cache()` memoizes it per primitive and parameters, so there is one jitted wrapper
+  per distinct `(tanh,)` or `(integer_pow, y=2)`.
+- Calling it traces `prim_fun`. Inside that trace, `prim.bind` reaches `DynamicJaxprTrace`, which
+  records a one-equation jaxpr. That jaxpr is lowered and compiled like any other.
+
+So eager JAX is "compile one primitive, cache it, run it". Turning on `jax_log_compiles` shows it:
+
+```python
+jax.config.update("jax_log_compiles", True)
+x = jnp.ones(3)   # Compiling jit(convert_element_type) ... and jit(broadcast_in_dim) ...
+jnp.tanh(x)       # Compiling jit(tanh) with global shapes and types (ShapedArray(float32[3]),)
+jnp.tanh(x)       # (nothing: cached)
+lax.tanh(x)       # Compiling jit(tanh) ...   <- the primitive's own impl, a different jit
+lax.tanh(x)       # (nothing: cached)
+```
+
+`jnp.ones` alone compiles two tiny programs. `jnp.tanh` and `lax.tanh` each compile once: the
+first is the `jnp` wrapper's `jit`, the second is `xla_primitive_callable`'s. Every later call
+with the same shape hits a cache in C++.
+
 ## Tracing into a jaxpr
 
 ### Reading the jaxpr
@@ -301,6 +351,132 @@ A jaxpr is in **A-normal form**: every intermediate has a name and every equatio
 primitive to variables or literals. It has no loops, no branches and no mutation; control flow is
 expressed with primitives like `cond`, `while` and `scan` whose parameters hold sub-jaxprs.
 
+#### The objects behind the text
+
+The printout is a view of four small classes in
+[`core.py`](https://github.com/jax-ml/jax/blob/32544801e26115ac1794926d027148abf3baf009/jax/_src/core.py#L100):
+
+```python
+class Var:                       # a variable: nothing but its type
+    __slots__ = ["aval"]
+
+class Literal:                   # an inline constant such as 3.0:f32[]
+    __slots__ = ["val", "aval"]
+
+class JaxprEqn:                  # one line of the jaxpr
+    __slots__ = ['invars', 'outvars', 'primitive', 'params', 'effects',
+                 'source_info', 'ctx']
+
+class Jaxpr:                     # the whole program
+    __slots__ = ["__weakref__", "_all_invars", "_outvars", "_eqns", "_effects",
+                 "_debug_info", "_is_high", "_consts"]
+```
+
+- A [`Var`](https://github.com/jax-ml/jax/blob/32544801e26115ac1794926d027148abf3baf009/jax/_src/core.py#L535)
+  stores only its abstract value. Its identity *is* the variable. The letters `a`, `b`, `c` do not
+  exist in memory; the pretty-printer invents them in order of appearance.
+- A [`Literal`](https://github.com/jax-ml/jax/blob/32544801e26115ac1794926d027148abf3baf009/jax/_src/core.py#L567)
+  carries a small constant directly. Large constants become `constvars` instead.
+- A [`JaxprEqn`](https://github.com/jax-ml/jax/blob/32544801e26115ac1794926d027148abf3baf009/jax/_src/core.py#L456)
+  holds input atoms (vars or literals), output vars, the primitive object, the parameter dict,
+  effects (for I/O and randomness ordering), and source information (file and line) used in error
+  messages and HLO metadata.
+- A `Jaxpr` holds inputs, equations and outputs. In 0.11.2 it also holds the values of its
+  constants (`_consts`, the first `constvars` of `_all_invars`); older versions kept those in a
+  separate `ClosedJaxpr`, and `make_jaxpr` now returns the `Jaxpr` itself.
+
+Poking at the object returned by `make_jaxpr(loss)(w, x, y)`:
+
+```python
+jaxpr = jax.make_jaxpr(loss)(w, x, y)
+eqn = jaxpr.eqns[0]
+eqn.primitive         # dot_general
+eqn.invars            # [Var(id=...):float32[3,2], Var(id=...):float32[2]]
+eqn.outvars           # [Var(id=...):float32[3]]
+eqn.params            # {'dimension_numbers': (((1,), (0,)), ((), ())), 'precision': None,
+                      #  'preferred_element_type': dtype('float32'), 'out_sharding': None}
+jaxpr.eqns[-1].invars # [Var(id=...):float32[], Literal(3.0)]
+```
+
+`params` holds more than the printout shows: the printer hides parameters that are `None`.
+
+#### A jaxpr interpreter
+
+Running a jaxpr is a loop over its equations. Here is
+[`core.eval_jaxpr`](https://github.com/jax-ml/jax/blob/32544801e26115ac1794926d027148abf3baf009/jax/_src/core.py#L803),
+lightly trimmed:
+
+```python
+def eval_jaxpr(jaxpr: Jaxpr, consts, *args, propagate_source_info=True) -> list[Any]:
+    def read(v: Atom) -> Any:
+        return v.val if isinstance(v, Literal) else env[v]
+
+    def write(v: Var, val: Any) -> None:
+        env[v] = val
+
+    env: dict[Var, Any] = {}
+    foreach(write, jaxpr.all_invars, [*consts, *args])
+    lu = last_used(jaxpr)
+    for eqn in jaxpr.eqns:
+        bind_params = eqn.primitive.get_bind_params(eqn.params)
+        ...
+        ans = eqn.primitive.bind(*map(read, eqn.invars), **bind_params)
+        if eqn.primitive.multiple_results:
+            foreach(write, eqn.outvars, ans)
+        else:
+            write(eqn.outvars[0], ans)
+        clean_up_dead_vars(eqn, env, lu)
+    return map(read, jaxpr.outvars)
+```
+
+- `env` maps each `Var` object to its current value. Because a `Var`'s identity is the variable,
+  the dict is keyed by the objects themselves.
+- Constants and inputs are written first, then each equation reads its inputs, calls
+  `primitive.bind` and writes its outputs.
+- `last_used` and `clean_up_dead_vars` delete a value from `env` after its last use, so memory is
+  freed as early as Python allows.
+
+The key line is `eqn.primitive.bind(...)`. The interpreter does not compute anything; it
+re-binds each primitive, and **the current trace decides what that means**. Run it at top level
+and you get numbers; run it under a trace and you get that trace's behaviour. Here is the same
+loop as a 12-line function that also prints each step:
+
+```python
+from jax.extend import core as jcore
+
+def run(jaxpr, consts, *args):
+    env = {}
+    read = lambda v: v.val if isinstance(v, jcore.Literal) else env[v]
+    for v, a in zip(jaxpr.constvars, consts): env[v] = a
+    for v, a in zip(jaxpr.invars, args): env[v] = a
+    for e in jaxpr.eqns:
+        outs = e.primitive.bind(*map(read, e.invars), **e.params)
+        outs = outs if e.primitive.multiple_results else [outs]
+        for v, o in zip(e.outvars, outs): env[v] = o
+        print(f"{e.primitive.name:12s} -> {outs[0]}")
+    return [read(v) for v in jaxpr.outvars]
+```
+
+Called with arrays, it evaluates the loss (the values are the ones we computed by hand):
+
+```text
+dot_general  -> [-0.3        -0.5        -0.70000005]
+tanh         -> [-0.2913126  -0.46211717 -0.6043678 ]
+sub          -> [-0.2913126 -1.4621172 -0.6043678]
+integer_pow  -> [0.08486304 2.1377866  0.36526042]
+reduce_sum   -> 2.5879099369049072
+div          -> 0.8626366257667542
+```
+
+Called under `jax.make_jaxpr(lambda w: run(jaxpr, jaxpr.consts, w, x, y)[0])(w)`, the same loop
+prints `JitTracer(float32[3])` at every step and produces the original jaxpr again (with `x` and
+`y` now captured as constants). This is how transformations handle a jaxpr they receive: evaluate
+it with their own tracers and trace the result. For example, when `grad` meets a `jit` equation,
+[`ad.jvp_jaxpr`](https://github.com/jax-ml/jax/blob/32544801e26115ac1794926d027148abf3baf009/jax/_src/interpreters/ad.py#L1059)
+calls `jvp(core.jaxpr_as_fun(jaxpr), ...)` inside `pe.trace_to_jaxpr`. `jaxpr_as_fun` wraps
+`eval_jaxpr`, so the inner jaxpr is replayed under `JVPTrace` and the replay is recorded as a new
+jaxpr.
+
 ### Tracing step by step
 
 Step through the figure to watch the jaxpr being built. The top listing highlights the Python
@@ -313,6 +489,53 @@ Notice step 2: `x @ w` runs through four layers of Python (`Tracer.__matmul__`, 
 `lax.dot_general`, `lax.dot`) before reaching `dot_general_p.bind`. Only the last one matters to
 the jaxpr. And in step 5, `jnp.mean` binds a `convert_element_type` that leaves no equation at
 all, because its input is a constant; JAX folds it while tracing.
+
+#### From `x @ w` to `bind`
+
+Here is the Python call stack at the moment `dot_general` is recorded, captured by wrapping
+`DynamicJaxprTrace.default_process_primitive` while `make_jaxpr(loss)` ran (paths relative to
+`jax/_src`, source lines shortened; the `make_jaxpr` frames above `loss` and a few wrapper frames are omitted):
+
+```text
+model.py:7                  loss               err = predict(w, x) - y
+model.py:4                  predict            return jnp.tanh(x @ w)
+numpy/array_methods.py:1532 op                 getattr(self.aval, "_matmul")(...)
+numpy/array_methods.py:880  _operator_matmul   tensor_contractions.matmul(...)
+pjit.py:264                 cache_miss         _infer_params(...)
+pjit.py:550                 _trace_for_jit     pe.trace_to_jaxpr(...)
+partial_eval.py:2093        trace_to_jaxpr_..  fun(*args, **kwargs)
+tensor_contractions.py:273  matmul             lax.dot_general(...)
+lax/lax.py:2569             dot_general        dot(lhs, rhs, ...)
+lax/lax.py:2652             dot                dot_general_p.bind(lhs, rhs, ...)
+core.py:731                 bind               self.bind_with_trace(...)
+core.py:739                 bind_with_trace    trace.process_primitive(...)
+partial_eval.py:1747        process_primitive  self.default_process_primitive(...)
+```
+
+Reading from the top:
+
+- **Operator forwarding.** `Tracer` has no hand-written `__matmul__`. At import time,
+  [`_set_tracer_aval_forwarding`](https://github.com/jax-ml/jax/blob/32544801e26115ac1794926d027148abf3baf009/jax/_src/numpy/array_methods.py#L1546)
+  installs one for every operator, each built by `_forward_operator_to_aval`:
+
+  ```python
+  def _forward_operator_to_aval(name):
+      def op(self, *args):
+          return getattr(self.aval, f"_{name}")(self, *args)
+      return op
+  ```
+
+  So `tracer @ w` becomes `tracer.aval._matmul(tracer, w)`. The aval (a `ShapedArray`) was given
+  `_matmul = _operator_matmul` by `_set_shaped_array_attributes`. Dispatching through the aval
+  lets different kinds of abstract value (arrays, refs, keys) define operators differently.
+- **A nested `jit`.** `jnp.matmul` is decorated with `jit(inline=JAX_EARLY)`, so a whole
+  `jit` cache miss happens *inside* our trace: `matmul` is traced into its own small jaxpr, which
+  is then inlined into ours by `pjit_staging_rule`. The stack shows the inner trace, which is why
+  `trace_to_jaxpr_nocache` appears below `matmul`'s caller.
+- **`lax` is the boundary.** `jnp.matmul` handles NumPy's broadcasting and rank rules and calls
+  `lax.dot_general`, whose arguments are already explicit: contracting and batch dimensions. That
+  calls `dot_general_p.bind`, and from there on it is the generic path: `bind`, the current trace,
+  `process_primitive`.
 
 ### Inside DynamicJaxprTrace
 
@@ -368,6 +591,57 @@ def default_process_primitive(self, primitive, tracers, params, source_info=None
   to those vars, and output tracers that point at the new vars.
 - `add_eqn` appends the equation to the frame. The returned tracer goes back to Python, which
   uses it as the result of `x @ w`.
+
+#### Shape rules
+
+The `_cached_abstract_eval` call above is where a primitive's **abstract evaluation rule** runs.
+For the `lax` primitives, that rule is assembled by
+[`standard_primitive`](https://github.com/jax-ml/jax/blob/32544801e26115ac1794926d027148abf3baf009/jax/_src/lax/utils.py#L47)
+from separate small rules:
+
+```python
+def standard_primitive(shape_rule, dtype_rule, name, weak_type_rule=None,
+                       sharding_rule=None, vma_rule=None, ur_rule=None,
+                       memory_space_rule=None, layout_rule=None):
+    weak_type_rule = weak_type_rule or _standard_weak_type_rule
+    prim = core.Primitive(name)
+    prim.def_impl(partial(dispatch.apply_primitive, prim))
+    prim.def_abstract_eval(
+        partial(standard_abstract_eval, prim, shape_rule, dtype_rule,
+                weak_type_rule, sharding_rule, vma_rule, ur_rule,
+                memory_space_rule, layout_rule))
+    return prim
+```
+
+[`standard_abstract_eval`](https://github.com/jax-ml/jax/blob/32544801e26115ac1794926d027148abf3baf009/jax/_src/lax/utils.py#L200)
+checks that every input is a `ShapedArray`, calls the shape, dtype and sharding rules, and builds
+the output `ShapedArray`. Each rule is a plain function of avals and parameters. For elementwise
+ops,
+[`unop`](https://github.com/jax-ml/jax/blob/32544801e26115ac1794926d027148abf3baf009/jax/_src/lax/lax.py#L4320)
+uses `_attrgetter('shape')`: the output shape is the input's shape. For `dot_general`, the shape
+rule first validates the dimension numbers (in range, distinct, batch dimensions equal) and then
+computes the result in
+[`_dot_general_shape_computation`](https://github.com/jax-ml/jax/blob/32544801e26115ac1794926d027148abf3baf009/jax/_src/lax/lax.py#L5838):
+
+```python
+def _dot_general_shape_computation(lhs_shape, rhs_shape, dimension_numbers):
+    (lhs_contracting, rhs_contracting), (lhs_batch, rhs_batch) = ...
+    batch_shape = tuple(lhs_shape[i] for i in lhs_batch)
+    lhs_contract_or_batch = tuple(sorted(tuple(lhs_contracting) + tuple(lhs_batch)))
+    lhs_tensored_shape = tuple_delete(lhs_shape, lhs_contract_or_batch)
+    ...
+    rhs_tensored_shape = tuple_delete(rhs_shape, rhs_contract_or_batch_or_group)
+    return batch_shape + lhs_tensored_shape + rhs_tensored_shape
+```
+
+For `x @ w`: no batch dimensions; `lhs_shape = (3, 2)` minus contracting dim 1 leaves `(3,)`;
+`rhs_shape = (2,)` minus contracting dim 0 leaves `()`. The result is `() + (3,) + () = (3,)`,
+the `f32[3]` on equation `d`. A shape error in your program (say, `x @ x`) is raised right
+here, while tracing, before anything is compiled.
+
+[`_cached_abstract_eval`](https://github.com/jax-ml/jax/blob/32544801e26115ac1794926d027148abf3baf009/jax/_src/interpreters/partial_eval.py#L1577)
+is the same call wrapped in `multi_weakref_lru_cache`, keyed on the primitive, the avals and the parameters. A
+model that applies the same layer 100 times runs each shape rule once.
 
 ### What tracing cannot see
 
@@ -451,6 +725,47 @@ print(lowered.as_text())                  # StableHLO
 print(compiled.as_text())                 # optimized HLO
 ```
 
+#### Four caches
+
+A call to a jitted function can stop at any of four caches. From fastest to slowest:
+
+| Cache | Where | Key | Saves |
+| --- | --- | --- | --- |
+| C++ dispatch cache | `_jax.pjit` object from `_cpp_pjit` | argument signature: pytree structure, static args, shapes, dtypes, weak types, shardings | everything: the call goes straight to the executable |
+| trace cache | [`_infer_params_cached`](https://github.com/jax-ml/jax/blob/32544801e26115ac1794926d027148abf3baf009/jax/_src/pjit.py#L607) | `fun`, jit options, argument signature, input avals, mesh | tracing |
+| lowering cache | [`_pjit_lower`](https://github.com/jax-ml/jax/blob/32544801e26115ac1794926d027148abf3baf009/jax/_src/pjit.py#L1224) (`weakref_lru_cache`) | the jaxpr object, shardings, layouts, donation | building StableHLO |
+| compilation cache | [`compile_or_get_cached`](https://github.com/jax-ml/jax/blob/32544801e26115ac1794926d027148abf3baf009/jax/_src/compiler.py#L429) | a hash of the module, compile options and backend | XLA compilation, across processes if a cache directory is set |
+
+The trace cache is filled in
+[`_infer_params`](https://github.com/jax-ml/jax/blob/32544801e26115ac1794926d027148abf3baf009/jax/_src/pjit.py#L629):
+
+```python
+arg_signature, dynargs = jax_jit.parse_arguments(
+    args, tuple(kwargs.values()), tuple(kwargs.keys()), ji.static_argnums,
+    ji.static_argnames, tree_util.tracing_registry)
+avals = _infer_input_type(fun, dbg_fn, dynargs)
+entry = _infer_params_cached(fun, ji, arg_signature, avals, ctx_mesh)
+if entry.pjit_params is not None:
+    return entry.pjit_params, entry.pjit_params.consts + dynargs
+p = _trace_for_jit(fun, ji, ctx_mesh, dbg_fn(), avals, args, kwargs)
+entry.pjit_params = p
+```
+
+- `parse_arguments` (C++) flattens the arguments as a **pytree**: lists, tuples, dicts and
+  registered classes become a tree structure plus a flat list of leaves (`dynargs`). Static
+  arguments are pulled out and become part of the signature *by value*, which is why they must be
+  hashable.
+- [`_infer_input_type`](https://github.com/jax-ml/jax/blob/32544801e26115ac1794926d027148abf3baf009/jax/_src/pjit.py#L651)
+  calls `core.shaped_abstractify` on each leaf: an array becomes its `ShapedArray`, a Python float
+  becomes a weakly typed `f32[]`. The error "a jit-wrapped function was called with a non-array
+  argument" comes from here.
+- `_infer_params_cached` returns a cache entry. If it already holds a traced jaxpr, tracing is
+  skipped; otherwise `_trace_for_jit` runs `trace_to_jaxpr` and stores the result.
+
+The C++ cache sits in front of all this and is why a cached call costs microseconds: the
+signature is computed in C++, the arrays' device buffers are handed to the executable, and no
+Python frame runs.
+
 ### Lowering rules
 
 Lowering walks the jaxpr once, in order, and asks each primitive for its StableHLO.
@@ -482,6 +797,93 @@ def _integer_pow_lowering(ctx, x, *, y):
 
 Because `y` is a parameter, the rule chooses the code at compile time: our `err ** 2` becomes a
 single multiply.
+
+#### Building the module
+
+[`lower_jaxpr_to_module`](https://github.com/jax-ml/jax/blob/32544801e26115ac1794926d027148abf3baf009/jax/_src/interpreters/mlir.py#L1374)
+creates an MLIR context and an empty module, names it, and lowers the jaxpr into its `main`:
+
+```python
+with ctx.context, ir.Location.unknown(ctx.context):
+    attrs = ctx.module.operation.attributes
+    attrs["sym_name"] = ir.StringAttr.get(sanitize_name(module_name).rstrip("_"))
+    attrs["mhlo.num_replicas"] = i32_attr(1)
+    attrs["mhlo.num_partitions"] = i32_attr(num_partitions)
+    lower_jaxpr_to_fun(ctx, module_name, jaxpr, ordered_effects, ...,
+                       main_function=True, in_avals=in_avals, out_avals=out_avals,
+                       arg_shardings=arg_shardings, result_shardings=result_shardings, ...)
+...
+if not ctx.module.operation.verify():
+    raise ValueError("Cannot lower jaxpr with verifier errors. " + ...)
+```
+
+These are the attributes on the first line of the StableHLO listing below:
+`module @jit_loss attributes {mhlo.num_partitions = 1 : i32, mhlo.num_replicas = 1 : i32}`.
+`lower_jaxpr_to_fun` creates `func.func public @main` with one argument per jaxpr input, typed by
+`_aval_to_ir_types` (`f32[3,2]` becomes `tensor<3x2xf32>`), marks it `public` (helper functions
+are `private`), attaches sharding annotations, and calls
+`jaxpr_subcomp` to fill the body. MLIR's verifier then checks the module, so a lowering rule that
+emits ill-typed IR fails here rather than inside XLA.
+
+Two lowering rules from our example. Elementwise primitives share
+[`_nary_lower_hlo`](https://github.com/jax-ml/jax/blob/32544801e26115ac1794926d027148abf3baf009/jax/_src/lax/lax.py#L4513):
+
+```python
+def _nary_lower_hlo(op: Callable, ctx, *args: ir.Value, accuracy=None, **params):
+    out_dtype = params.pop('out_dtype', None)
+    del params
+    avals_in, (aval_out,) = ctx.avals_in, ctx.avals_out
+    args = tuple(mlir.multi_broadcast_in_dim(ctx, args, avals_in, aval_out.shape,
+                                             aval_out.sharding))
+    if out_dtype is not None:
+        ir_type = mlir.aval_to_ir_type(ctx.module_context, aval_out)
+        args = tuple(hlo.convert(ir_type, a) for a in args)
+    out = op(*args)
+    ...
+    return [mlir.lower_with_sharding_in_types(ctx, out, aval_out)]
+```
+
+- `op` is the StableHLO builder, bound at registration: `hlo.tanh` for `tanh_p`, `hlo.subtract`
+  for `sub_p`, `hlo.multiply` for `mul_p`.
+- `ctx.avals_in` and `ctx.avals_out` are the jaxpr types of the equation, so a rule never has to
+  re-derive shapes.
+- `multi_broadcast_in_dim` broadcasts scalar operands to the output shape. This is where
+  `mul 2.0:f32[] j` (a scalar times a vector) gets its `stablehlo.broadcast_in_dim`, visible in the
+  `jit(grad(loss))` listing further down.
+
+The [`dot_general` rule](https://github.com/jax-ml/jax/blob/32544801e26115ac1794926d027148abf3baf009/jax/_src/lax/lax.py#L6354)
+translates the dimension numbers one-to-one:
+
+```python
+def _dot_general_lower(ctx, lhs, rhs, *, dimension_numbers, precision,
+                       preferred_element_type, out_sharding, platform="default"):
+    lhs, rhs, accumulation_aval, algorithm_kwarg = _handle_dot_precision(ctx, lhs, rhs, precision, platform)
+    (lhs_contracting, rhs_contracting), (lhs_batch, rhs_batch) = dimension_numbers
+    dot_dnums = hlo.DotDimensionNumbers.get(
+        lhs_batching_dimensions=list(lhs_batch), rhs_batching_dimensions=list(rhs_batch),
+        lhs_contracting_dimensions=list(lhs_contracting),
+        rhs_contracting_dimensions=list(rhs_contracting))
+    acc_type = mlir.aval_to_ir_type(ctx.module_context, accumulation_aval)
+    result = hlo.dot_general(acc_type, lhs, rhs, dot_dnums,
+                             precision_config=precision_attr(precision), **algorithm_kwarg)
+    ...
+    if accumulation_aval.dtype != aval_out.dtype:
+        result = mlir.convert_hlo(ctx, result, accumulation_aval, aval_out)
+    return [result]
+```
+
+The jaxpr parameter `dimension_numbers=(([1], [0]), ([], []))` becomes
+`contracting_dims = [1] x [0]` in the StableHLO, and `precision=None` becomes
+`precision = [DEFAULT, DEFAULT]`. If the accumulation type differs from the output type (for
+example bf16 inputs accumulated in f32), a `convert` is added after the dot.
+
+**The lowering cache.** `jaxpr_subcomp` does not call rules directly. For each equation it builds
+a `LoweringCacheKey` from the primitive, input avals, parameters and platforms. On a miss,
+[`_cached_lowering_miss`](https://github.com/jax-ml/jax/blob/32544801e26115ac1794926d027148abf3baf009/jax/_src/interpreters/mlir.py#L2330)
+runs the rule into a small MLIR function and stores it; on a hit the stored function is reused.
+Most rules are marked `inline`, so the function body is pasted at the call site and the listing
+shows plain ops. A rule registered with `inline=False` stays an out-of-line `func.call`, so a
+model that uses an expensive-to-lower op 100 times lowers it once.
 
 ### StableHLO and XLA
 
@@ -553,7 +955,8 @@ def process_primitive(self, primitive, tracers, params, /):
         return primitive.bind_with_trace(self.parent_trace, primals_in, avals, params)
     jvp = primitive_jvps.get(primitive)
     if not jvp:
-        raise NotImplementedError(f"Differentiation rule for '{primitive}' not implemented")
+        msg = f"Differentiation rule for '{primitive}' not implemented"
+        raise NotImplementedError(msg)
     with core.set_current_trace(self.parent_trace):
         primal_out, tangent_out = jvp(primals_in, tangents_in, **params)
     ...
@@ -598,6 +1001,46 @@ The tangent of the loss, $-3.7562$, equals the first entry of the gradient: the 
 $[1, 0]$ is $\partial L / \partial w_0$. To get $\partial L / \partial w_1$ we would need a
 second pass with $t = [0, 1]$. `jax.jacfwd` does exactly this, one JVP per input direction
 (batched with `vmap`).
+
+#### Symbolic zeros
+
+Most values in a program have no derivative with respect to the inputs you care about: the data
+`x`, the labels `y`, integer indices, constants. JAX represents their tangents with
+[`Zero`](https://github.com/jax-ml/jax/blob/32544801e26115ac1794926d027148abf3baf009/jax/_src/ad_util.py#L76):
+
+```python
+class Zero:
+    __slots__ = ['aval']
+    def __init__(self, aval: core.AbstractValue):
+        self.aval = aval
+    def instantiate(self):
+        return zeros_like_aval(self.aval)
+
+def p2tz(primal_value):              # "primal to tangent zero"
+    return Zero(typeof(primal_value).to_tangent_aval())
+```
+
+A `Zero` knows its type but holds no data. Rules check for it explicitly, as `standard_jvp` does
+with `type(t) is not Zero`, and skip the work:
+
+```python
+def add_tangents(x, y):
+    if type(x) is Zero:
+        return y
+    elif type(y) is Zero:
+        return x
+    else:
+        return add_jaxvals(x, y)
+```
+
+That is why the JVP jaxpr has no equations for the tangents of `x` and `y`: `dot_general`'s rule
+got `Zero` for `x` and produced one product, not two, and `sub`'s rule passed `ė` through
+because `y`'s tangent was `Zero`. Only when a real array is required (a function output, or a
+primitive with no zero-aware rule) does
+[`instantiate_zeros`](https://github.com/jax-ml/jax/blob/32544801e26115ac1794926d027148abf3baf009/jax/_src/interpreters/ad.py#L1040)
+turn a `Zero` into an actual array of zeros. `to_tangent_aval` also changes the dtype where
+needed: an integer input gets a tangent of dtype `float0`, a zero-size type that cannot hold a
+value at all.
 
 ### Reverse mode: linearize, then transpose
 
@@ -652,6 +1095,66 @@ jaxpr, out_consts, _ = pe.tracers_to_jaxpr(in_tracers, out_nz_tracers, ...)
 - `tracers_to_jaxpr` turns the recorded operations into a small jaxpr from tangents to output
   tangents. Known values that it uses become its constants: the residuals.
 
+#### Partial evaluation, inside
+
+The trace that does the splitting is
+[`JaxprTrace`](https://github.com/jax-ml/jax/blob/32544801e26115ac1794926d027148abf3baf009/jax/_src/interpreters/partial_eval.py#L114)
+(not to be confused with `DynamicJaxprTrace`). Its tracers hold a
+[`PartialVal`](https://github.com/jax-ml/jax/blob/32544801e26115ac1794926d027148abf3baf009/jax/_src/interpreters/partial_eval.py#L67),
+which is either a known value or an unknown abstract value:
+
+```python
+class PartialVal(tuple):
+    @classmethod
+    def known(cls, const):          return PartialVal((None, const))
+    @classmethod
+    def unknown(cls, aval):         return PartialVal((aval, None))
+    def is_known(self):             return self[0] is None
+    def get_known(self):            return self[1] if self[0] is None else None
+```
+
+and a **recipe** saying how the value came to be:
+
+| Recipe | Meaning | Becomes, in the extracted jaxpr |
+| --- | --- | --- |
+| `LambdaBinding()` | an unknown input (a tangent) | an input variable |
+| `JaxprEqnRecipe(...)` | the output of a recorded equation | an equation |
+| `ConstVar(val)` | a known value used by an unknown equation | a constant: **a residual** |
+| `Literal(val, aval)` | a small known scalar | an inline literal |
+| `None` | a known value, never used by unknown work | nothing |
+
+The rule that matters is in `JaxprTrace.default_process_primitive` (linked above):
+if every input is known, bind on the parent trace and return a known result. Otherwise, before
+recording the equation, each input goes through
+[`instantiate_const`](https://github.com/jax-ml/jax/blob/32544801e26115ac1794926d027148abf3baf009/jax/_src/interpreters/partial_eval.py#L160):
+
+```python
+def instantiate_const(self, tracer: JaxprTracer) -> JaxprTracer:
+    const = tracer.pval.get_known()
+    if const is None:
+        return tracer
+    else:
+        if core.is_literalable(const, True):
+            return self.new_instantiated_literal(const)
+        else:
+            return self.new_instantiated_const(const)
+```
+
+This is the exact moment a residual is born. In tanh's JVP rule, `one_minus_square(ans)` has
+only known inputs, so it is computed on the spot and its result is known. Then
+`mul(g, one_minus_square(ans))` has one unknown input (the tangent `g`), so it must be recorded,
+and its known input `[0.9151, 0.7864, 0.6347]` is wrapped as a `ConstVar`.
+
+At the end,
+[`tracers_to_jaxpr`](https://github.com/jax-ml/jax/blob/32544801e26115ac1794926d027148abf3baf009/jax/_src/interpreters/partial_eval.py#L545)
+walks backwards from the output tracers, collects every reachable tracer, sorts the recipes by
+creation order and emits equations; every `ConstVar` it meets becomes a constvar, with its value
+in the returned constants. Work that no output depends on is never reached, so it never enters the
+linear jaxpr: dead-code elimination comes for free. For each primitive, `linearize_from_jvp` runs
+this once and wraps the small jaxpr in a `linearized` function, which `LinearizeTrace` then
+replays on the tangent trace. That replay is what builds the full linear jaxpr in the figure
+below, with the residuals as its constants.
+
 Step through it on our loss. Watch the table: primal values are computed as we go, and three
 residuals appear.
 
@@ -675,7 +1178,7 @@ output, it returns the cotangents of its linear inputs. For our five equations:
 | `f = mul e b` | $\bar e = \bar f \odot b$ | same |
 | `e = dot_general a d` | $\bar d = \bar e^\top a$ | [`_dot_general_transpose_rhs`](https://github.com/jax-ml/jax/blob/32544801e26115ac1794926d027148abf3baf009/jax/_src/lax/lax.py#L6023) |
 
-The bar marks a cotangent: $\bar v = \partial L / \partial v$. The driver is
+The bar marks a cotangent: $\bar v = \partial L / \partial v$. The figure below writes $\bar v$ as `ct_v`. The driver is
 [`backward_pass3`](https://github.com/jax-ml/jax/blob/32544801e26115ac1794926d027148abf3baf009/jax/_src/interpreters/ad.py#L299):
 
 ```python
@@ -721,6 +1224,45 @@ entry matches the JVP along $[1, 0]$. Check the second by hand: $\bar e = [-0.17
 -0.2557]$ and the second column of $X$ is $[2, 4, 6]$, so $\bar w_1 = -0.1777 \cdot 2 - 0.7666
 \cdot 4 - 0.2557 \cdot 6 = -4.9563$ (to rounding).
 
+#### Accumulators and fan-out
+
+The accumulator classes are small (shape checks trimmed):
+
+```python
+class ValAccum(GradAccum):
+    def __init__(self, aval, val=None):
+        self.aval = aval
+        self.val = Zero(aval) if val is None else val
+
+    def accum(self, x):
+        if x is not None:
+            self.val = add_tangents(self.val, x)
+
+    def freeze(self):
+        return self.val
+```
+
+Each variable's accumulator starts as a symbolic `Zero`. Every transpose rule that produces a
+cotangent for it calls `accum`, which adds with `add_tangents`, so the first contribution costs
+nothing and later ones are summed. `freeze` is called once, when the backward walk reaches the
+equation that *defined* the variable; by then every use (which comes later in the forward
+order, so earlier in the backward walk) has contributed.
+
+This is how **fan-out** is handled: when a value is used twice, its cotangent is the sum of
+both uses. With `f(w) = sin(w) * w`, `w` reaches the output by two paths, and the VJP jaxpr ends
+in an `add_any`, the primitive that `add_jaxvals` binds:
+
+```text
+{ lambda a:f32[2] b:f32[2] c:f32[2]; d:f32[2]. let
+    e:f32[2] = mul a d          # cotangent through the "* w" factor:   ct · sin(w)
+    f:f32[2] = mul d b          # cotangent through sin(w): ct · w ...
+    g:f32[2] = mul f c          #                          ... · cos(w)
+    h:f32[2] = add_any e g      # both contributions to w, summed by accum
+  in (h,) }
+```
+
+At `w = [0.5, 1.0]` it returns `[0.9182, 1.3818]`, equal to `cos(w)·w + sin(w)`.
+
 ### How grad puts it together
 
 `jax.grad` is a thin layer over `vjp`. Its inner function,
@@ -763,6 +1305,47 @@ Three things to notice:
   XLA folded $2 \cdot \frac{1}{3}$ into the constant `0.666666687`. The $1 - e^2$ is computed as
   $(1 + e)(1 - e)$ because that is how `one_minus_square` lowers, for accuracy near $|e| = 1$.
 
+#### What a VJP function holds
+
+The object `vjp` returns is a small dataclass,
+[`VJP`](https://github.com/jax-ml/jax/blob/32544801e26115ac1794926d027148abf3baf009/jax/_src/api.py#L2014):
+
+```python
+class VJP:
+    fun: Callable                # partial(_vjp3_callable, spec, ..., jaxpr, ...)
+    in_tree: PyTreeDef
+    out_tree: PyTreeDef
+    args_res: list[Any]          # residuals that are the inputs themselves
+    opaque_residuals: list[Any]  # every other residual
+    structured_residuals: list[Any]
+```
+
+When `vjp` builds it, it checks each residual's identity against the inputs:
+
+```python
+id_map = {id(x): i for i, x in enumerate(primals_ft)}
+used, opaque_residuals = set(), []
+spec = [used.add(id(r)) or RSpec(id_map[id(r)], True) if id(r) in id_map else
+        RSpec(opaque_residuals.append(r) or (len(opaque_residuals) - 1), False)
+        for r in residuals]
+```
+
+A residual that is the very same array as an input is recorded as "input number i"
+(`RSpec(i, True)`) instead of being stored again. For `sin(w) * w`:
+
+```python
+out, f_vjp = jax.vjp(lambda w: jnp.sin(w) * w, w)
+f_vjp.args_res          # [w]:       [Array([0.5, 1.])]
+f_vjp.opaque_residuals  # [cos(w), sin(w)]:
+                        #   [Array([0.8776, 0.5403]), Array([0.4794, 0.8415])]
+```
+
+The VJP function is therefore a closure over exactly the memory the backward pass needs: the
+linear jaxpr, the input `w` and two computed arrays. This is the JAX equivalent of PyTorch's
+saved tensors, and it is why calling `f_vjp` later does not rerun the forward pass. The
+`saveable_args` option of `jax.vjp` lets a caller drop the `args_res` references and pass them back
+in later, to avoid keeping inputs alive.
+
 ### Composing transformations
 
 Because each transformation is a trace and each rule binds primitives on the trace below,
@@ -784,6 +1367,174 @@ The same holds for `jit` inside other transformations. When `grad` meets a `jit`
 transforms the inner jaxpr with `ad.jvp_jaxpr` and binds a new `jit` on the result, so the
 differentiated function stays a single compiled unit.
 
+## Writing a primitive from scratch
+
+Everything above can be tested in one exercise: define new primitives and give them each rule in
+turn. We will add two: `cube(x) = x³`, which is non-linear, and `scale(x, c) = c·x`, which is
+linear and so needs a transpose rule. The code below ran on JAX 0.11.2 and every output shown is
+real.<Sidenote>`Primitive`, `ad` and `mlir` are public (`jax.extend.core`, `jax.interpreters`).
+The StableHLO op builders are not exposed under `jax.extend` in this version, so the lowering
+rules import `hlo` from `jax._src.lib.mlir.dialects`, the module JAX's own rules use. For
+production code, `jax.custom_jvp`, `jax.custom_vjp` and `jax.ffi` are the supported routes.</Sidenote>
+
+```python
+import numpy as np
+import jax, jax.numpy as jnp
+from jax.extend.core import Primitive
+from jax.interpreters import ad, mlir
+from jax._src.lib.mlir.dialects import hlo
+
+# ---- cube(x) = x ** 3: non-linear ----
+cube_p = Primitive("cube")
+
+def cube(x):
+    return cube_p.bind(x)
+
+@cube_p.def_impl
+def _cube_impl(x):
+    return np.asarray(x) ** 3
+
+@cube_p.def_abstract_eval
+def _cube_abstract_eval(x_aval):
+    return jax.core.ShapedArray(x_aval.shape, x_aval.dtype)
+
+def _cube_jvp(primals, tangents):
+    (x,), (t,) = primals, tangents
+    return cube(x), scale(t * x * x, 3.0)
+
+ad.primitive_jvps[cube_p] = _cube_jvp
+
+def _cube_lowering(ctx, x):
+    return [hlo.multiply(hlo.multiply(x, x), x)]
+
+mlir.register_lowering(cube_p, _cube_lowering)
+
+# ---- scale(x, c) = c * x: linear ----
+scale_p = Primitive("scale")
+
+def scale(x, c):
+    return scale_p.bind(x, c=c)
+
+@scale_p.def_impl
+def _scale_impl(x, *, c):
+    return np.asarray(x) * np.float32(c)
+
+@scale_p.def_abstract_eval
+def _scale_abstract_eval(x_aval, *, c):
+    return jax.core.ShapedArray(x_aval.shape, x_aval.dtype)
+
+def _scale_transpose(ct, x, *, c):
+    assert ad.is_undefined_primal(x)
+    return [scale(ct, c)]
+
+ad.deflinear2(scale_p, _scale_transpose)
+
+def _scale_lowering(ctx, x, *, c):
+    aval_out, = ctx.avals_out
+    c_ir = mlir.ir_constant(np.full(aval_out.shape, c, aval_out.dtype))
+    return [hlo.multiply(x, c_ir)]
+
+mlir.register_lowering(scale_p, _scale_lowering)
+```
+
+Rule by rule, and which part of JAX uses it:
+
+- **`Primitive("cube")` and `cube()`.** The primitive is just a name. The wrapper function is what
+  users call; its only job is `bind`, which hands the call to the current trace.
+- **`def_impl`** is what `EvalTrace` calls. Here it is NumPy on the host, so eager calls run in
+  Python. JAX's own primitives use `apply_primitive` instead, which compiles the primitive with
+  XLA.
+- **`def_abstract_eval`** is what `DynamicJaxprTrace` calls through `_cached_abstract_eval`. It
+  receives avals, not arrays, and returns the output aval. Without it `make_jaxpr` and `jit` fail
+  with "Abstract evaluation for 'cube' not implemented".
+- **The JVP rule** receives tuples of primals and tangents and returns the primal output and its
+  tangent: $\frac{d}{dx}x^3 = 3x^2$, so the tangent is $3 x^2 t$. It is written with other
+  primitives (`mul` via `*`, and our `scale`), so it can be traced, linearized and
+  differentiated again. During linearization `x` is known and `t` is not. Python evaluates
+  `t * x * x` as `(t * x) * x`, so both multiplications touch the tangent and are recorded, and the
+  only residual is `x` itself. Writing `t * (x * x)` instead would compute `x * x` now and save
+  that as the residual. (Checked: the `grad` jaxpr then gains `c = mul a a` in its forward half
+  and has a single `mul g c` in its backward half.)
+- **The lowering rules** receive MLIR values plus the same `ctx.avals_in`/`ctx.avals_out` as
+  JAX's own rules, and return MLIR values. `scale` builds a constant tensor with
+  `mlir.ir_constant`.
+- **`ad.deflinear2`** registers both a JVP and a transpose for a linear primitive. The JVP is
+  "apply the same primitive to the tangent"
+  ([`linear_jvp`](https://github.com/jax-ml/jax/blob/32544801e26115ac1794926d027148abf3baf009/jax/_src/interpreters/ad.py#L934)).
+  The transpose rule receives the output cotangent and the input as an `UndefinedPrimal`, the
+  marker for "the linear input", and returns the input cotangent. Multiplying by $c$ is its own
+  adjoint, so the transpose is `scale(ct, c)` again.
+
+Now use them inside an ordinary JAX function:
+
+```python
+def f(x):
+    return jnp.sum(scale(cube(x), 2.0))
+
+x = jnp.array([1.0, 2.0, 3.0])
+f(x)                # 72.0               = 2·(1 + 8 + 27)
+jax.jit(f)(x)       # 72.0               (traced, lowered with our rules, compiled)
+jax.grad(f)(x)      # [ 6. 24. 54.]      = 6x²
+jax.jvp(f, (x,), (jnp.ones(3),))   # (72.0, 84.0)  = Σ 6x²
+```
+
+The jaxpr shows our primitives next to JAX's, with `c` as a parameter:
+
+```text
+{ lambda ; a:f32[3]. let
+    b:f32[3] = cube a
+    c:f32[3] = scale[c=2.0] b
+    d:f32[] = reduce_sum[axes=(0,) out_sharding=None] c
+  in (d,) }
+```
+
+The jaxpr of `grad(f)` shows linearize and transpose using our rules:
+
+```text
+{ lambda ; a:f32[3]. let
+    b:f32[3] = cube a                          # forward: our impl rule, staged
+    c:f32[3] = scale[c=2.0] b
+    _:f32[] = reduce_sum[axes=(0,) out_sharding=None] c   # unused loss value
+    d:f32[3] = broadcast_in_dim 1.0:f32[]      # transpose of reduce_sum on the seed 1.0
+    e:f32[3] = scale[c=2.0] d                  # transpose of scale[c=2.0]: our rule
+    f:f32[3] = scale[c=3.0] e                  # transpose of the scale in _cube_jvp
+    g:f32[3] = mul f a                         # transpose of t * x ...
+    h:f32[3] = mul g a                         # ... * x
+  in (h,) }
+```
+
+Read the backward half from `d` down: it is the tangent expression `scale(t * x * x, 3.0)`
+from our JVP rule, inside `scale(·, 2.0)` and `sum`, run in reverse. Each linear step is replaced
+by its transpose: the sum by a broadcast, each `scale` by our transpose rule, and each
+multiplication by a residual `x` by the same multiplication. Nobody wrote a derivative of `cube`
+for reverse mode; it fell out of the JVP rule.
+
+Under `jit`, both rules lower through our lowering functions (the transposed `scale` ops are the
+multiplies by `dense<2.0>` and `dense<3.0>`):
+
+```mlir
+func.func public @main(%arg0: tensor<3xf32>) -> (tensor<3xf32> {jax.result_info = "result"}) {
+  %cst = stablehlo.constant dense<1.000000e+00> : tensor<f32>
+  %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<3xf32>
+  %cst_0 = stablehlo.constant dense<2.000000e+00> : tensor<3xf32>
+  %1 = stablehlo.multiply %0, %cst_0 : tensor<3xf32>
+  %cst_1 = stablehlo.constant dense<3.000000e+00> : tensor<3xf32>
+  %2 = stablehlo.multiply %1, %cst_1 : tensor<3xf32>
+  %3 = stablehlo.multiply %2, %arg0 : tensor<3xf32>
+  %4 = stablehlo.multiply %3, %arg0 : tensor<3xf32>
+  return %4 : tensor<3xf32>
+}
+```
+
+The forward `cube` and its `stablehlo.multiply`s are gone because the loss value is unused and
+was removed before lowering. And because the JVP rule is itself built from primitives with rules,
+second derivatives work too:
+`jax.grad(lambda s: jax.grad(f)(jnp.array([s]))[0])(2.0)` returns `24.0`, which is
+$\frac{d}{dx}6x^2 = 12x$ at $x = 2$.
+
+That is the whole contract between a primitive and JAX: a name, plus one rule for each thing a
+trace may ask of it.
+
 ## Summary
 
 - JAX never parses Python. It **runs** the function once with **tracers**, and every **primitive**
@@ -801,6 +1552,9 @@ differentiated function stays a single compiled unit.
   that linear program, walked backwards with accumulators.
 - Because rules are written in primitives and transformations are nested traces, `jit`, `grad`
   and `vmap` compose freely, and higher derivatives come for free.
+- A primitive is a name plus rules: impl, abstract eval, JVP, transpose (if linear), batching and
+  lowering. Adding those rules for a new primitive is enough to make it work under every
+  transformation.
 
 ## References
 

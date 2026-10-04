@@ -1,0 +1,31 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import ChordSteps from "../../utils/hashing/ChordSteps.astro";
+import HashRing from "../../utils/hashing/HashRing.astro";
+---
+
+<Layout title="Consistent hashing and Chord demo">
+	<h1>Consistent hashing and Chord demo</h1>
+	<p>
+		<code>HashRing</code> from <code>src/utils/hashing</code>: servers and keys on a 32-bit hash ring. Hover a key
+		to see its clockwise walk to its server; outlined keys moved since one server fewer.
+	</p>
+
+	<h2>Servers and virtual nodes</h2>
+	<HashRing nodes={4} keys={24} vnodeChoices={[1, 2, 4, 16]} />
+
+	<h2>Two server counts only, 12 keys</h2>
+	<HashRing nodes={5} keys={12} nodeChoices={[4, 5]} title="Adding node-E" />
+
+	<h2>Fixed 8 servers × 16 virtual nodes, no move marks</h2>
+	<HashRing nodes={8} nodeChoices={[8]} vnodeChoices={[16]} keys={48} showMoves={false} />
+
+	<h2>ChordSteps: lookup</h2>
+	<ChordSteps m={6} nodes={[1, 8, 14, 21, 32, 38, 42, 48, 51, 56]} lookup={{ from: 8, key: 54 }} />
+
+	<h2>ChordSteps: the paper's Figure 3 ring (m = 3), node 3 looks up 1</h2>
+	<ChordSteps m={3} nodes={[0, 1, 3]} lookup={{ from: 3, key: 1 }} />
+
+	<h2>ChordSteps: join with stabilization, starting at step 3</h2>
+	<ChordSteps m={6} nodes={[1, 8, 14, 21, 32, 38, 42, 48, 51, 56]} join={{ node: 26, via: 8 }} step={2} />
+</Layout>

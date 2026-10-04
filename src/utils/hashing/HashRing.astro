@@ -1,0 +1,366 @@
+---
+// A consistent-hashing ring. Servers are points on a circle at hash32(`${name}#${v}`), coloured
+// arcs show which part of the ring each server owns, and keys (dots inside the ring) belong to
+// the first server point clockwise from their hash. Hover a key to see its clockwise walk and
+// its hash. Keys whose server changed since one server fewer are outlined, so the cost of adding
+// a server is visible. The reader picks the server count and the virtual nodes per server; bars
+// beside the ring give each server's share of the ring and its key count. Logic is in ring.ts.
+// Usage in .mdx:
+//   <HashRing nodes={4} keys={24} vnodeChoices={[1, 4, 16]} />
+//   <HashRing nodes={5} keys={12} nodeChoices={[4, 5]} title="Adding node-E" />
+import { drawRing, nodeName } from "./ring";
+
+interface Props {
+	/** Servers shown first. */
+	nodes?: number;
+	/** Server counts the reader can pick; a single value hides the control. */
+	nodeChoices?: number[];
+	/** Virtual nodes per server shown first. */
+	vnodes?: number;
+	/** Virtual-node counts the reader can pick; a single value hides the control. */
+	vnodeChoices?: number[];
+	/** Number of keys, named acct_1001, acct_1002, ... */
+	keys?: number;
+	/** Outline keys that moved since one server fewer. */
+	showMoves?: boolean;
+	title?: string;
+}
+
+const {
+	nodes = 4,
+	nodeChoices = [2, 3, 4, 5, 6, 7, 8],
+	vnodeChoices = [1],
+	vnodes = vnodeChoices[0],
+	keys: nKeys = 24,
+	showMoves = true,
+	title,
+} = Astro.props;
+const keys = Array.from({ length: nKeys }, (_, i) => `acct_${1001 + i}`);
+const first = drawRing(keys, { nodes, vnodes, showMoves });
+const pct = (x: number) => `${(100 * x).toFixed(1)}%`;
+---
+
+<figure class="hr" data-config={JSON.stringify({ nodes, vnodes, nKeys, showMoves })}>
+	{title && <figcaption class="hr-title">{title}</figcaption>}
+	<div class="hr-bar">
+		{
+			nodeChoices.length > 1 && (
+				<div class="hr-tabs" role="tablist" data-knob="nodes" aria-label="Servers">
+					<span class="hr-lab">servers</span>
+					{nodeChoices.map((n) => (
+						<button type="button" role="tab" data-v={n} aria-selected={String(n === nodes)}>
+							{n}
+						</button>
+					))}
+				</div>
+			)
+		}
+		{
+			vnodeChoices.length > 1 && (
+				<div class="hr-tabs" role="tablist" data-knob="vnodes" aria-label="Virtual nodes per server">
+					<span class="hr-lab">virtual nodes per server</span>
+					{vnodeChoices.map((v) => (
+						<button type="button" role="tab" data-v={v} aria-selected={String(v === vnodes)}>
+							{v}
+						</button>
+					))}
+				</div>
+			)
+		}
+	</div>
+	<div class="hr-body">
+		<div class="hr-canvas" set:html={first.svg} />
+		<table class="hr-load">
+			<thead>
+				<tr><th>server</th><th>ring</th><th>keys</th></tr>
+			</thead>
+			<tbody>
+				{
+					first.share.map((s, i) => (
+						<tr class={`s${i}`}>
+							<td class="hr-name">{nodeName(i)}</td>
+							<td><span class="hr-b" style={`width:${(100 * s).toFixed(1)}%`} />{pct(s)}</td>
+							<td>{first.load[i]}</td>
+						</tr>
+					))
+				}
+			</tbody>
+		</table>
+	</div>
+	<dl class="hr-stats">
+		{
+			showMoves && (
+				<div>
+					<dt>moved when going from <span data-s="prev">{nodes - 1}</span> to <span data-s="n">{nodes}</span> servers</dt>
+					<dd data-s="moved">{first.moved} of {nKeys}</dd>
+				</div>
+			)
+		}
+		<div>
+			<dt>largest ring share / fair share</dt>
+			<dd data-s="imb">{(Math.max(...first.share) * nodes).toFixed(2)}×</dd>
+		</div>
+	</dl>
+</figure>
+
+<script>
+	import { drawRing, nodeName } from "./ring";
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".hr")) {
+		const cfg = JSON.parse(fig.dataset.config ?? "{}");
+		const keys = Array.from({ length: cfg.nKeys }, (_, i) => `acct_${1001 + i}`);
+		const state = { nodes: cfg.nodes as number, vnodes: cfg.vnodes as number };
+		const canvas = fig.querySelector<HTMLElement>(".hr-canvas");
+		const body = fig.querySelector<HTMLElement>(".hr-load tbody");
+		const set = (k: string, v: string) => {
+			const el = fig.querySelector(`[data-s=${k}]`);
+			if (el) el.textContent = v;
+		};
+		const render = () => {
+			const r = drawRing(keys, { ...state, showMoves: cfg.showMoves });
+			if (canvas) canvas.innerHTML = r.svg;
+			if (body)
+				body.innerHTML = r.share
+					.map(
+						(s, i) =>
+							`<tr class="s${i}"><td class="hr-name">${nodeName(i)}</td><td><span class="hr-b" style="width:${(100 * s).toFixed(1)}%"></span>${(100 * s).toFixed(1)}%</td><td>${r.load[i]}</td></tr>`,
+					)
+					.join("");
+			set("prev", String(state.nodes - 1));
+			set("n", String(state.nodes));
+			set("moved", `${r.moved} of ${keys.length}`);
+			set("imb", `${(Math.max(...r.share) * state.nodes).toFixed(2)}×`);
+		};
+		for (const list of fig.querySelectorAll<HTMLElement>("[role=tablist]"))
+			for (const tab of list.querySelectorAll<HTMLButtonElement>("[role=tab]"))
+				tab.addEventListener("click", () => {
+					for (const t of list.querySelectorAll("[role=tab]")) t.setAttribute("aria-selected", String(t === tab));
+					if (list.dataset.knob === "nodes") state.nodes = Number(tab.dataset.v);
+					else state.vnodes = Number(tab.dataset.v);
+					render();
+				});
+	}
+</script>
+
+<style>
+	.hr {
+		--s0: #2f6fb0;
+		--s1: #b8742a;
+		--s2: #2f8a5b;
+		--s3: #b33b5e;
+		--s4: #7a62b8;
+		--s5: #5f7380;
+		--s6: #2b8c96;
+		--s7: #9a7b1f;
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+	}
+	@media (prefers-color-scheme: dark) {
+		.hr {
+			--s0: #6aa8e6;
+			--s1: #e0a25e;
+			--s2: #5fc08b;
+			--s3: #e2708f;
+			--s4: #a993e6;
+			--s5: #98aab5;
+			--s6: #5cc4cf;
+			--s7: #d6b552;
+		}
+	}
+	.hr :global(.s0) {
+		--c: var(--s0);
+	}
+	.hr :global(.s1) {
+		--c: var(--s1);
+	}
+	.hr :global(.s2) {
+		--c: var(--s2);
+	}
+	.hr :global(.s3) {
+		--c: var(--s3);
+	}
+	.hr :global(.s4) {
+		--c: var(--s4);
+	}
+	.hr :global(.s5) {
+		--c: var(--s5);
+	}
+	.hr :global(.s6) {
+		--c: var(--s6);
+	}
+	.hr :global(.s7) {
+		--c: var(--s7);
+	}
+	.hr-title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.5rem;
+	}
+	.hr-bar {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.4rem 1.5rem;
+		margin-bottom: 0.5rem;
+		font-size: 0.78rem;
+	}
+	.hr-tabs {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 0.25rem;
+	}
+	.hr-lab {
+		color: var(--muted);
+		margin-right: 0.2rem;
+	}
+	.hr-tabs button {
+		padding: 0.25rem 0.6rem;
+		border: 1px solid var(--faint);
+		border-radius: 999px;
+		background: var(--bg);
+		color: var(--text);
+		font: inherit;
+		cursor: pointer;
+	}
+	.hr-tabs button:hover {
+		border-color: var(--accent);
+	}
+	.hr-tabs button[aria-selected="true"] {
+		background: var(--accent);
+		border-color: var(--accent);
+		color: var(--bg);
+	}
+	.hr-body {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		align-items: center;
+		gap: 0.5rem 1.5rem;
+	}
+	.hr-canvas {
+		flex: 0 1 340px;
+		min-width: 0;
+	}
+	.hr-canvas :global(svg) {
+		display: block;
+		max-width: 100%;
+		height: auto;
+		margin: 0 auto;
+	}
+	.hr-canvas :global(.hr-base) {
+		fill: none;
+		stroke: var(--faint);
+		stroke-width: 1;
+	}
+	.hr-canvas :global(.hr-arc) {
+		fill: none;
+		stroke: var(--c);
+		stroke-width: 7;
+		stroke-opacity: 0.45;
+	}
+	.hr-canvas :global(.hr-zero) {
+		stroke: var(--muted);
+		stroke-width: 1;
+	}
+	.hr-canvas :global(.hr-zt) {
+		font-size: 9px;
+		text-anchor: middle;
+		fill: var(--muted);
+	}
+	.hr-canvas :global(.hr-nd) {
+		fill: var(--c);
+		stroke: var(--bg);
+		stroke-width: 1.5;
+	}
+	.hr-canvas :global(.hr-nt) {
+		font-family: var(--mono);
+		font-size: 10px;
+		font-weight: 600;
+		text-anchor: middle;
+		fill: var(--c);
+	}
+	.hr-canvas :global(.hr-kd) {
+		fill: color-mix(in oklch, var(--c) 35%, var(--bg));
+		stroke: var(--c);
+		stroke-width: 1.2;
+		cursor: default;
+	}
+	.hr-canvas :global(.mv .hr-kd) {
+		stroke: var(--text);
+		stroke-width: 1.8;
+		stroke-dasharray: 2.5 1.5;
+	}
+	.hr-canvas :global(.hr-walk) {
+		display: none;
+		fill: none;
+		stroke: var(--c);
+		stroke-width: 2;
+		pointer-events: none;
+	}
+	.hr-canvas :global(.hr-key:hover .hr-walk) {
+		display: inline;
+	}
+	.hr-load {
+		flex: 0 1 220px;
+		font-size: 0.75rem;
+		border-collapse: collapse;
+		margin: 0;
+	}
+	.hr-load th {
+		color: var(--muted);
+		font-weight: 500;
+		text-align: right;
+		padding: 0.15rem 0.4rem;
+		border-bottom: 1px solid var(--faint);
+	}
+	.hr-load th:first-child,
+	.hr-load :global(.hr-name) {
+		text-align: left;
+	}
+	.hr-load :global(td) {
+		padding: 0.15rem 0.4rem;
+		font-family: var(--mono);
+		text-align: right;
+		white-space: nowrap;
+	}
+	.hr-load :global(.hr-name) {
+		color: var(--c);
+		font-weight: 600;
+	}
+	.hr-load :global(td:nth-child(2)) {
+		position: relative;
+		width: 6.5rem;
+	}
+	.hr-load :global(.hr-b) {
+		position: absolute;
+		left: 0.4rem;
+		top: 0.25rem;
+		bottom: 0.25rem;
+		max-width: calc(100% - 0.8rem);
+		background: var(--c);
+		opacity: 0.25;
+		border-radius: 2px;
+	}
+	.hr-stats {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.3rem 1.5rem;
+		margin: 0.5rem 0 0;
+		font-size: 0.78rem;
+	}
+	.hr-stats div {
+		display: flex;
+		gap: 0.4rem;
+	}
+	.hr-stats dt {
+		color: var(--muted);
+	}
+	.hr-stats dd {
+		margin: 0;
+		font-family: var(--mono);
+		font-weight: 600;
+	}
+</style>

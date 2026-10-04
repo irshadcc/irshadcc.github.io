@@ -1,0 +1,69 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import JaxprSteps from "../../utils/compiler/JaxprSteps.astro";
+import { bwdSteps, traceSteps } from "../../utils/compiler/jaxFigures";
+import type { JaxprStepsData } from "../../utils/compiler/jaxprSteps";
+import { upTo } from "../../utils/compiler/jaxprSteps";
+
+// A hand-written example: tracing f(x) = sin(x) * 2, with no rows highlighted.
+const tiny: JaxprStepsData = {
+	top: { title: "f.py", lines: ["def f(x):", "    return jnp.sin(x) * 2"] },
+	bottom: {
+		title: "jaxpr",
+		lines: [
+			"{ lambda ; a:f32[]. let",
+			"    b:f32[] = sin a",
+			"    c:f32[] = mul b 2.0:f32[]",
+			"  in (c,) }",
+		],
+	},
+	columns: ["Python value", "tracer"],
+	steps: [
+		{
+			label: "x",
+			top: [0],
+			shown: [0],
+			bottom: [0],
+			rows: [{ cells: ["x", "a"] }],
+			note: "One tracer for <code>x</code>.",
+		},
+		{
+			label: "sin",
+			top: [1],
+			shown: upTo(2),
+			bottom: [1],
+			rows: [{ cells: ["x", "a"] }, { cells: ["jnp.sin(x)", "b"], hi: true }],
+			note: "<code>sin</code> is recorded.",
+		},
+		{
+			label: "* 2",
+			top: [1],
+			shown: upTo(4),
+			bottom: [2, 3],
+			rows: [
+				{ cells: ["x", "a"] },
+				{ cells: ["jnp.sin(x)", "b"] },
+				{ cells: ["... * 2", "c"], hi: true },
+			],
+			note: "The constant becomes a literal and the output is set.",
+		},
+	],
+};
+---
+
+<Layout title="Jaxpr steps demo">
+	<h1>Jaxpr steps demo</h1>
+	<p>
+		<code>JaxprSteps</code> from <code>src/utils/compiler</code>: a program being read (top), a program being written
+		(bottom), and a table of values, one step at a time. Used by the JAX post.
+	</p>
+
+	<h2>Tracing loss into a jaxpr (from the JAX post)</h2>
+	<JaxprSteps data={traceSteps} title="Tracing loss" />
+
+	<h2>Transposing a linear jaxpr, last step shown on load</h2>
+	<JaxprSteps data={bwdSteps} step={5} />
+
+	<h2>Hand-written data, no title</h2>
+	<JaxprSteps data={tiny} />
+</Layout>

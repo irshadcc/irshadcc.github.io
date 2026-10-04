@@ -624,8 +624,10 @@ $$
   $y = 0$ (probability $1 - p$). So
 
 $$
-L_N = N\,\mathbb E\big\{p(1-p)^2\|\dot g\|^2\,\mathbb 1\big((1-p)\|\dot g\| > \epsilon a_N\big)\big\}
-+ N\,\mathbb E\big\{(1-p)p^2\|\dot g\|^2\,\mathbb 1\big(p\|\dot g\| > \epsilon a_N\big)\big\}.
+\begin{aligned}
+L_N = {}& N\,\mathbb E\big\{p(1-p)^2\|\dot g\|^2\,\mathbb 1\big((1-p)\|\dot g\| > \epsilon a_N\big)\big\} \\
+&+ N\,\mathbb E\big\{(1-p)p^2\|\dot g\|^2\,\mathbb 1\big(p\|\dot g\| > \epsilon a_N\big)\big\}.
+\end{aligned}
 $$
 
   Since $0 \le p \le 1$: if $(1-p)\|\dot g\| > \epsilon a_N$ then certainly
@@ -720,8 +722,10 @@ $R = o_P(1)$.
 **Step 6: take the argmax.** For each fixed $u$, combine Steps 2, 4 and 5:
 
 $$
-\gamma(u) = u^\top S_N - \tfrac12 u^\top M_f u + r_N(u), \qquad
-r_N(u) = -\tfrac12 u^\top(H_N - M_f)u + \Delta_\ell + R = o_P(1).
+\begin{aligned}
+\gamma(u) &= u^\top S_N - \tfrac12 u^\top M_f u + r_N(u), \\
+r_N(u) &= -\tfrac12 u^\top(H_N - M_f)u + \Delta_\ell + R = o_P(1).
+\end{aligned}
 $$
 
 Now check the conditions of the Hjort–Pollard corollary. $\gamma$ is concave in $u$ (for linear
@@ -852,7 +856,10 @@ kept negatives per positive) the loss is already small.
 The proof runs the seven steps of Theorem 1 on the weighted log-likelihood
 
 $$
-\ell_w(\theta) = \sum_{i=1}^N \frac{\delta_i}{\pi_i}\Big[y_i g(x_i;\theta) - \log\{1 + e^{g(x_i;\theta)}\}\Big], \qquad \pi_i = \pi(x_i, y_i) = y_i + (1 - y_i)\rho\varphi(x_i).
+\begin{aligned}
+\ell_w(\theta) &= \sum_{i=1}^N \frac{\delta_i}{\pi_i}\Big[y_i g(x_i;\theta) - \log\{1 + e^{g(x_i;\theta)}\}\Big], \\
+\pi_i &= \pi(x_i, y_i) = y_i + (1 - y_i)\rho\varphi(x_i).
+\end{aligned}
 $$
 
 Two facts about the sampling drive everything. **(W1)** Algorithm 1 keeps example $i$ with
@@ -981,8 +988,8 @@ $|u^\top\ddot g u| \le \|u\|^2\|\ddot g\|$:
 
 $$
 \begin{aligned}
-\operatorname{Var}(\Delta_w) &\le \frac{\|u\|^4N}{4a_N^4}\mathbb E\left[\Big\{p(1-p)^2 + \frac{(1-p)p^2}{\rho\varphi}\Big\}\|\ddot g\|^2\right]
-\le \frac{\|u\|^4N}{4a_N^4}\mathbb E\left[\Big\{1 + \frac{p}{\rho\varphi}\Big\}p\,\|\ddot g\|^2\right] \\
+\operatorname{Var}(\Delta_w) &\le \frac{\|u\|^4N}{4a_N^4}\mathbb E\left[\Big\{p(1-p)^2 + \frac{(1-p)p^2}{\rho\varphi}\Big\}\|\ddot g\|^2\right] \\
+&\le \frac{\|u\|^4N}{4a_N^4}\mathbb E\left[\Big\{1 + \frac{p}{\rho\varphi}\Big\}p\,\|\ddot g\|^2\right] \\
 &\le \frac{\|u\|^4}{4a_N^2}\mathbb E\left[\Big\{1 + \frac{c_Ne^{f}}{\varphi}\Big\}e^{f}\|\ddot g\|^2\right] \to 0.
 \end{aligned}
 $$
@@ -999,8 +1006,10 @@ converges to $N(0, M_f^{-1}M_wM_f^{-1})$.
 by $\mathbb E\{e^f\}$:
 
 $$
-V_w = \mathbb E\{e^f\}M_f^{-1}M_wM_f^{-1}
-= \underbrace{\mathbb E\{e^f\}M_f^{-1}M_fM_f^{-1}}_{V_f} + \underbrace{c\,\mathbb E\{e^f\}M_f^{-1}\mathbb E\{\varphi^{-1}e^{2f}\dot g\dot g^\top\}M_f^{-1}}_{V_{\text{sub}}}. \;∎
+\begin{aligned}
+V_w &= \mathbb E\{e^f\}M_f^{-1}M_wM_f^{-1} \\
+&= \underbrace{\mathbb E\{e^f\}M_f^{-1}M_fM_f^{-1}}_{V_f} + \underbrace{c\,\mathbb E\{e^f\}M_f^{-1}\mathbb E\{\varphi^{-1}e^{2f}\dot g\dot g^\top\}M_f^{-1}}_{V_{\text{sub}}}. \;∎
+\end{aligned}
 $$
 
 **Why the answer is a sandwich.** The curvature $M_f^{-1}$ is the bread and the score variance
@@ -1170,10 +1179,12 @@ Apply it with $a = \zeta m$, multiply the split of $t^2$ by $\zeta^2/\varphi$, a
 expectations:
 
 $$
+\begin{aligned}
 \mathbb E\left\{\frac{\zeta^2t^2}{\varphi}\right\}
-= \mathbb E\left[\Big(\sqrt\varphi - \frac{\zeta m}{\sqrt\varphi}\Big)^2\right] - \mathbb E\varphi + 2\zeta\,\mathbb E m
-+ \mathbb E\left[\frac{\zeta^2(t^2 - T^2)}{\varphi}\mathbb 1(t > T)\right]
-= E_1 + E_2 + 1.
+&= \mathbb E\left[\Big(\sqrt\varphi - \frac{\zeta m}{\sqrt\varphi}\Big)^2\right] - \mathbb E\varphi + 2\zeta\,\mathbb E m \\
+&\quad + \mathbb E\left[\frac{\zeta^2(t^2 - T^2)}{\varphi}\mathbb 1(t > T)\right] \\
+&= E_1 + E_2 + 1.
+\end{aligned}
 $$
 
 The $+1$ is $-\mathbb E\varphi + 2\zeta\mathbb E m = -1 + 2$. $E_1$ is the first expectation and
@@ -1213,15 +1224,20 @@ kept gets a huge weight and can dominate the objective. The paper proposes a dif
 A positive at $x$ is kept with probability 1; a negative at $x$ is kept with probability $\pi(x)$:
 
 $$
+\begin{aligned}
 \Pr(y = 1 \mid x, \delta = 1)
-= \frac{\Pr(y=1\mid x)\cdot 1}{\Pr(y=1 \mid x)\cdot 1 + \Pr(y=0\mid x)\,\pi(x)}
-= \frac{p}{p + (1-p)\pi(x)}.
+&= \frac{\Pr(y=1\mid x)\cdot 1}{\Pr(y=1 \mid x)\cdot 1 + \Pr(y=0\mid x)\,\pi(x)} \\
+&= \frac{p}{p + (1-p)\pi(x)}.
+\end{aligned}
 $$
 
 Divide top and bottom by $1-p$ and use $p/(1-p) = e^{g}$:
 
 $$
-p_\pi(x;\theta) := \Pr(y = 1 \mid x, \delta = 1) = \frac{e^{g}}{e^{g} + \pi(x)} = \frac{1}{1 + e^{-g(x;\theta) - l}}, \qquad l = -\log \pi(x). \tag{4}
+\begin{aligned}
+p_\pi(x;\theta) &:= \Pr(y = 1 \mid x, \delta = 1) = \frac{e^{g}}{e^{g} + \pi(x)} = \frac{1}{1 + e^{-g(x;\theta) - l}}, \\
+l &= -\log \pi(x).
+\end{aligned} \tag{4}
 $$
 
 So **the sampled data follow the same model with the log odds shifted up by $l = -\log\pi(x)$**.
@@ -1302,8 +1318,10 @@ By the definition of conditional probability, then splitting the denominator by 
 using the product rule $\Pr(y, \delta \mid x) = \Pr(y \mid x)\Pr(\delta \mid x, y)$:
 
 $$
-\Pr(y=1 \mid x, \delta=1) = \frac{\Pr(y=1, \delta=1 \mid x)}{\Pr(y=1, \delta=1 \mid x) + \Pr(y=0, \delta=1 \mid x)}
-= \frac{p\cdot 1}{p\cdot 1 + (1-p)\,\pi(x)}.
+\begin{aligned}
+\Pr(y=1 \mid x, \delta=1) &= \frac{\Pr(y=1, \delta=1 \mid x)}{\Pr(y=1, \delta=1 \mid x) + \Pr(y=0, \delta=1 \mid x)} \\
+&= \frac{p\cdot 1}{p\cdot 1 + (1-p)\,\pi(x)}.
+\end{aligned}
 $$
 
 Divide the numerator and denominator by $1 - p$ and use $p/(1-p) = e^{g}$:
@@ -1341,9 +1359,11 @@ $$
 $$
 
 $$
-S_{\text{lik}} = \frac{1}{a_N}\sum_i\delta_i(y_i - p_{\pi,i})\dot g_i, \quad
-H_{\text{lik}} = \frac{1}{a_N^2}\sum_i\delta_i\psi_{\pi,i}\dot g_i\dot g_i^\top, \quad
-\Delta_{\text{lik}} = \frac{1}{2a_N^2}\sum_i\delta_i(y_i - p_{\pi,i})u^\top\ddot g_iu,
+\begin{aligned}
+S_{\text{lik}} &= \frac{1}{a_N}\sum_i\delta_i(y_i - p_{\pi,i})\dot g_i, \qquad
+H_{\text{lik}} = \frac{1}{a_N^2}\sum_i\delta_i\psi_{\pi,i}\dot g_i\dot g_i^\top, \\
+\Delta_{\text{lik}} &= \frac{1}{2a_N^2}\sum_i\delta_i(y_i - p_{\pi,i})u^\top\ddot g_iu,
+\end{aligned}
 $$
 
 and $R_{\text{lik}}$ is $(6a_N^3)^{-1}\sum_i\delta_iD_i$ with $p$ replaced by $p_\pi$ inside $D_i$.
@@ -1383,8 +1403,10 @@ because $1 - p_\pi \le 1$, and it does not involve $\varphi$ at all.
 negative gives $-p_\pi\dot g$ (probability $(1-p)\pi$). A dropped example gives 0. So
 
 $$
-L_N = N\,\mathbb E\big\{p(1 - p_\pi)^2\|\dot g\|^2\mathbb 1\big((1-p_\pi)\|\dot g\| > \epsilon a_N\big)\big\}
-+ N\,\mathbb E\big\{(1-p)\pi p_\pi^2\|\dot g\|^2\mathbb 1\big(p_\pi\|\dot g\| > \epsilon a_N\big)\big\}.
+\begin{aligned}
+L_N = {}& N\,\mathbb E\big\{p(1 - p_\pi)^2\|\dot g\|^2\mathbb 1\big((1-p_\pi)\|\dot g\| > \epsilon a_N\big)\big\} \\
+&+ N\,\mathbb E\big\{(1-p)\pi p_\pi^2\|\dot g\|^2\mathbb 1\big(p_\pi\|\dot g\| > \epsilon a_N\big)\big\}.
+\end{aligned}
 $$
 
 In the first part use $(1 - p_\pi)^2 \le 1$ and $p \le e^{\alpha^*}e^f$. In the second use
@@ -1413,8 +1435,10 @@ For the variance of an entry, use $\operatorname{Var} \le$ mean square, $\delta^
 $\psi_\pi^2 \le p_\pi$ and (G4):
 
 $$
-\operatorname{Var}\big((H_{\text{lik}})_{jk}\big) \le \frac{N}{a_N^4}\mathbb E\big[\{p + (1-p)\pi\}\,p_\pi\,\|\dot g\|^4\big]
-\le \frac{2N}{a_N^4}\mathbb E\{p\,\|\dot g\|^4\} \le \frac{2}{a_N^2}\mathbb E\{e^f\|\dot g\|^4\} \to 0. \tag{S.28}
+\begin{aligned}
+\operatorname{Var}\big((H_{\text{lik}})_{jk}\big) &\le \frac{N}{a_N^4}\mathbb E\big[\{p + (1-p)\pi\}\,p_\pi\,\|\dot g\|^4\big] \\
+&\le \frac{2N}{a_N^4}\mathbb E\{p\,\|\dot g\|^4\} \le \frac{2}{a_N^2}\mathbb E\{e^f\|\dot g\|^4\} \to 0.
+\end{aligned} \tag{S.28}
 $$
 
 The middle step uses $p\,p_\pi \le p$ and $(1-p)\pi p_\pi = p(1 - p_\pi) \le p$ (G1). Chebyshev
@@ -1743,9 +1767,11 @@ positive part, $e^{-\alpha^*}p(1-p)^2\dot g\dot g^\top \to e^f\dot g\dot g^\top$
 part:
 
 $$
+\begin{aligned}
 e^{-\alpha^*}\frac{(1-p)p^2}{\pi_\varrho(x)}\dot g\dot g^\top
-= c_N\,\frac{e^{2f}(1-p)}{(1 + e^{\alpha^*+f})^2}\cdot\frac{1}{\pi_\varrho(x)/\rho}\,\dot g\dot g^\top
-\longrightarrow \frac{c\,e^{2f}}{\max\{\varphi_{\text{plt}}(x), c_l\}}\dot g\dot g^\top.
+&= c_N\,\frac{e^{2f}(1-p)}{(1 + e^{\alpha^*+f})^2}\cdot\frac{1}{\pi_\varrho(x)/\rho}\,\dot g\dot g^\top \\
+&\longrightarrow \frac{c\,e^{2f}}{\max\{\varphi_{\text{plt}}(x), c_l\}}\dot g\dot g^\top.
+\end{aligned}
 $$
 
 For dominated convergence we need a roof that does not depend on the pilot. The floor provides

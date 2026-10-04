@@ -13,6 +13,9 @@ already exist, and how to check the result before handing it back.
 Every post should leave the reader able to explain the topic to someone else. In practice
 that means four things.
 
+## Note to agent
+Do not use the repository to store files used for scratchpad
+
 ### 1. A clear introduction
 
 Open with a `## Background` section (no `# Title`; the page shows `title` already) that answers,
@@ -127,7 +130,9 @@ has a demo page under `src/pages/demo/`, listed at `/demo`.
 | `PagedAddress` | `src/utils/inference/PagedAddress.astro` | Hover a token to follow it through a block table (or `req_to_token` row) to its KV slot |
 | `OverlapTimeline` | `src/utils/inference/OverlapTimeline.astro` | CPU/GPU timeline of a serving loop with and without overlapped scheduling |
 | `TokenStrip` | `src/utils/inference/TokenStrip.astro` | A prompt as token chips (text, id, kind), runs of repeated tokens, KV-block markers, switchable views |
+| `NegativeSamplingExplorer` | `src/utils/probability/NegativeSamplingExplorer.astro` | Rare-events data with uniform or optimal negative sampling: histogram of kept negatives, π(x), and naive / IPW / log-odds-corrected fits with a repeat-and-compare-to-theory button |
 | `MinCutSteps` | `src/utils/compiler/MinCutSteps.astro` | Step-through max-flow / min-cut on a node-capacitated network (augmenting paths, saved nodes), as built by AOTAutograd's partitioner |
+| `JaxprSteps` | `src/utils/compiler/JaxprSteps.astro` | Step-through program transformation: source or jaxpr being read (top), jaxpr being written (bottom), table of tracers / primals / cotangents per step |
 
 ### Building a new component
 

@@ -1,0 +1,239 @@
+---
+// Step-through Chord (Stoica et al., SIGCOMM 2001) on an m-bit identifier circle. In "lookup"
+// mode it follows find_successor(key) from one node: each step shows the node holding the query,
+// its finger table with the finger it uses highlighted, and the hops so far as arrows across the
+// circle. In "join" mode a new node joins and stabilize() links it in: the arrows are successor
+// (outside) and predecessor (inside, dashed) pointers that the join changes; the ones changed by
+// the current step are highlighted. The protocol code and
+// the drawing are in chord.ts; the controls are the shared StepControls.
+// Usage in .mdx:
+//   <ChordSteps m={6} nodes={[1, 8, 14, 21, 32, 38, 42, 48, 51, 56]} lookup={{ from: 8, key: 54 }} />
+//   <ChordSteps m={6} nodes={[1, 8, 14, 21, 32, 38, 42, 48, 51, 56]} join={{ node: 26, via: 8 }} />
+import StepControls from "../compiler/StepControls.astro";
+import { chordTable, drawChordStep, joinSteps, lookupSteps } from "./chord";
+
+interface Props {
+	/** Identifier bits; the circle has 2^m points. */
+	m: number;
+	nodes: number[];
+	lookup?: { from: number; key: number };
+	join?: { node: number; via: number };
+	step?: number;
+	title?: string;
+}
+
+const { m, nodes, lookup, join, step = 0, title } = Astro.props;
+const steps = lookup
+	? lookupSteps(m, nodes, lookup.from, lookup.key)
+	: join
+		? joinSteps(m, nodes, join.node, join.via)
+		: [];
+const at = Math.max(0, Math.min(steps.length - 1, step));
+const uid = [...JSON.stringify({ m, nodes, lookup, join })]
+	.reduce((h, ch) => (h * 31 + ch.charCodeAt(0)) >>> 0, 7)
+	.toString(36);
+---
+
+<figure class="cs" data-step={at} tabindex="-1">
+	{title && <figcaption class="cs-title">{title}</figcaption>}
+	<StepControls labels={steps.map((s) => s.label)} step={at} />
+	{
+		steps.map((s, i) => (
+			<div class="cs-pane" hidden={i !== at}>
+				<div class="cs-ring-wrap" set:html={drawChordStep(s, m, `${uid}-${i}`)} />
+				<div class="cs-table" set:html={chordTable(s, m)} />
+			</div>
+		))
+	}
+	{
+		steps.map((s, i) => (
+			<p class="cs-text" hidden={i !== at}>
+				{s.text}
+			</p>
+		))
+	}
+</figure>
+
+<script>
+	import { bindStepper } from "../compiler/stepper";
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".cs")) {
+		const panes = [...fig.querySelectorAll<HTMLElement>(".cs-pane")];
+		const texts = [...fig.querySelectorAll<HTMLElement>(".cs-text")];
+		bindStepper(fig, panes.length, (i) => {
+			panes.forEach((p, k) => {
+				p.hidden = k !== i;
+			});
+			texts.forEach((t, k) => {
+				t.hidden = k !== i;
+			});
+		});
+	}
+</script>
+
+<style>
+	.cs {
+		--cs-node: #5f7380;
+		--cs-on: #b33b5e;
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+	}
+	@media (prefers-color-scheme: dark) {
+		.cs {
+			--cs-node: #98aab5;
+			--cs-on: #e2708f;
+		}
+	}
+	.cs:focus {
+		outline: none;
+	}
+	.cs-title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.3rem;
+	}
+	.cs-pane {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		align-items: center;
+		gap: 0.5rem 1.5rem;
+	}
+	.cs-pane[hidden],
+	.cs-text[hidden] {
+		display: none;
+	}
+	.cs-ring-wrap {
+		flex: 0 1 340px;
+		min-width: 0;
+	}
+	.cs-ring-wrap :global(svg) {
+		display: block;
+		max-width: 100%;
+		height: auto;
+		margin: 0 auto;
+	}
+	.cs-ring-wrap :global(.cs-ring) {
+		fill: none;
+		stroke: var(--faint);
+	}
+	.cs-ring-wrap :global(.cs-tick) {
+		stroke: var(--faint);
+	}
+	.cs-ring-wrap :global(.cs-tick.major) {
+		stroke: var(--muted);
+	}
+	.cs-ring-wrap :global(.cs-zero) {
+		font-size: 9px;
+		text-anchor: middle;
+		fill: var(--muted);
+	}
+	.cs-ring-wrap :global(.cs-node circle) {
+		fill: var(--bg);
+		stroke: var(--cs-node);
+		stroke-width: 2;
+	}
+	.cs-ring-wrap :global(.cs-node text) {
+		font-family: var(--mono);
+		font-size: 10px;
+		font-weight: 600;
+		text-anchor: middle;
+		fill: var(--cs-node);
+	}
+	.cs-ring-wrap :global(.cs-node.focus circle) {
+		fill: var(--accent);
+		stroke: var(--accent);
+	}
+	.cs-ring-wrap :global(.cs-node.focus text) {
+		fill: var(--accent);
+	}
+	.cs-ring-wrap :global(.cs-node.pending circle) {
+		stroke-dasharray: 2 2;
+	}
+	.cs-ring-wrap :global(.cs-finger) {
+		fill: none;
+		stroke: var(--accent);
+		stroke-opacity: 0.35;
+		stroke-width: 1.2;
+	}
+	.cs-ring-wrap :global(.cs-hop) {
+		fill: none;
+		stroke: var(--muted);
+		stroke-width: 1.6;
+	}
+	.cs-ring-wrap :global(.cs-hop.on) {
+		stroke: var(--cs-on);
+		stroke-width: 2.2;
+	}
+	.cs-ring-wrap :global(.cs-head) {
+		fill: var(--muted);
+	}
+	.cs-ring-wrap :global(.cs-head-on) {
+		fill: var(--cs-on);
+	}
+	.cs-ring-wrap :global(.cs-succ),
+	.cs-ring-wrap :global(.cs-pred) {
+		fill: none;
+		stroke: var(--muted);
+		stroke-width: 1.5;
+	}
+	.cs-ring-wrap :global(.cs-pred) {
+		stroke-dasharray: 4 3;
+	}
+	.cs-ring-wrap :global(.cs-succ.on),
+	.cs-ring-wrap :global(.cs-pred.on) {
+		stroke: var(--cs-on);
+		stroke-width: 2.2;
+	}
+	.cs-ring-wrap :global(.cs-key rect) {
+		fill: var(--cs-on);
+	}
+	.cs-ring-wrap :global(.cs-key text) {
+		font-family: var(--mono);
+		font-size: 10px;
+		font-weight: 600;
+		text-anchor: middle;
+		fill: var(--cs-on);
+	}
+	.cs-table {
+		flex: 0 1 230px;
+		font-size: 0.75rem;
+	}
+	.cs-table :global(table) {
+		border-collapse: collapse;
+		margin: 0;
+		width: 100%;
+	}
+	.cs-table :global(caption) {
+		color: var(--muted);
+		font-weight: 600;
+		text-align: left;
+		padding-bottom: 0.2rem;
+	}
+	.cs-table :global(th) {
+		color: var(--muted);
+		font-weight: 500;
+		text-align: right;
+		padding: 0.15rem 0.4rem;
+		border-bottom: 1px solid var(--faint);
+	}
+	.cs-table :global(td) {
+		font-family: var(--mono);
+		text-align: right;
+		padding: 0.15rem 0.4rem;
+		white-space: nowrap;
+	}
+	.cs-table :global(tr.on td) {
+		background: var(--accent-soft);
+		color: var(--text);
+		font-weight: 700;
+	}
+	.cs-text {
+		margin: 0.6rem auto 0;
+		max-width: 40rem;
+		font-size: 0.85rem;
+		color: var(--text);
+		min-height: 3.6em;
+	}
+</style>

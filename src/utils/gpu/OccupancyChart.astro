@@ -1,0 +1,26 @@
+---
+import LineChart from "../charts/LineChart.astro";
+import { CC80, occupancy } from "./occupancy";
+
+interface Props {
+	blockThreads?: number;
+	smemPerBlock?: number;
+}
+const { blockThreads = 256, smemPerBlock = 0 } = Astro.props;
+const regs = Array.from({ length: 255 }, (_, i) => i + 1);
+
+const series = [
+	{
+		name: "Occupancy (%)",
+		fn: (r: number) => occupancy(CC80, blockThreads, r, smemPerBlock).pct,
+	},
+];
+---
+
+<LineChart
+	x={() => regs}
+	series={series}
+	xLabel="Registers per Thread"
+	yLabel="Occupancy (%)"
+	title={`Occupancy vs Registers (Block Threads = ${blockThreads}, Smem = ${smemPerBlock}B)`}
+/>
