@@ -1,0 +1,1126 @@
+---
+title: "Torch FX Graphs and Symbolic Shapes"
+description: "torch.fx turns a PyTorch program into a graph of nodes that Python code can read, edit and run again. This post builds FX graphs by tracing, rewrites them with passes, interpreters and pattern matching, compares the graphs Dynamo, make_fx and torch.export produce, and shows how symbolic shapes are represented inside them."
+date: 2026-10-04
+tags: [DL Frameworks, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import MarginNote from "../../components/MarginNote.astro";
+import DependencyGraph from "../../utils/graph/DependencyGraph.astro";
+import CodeStages from "../../utils/compiler/CodeStages.astro";
+import SymbolicShapes from "../../utils/compiler/SymbolicShapes.astro";
+import {
+	blockNodes,
+	blockEdges,
+	traceStages,
+	traceTags,
+	editStages,
+	editTags,
+	tracerStages,
+	tracerTags,
+	dynamoShapes,
+	symNodes,
+	symEdges,
+} from "../../utils/compiler/fxFigures";
+import SequenceSteps from "../../utils/payments/SequenceSteps.astro";
+import { symIntParticipants, symIntMessages } from "../../utils/compiler/fxSymIntFigures";
+
+## Background
+
+A PyTorch model is ordinary Python. `forward` calls functions, reads attributes and loops, and
+nothing in it says "this is a graph". That is pleasant to write, but awkward for any tool that
+wants to look at the whole program first: a quantizer that swaps every `Linear` for an `int8`
+version, a pass that fuses a convolution with the batch norm after it, or a compiler such as
+[TorchInductor](/blog/torch-inductor/) that merges many small kernels into one. Each of them needs
+the program as data: a list of operations, which values each one reads, and what it produces.
+
+**torch.fx** provides that data structure. An **FX graph** is a list of nodes, one per operation,
+held inside a **GraphModule** that turns the graph back into Python source and runs it. The same
+structure is used everywhere in PyTorch 2: TorchDynamo hands an FX graph to `torch.compile`
+backends, AOTAutograd and `make_fx` trace to FX graphs of ATen operators, and `torch.export`
+saves one to disk. When shapes are allowed to change between calls, the same graphs carry
+**symbolic shapes**, sizes such as `s77` or `2*s77` instead of `6` or `12`.
+
+This post covers, in order:
+
+1. **The data structure**: `Graph`, `Node` and `GraphModule`, and the six kinds of node.
+2. **Symbolic tracing**: how `torch.fx.symbolic_trace` records a graph with proxies, and what it
+   cannot see.
+3. **Transforming graphs**: editing nodes, pattern rewriting, interpreters and transformers, each
+   with a worked example.
+4. **Where FX graphs come from in PyTorch 2**: one function captured five ways.
+5. **Symbolic shapes**: FakeTensors, `SymInt`, `ShapeEnv`, how symbols are named, how they appear
+   in the graph, the guards they create, `torch.export` ranges and data-dependent sizes.
+
+Every graph, printout and number below was produced by running torch 2.13.0, and source links
+point at the commit that build came from.<Sidenote>Version `2.13.0`, git `cf30153c`. FX lives in
+`torch/fx`; symbolic shapes live in `torch/fx/experimental/symbolic_shapes.py` and
+`sym_node.py`.</Sidenote>
+
+## The FX data structure
+
+### Graph, Node and GraphModule
+
+Start with a small module: a linear layer, a ReLU, a learned per-feature scale and a sum.
+
+```python
+import torch, torch.nn as nn
+from torch.fx import symbolic_trace
+
+class Block(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(4, 4)
+        self.scale = nn.Parameter(torch.ones(4))
+
+    def forward(self, x):
+        y = self.linear(x)
+        y = torch.relu(y)
+        y = y * self.scale
+        return y.sum(dim=-1)
+
+gm = symbolic_trace(Block())
+print(gm.graph)
+```
+
+`symbolic_trace` returns a `GraphModule`. Its `graph` prints one line per node:
+
+```text
+graph():
+    %x : [num_users=1] = placeholder[target=x]
+    %linear : [num_users=1] = call_module[target=linear](args = (%x,), kwargs = {})
+    %relu : [num_users=1] = call_function[target=torch.relu](args = (%linear,), kwargs = {})
+    %scale : [num_users=1] = get_attr[target=scale]
+    %mul : [num_users=1] = call_function[target=operator.mul](args = (%relu, %scale), kwargs = {})
+    %sum_1 : [num_users=1] = call_method[target=sum](args = (%mul,), kwargs = {dim: -1})
+    return sum_1
+```
+
+Each line reads as `%name : [num_users=k] = op[target=...](args, kwargs)`. A `%name` inside
+`args` is a reference to another node, which is how the graph records data flow. The figure draws
+the same graph: an edge goes from a node to every node that reads its value. Hover a node to see
+its fields and the shape that `ShapeProp` (introduced [below](#interpreter-run-a-graph-node-by-node))
+recorded when the module ran on an input of shape (2, 4).
+
+<DependencyGraph
+	nodes={blockNodes}
+	edges={blockEdges}
+	rankdir="TB"
+	directed
+	ranksep={34}
+	title="The FX graph of Block (badge = opcode)"
+/>
+
+Three classes hold this together:
+
+- A **`Node`** ([`fx/node.py`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/fx/node.py#L238))
+  is one operation. Its fields are `name`, `op`, `target`, `args`, `kwargs`, `users` (the nodes
+  that read it) and `meta`, a free-form dictionary that passes use to attach information such as
+  shapes.
+- A **`Graph`** ([`fx/graph.py`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/fx/graph.py#L1311))
+  owns the nodes. It keeps them in a circular doubly linked list behind a sentinel `_root` node,
+  in program order, so iterating `graph.nodes` always visits a node after everything it reads.
+- A **`GraphModule`** ([`fx/graph_module.py`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/fx/graph_module.py#L511))
+  is an `nn.Module` that holds a graph plus the submodules and parameters the graph refers to,
+  and a `forward` generated from the graph.
+
+The generated `forward` is real Python, available as `gm.code`:
+
+```python
+def forward(self, x):
+    linear = self.linear(x);  x = None
+    relu = torch.relu(linear);  linear = None
+    scale = self.scale
+    mul = relu * scale;  relu = scale = None
+    sum_1 = mul.sum(dim = -1);  mul = None
+    return sum_1
+```
+
+`Graph.python_code` writes this source and `GraphModule.recompile` `exec`s it, so calling `gm(x)`
+runs plain Python with no interpreter in between. The `x = None` assignments free each value right
+after its last use, which lets PyTorch release the memory early.<Sidenote>The source is compiled
+under a fake file name, `<eval_with_key>.0`, and FX registers it with `linecache` so stack traces
+still show the line. `type(gm).__name__` is `Block`: each GraphModule gets its own subclass named
+after the traced module.</Sidenote>
+
+### The six opcodes
+
+Every node has one of six values of `op`. `Block` happens to use all six, so the figure above
+has one of each.
+
+| `op` | What it does | `target` is | Node in `Block` |
+| --- | --- | --- | --- |
+| `placeholder` | A function input | the parameter name | `x` |
+| `get_attr` | Reads a parameter, buffer or constant from the module | its qualified name, e.g. `"linear.weight"` | `scale` |
+| `call_function` | Calls a free function | the function object | `relu`, `mul` |
+| `call_method` | Calls a method on `args[0]` | the method name, a string | `sum_1` |
+| `call_module` | Calls a submodule's `forward` | the submodule's qualified name | `linear` |
+| `output` | The return value, in `args[0]` | `"output"` | `output` |
+
+Two details are worth noticing. First, `y * self.scale` became `call_function` with target
+`operator.mul`: Python operators map to functions in the `operator` module. Second, the target
+of `call_method` and `call_module` is a string, so the graph says *what* to call and the module
+supplies the object at run time.
+
+### Reading and walking nodes
+
+Because the graph is a list of objects, inspecting it is a loop:
+
+```python
+for n in gm.graph.nodes:
+    print(f"{n.name:7} {n.op:14} args={n.args} users={list(n.users)}")
+```
+
+```text
+x       placeholder    args=() users=[linear]
+linear  call_module    args=(x,) users=[relu]
+relu    call_function  args=(linear,) users=[mul]
+scale   get_attr       args=() users=[mul]
+mul     call_function  args=(relu, scale) users=[sum_1]
+sum_1   call_method    args=(mul,) users=[output]
+output  output         args=(sum_1,) users=[]
+```
+
+`args` and `users` are two views of the same edges. `mul.args` is `(relu, scale)`, and `mul` in
+turn appears in `relu.users` and `scale.users`. FX keeps both sides in sync: when you change a
+node's `args`, the `users` of the old and new inputs are updated for you. Other useful accessors
+are `n.all_input_nodes` (every node in `args` and `kwargs`, here `[relu, scale]`) and `n.prev` /
+`n.next` (the neighbours in the list, here `scale` and `sum_1`).
+
+## Symbolic tracing
+
+### Proxies record operations
+
+`symbolic_trace` builds the graph by running `forward` once, with a **Proxy** in place of each
+input. A `Proxy` ([`fx/proxy.py`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/fx/proxy.py#L600))
+holds no data. It overrides every Python operator and implements `__torch_function__`, so any
+operation on it calls back into the **Tracer**, which appends a node to the graph and returns a
+new Proxy for the result. Step through the trace of `Block` below: each step is the graph right
+after the tracer created one more node. The colours link each node to the source line that made
+it.
+
+<CodeStages stages={traceStages} tags={traceTags} title="symbolic_trace(Block()), one node at a time" maxLines={12} />
+
+Each kind of Python expression reaches the tracer through a different hook:
+
+- **Torch functions** (`torch.relu(y)`) see a Proxy argument and dispatch through
+  `Proxy.__torch_function__`, which records `call_function`.
+- **Operators** (`y * self.scale`) call `Proxy.__mul__`, which records `operator.mul`.
+- **Methods** (`y.sum(...)`) look up an attribute on the Proxy. That returns a method proxy, and
+  calling it records `call_method`.
+- **Submodule calls** (`self.linear(x)`) go through `nn.Module.__call__`, which the tracer patches
+  for the duration of the trace. It asks `Tracer.is_leaf_module` whether to record the call as one
+  node or trace inside it.
+- **Parameter reads** (`self.scale`) go through a patched `nn.Module.__getattr__`, which records
+  `get_attr`.
+
+Notice what is *not* in the graph. The local variable `y` was reassigned three times, but the
+graph has no variables at all, only values. Python control flow, function boundaries and the
+`Block` class have all disappeared: the graph is the straight-line sequence of operations that
+one call executed.
+
+### What tracing cannot see
+
+That last point is also the main limit. A Proxy has no value, so Python cannot branch on it:
+
+```python
+def f(x):
+    if x.sum() > 0:
+        return x * 2
+    return x
+
+symbolic_trace(f)
+# TraceError: symbolically traced variables cannot be used as inputs to control flow
+```
+
+`if` calls `bool()` on the Proxy, which calls
+[`Tracer.to_bool`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/fx/proxy.py#L485),
+which raises. If the branch depends on a plain argument rather than a tensor, you can fix that
+argument with `concrete_args`, and FX inserts an assertion that it still has the value it was
+traced with:
+
+```python
+def g(x, flag):
+    if flag:
+        return x + 1
+    return x - 1
+
+print(symbolic_trace(g, concrete_args={"flag": True}).code)
+```
+
+```python
+def forward(self, x, flag_1):
+    eq = flag_1 == True;  flag_1 = None
+    _assert = torch._assert(eq, 'flag has been specialized to have value True but got another value');  eq = _assert = None
+    add = x + 1;  x = None
+    return add
+```
+
+Shapes are a subtler case. `x.shape[0]` is an attribute read on a Proxy, so it does not fail. It
+becomes two nodes, a `getattr` of `shape` and a `getitem` of index 0:
+
+```python
+def h(x):
+    n = x.shape[0]
+    return x.view(n, -1)
+```
+
+```text
+graph():
+    %x : [num_users=2] = placeholder[target=x]
+    %getattr_1 : [num_users=1] = call_function[target=builtins.getattr](args = (%x, shape), kwargs = {})
+    %getitem : [num_users=1] = call_function[target=operator.getitem](args = (%getattr_1, 0), kwargs = {})
+    %view : [num_users=1] = call_method[target=view](args = (%x, %getitem, -1), kwargs = {})
+    return view
+```
+
+This graph computes the size at run time, so it works for any input. But it knows nothing about
+the size: no pass can ask "how many rows does `view` produce?", and `if n > 4:` would still raise.
+Answering such questions is what [symbolic shapes](#symbolic-shapes) are for.
+
+### Leaf modules and wrapped functions
+
+Two knobs control how deep tracing goes. **Leaf modules** are recorded as a single
+`call_module` node; by default these are the modules in `torch.nn` (`Linear`, `Conv2d`, ...), and
+everything else is traced through. A custom `Tracer` can change the rule. With every module
+traced through, `nn.Linear` opens up into its parameters and the functional call:
+
+```python
+class TraceEverything(fx.Tracer):
+    def is_leaf_module(self, m, qualname):
+        return False
+```
+
+```text
+graph():
+    %x : [num_users=1] = placeholder[target=x]
+    %lin_weight : [num_users=1] = get_attr[target=lin.weight]
+    %lin_bias : [num_users=1] = get_attr[target=lin.bias]
+    %linear : [num_users=1] = call_function[target=torch._C._nn.linear](args = (%x, %lin_weight, %lin_bias), kwargs = {})
+    return linear
+```
+
+The opposite knob, `torch.fx.wrap("fn")`, makes a free function a leaf: the tracer records one
+`call_function` node for it instead of running its body. This is how you keep a helper that calls
+`len()` or branches on a value out of the trace.
+
+## Transforming graphs
+
+A **pass** is a function that takes a GraphModule and changes its graph. FX offers four levels
+of help, from editing nodes by hand to rewriting while running.
+
+### Editing nodes directly
+
+Take a function with an addition, a multiply, a value nobody uses and a ReLU:
+
+```python
+def f(x, y):
+    a = torch.add(x, y)
+    b = torch.mul(a, 2)
+    unused = torch.sin(x)
+    return torch.relu(b)
+```
+
+The pass below makes three edits. It points the `add` node at `torch.sub`, removes dead code, and
+inserts a `clamp` after the multiply. After any edit, `gm.recompile()` regenerates `forward` from
+the graph.
+
+```python
+gm = symbolic_trace(f)
+
+# 1. Change what a node calls.
+for n in gm.graph.nodes:
+    if n.op == "call_function" and n.target is torch.add:
+        n.target = torch.sub
+
+# 2. Drop nodes whose value is never used.
+gm.graph.eliminate_dead_code()
+
+# 3. Insert a node, then reroute the old node's users to it.
+for n in list(gm.graph.nodes):
+    if n.op == "call_function" and n.target is torch.mul:
+        with gm.graph.inserting_after(n):
+            c = gm.graph.call_function(torch.clamp, (n,), {"max": 1.0})
+        n.replace_all_uses_with(c, delete_user_cb=lambda u: u is not c)
+
+gm.graph.lint()
+gm.recompile()
+```
+
+Step through the generated code after each edit:
+
+<CodeStages stages={editStages} tags={editTags} title="Three graph edits, with x = [1, 2, 3] and y = [0.5, 2.5, -1]" maxLines={8} />
+
+Check the final output by hand. $x - y = [0.5, -0.5, 4]$, times 2 is $[1, -1, 8]$, clamped at 1
+is $[1, -1, 1]$, and ReLU gives $[1, 0, 1]$, which is what the graph returns.
+
+Three API details matter here:
+
+- **`replace_all_uses_with`** rewires every user of `mul` to read `clamp` instead. Without
+  `delete_user_cb`, it would also rewire `clamp` itself, making `clamp` read its own output. The
+  callback skips that one user.
+- **`eliminate_dead_code`** removes nodes with no users unless
+  [`Node.is_impure`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/fx/node.py#L740)
+  says they have side effects: placeholders and outputs, ops that mutate an input, random ops,
+  and a list of known side-effecting functions such as `torch._assert`. `torch.sin` is pure, so
+  it went.
+- **`graph.lint()`** checks the invariants: every input of a node appears before it, names are
+  unique, and `users` matches `args`. Run it after hand edits; it is cheap.
+
+### Pattern rewriting with replace_pattern
+
+Hand-written loops get tedious when the thing to find is several nodes long.
+[`subgraph_rewriter.replace_pattern`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/fx/subgraph_rewriter.py#L96)
+takes two plain functions: a **pattern** to find and a **replacement** with the same signature.
+Both are traced to FX graphs, every match of the pattern graph in the target graph is found, and
+each match is replaced by a copy of the replacement graph.
+
+Here the pattern is SiLU written out by hand, $\sigma(a) \cdot a$, and the replacement is the fused
+`F.silu`:
+
+```python
+def f(x, w):
+    y = torch.matmul(x, w)
+    y = torch.sigmoid(y) * y
+    z = torch.sigmoid(x) * x
+    return y + z.sum()
+
+def pattern(a):
+    return torch.sigmoid(a) * a
+
+def replacement(a):
+    return torch.nn.functional.silu(a)
+
+gm = symbolic_trace(f)
+matches = subgraph_rewriter.replace_pattern(gm, pattern, replacement)
+print(len(matches))   # 2
+print(gm.code)
+```
+
+```python
+def forward(self, x, w):
+    matmul = torch.matmul(x, w);  w = None
+    silu_1 = torch.nn.functional.silu(x, inplace = False);  x = None
+    sum_1 = silu_1.sum();  silu_1 = None
+    silu = torch.nn.functional.silu(matmul, inplace = False);  matmul = None
+    add = silu + sum_1;  silu = sum_1 = None
+    return add
+```
+
+Both occurrences matched, one on `matmul` and one on the input `x`, because the pattern's
+placeholder `a` matches any node. The rewritten module gives the same output as the original
+(`torch.allclose` is `True` on random inputs). The rewriter also reordered the nodes, which is
+allowed: any order in which every node comes after its inputs computes the same thing.
+
+Matching is structural. A pattern written with `torch.sigmoid` will not match code that called
+`x.sigmoid()`, because one is `call_function` and the other `call_method`. This is one reason
+compilers rewrite ATen-level graphs (see [below](#one-function-five-graphs)), where each operation
+has exactly one spelling.
+
+### Interpreter: run a graph node by node
+
+`gm(x)` runs the generated Python in one go. An
+[`Interpreter`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/fx/interpreter.py#L52)
+runs the same graph one node at a time, calling a method per node (`run_node`, which dispatches to
+`placeholder`, `call_function`, `call_module` and so on). Override one of those methods and you
+can observe or change every value as it is computed.
+
+A practical example: find the first node that produces a NaN.
+
+```python
+def f(x):
+    a = x - 1
+    b = torch.sqrt(a)
+    c = b * 2
+    return c.sum()
+
+class FindNaN(fx.Interpreter):
+    def run_node(self, n):
+        out = super().run_node(n)
+        if isinstance(out, torch.Tensor) and torch.isnan(out).any():
+            print("first NaN at", n.name, n.format_node())
+            ...
+        return out
+
+FindNaN(symbolic_trace(f)).run(torch.tensor([4.0, 0.5, 2.0]))
+```
+
+Recording every value instead gives this trace:
+
+| Node | `op` | target | Value | NaN? |
+| --- | --- | --- | --- | :-: |
+| `x` | placeholder | `x` | [4, 0.5, 2] | |
+| `sub` | call_function | `operator.sub` | [3, −0.5, 1] | |
+| `sqrt` | call_function | `torch.sqrt` | [1.7321, NaN, 1] | ✗ |
+| `mul` | call_function | `operator.mul` | [3.4641, NaN, 2] | ✗ |
+| `sum_1` | call_method | `sum` | NaN | ✗ |
+
+The culprit is `sqrt`, fed the $-0.5$ that `sub` produced from the input $0.5$. Every later node
+is NaN only because it read a NaN.
+
+PyTorch's own
+[`ShapeProp`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/fx/passes/shape_prop.py#L89)
+is an Interpreter of this kind. It runs the graph on example inputs and stores each result's
+shape, dtype and strides in `node.meta["tensor_meta"]`. The shapes in the `Block` figure above came
+from `ShapeProp(gm).propagate(torch.randn(2, 4))`: `linear`, `relu` and `mul` are $2 \times 4$,
+`scale` is $4$, and `sum_1` is $2$.
+
+### Transformer: rewrite while running
+
+A [`Transformer`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/fx/interpreter.py#L518)
+is an Interpreter whose values are Proxies. "Running" a node therefore traces it again into a new
+graph, and an override can emit several nodes in place of one. This pass expands every
+`torch.sigmoid` using the identity $\sigma(a) = \tfrac{1}{2}\left(\tanh(a/2) + 1\right)$:
+
+```python
+class SigmoidToTanh(fx.Transformer):
+    def call_function(self, target, args, kwargs):
+        if target is torch.sigmoid:
+            (a,) = args
+            half = super().call_function(operator.mul, (a, 0.5), {})
+            t = super().call_function(torch.tanh, (half,), {})
+            t1 = super().call_function(operator.add, (t, 1.0), {})
+            return super().call_function(operator.mul, (t1, 0.5), {})
+        return super().call_function(target, args, kwargs)
+
+def f(x):
+    return torch.sigmoid(x) * x
+
+print(SigmoidToTanh(symbolic_trace(f)).transform().code)
+```
+
+```python
+def forward(self, x):
+    mul = x * 0.5
+    tanh = torch.tanh(mul);  mul = None
+    add = tanh + 1.0;  tanh = None
+    mul_1 = add * 0.5;  add = None
+    mul_2 = mul_1 * x;  mul_1 = x = None
+    return mul_2
+```
+
+Check one entry: for $x = 0.5$, $\sigma(0.5) = 0.62246$ and
+$\tfrac{1}{2}(\tanh(0.25) + 1) = \tfrac{1}{2}(0.24492 + 1) = 0.62246$, so both graphs return
+$0.5 \times 0.62246 = 0.31123$.
+
+Which tool to use:
+
+| Tool | Good for | Cost |
+| --- | --- | --- |
+| Edit nodes | Small local changes: retarget, insert, delete | You maintain `users` and order by hand (use `lint`) |
+| `replace_pattern` | Multi-node patterns with a fixed shape | Structural match only |
+| `Interpreter` | Observing values: shapes, NaNs, timing, memory | Runs with real (or fake) data |
+| `Transformer` | Replacing one node by many, or rebuilding a graph | Re-traces every node |
+
+## One function, five graphs
+
+`symbolic_trace` is the original FX front end, but in PyTorch 2 most FX graphs come from
+elsewhere. Each front end produces the same data structure at a different level:
+
+- **TorchDynamo** (`torch.compile`) reads Python bytecode, so it handles control flow by
+  specializing on it and breaking the graph where it must. Its graph holds Torch-level calls
+  (`torch.relu`, `@`, `Tensor.reshape`).
+- **`make_fx`** ([`proxy_tensor.py`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/fx/experimental/proxy_tensor.py#L3015))
+  traces below the [dispatcher](/blog/pytorch-dispatcher/), so every node is an **ATen**
+  operator overload such as `aten.mm.default`. AOTAutograd uses it to build forward and
+  backward graphs.
+- **`torch.export`** runs Dynamo and then AOTAutograd-style tracing, and produces an ATen graph
+  with a signature and shape constraints that can be saved and loaded elsewhere.
+
+Step through one function captured five ways. Watch how `x.shape[0]` is represented each time.
+
+<CodeStages stages={tracerStages} tags={tracerTags} title="def f(x, w): relu((x @ w).reshape(2 * x.shape[0], -1)) + x.shape[0]" maxLines={16} />
+
+The five graphs represent the size `x.shape[0]` in three different ways:
+
+| Capture | `x.shape[0]` becomes | Knows the value? | Graph valid for |
+| --- | --- | --- | --- |
+| `symbolic_trace` | `getattr` + `getitem` nodes | No | any size, but no shape reasoning |
+| `make_fx`, real | the literal `6` (and `12` for `2 * 6`) | Yes, fixed | only $x$ with 6 rows |
+| Dynamo / `make_fx` symbolic / export | a symbol, `s77` | As an expression, plus a hint of 6 | every size that satisfies the guards |
+
+The third row is the useful one. The graph is traced once, like the second row, so every node has
+a known shape and passes can reason about it. But the shape is an *expression* over input sizes,
+so the graph is valid for many inputs, like the first row. The rest of the post is about that row.
+
+## Symbolic shapes
+
+### Why shapes need symbols
+
+`torch.compile` specializes each graph to what it saw: the dtypes, the devices, and by default the
+sizes. If a model sees batch sizes 6, 10 and 3, specializing on sizes means three traces and three
+compilations. With **dynamic shapes** (`dynamic=True`, or automatically: by default, when a size changes,
+Dynamo recompiles with that size dynamic), Dynamo traces once with a symbol for each size and compiles one graph for all of them.
+
+Tracing with a symbol needs three things:
+
+1. **A tensor with no data but a symbolic shape**, so every operator can compute its output shape.
+   This is a **FakeTensor**: it runs each operator's shape logic (its "meta" kernel) without
+   allocating memory or computing values.
+2. **An integer that records arithmetic** instead of performing it, so that
+   `x.shape[0] * 2` yields `2*s77`. This is a **`SymInt`**.
+3. **A place that remembers what each symbol is and what the trace assumed about it.** This is the
+   **`ShapeEnv`**.
+
+### FakeTensor, SymInt, SymNode and ShapeEnv
+
+Each traced value lives in `node.meta`: under `"example_value"` in Dynamo graphs and `"val"` in
+`make_fx` and export graphs. For a tensor it is a FakeTensor, and each entry of its shape is either
+a plain `int` or a `SymInt`. The figure follows one size, dimension 1 of the reshaped tensor `y_1`
+from the Dynamo graph above, from the node down to the `ShapeEnv`. Hover each box.
+
+<DependencyGraph
+	nodes={symNodes}
+	edges={symEdges}
+	rankdir="TB"
+	directed
+	ranksep={30}
+	active="symnode"
+	title="How the size (s21//2) is stored"
+/>
+
+The layers, from the outside in:
+
+- **[`SymInt`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/__init__.py#L448)**
+  is the user-facing type. It behaves like an `int` and forwards every operator to its `node`.
+  (`SymFloat` and `SymBool` exist for the same reason.)
+- **[`SymNode`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/fx/experimental/sym_node.py#L89)**
+  holds a **sympy** expression (here `FloorDiv(s21, 2)`, printed `(s21//2)`), a **hint** (the
+  value in this particular trace, 2) and a pointer to the ShapeEnv. `SymNode.mul` builds the
+  sympy product, `SymNode.floordiv` builds a `FloorDiv`, and so on.
+- **[`ShapeEnv`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/fx/experimental/symbolic_shapes.py#L3838)**
+  is shared by the whole trace. It maps each symbol to its hint (`backed_var_to_val`:
+  `s77: 6, s27: 8, s21: 4`) and its source (`L['x'].size()[0]`), stores its range
+  (`var_to_range`, here $[2, \infty)$ for all three), and collects **guards**, the conditions the
+  trace relied on.
+
+The hint matters whenever Python needs an actual value. `if y_1.shape[1] > 1:` needs a `bool`.
+`SymNode.guard_bool` evaluates the expression with the hints (here $\lfloor 4/2 \rfloor = 2 > 1$,
+so `True`), records the guard `(s21//2) > 1` in the ShapeEnv, and returns `True`. The trace
+continues down the branch that was taken, and the guard makes sure the compiled graph is used
+only for inputs where it would be taken again.<Sidenote>`ShapeEnv.evaluate_expr`
+([source](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/fx/experimental/symbolic_shapes.py#L8186))
+first tries to prove the expression from the ranges and existing guards. Only if it cannot does it
+fall back on the hint and add a new guard. That is why many shape checks inside meta kernels add
+no guard at all.</Sidenote>
+
+### SymInt and SymNode in code
+
+Shapes are computed in two languages. Dynamo, decompositions and many meta functions are Python,
+but a lot of shape logic lives in C++: `TensorImpl` stores sizes and strides, and ATen kernels
+check and compute sizes. So a symbolic integer exists twice, once per language, with a bridge
+between them:
+
+| Role | Python | C++ |
+| --- | --- | --- |
+| Value type that acts like an integer | `torch.SymInt` | `c10::SymInt` |
+| Type-erased node that does the work | `torch.fx.experimental.sym_node.SymNode` | `c10::SymNodeImpl` (an interface) |
+| Boolean result of a comparison | `torch.SymBool` | `c10::SymBool` |
+| Bridge | | `PythonSymNodeImpl`, a `SymNodeImpl` that calls a Python `SymNode` |
+
+The Python `SymNode` is the source of truth: it holds the sympy expression, the hint and the
+`ShapeEnv`. The C++ classes either hold a plain integer or forward to it.
+
+#### The Python side: torch.SymInt and SymNode
+
+`torch.SymInt`
+([`torch/__init__.py`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/__init__.py#L448))
+is a thin class with a single field, `node`. Most of its methods in that file are stubs that raise
+`TypeError("type stub not overridden")`. The real ones are installed when `sym_node.py` is
+imported. For every entry of a table of operations (`"add": operator.add`, `"mul": operator.mul`,
+`"int_floordiv": _sympy_floordiv`, `"eq": _sympy_eq`, ...) two generators run:
+
+- [`_make_node_magic`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/fx/experimental/sym_node.py#L1387)
+  defines `SymNode.mul` and friends, which compute a new sympy expression.
+- [`_make_user_magic`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/fx/experimental/sym_node.py#L1832)
+  defines `SymInt.__mul__`, `__rmul__` and friends, which convert the other operand to a node and
+  call the node method. In the running process,
+  `torch.SymInt.__mul__.__qualname__` is `_make_user_magic.<locals>.binary_magic_impl`.
+
+You can drive this machinery by hand with a fresh `ShapeEnv`, without tracing anything:
+
+```python
+from torch.fx.experimental.symbolic_shapes import ShapeEnv, DimDynamic
+from torch._dynamo.source import ConstantSource
+
+env = ShapeEnv()
+def sym(val, name):
+    s = env.create_symbol(val, ConstantSource(name), dynamic_dim=DimDynamic.DYNAMIC)
+    return env.create_symintnode(s, hint=val)
+
+a, b = sym(6, "a"), sym(4, "b")   # s99 and s65: sha256("a") % 100 = 99, sha256("b") % 100 = 65
+c = a * 2 + b                     # SymInt s65 + 2*s99, hint 16
+d = c // 4                        # SymInt ((s65 + 2*s99)//4), hint 4
+print(env.guards)                 # []
+bool(c > 10)                      # True, guard s65 + 2*s99 > 10
+int(d)                            # 4, guard Eq(((s65 + 2*s99)//4), 4)
+```
+
+Arithmetic adds no guards: it only builds expressions and propagates hints
+($2 \cdot 6 + 4 = 16$, then $\lfloor 16/4 \rfloor = 4$). Guards appear only when Python demands a
+concrete value: `bool()` and `int()` both evaluate the expression on the hints and record what they
+assumed.
+
+Here is what `a * 2` does, condensed from the two generated functions:
+
+```python
+# _make_user_magic: SymInt.__mul__(self, other)
+def binary_magic_impl(self, other):
+    other_node = to_node(self.node, other)           # 2 -> self.node.wrap_int(2), a constant SymNode
+    ret = wrap_node(getattr(self.node, "mul")(other_node))
+    return get_constant(ret) if is_constant(ret) else ret
+
+# _make_node_magic: SymNode.mul(self, other)
+def binary_magic_impl(self, other):
+    op = method_to_operator("mul")                   # operator.mul
+    out_hint = op(self.hint, other.hint)             # 6 * 2 = 12
+    if get_proxy_mode():                             # make_fx is tracing: record an FX node
+        return to_node(self, handle_sym_dispatch(op, (wrap_node(self), wrap_node(other)), {}))
+    out = op(self.expr, other.expr)                  # sympy: 2*s99
+    return SymNode(out, self.shape_env, int, out_hint)
+```
+
+The `get_proxy_mode()` branch is how size arithmetic reaches the FX graph. When `make_fx` is
+tracing, the operation is passed to
+[`ProxyTorchDispatchMode.__sym_dispatch__`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/fx/experimental/proxy_tensor.py#L2047),
+which runs it (re-entering `SymNode.mul` with the mode switched off) and attaches a lazy proxy to
+the result. The `operator.mul` node is written into the graph only if a traced value later uses
+that SymInt, which is why internal size checks leave no trace in the graph. Dynamo has its own
+equivalent: it records `s77 * 2` as a node when it interprets the bytecode.
+
+Turning a symbol back into a Python value goes through three `SymNode` methods:
+
+- [`guard_int`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/fx/experimental/sym_node.py#L553)
+  and
+  [`guard_bool`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/fx/experimental/sym_node.py#L573)
+  call `ShapeEnv.evaluate_expr`, which returns the value and records a guard if the value was not
+  already provable. `int(s)` and `bool(s)` end up here.
+- [`expect_true`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/fx/experimental/sym_node.py#L583)
+  is for checks that must hold, such as "size is non-negative". With a hint it guards like
+  `guard_bool`; with an unbacked symbol it records a runtime assertion instead (the
+  `_assert_scalar` nodes [below](#data-dependent-sizes-unbacked-symbols)).
+
+#### The C++ side: c10::SymInt in one word
+
+[`c10::SymInt`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/c10/core/SymInt.h#L36)
+replaces `int64_t` in kernel signatures, so it must be as cheap as an `int64_t` when sizes are
+concrete, which is almost always. It is a single 64-bit field, `int64_t data_`, that holds
+*either* the integer itself *or* a tagged pointer to a `SymNodeImpl`. The top three bits decide
+which:
+
+| Top bits of `data_` | Meaning | Values |
+| --- | --- | --- |
+| `0…` | the integer itself, non-negative | $[0, 2^{63})$ |
+| `11…` | the integer itself, small negative | $[-2^{62}, -1]$ |
+| `101…` | pointer to a `SymNodeImpl` | not an integer |
+| `100…` | never stored | integers below $-2^{62}$ are boxed on the heap instead |
+
+```cpp
+// c10/core/SymInt.h (condensed)
+static constexpr uint64_t MASK   = 1ULL << 63 | 1ULL << 62 | 1ULL << 61;
+static constexpr uint64_t IS_SYM = 1ULL << 63 | 1ULL << 61;
+static constexpr int64_t MAX_UNREPRESENTABLE_INT = -1LL & static_cast<int64_t>(~(1ULL << 62));
+
+bool is_heap_allocated() const { return !(data_ > MAX_UNREPRESENTABLE_INT); }
+
+SymInt operator*(const SymInt& sci) const {
+  if (auto ma = maybe_as_int())
+    if (auto mb = sci.maybe_as_int())
+      return SymInt(*ma * *mb);              // fast path: two plain integers
+  return operator_mul_slow_path(sci);        // at least one symbolic operand
+}
+```
+
+`MAX_UNREPRESENTABLE_INT` is $-2^{62} - 1$. Every `data_` with prefix `101` is below it, and every
+inline integer is above it, so "is this symbolic?" is one signed comparison. Work through one
+pointer. The
+[constructor](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/c10/core/SymInt.cpp#L36)
+computes `(ptr & ~MASK) | IS_SYM`, so a `SymNodeImpl*` at `0x0000600001234560` (an illustrative
+user-space address) becomes:
+
+| Step | Value |
+| --- | --- |
+| pointer | `0x0000600001234560` |
+| `data_ = (ptr & ~MASK) \| IS_SYM` | `0xa000600001234560` = $-6{,}917{,}423{,}474{,}505{,}726{,}624$ |
+| `data_ > -2^62 - 1`? | no, so `is_heap_allocated()` is true |
+| `toSymNodeImplUnowned()`: clear the top 3 bits, sign-extend from bit 61 | `0x0000600001234560` again |
+
+User-space pointers fit in the low 61 bits on current 64-bit platforms, so nothing is lost.
+The price is that integers below $-2^{62}$ cannot be stored inline: the constructor detects them
+and boxes them in a heap-allocated `ConstantSymNodeImpl` (`promote_to_negative`). Since `data_`
+may own a reference-counted pointer, the copy constructor, assignment and destructor increment and
+decrement the node's reference count when `is_heap_allocated()`.
+
+The slow path is one macro,
+[`DEFINE_BINARY`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/c10/core/SymInt.cpp#L52).
+It wraps whichever operand is a plain integer with `wrap_int` and calls a virtual method on the
+node: `+` calls `add`, `*` calls `mul`, `/` calls `floordiv`, and `sym_eq`, `sym_lt`, ... return a
+`c10::SymBool`. Those methods are declared on
+[`SymNodeImpl`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/c10/core/SymNodeImpl.h#L24),
+an abstract interface whose default implementations fail with `"NYI"`.
+
+C++ has to turn symbols into concrete values too, and it marks every place it does so:
+
+```cpp
+// c10/core/SymInt.h: a C++ comparison is a guard, tagged with its source location
+bool operator==(const SymInt& o) const {
+  return sym_eq(o).guard_bool(__FILE__, __LINE__);
+}
+
+// c10/core/SymBool.h
+#define TORCH_SYM_CHECK(cond, ...) \
+  TORCH_CHECK((cond).expect_true(__FILE__, __LINE__), __VA_ARGS__)
+```
+
+Kernels that know about symbolic shapes use `sym_eq`, `sym_ge` and `TORCH_SYM_CHECK`, and read
+sizes with `sym_sizes()`. A tensor with symbolic sizes keeps them in a `SymbolicShapeMeta` on its
+`TensorImpl`, and
+[`sym_sizes_default`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/c10/core/TensorImpl.h#L638)
+returns them from there. The old `sizes()` returns `IntArrayRef`, plain integers, and throws on
+such a tensor. A kernel that still calls `sizes()` fails loudly under symbolic tracing instead of
+silently baking in a number.
+
+#### Crossing the boundary
+
+C++ cannot run sympy, so every symbolic `c10::SymInt` that comes from Python points to a
+[`PythonSymNodeImpl`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/csrc/utils/python_symnode.h#L37).
+It holds a reference to the Python `SymNode`, and each virtual method takes the GIL and calls the
+Python method of the same name:
+
+```cpp
+// torch/csrc/utils/python_symnode.h (condensed)
+c10::SymNode dispatch_common_(const char* fname, const c10::SymNode& other) {
+  auto pother = dynamic_cast<PythonSymNodeImpl*>(other.get());
+  py::gil_scoped_acquire acquire;
+  auto r = getPyObj().attr(fname)(pother->getPyObj());   // e.g. pynode.mul(other_pynode)
+  return c10::make_intrusive<PythonSymNodeImpl>(r);
+}
+c10::SymNode mul(const c10::SymNode& other) override { return dispatch_common_(__func__, other); }
+
+bool guard_bool(const char* file, int64_t line) override {
+  py::gil_scoped_acquire acquire;
+  return getPyObj().attr("guard_bool")(file, line).cast<bool>();
+}
+```
+
+The conversion itself happens in the pybind type caster
+([`pybind.cpp`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/csrc/utils/pybind.cpp#L7)).
+Going in, `load` sees a `torch.SymInt`, takes its `.node` and wraps it in a `PythonSymNodeImpl`.
+Plain Python ints become inline `c10::SymInt`s. Coming out, `cast` returns a Python `int` for a
+concrete value. For a symbolic one it unwraps the `PythonSymNodeImpl` and builds a `torch.SymInt`
+around the original Python node. So a size that goes into C++ and comes back is a new
+`torch.SymInt` wrapping the same `SymNode` object (`e.shape[0].node is n.node` is `True` in the
+trace below).
+
+Step through one call that crosses the boundary both ways, `torch.empty(x.shape[0] * 2)` traced
+by `make_fx` in symbolic mode:
+
+<SequenceSteps participants={symIntParticipants} messages={symIntMessages} colWidth={128} title="torch.empty(x.shape[0] * 2) with x.shape[0] = s75" />
+
+The C++ half is observable. With a logging wrapper around the Python `SymNode` methods, tracing
+that call records calls whose `file` and `line` arguments point into ATen's C++ source:
+
+```python
+orig = SymNode.expect_true
+def logged(self, file, line):
+    print("expect_true", self.expr, file.split("/")[-1], line)
+    return orig(self, file, line)
+SymNode.expect_true = logged
+
+make_fx(lambda x: torch.empty(x.shape[0] * 2), tracing_mode="symbolic")(torch.randn(6, 4))
+# expect_true True EmptyTensor.h 24     (printed several times, never with a new guard)
+```
+
+`EmptyTensor.h:24` is the `TORCH_SYM_CHECK(x.sym_ge(0), ...)` in
+[`check_size_nonnegative`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/aten/src/ATen/EmptyTensor.h#L17).
+The expression arrives already simplified to `True` (sympy knows `s75` is a positive integer), so
+the check costs no guard. The same hook also sees C++ calling `SymNode.mul` and `SymNode.add` with
+operands such as `4` and `2*s75` as the kernel computes the element count and storage size.
+
+### How a symbol is created
+
+When Dynamo wraps an input tensor, it calls `ShapeEnv.create_symbol` once per dimension, with the
+size and a **source** that says where the size comes from, such as `L['x'].size()[0]` (the size of
+local `x`, dimension 0). Four rules from
+[`create_symbol`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/fx/experimental/symbolic_shapes.py#L5484)
+decide what comes out:
+
+1. **Sizes 0 and 1 are specialized.** They return the constants `0` and `1`, never a symbol,
+   because so much code treats them specially (broadcasting, empty tensors). Every symbol therefore
+   gets the range $[2, \infty)$ and a guard `2 <= s`.
+2. **Duck sizing.** If another input dimension already has the same value, the existing symbol is
+   reused. In `f(x, w)` with $x$ of shape $6 \times 8$ and $w$ of shape $8 \times 4$, both
+   `x.size(1)` and `w.size(0)` are 8, so both become `s27`. That guesses that equal sizes are equal
+   by design (true here, as matmul requires it) and adds the guard `x.size(1) == w.size(0)`.
+   `torch.fx.experimental._config.use_duck_shape = False` turns this off.
+3. **Names come from a hash of the source.** The symbol id is
+   `sha256(source_name) % 100`, moved up by one until it is unused
+   ([`_generate_unique_id`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/fx/experimental/symbolic_shapes.py#L7959)).
+   `sha256("L['x'].size()[0]") % 100` is 77, so `x.size(0)` is `s77` in every trace of every
+   function whose argument is called `x`. Stable names make logs comparable across runs.
+   `L['w'].size()[0]` would have hashed to 15, but duck sizing gave it `s27` first.
+4. **Data-dependent sizes are unbacked.** Sizes that are not known until a kernel runs, such as
+   the length of `torch.nonzero(x)`, get symbols `u0`, `u1`, ... with no hint. They are covered
+   [at the end](#data-dependent-sizes-unbacked-symbols).
+
+| Symbol | Source | Hint | Range | Name from |
+| --- | --- | --: | --- | --- |
+| `s77` | `L['x'].size()[0]` | 6 | $[2, \infty)$ | `sha256 % 100 = 77` |
+| `s27` | `L['x'].size()[1]` and `L['w'].size()[0]` | 8 | $[2, \infty)$ | `sha256 % 100 = 27`, shared by duck sizing |
+| `s21` | `L['w'].size()[1]` | 4 | $[2, \infty)$ | `sha256 % 100 = 21` |
+
+### Symbolic shapes in the graph
+
+Here is the Dynamo graph of `f` again, as `gm.print_readable()` shows it:
+
+```python
+class GraphModule(torch.nn.Module):
+    def forward(self, s77: "Sym(s77)", s27: "Sym(s27)", L_x_: "f32[s77, s27]", s21: "Sym(s21)", L_w_: "f32[s27, s21]"):
+        l_x_ = L_x_
+        l_w_ = L_w_
+
+        # y = x @ w
+        y: "f32[s77, s21]" = l_x_ @ l_w_;  l_x_ = l_w_ = None
+
+        # y = y.reshape(x.shape[0] * 2, -1)
+        mul: "Sym(2*s77)" = s77 * 2
+        y_1: "f32[2*s77, (s21//2)]" = y.reshape(mul, -1);  y = mul = None
+
+        # return torch.relu(y) + x.shape[0]
+        relu: "f32[2*s77, (s21//2)]" = torch.relu(y_1);  y_1 = None
+        add: "f32[2*s77, (s21//2)]" = relu + s77;  relu = s77 = None
+        return (add,)
+```
+
+Symbolic shapes show up in the graph in four ways:
+
+1. **Type annotations.** Each node's string annotation, such as `"f32[2*s77, (s21//2)]"`, is
+   printed from `meta["example_value"]`: dtype, then each size as a sympy expression. It is only
+   a comment; the information lives in the FakeTensor.
+2. **Symbols as inputs.** Dynamo adds a `placeholder` for every symbol, annotated `Sym(s77)`, ahead
+   of the tensor it came from. At run time, the compiled code is called with the actual sizes
+   (6, 8 and 4 for the traced inputs), so a backend that needs a size has it as an ordinary
+   argument.
+3. **Size arithmetic as nodes.** `x.shape[0] * 2` became the node `mul = s77 * 2` with target
+   `operator.mul` on SymInts, whose own value is the `SymInt` `2*s77`. `relu + s77` reads the
+   symbol node directly. Size computations are part of the data flow like any tensor op.
+4. **Reading a size back.** ATen-level graphs (`make_fx`, export) have no symbol placeholders.
+   They read sizes from tensors with `torch.ops.aten.sym_size.int(x, 0)`, whose value is
+   `Sym(s77)`. `make_fx` creates that node lazily, the first time a traced op uses the size, which
+   is why `sym_size_int` sits after `mm` in the `make_fx` symbolic graph
+   ([`track_tensor`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/fx/experimental/proxy_tensor.py#L832)).
+
+Notice which sizes are *not* nodes. The `(s21//2)` in `y_1`'s shape was derived by reshape's
+meta kernel from the element count $s77 \cdot s21$ divided by $2 \cdot s77$; it exists only in the
+FakeTensor's shape. Only sizes the *user program* computed with, like `x.shape[0] * 2`, become
+nodes.
+
+Now run the graph. Pick an input size in the figure: the "this call" column shows what each
+node actually produces when the Dynamo graph runs on real tensors of that size, and the list
+below checks every guard the trace recorded. Hover a symbol to find it everywhere.
+
+<SymbolicShapes data={dynamoShapes} title="The Dynamo graph of f, run at five input sizes" />
+
+Check the first configuration by hand. With $s77 = 6$ and $s21 = 4$, `y` is $6 \times 4$, which is
+24 elements. `mul` is $2 \cdot 6 = 12$, so `reshape(12, -1)` infers $24 / 12 = 2$ columns, and the
+symbolic shape agrees: $\lfloor s21/2 \rfloor = \lfloor 4/2 \rfloor = 2$. For $x$ of shape
+$3 \times 16$ and $w$ of shape $16 \times 6$, the same graph gives `y_1` of shape $6 \times 3$
+without retracing.
+
+### Guards and recompilation
+
+The guards in the figure came from four places in the trace:
+
+| Guard | Where it came from | What it means for `s21`, `s77` |
+| --- | --- | --- |
+| `Eq(Mod(s21*s77, 2*s77), 0)` | `reshape` checks that the element count divides into `2*s77` rows | $s21$ is even |
+| `Eq(s21*s77, 2*s77*((s21//2)))` | `reshape` checks the inferred size times the rows is the element count | $s21$ is even (again) |
+| `Ne(s21*s77, 2*s77)` | `reshape`'s view algorithm asks whether the inferred size is 1 | $s21 \ne 2$ |
+| `Ne((s21//2), 1)` | broadcasting in `relu(y) + s77` asks whether the last size is 1 | $s21 \notin \{2, 3\}$ |
+| `2 <= s77` (and `s27`, `s21`) | 0/1 specialization when the symbols were created | no size is 0 or 1 |
+| `x.size(1) == w.size(0)` | duck sizing | the shared dimension stays shared |
+
+Before calling a compiled graph, Dynamo runs a guard function that checks all of these on the new
+inputs. If every guard holds, it reuses the graph. If any fails, it traces again. The figure's
+last two configurations show both kinds of failure. Calling the compiled `f` with them (and a
+backend that counts compilations) confirms that each one triggers a new compilation, while the
+first three reuse the graph:
+
+- **$x$ of shape $1 \times 8$** fails `2 <= s77`. The new trace specializes `x.size(0)` to 1.
+- **$w$ of shape $8 \times 2$** fails `Ne(s21*s77, 2*s77)` and `Ne((s21//2), 1)`. A last
+  dimension of 1 after the reshape broadcasts differently, so the old graph's assumptions are wrong.
+
+Branches on sizes are the most common source of guards. In
+
+```python
+@torch.compile(dynamic=True)
+def f(x):
+    if x.shape[0] > 4:
+        return x.sin()
+    return x.cos()
+```
+
+`x.shape[0] > 4` is a `SymBool`, and `if` asks for its `bool`. The hint 6 gives `True`, so the
+trace records the guard `5 <= x.size()[0]` and the graph contains only `sin`. The branch itself is
+gone. Calling with 9 rows reuses that graph. Calling with 3 rows fails the guard, and the second
+trace produces a `cos` graph guarded by `2 <= x.size()[0] <= 4`. Calling with 1 row fails both, and
+the third graph has no `SymInt` input at all, because size 1 is specialized:
+
+```python
+# graph 1, guard 5 <= x.size()[0]
+def forward(self, s77 : torch.SymInt, L_x_ : torch.Tensor):
+    l_x_ = L_x_
+    sin = l_x_.sin();  l_x_ = None
+    return (sin,)
+
+# graph 3, x.size()[0] == 1
+def forward(self, L_x_ : torch.Tensor):
+    l_x_ = L_x_
+    cos = l_x_.cos();  l_x_ = None
+    return (cos,)
+```
+
+### torch.export: named dimensions and ranges
+
+`torch.export` cannot recompile later: the exported graph must be right for every input it will
+ever see. So instead of guessing which sizes are dynamic, it asks. A **`Dim`** names a dynamic
+dimension and gives its range, and every dimension not named is static.
+
+```python
+from torch.export import export, Dim
+
+class M(torch.nn.Module):
+    def forward(self, x, w):
+        return f(x, w)          # the same f as above
+
+batch = Dim("batch", min=2, max=1024)
+ep = export(M(), (torch.randn(6, 8), torch.randn(8, 4)),
+            dynamic_shapes={"x": {0: batch}, "w": None})
+print(ep.range_constraints)     # {s77: VR[2, 1024]}
+```
+
+```python
+class GraphModule(torch.nn.Module):
+    def forward(self, x: "f32[s77, 8]", w: "f32[8, 4]"):
+        sym_size_int_1: "Sym(s77)" = torch.ops.aten.sym_size.int(x, 0)
+        matmul: "f32[s77, 4]" = torch.ops.aten.matmul.default(x, w);  x = w = None
+        mul: "Sym(2*s77)" = sym_size_int_1 * 2
+        reshape: "f32[2*s77, 2]" = torch.ops.aten.reshape.default(matmul, [mul, -1]);  matmul = mul = None
+        relu: "f32[2*s77, 2]" = torch.ops.aten.relu.default(reshape);  reshape = None
+        add: "f32[2*s77, 2]" = torch.ops.aten.add.Tensor(relu, sym_size_int_1);  relu = sym_size_int_1 = None
+        return (add,)
+```
+
+Only `x.size(0)` is a symbol now; the 8 and 4 are constants, so the reshape's second dimension is
+the constant 2 and none of the `s21` guards exist. The range from the `Dim` is stored in
+`ep.range_constraints`, and the exported module checks inputs against it:
+`ep.module()(torch.randn(2000, 8), w)` fails with `Guard failed: x.size()[0] <= 1024`, and a 7-column
+`x` fails with `Guard failed: x.size()[1] == 8`.
+
+If the program needs a guard that the declared range does not imply, export refuses instead of
+silently specializing. Exporting the `sin`/`cos` function above with `Dim("n")` for the first
+dimension fails with:
+
+```text
+UserError: Constraints violated (n)! ...
+  - Not all values of n = L['x'].size()[0] in the specified range satisfy the generated guard
+    5 <= L['x'].size()[0] and L['x'].size()[0] <= IntInfinity()
+Suggested fixes:
+  n = Dim('n', min=5)
+```
+
+### Data-dependent sizes: unbacked symbols
+
+Some sizes depend on tensor *values*: `torch.nonzero(x)` returns one row per nonzero element, and
+`t.item()` returns a number nobody knows until the kernel runs. A FakeTensor has no values, so
+these get **unbacked** symbols, `u0`, `u1`, ..., made by
+[`create_unbacked_symint`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/fx/experimental/symbolic_shapes.py#L5379).
+"Unbacked" means there is no hint, so the tracer can never fall back on a value to decide a
+branch. Either the answer follows from what it knows (the range and existing facts) or tracing
+fails with a data-dependent error. `torch._check` adds facts:
+
+```python
+class U(torch.nn.Module):
+    def forward(self, x):
+        idx = torch.nonzero(x)            # shape (u0, 1)
+        n = (x > 0).sum().item()          # u1
+        torch._check(n >= 2)
+        return idx.float().sum() + torch.zeros(n).sum()
+
+ep = export(U(), (torch.tensor([1.0, -2.0, 3.0, 0.0, 5.0]),))
+print(ep.range_constraints)   # {u0: VR[0, 5], u1: VR[2, int_oo]}
+```
+
+```python
+class GraphModule(torch.nn.Module):
+    def forward(self, x: "f32[5]"):
+        nonzero: "i64[u0, 1]" = torch.ops.aten.nonzero.default(x)
+        sym_size_int: "Sym(u0)" = torch.ops.aten.sym_size.int(nonzero, 0)
+        ge_1: "Sym(u0 >= 0)" = sym_size_int >= 0
+        _assert_scalar_default = torch.ops.aten._assert_scalar.default(ge_1, "Runtime assertion failed for expression u0 >= 0 on node 'ge_1'")
+        le: "Sym(u0 <= 5)" = sym_size_int <= 5;  sym_size_int = None
+        _assert_scalar_default_1 = torch.ops.aten._assert_scalar.default(le, "Runtime assertion failed for expression u0 <= 5 on node 'le'")
+
+        gt: "b8[5]" = torch.ops.aten.gt.Scalar(x, 0);  x = None
+        sum_1: "i64[]" = torch.ops.aten.sum.default(gt);  gt = None
+        item: "Sym(u1)" = torch.ops.aten.item.default(sum_1);  sum_1 = None
+        ge_2: "Sym(u1 >= 2)" = item >= 2
+        _assert_scalar_default_2 = torch.ops.aten._assert_scalar.default(ge_2, "Runtime assertion failed for expression u1 >= 2 on node 'ge_2'")
+
+        to: "f32[u0, 1]" = torch.ops.aten.to.dtype(nonzero, torch.float32);  nonzero = None
+        sum_2: "f32[]" = torch.ops.aten.sum.default(to);  to = None
+        zeros: "f32[u1]" = torch.ops.aten.zeros.default([item], device = device(type='cpu'), pin_memory = False);  item = None
+        sum_3: "f32[]" = torch.ops.aten.sum.default(zeros);  zeros = None
+        add: "f32[]" = torch.ops.aten.add.Tensor(sum_2, sum_3);  sum_2 = sum_3 = None
+        return (add,)
+```
+
+(Shortened slightly: one `_assert_tensor_metadata` node is left out.) Three things are new compared
+with backed symbols:
+
+- **Ranges come from the operator.** `nonzero` of 5 elements returns between 0 and 5 rows, so
+  `u0` gets the range $[0, 5]$. Unbacked symbols are not 0/1-specialized: 0 and 1 are allowed.
+- **The facts become runtime assertions.** A guard on a backed symbol is checked *before* the graph
+  runs, from the input sizes. An unbacked symbol is only known *inside* the graph, so each fact
+  is checked there, as `sym` comparison nodes (`ge_1`, `le`, `ge_2`) feeding
+  `aten._assert_scalar`. The user's `torch._check(n >= 2)` became the `ge_2` assertion and the
+  range $[2, \infty)$ for `u1`.
+- **The symbol flows like any other.** `item` has value `Sym(u1)` and is passed to `zeros`, whose
+  output has shape `f32[u1]`.
+
+On the example input, `nonzero` finds indices 0, 1, 2 and 4, so `u0 = 4`, the index sum is
+$0 + 1 + 2 + 4 = 7$, and the module returns $7.0$ (the zeros add nothing).
+
+## Summary
+
+- An FX graph is a linked list of `Node`s, each with an `op` (one of six), a `target`, `args` and
+  `kwargs` that point at other nodes, `users`, and a `meta` dictionary. A `GraphModule` turns the
+  graph into Python source and runs it.
+- `symbolic_trace` builds a graph by running `forward` on Proxies. It records one straight-line
+  path, so it cannot branch on tensor values and only sees sizes as opaque `getattr`/`getitem`
+  nodes.
+- Passes edit nodes directly, rewrite patterns with `replace_pattern`, observe values with an
+  `Interpreter` (as `ShapeProp` does) or rebuild graphs with a `Transformer`.
+- Dynamo, `make_fx` and `torch.export` all produce FX graphs; they differ in level (Torch calls or
+  ATen ops) and in how sizes appear: literals, or symbols.
+- A symbolic size is a `SymInt` wrapping a `SymNode` that holds a sympy expression and a hint,
+  with a shared `ShapeEnv` that names symbols, tracks their ranges and records guards. In the
+  graph it shows up as `Sym(...)` placeholders, `sym_size.int` reads, arithmetic nodes on
+  SymInts, shape annotations from `meta`, and, for unbacked symbols, runtime assertions.
+
+## References
+
+- PyTorch, [torch.fx documentation](https://docs.pytorch.org/docs/stable/fx.html).
+- J. Reed, Z. DeVito, H. He, A. Ussery, J. Ansel,
+  [torch.fx: Practical Program Capture and Transformation for Deep Learning in Python](https://arxiv.org/abs/2112.08429),
+  MLSys 2022.
+- J. Ansel et al., [PyTorch 2: Faster Machine Learning Through Dynamic Python Bytecode Transformation and Graph Compilation](https://doi.org/10.1145/3620665.3640366),
+  ASPLOS 2024.
+- PyTorch, [Dynamic shapes](https://docs.pytorch.org/docs/stable/torch.compiler_dynamic_shapes.html)
+  and [torch.export](https://docs.pytorch.org/docs/stable/export.html) documentation.
+- Source at commit `cf30153c`:
+  [`torch/fx`](https://github.com/pytorch/pytorch/tree/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/fx),
+  [`symbolic_shapes.py`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/fx/experimental/symbolic_shapes.py),
+  [`sym_node.py`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/fx/experimental/sym_node.py),
+  [`proxy_tensor.py`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/fx/experimental/proxy_tensor.py).

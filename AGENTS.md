@@ -127,6 +127,7 @@ has a demo page under `src/pages/demo/`, listed at `/demo`.
 | `PagedAddress` | `src/utils/inference/PagedAddress.astro` | Hover a token to follow it through a block table (or `req_to_token` row) to its KV slot |
 | `OverlapTimeline` | `src/utils/inference/OverlapTimeline.astro` | CPU/GPU timeline of a serving loop with and without overlapped scheduling |
 | `TokenStrip` | `src/utils/inference/TokenStrip.astro` | A prompt as token chips (text, id, kind), runs of repeated tokens, KV-block markers, switchable views |
+| `MinCutSteps` | `src/utils/compiler/MinCutSteps.astro` | Step-through max-flow / min-cut on a node-capacitated network (augmenting paths, saved nodes), as built by AOTAutograd's partitioner |
 
 ### Building a new component
 

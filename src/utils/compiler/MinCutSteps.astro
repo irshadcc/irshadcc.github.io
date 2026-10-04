@@ -1,0 +1,400 @@
+---
+// Step-through min-cut of the flow network that AOTAutograd's min-cut partitioner builds from a
+// joint forward-backward graph. Each box is an FX node; its capacity (bottom right) is the cost of
+// saving that node's output, and the bar fills as flow passes through it. Dashed edges from the
+// source mark nodes that may not be recomputed; edges into the sink mark values the backward
+// needs. Each step pushes one augmenting path (highlighted) with Edmonds-Karp; the last step shows
+// the minimum cut: saved nodes, nodes left in the forward, and nodes recomputed in the backward.
+// Hover a box to read how its capacity was computed. The flow logic is in minCut.ts.
+// Usage in .mdx:
+//   import MinCutSteps from "../../utils/compiler/MinCutSteps.astro";
+//   import { rmsSiluNodes, rmsSiluEdges } from "../../utils/compiler/aotMinCutData";
+//   <MinCutSteps nodes={rmsSiluNodes} edges={rmsSiluEdges} title="Min cut of the running example" />
+//   Optional: step={n} (step shown on load), wide={false} (keep to the text column).
+import StepControls from "./StepControls.astro";
+import {
+	type FlowEdge,
+	type FlowNode,
+	layoutFlow,
+	minCutSteps,
+} from "./minCut";
+
+interface Props {
+	nodes: FlowNode[];
+	edges: FlowEdge[];
+	step?: number;
+	title?: string;
+	/** On wide screens, extend into the margin-note column. */
+	wide?: boolean;
+}
+
+const { nodes, edges, step = 0, title, wide = true } = Astro.props;
+const steps = minCutSteps(nodes, edges);
+const at = Math.max(0, Math.min(steps.length - 1, step));
+const lay = layoutFlow(nodes, edges);
+const pos = new Map(lay.nodes.map((n) => [n.id, n]));
+const byId = new Map(nodes.map((n) => [n.id, n]));
+const W = lay.width;
+const H = lay.height;
+const hash = [...JSON.stringify({ nodes, edges })]
+	.reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7)
+	.toString(36);
+const fmt = (v: number) => v.toLocaleString("en-US");
+const BAR = 6;
+const notes = nodes.filter((n) => n.note);
+---
+
+<figure class:list={["mc", { "mc-wide": wide }]} data-step={at} tabindex="-1">
+	{title && <figcaption class="mc-title">{title}</figcaption>}
+	<StepControls labels={steps.map((s) => s.label)} step={at} />
+	<div class="mc-panes">
+		{
+			steps.map((s, i) => {
+				const onPath = new Set(s.path);
+				const pathEdges = new Set(s.pathEdges);
+				return (
+					<div class="mc-pane" data-i={i} aria-hidden={i !== at ? "true" : undefined}>
+						<svg viewBox={`0 0 ${W} ${H}`} style={`width: min(100%, ${W}px); min-width: ${Math.min(W, 520)}px`} role="img" aria-label={`${s.label}: ${s.text}`}>
+							<defs>
+								<marker id={`mc-a-${hash}-${i}`} viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+									<path d="M0,0 L8,4 L0,8 z" class="mc-head" />
+								</marker>
+								<marker id={`mc-ap-${hash}-${i}`} viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+									<path d="M0,0 L8,4 L0,8 z" class="mc-head path" />
+								</marker>
+							</defs>
+							{lay.edges.map((e) => {
+								const on = pathEdges.has(e.key);
+								const flow = s.edgeFlow[e.key] ?? 0;
+								return (
+									<path
+										class:list={["mc-edge", { ban: e.from === "source", need: e.to === "sink", flow: flow > 0, on }]}
+										d={e.d}
+										marker-end={`url(#mc-${on ? "ap" : "a"}-${hash}-${i})`}
+									/>
+								);
+							})}
+							{["source", "sink"].map((id) => {
+								const p = pos.get(id);
+								return p ? (
+									<g class="mc-term" transform={`translate(${p.x},${p.y})`}>
+										<circle r={p.w / 2} />
+										<text y="4">{id === "source" ? "s" : "t"}</text>
+										<text class="sub" y={p.h / 2 + 11}>{id}</text>
+									</g>
+								) : null;
+							})}
+							{nodes.map((n) => {
+								const p = pos.get(n.id);
+								if (!p) return null;
+								const flow = s.nodeFlow[n.id] ?? 0;
+								const cap = n.cap;
+								const frac = cap === null ? 0 : cap === 0 ? 1 : Math.min(1, flow / cap);
+								const full = cap !== null && flow >= cap && flow > 0;
+								const side = s.sides?.[n.id];
+								return (
+									<g
+										class:list={["mc-node", n.kind ?? "fwd", side && `side-${side}`, { on: onPath.has(n.id), full }]}
+										data-id={n.id}
+										tabindex={n.note ? "0" : undefined}
+										transform={`translate(${p.x - p.w / 2},${p.y - p.h / 2})`}
+									>
+										{n.note && <title>{n.note}</title>}
+										<rect class="box" width={p.w} height={p.h} rx="5" />
+										<text class="name" x={p.w / 2} y="15">{n.label}</text>
+										<text class="op" x={p.w / 2} y="27">{n.op ?? ""}</text>
+										<rect class="track" x="6" y={p.h - BAR - 9} width={p.w - 12} height={BAR} rx="2" />
+										<rect class="bar" x="6" y={p.h - BAR - 9} width={(p.w - 12) * frac} height={BAR} rx="2" />
+										<text class="cap" x={p.w / 2} y={p.h - 1.5}>
+											{cap === null ? "∞" : `${fmt(flow)} / ${fmt(cap)}`}
+										</text>
+										{side === "saved" && <text class="badge" x={p.w - 4} y="-3">saved</text>}
+									</g>
+								);
+							})}
+						</svg>
+					</div>
+				);
+			})
+		}
+	</div>
+	<div class="mc-texts">
+		{
+			steps.map((s, i) => (
+				<p class="mc-text" data-i={i} hidden={i !== at}>
+					{s.text}
+				</p>
+			))
+		}
+	</div>
+	{notes.length > 0 && <p class="mc-hover" aria-live="polite">Hover a box to see how its capacity was computed.</p>}
+	<ul class="mc-legend">
+		<li><svg viewBox="0 0 22 10" aria-hidden="true"><path class="mc-edge ban" d="M1,5 H21"></path></svg>cannot be recomputed</li>
+		<li><svg viewBox="0 0 22 10" aria-hidden="true"><path class="mc-edge on" d="M1,5 H21"></path></svg>augmenting path</li>
+		<li><svg viewBox="0 0 14 10" aria-hidden="true"><rect class="sw input" x="0.5" y="0.5" width="13" height="9" rx="2"></rect></svg>input</li>
+		<li><svg viewBox="0 0 14 10" aria-hidden="true"><rect class="sw fwd" x="0.5" y="0.5" width="13" height="9" rx="2"></rect></svg>forward op</li>
+		<li><svg viewBox="0 0 14 10" aria-hidden="true"><rect class="sw bwd" x="0.5" y="0.5" width="13" height="9" rx="2"></rect></svg>backward op</li>
+		<li><svg viewBox="0 0 14 10" aria-hidden="true"><rect class="sw saved" x="1" y="1" width="12" height="8" rx="2"></rect></svg>saved (in the cut)</li>
+		<li><svg viewBox="0 0 14 10" aria-hidden="true"><rect class="sw side-bwd" x="0.5" y="0.5" width="13" height="9" rx="2"></rect></svg>runs in the backward</li>
+	</ul>
+</figure>
+
+<script>
+	import { bindStepper } from "./stepper";
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".mc")) {
+		const panes = [...fig.querySelectorAll<HTMLElement>(".mc-pane")];
+		const texts = [...fig.querySelectorAll<HTMLElement>(".mc-text")];
+		const hover = fig.querySelector<HTMLElement>(".mc-hover");
+		const hint = hover?.textContent ?? "";
+		bindStepper(fig, panes.length, (i) => {
+			panes.forEach((p, k) => (k === i ? p.removeAttribute("aria-hidden") : p.setAttribute("aria-hidden", "true")));
+			texts.forEach((t, k) => {
+				t.hidden = k !== i;
+			});
+		});
+		for (const node of fig.querySelectorAll<SVGGElement>(".mc-node")) {
+			const note = node.querySelector("title")?.textContent ?? "";
+			const show = () => {
+				if (hover && note) hover.textContent = note;
+			};
+			const hide = () => {
+				if (hover) hover.textContent = hint;
+			};
+			node.addEventListener("mouseenter", show);
+			node.addEventListener("focus", show);
+			node.addEventListener("mouseleave", hide);
+			node.addEventListener("blur", hide);
+		}
+	}
+</script>
+
+<style>
+	.mc {
+		--in-fill: #eceae3;
+		--in-line: #8e8b80;
+		--fw-fill: #e8eef5;
+		--fw-line: #7d97b3;
+		--bw-fill: #f6ead9;
+		--bw-line: #c08a45;
+		--path: #c2410c;
+		--bar: #4f7fa8;
+		--bar-full: #b4442b;
+		--side-fw: #dde9f5;
+		--side-bw: #fbe3cf;
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+		outline: none;
+	}
+	@media (prefers-color-scheme: dark) {
+		.mc {
+			--in-fill: #26262a;
+			--in-line: #7d7b74;
+			--fw-fill: #1f2a36;
+			--fw-line: #6d8cad;
+			--bw-fill: #33291b;
+			--bw-line: #c99a5b;
+			--path: #f0884f;
+			--bar: #7fb0dc;
+			--bar-full: #e9765b;
+			--side-fw: #1d3047;
+			--side-bw: #44301c;
+		}
+	}
+	@media (min-width: 1081px) {
+		.mc-wide {
+			width: calc(100% + var(--gap) + var(--note));
+		}
+	}
+	.mc-title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.3rem;
+	}
+	.mc-panes {
+		display: grid;
+		overflow-x: auto;
+	}
+	.mc-pane {
+		grid-area: 1 / 1;
+		min-width: 0;
+	}
+	.mc-pane[aria-hidden="true"] {
+		visibility: hidden;
+	}
+	.mc-pane svg {
+		display: block;
+		height: auto;
+		margin: 0 auto;
+	}
+	.mc-edge {
+		fill: none;
+		stroke: var(--muted);
+		stroke-width: 1;
+		opacity: 0.75;
+	}
+	.mc-edge.ban {
+		stroke-dasharray: 4 3;
+	}
+	.mc-edge.flow {
+		stroke: var(--bar);
+		stroke-width: 1.8;
+		opacity: 1;
+	}
+	.mc-edge.on {
+		stroke: var(--path);
+		stroke-width: 2.6;
+		opacity: 1;
+	}
+	.mc-head {
+		fill: var(--muted);
+	}
+	.mc-head.path {
+		fill: var(--path);
+	}
+	.mc-term circle {
+		fill: var(--surface);
+		stroke: var(--text);
+		stroke-width: 1.3;
+	}
+	.mc-term text {
+		font-family: var(--mono);
+		font-size: 13px;
+		font-weight: 700;
+		text-anchor: middle;
+		fill: var(--text);
+	}
+	.mc-term text.sub {
+		font-size: 9.5px;
+		font-weight: 400;
+		fill: var(--muted);
+	}
+	.mc-node .box,
+	.sw {
+		stroke-width: 1.2;
+		transition: fill 150ms ease;
+	}
+	.mc-node.input .box,
+	.sw.input {
+		fill: var(--in-fill);
+		stroke: var(--in-line);
+	}
+	.mc-node.fwd .box,
+	.sw.fwd {
+		fill: var(--fw-fill);
+		stroke: var(--fw-line);
+	}
+	.mc-node.bwd .box,
+	.sw.bwd {
+		fill: var(--bw-fill);
+		stroke: var(--bw-line);
+	}
+	.mc-node.on .box {
+		stroke: var(--path);
+		stroke-width: 2.4;
+	}
+	.mc-node.side-fwd .box {
+		fill: var(--side-fw);
+	}
+	.mc-node.side-bwd .box,
+	.sw.side-bwd {
+		fill: var(--side-bw);
+		stroke: var(--bw-line);
+	}
+	.mc-node.side-saved .box,
+	.sw.saved {
+		fill: var(--side-fw);
+		stroke: var(--bar-full);
+		stroke-width: 2.6;
+	}
+	.mc-node:hover .box,
+	.mc-node:focus-visible .box {
+		stroke: var(--text);
+	}
+	.mc-node:focus-visible {
+		outline: none;
+	}
+	.mc-node text {
+		font-family: var(--mono);
+		text-anchor: middle;
+		fill: var(--text);
+		pointer-events: none;
+	}
+	.mc-node .name {
+		font-size: 11px;
+		font-weight: 600;
+	}
+	.mc-node .op {
+		font-size: 9px;
+		fill: var(--muted);
+	}
+	.mc-node .cap {
+		font-size: 8.5px;
+		fill: var(--muted);
+	}
+	.mc-node.full .cap {
+		fill: var(--bar-full);
+		font-weight: 700;
+	}
+	.mc-node .track {
+		fill: var(--bg);
+		stroke: var(--faint);
+		stroke-width: 0.8;
+	}
+	.mc-node .bar {
+		fill: var(--bar);
+	}
+	.mc-node.full .bar {
+		fill: var(--bar-full);
+	}
+	.mc-node .badge {
+		font-family: var(--sans);
+		font-size: 9px;
+		font-weight: 700;
+		text-anchor: end;
+		fill: var(--bar-full);
+	}
+	.mc-texts {
+		display: grid;
+		margin-top: 0.4rem;
+	}
+	.mc-text {
+		grid-area: 1 / 1;
+		margin: 0;
+		font-size: 0.8rem;
+		line-height: 1.5;
+	}
+	.mc-text[hidden] {
+		display: block;
+		visibility: hidden;
+	}
+	.mc-hover {
+		min-height: 2.6em;
+		margin: 0.35rem 0 0;
+		font-family: var(--mono);
+		font-size: 0.68rem;
+		color: var(--muted);
+	}
+	.mc-legend {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.2rem 0.9rem;
+		margin: 0.4rem 0 0;
+		padding: 0;
+		list-style: none;
+		font-size: 0.72rem;
+		color: var(--muted);
+	}
+	.mc-legend li {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.3rem;
+		margin: 0;
+	}
+	.mc-legend svg {
+		height: 0.7rem;
+		width: auto;
+		overflow: visible;
+	}
+</style>

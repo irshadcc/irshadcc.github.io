@@ -1,0 +1,1837 @@
+---
+title: "Inside AOTAutograd: Joint Graphs and the Min-Cut Partitioner"
+description: "AOTAutograd is the part of torch.compile that traces the backward pass ahead of time. This post follows one small layer through it: the metadata pass and functionalization, the joint forward-backward graph, the runtime autograd.Function, and the min-cut partitioner that decides which activations to save and which to recompute, worked through step by step on the real flow network."
+date: 2026-10-04
+tags: [Compilers, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import MarginNote from "../../components/MarginNote.astro";
+import BoxDiagram from "../../utils/payments/BoxDiagram.astro";
+import CodeStages from "../../utils/compiler/CodeStages.astro";
+import MinCutSteps from "../../utils/compiler/MinCutSteps.astro";
+import {
+	aotPipelineNodes,
+	aotPipelineEdges,
+	rmsStages,
+	rmsTags,
+	mutStages,
+	mutTags,
+} from "../../utils/compiler/aotFigures";
+import {
+	sinChainNodes,
+	sinChainEdges,
+	rmsSiluNodes,
+	rmsSiluEdges,
+} from "../../utils/compiler/aotMinCutData";
+
+## Background
+
+In eager mode, PyTorch builds the backward pass while the forward runs. Every op that touches a
+tensor requiring gradients records a node in the **autograd graph**, together with the tensors
+its derivative will need, and `loss.backward()` walks that graph in reverse. This works for any
+Python program, but a compiler never gets to see the backward: it is assembled one op at a time,
+at run time, after the forward has already finished.
+
+`torch.compile` needs the backward as a graph too, ahead of time, so that it can fuse its ops the
+same way it fuses the forward's. That is the job of **AOTAutograd** ("ahead-of-time autograd").
+It sits between **TorchDynamo**, which captures Python code as an [FX graph](/blog/torch-fx-graph/),
+and **TorchInductor**, which turns graphs into kernels
+([Inside TorchInductor](/blog/torch-inductor/)). AOTAutograd traces the forward and the backward
+together into one **joint graph**, splits it into a forward graph and a backward graph, hands
+both to the compiler, and wraps the results in a `torch.autograd.Function` so that the rest of
+PyTorch sees an ordinary differentiable op.
+
+The split is where the interesting decision lives. Every value the backward needs from the
+forward must either be **saved** (kept in memory from the forward until the backward runs) or
+**recomputed** in the backward. Saving costs memory; recomputing costs time. Inductor's
+partitioner makes this choice by solving a **minimum cut** problem on a graph built from the joint
+graph, and it usually saves less than the eager autograd engine would, at almost no extra
+compute.
+
+This post covers, in order:
+
+1. **The pipeline**: the stages AOTAutograd runs and the files that hold them.
+2. **The code, stage by stage**, following one compile of a small layer through the real source:
+   the entry point; stage 1, which collects metadata, functionalizes and traces the joint graph;
+   stage 2, which partitions it, extracts the two graphs and compiles them; and stage 3, the
+   generated runtime code around the `autograd.Function`.
+3. **The min-cut partitioner**: max-flow and min-cut from first principles, how the joint graph
+   becomes a flow network, the capacities and the bans, and a step-by-step run on the real
+   network for our example.
+4. **The memory budget**: trading more recomputation for less memory with a knapsack.
+5. **Using AOTAutograd directly**, with your own compilers and partitioner.
+
+Every graph, capacity and flow below was produced by running torch 2.13.0 on a CPU, and every
+link to PyTorch's source points at the commit that build came from.<Sidenote>Version `2.13.0`,
+git `cf30153c`, the same build as the [Inductor post](/blog/torch-inductor/). The flow networks
+were captured by wrapping `networkx.minimum_cut` and `solve_min_cut` while `torch.compile` ran a
+backward, so the capacities are the partitioner's own numbers.</Sidenote>
+
+## The pipeline
+
+AOTAutograd's entry point for `torch.compile` is
+[`aot_module_simplified`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/aot_autograd.py#L1131).
+Inductor calls it from `compile_fx` with its own **forward compiler**, **backward compiler**,
+**decomposition table** and **partition function**. Click a stage below to see what it does.
+
+<BoxDiagram nodes={aotPipelineNodes} edges={aotPipelineEdges} selected="joint" title="What AOTAutograd does with one Dynamo graph" />
+
+The stages map onto a handful of files under `torch/_functorch`:
+
+| File | Role |
+| --- | --- |
+| `aot_autograd.py` | Entry points: `aot_function`, `aot_module_simplified`, `create_aot_state` |
+| `_aot_autograd/collect_metadata_analysis.py` | The metadata pass that fills `ViewAndMutationMeta` |
+| `_aot_autograd/graph_capture.py`, `graph_capture_wrappers.py` | Tracing the joint function with `make_fx` |
+| `_aot_autograd/graph_compile.py` | Stage 1 (capture) and stage 2 (partition, compile, wrap) |
+| `partitioners.py` | `default_partition`, `min_cut_rematerialization_partition`, `solve_min_cut` |
+| `_aot_autograd/runtime_wrappers.py` | `CompiledFunction` and the wrappers that run around it |
+| `_aot_autograd/autograd_cache.py` | `AOTAutogradCache`, which caches the whole result across processes |
+
+The two stages are named in the code.
+[`aot_stage1_graph_capture`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/_aot_autograd/graph_compile.py#L191)
+produces the joint graph, and
+[`aot_stage2_autograd`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/_aot_autograd/graph_compile.py#L2421)
+partitions it (stage 2a), compiles the halves (2b) and builds the `autograd.Function` (2c). When
+no output needs a gradient, stage 2 takes the **inference** path instead: no joint graph, no
+partition, one graph compiled with the inference compiler.
+
+## The running example
+
+The example is a tiny slice of a transformer block: an RMSNorm, a linear layer, then SiLU.
+
+<CodeStages stages={rmsStages} tags={rmsTags} step={0} title="rms_silu through AOTAutograd" />
+
+The shapes are scaled down so that every graph fits on screen: 4 tokens of width 16, projected to
+width 8. All three inputs require gradients. Step through the figure: we will meet the joint
+graph in [stage 1](#the-joint-function), and the four partitioned graphs in
+[stage 2](#the-default-partitioner).
+
+## Stage 0: the entry point
+
+The rest of this post walks through the code that runs when `torch.compile` compiles
+`rms_silu` for training, function by function, in the order it runs. The excerpts are the real
+source at the pinned commit with logging, assertions and rarely used branches cut (marked
+`# ...`), and comments added to explain each line. The values in the comments were printed by
+instrumenting those functions during a real compile of the example.<Sidenote>The caches were
+disabled (`TORCHINDUCTOR_FORCE_DISABLE_CACHES=1`) so that every stage actually ran. With the
+default settings a second run of the same program would load the result from `AOTAutogradCache`
+and skip stages 1 and 2.</Sidenote>
+
+Before AOTAutograd runs, Dynamo has already captured `rms_silu` as an FX graph of torch calls and
+replaced the real inputs with **fake tensors**: tensors that carry a shape, dtype, device and
+strides but no storage, so every op on them computes only the metadata of its result. Inductor's
+`compile_fx` then calls
+[`aot_module_simplified`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/aot_autograd.py#L1131):
+
+```python
+def aot_module_simplified(
+    mod,
+    args,
+    fw_compiler,
+    bw_compiler=None,
+    partition_fn=default_partition,
+    decompositions=None,
+    keep_inference_input_mutations=False,
+    inference_compiler=None,
+    **kwargs
+):
+    with contextlib.ExitStack() as stack:
+        # 1. Normalize the module into a pure function of flat
+        # inputs, and fakify the inputs.
+        (
+            functional_call,
+            params_buffers_flat,
+            _params_spec,
+            _buffers_spec,
+            fake_flat_args,
+            full_args_descs,
+            aot_config,
+            fake_mode,
+            shape_env,
+            _in_spec,
+            _out_spec,
+            act_input_indices,
+        ) = prepare_aot_module_simplified(
+            mod,
+            args,
+            None,
+            decompositions,
+            keep_inference_input_mutations,
+            ignore_shape_env,
+            flatten=False,
+            ...,
+        )
+
+        compiled_fn = None
+        # 2. Inductor wraps its compilers in
+        # SerializableAOTDispatchCompiler, so the whole AOTAutograd
+        # result can be cached on disk.
+        if isinstance(fw_compiler, SerializableAOTDispatchCompiler) or ...:
+            local = should_use_local_autograd_cache()  # True by default
+            remote = should_use_remote_autograd_cache()
+            if local or remote:
+                compiled_fn, aot_config = AOTAutogradCache.try_load(
+                    mod, fake_flat_args, aot_config, ..., local, remote, ...
+                )
+
+        # cache miss: do the work
+        if compiled_fn is None:
+            stack.enter_context(compiled_autograd._disable())
+            # 3. Collect metadata and decide inference vs training.
+            aot_state = create_aot_state(
+                stack,
+                functional_call,
+                fake_flat_args,
+                full_args_descs,
+                aot_config,
+                fake_mode,
+                shape_env,
+            )
+            # 4. Stage 1: trace the joint graph.
+            aot_graph_capture = aot_stage1_graph_capture(
+                aot_state, functional_call
+            )
+            # 5. Stage 2: partition, compile both halves,
+            # build the autograd.Function.
+            compiled_fn, _ = aot_stage2_compile(
+                aot_state,
+                aot_graph_capture,
+                partition_fn,
+                fw_compiler,
+                bw_compiler,
+                inference_compiler,
+            )
+
+    # 6. What Dynamo gets back: prepend the parameters, call with one
+    # flat list.
+    def forward(*runtime_args):
+        full_args = []
+        full_args.extend(params_buffers_flat)
+        full_args.extend(runtime_args)
+        return compiled_fn(full_args)
+
+    return forward
+```
+
+Step 1 is
+[`prepare_aot_module_simplified`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/aot_autograd.py#L1032),
+which does four things:
+
+- `prepare_aot_config` reads `mod.named_parameters()` and `mod.named_buffers()` and builds
+  `full_args = [*params, *buffers, *args]`. It also builds the **`AOTConfig`**, a dataclass that
+  carries every option through the rest of the pipeline: the decomposition table,
+  `num_params_buffers`, `keep_inference_input_mutations`, `dynamic_shapes`, and
+  `static_input_indices` (which inputs are parameters, taken from Dynamo's metadata on the graph
+  module). The compilers themselves are passed separately.
+- [`create_functional_call`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/_aot_autograd/graph_capture_wrappers.py#L1490)
+  turns the module into a function of `(*params, *buffers, *args)`. Inside, it temporarily swaps
+  the module's parameters for the arguments (`stateless._reparametrize_module`) and runs the
+  Dynamo graph with an FX `Interpreter` (`PropagateUnbackedSymInts(mod).run(*args)`). From here
+  on, parameters are just inputs.
+- `construct_fake_mode` reuses the `FakeTensorMode` Dynamo already created, with its
+  `ShapeEnv` for symbolic shapes, instead of making a new one.
+- `process_inputs` converts any real tensor among the inputs to a fake one with
+  `fake_mode.from_tensor`. Dynamo's inputs are fake already, so for our example this is a no-op.
+
+Step 6 explains a detail visible later: every compiled function inside AOTAutograd takes **one
+list** of arguments (the "boxed" calling convention), not `*args`. A list can be cleared by the
+callee, which lets the compiled code free an input as soon as it is no longer needed instead of
+waiting for the caller's frame to drop it.
+
+## Stage 1: capturing the joint graph
+
+[`create_aot_state`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/aot_autograd.py#L473)
+prepares everything stage 1 needs:
+
+```python
+def create_aot_state(
+    stack,
+    flat_fn,
+    fake_flat_args,
+    flat_args_descs,
+    aot_config,
+    fake_mode,
+    shape_env,
+):
+    # Merge the caller's decompositions over AOTAutograd's own small table.
+    decompositions = {
+        **aot_autograd_decompositions,
+        **(aot_config.decompositions or {}),
+    }
+    aot_config = dataclasses.replace(
+        aot_config, decompositions=decompositions
+    )
+
+    # Everything below runs under these modes; the ExitStack keeps
+    # them active through stage 1 and stage 2 too.
+    # trace on this thread
+    stack.enter_context(torch.autograd.set_multithreading_enabled(False))
+    # tracing must not consume real RNG state
+    stack.enter_context(preserve_rng_state())
+    # all tensors are fake
+    stack.enter_context(fake_mode)
+    # Python decompositions/meta kernels
+    stack.enter_context(python_dispatcher_mode)
+    stack.enter_context(
+        torch._dynamo.utils._disable_saved_tensors_hooks_during_tracing()
+    )
+
+    needs_autograd = any(
+        x.requires_grad for x in fake_flat_args if isinstance(x, Tensor)
+    )
+    # -> True: x, g and w all require grad
+
+    with enable_python_dispatcher():
+        fw_metadata = run_functionalized_fw_and_collect_metadata(
+            flat_fn,
+            flat_args_descs=flat_args_descs,
+            static_input_indices=aot_config.static_input_indices,
+            keep_input_mutations=aot_config.keep_inference_input_mutations,
+            pre_dispatch=aot_config.pre_dispatch,
+        )(*fake_flat_args)
+
+        # A graph needs a backward only if some output needs a
+        # gradient, or some input that needs a gradient is mutated
+        # (outside no_grad).
+        output_and_mutation_safe = not any(
+            x.requires_grad and not is_alias_of_input_that_requires_grad(x)
+            for x in fw_metadata.output_info
+        ) and not any(
+            x.requires_grad
+            and x.mutates_data
+            and not x.mutations_under_no_grad_or_inference_mode
+            and not x.mutations_hidden_from_autograd
+            for x in fw_metadata.input_info
+        )
+        if needs_autograd and output_and_mutation_safe:
+            # -> stays True for rms_silu
+            needs_autograd = False
+    # ...
+    return AOTState(
+        needs_autograd=needs_autograd,
+        flat_args=fake_flat_args,
+        flat_args_descs=flat_args_descs,
+        fw_metadata=fw_metadata,
+        aot_config=aot_config,
+        stack=stack,
+        fake_mode=fake_mode,
+    )
+```
+
+The interesting call is the metadata pass. The aliasing condition in the middle is written out in
+words; the real code checks that the output's type is `alias_of_input` or `is_input` and that
+its base input requires grad, because such outputs are regenerated outside the compiled function
+(see [The runtime wrapper](#the-runtime-wrapper)) and do not need a backward of their own.
+
+### The metadata pass
+
+AOTAutograd cannot trace the joint graph until it knows things that only running the forward
+reveals: which inputs get mutated, which outputs are views of inputs, and what the gradients
+flowing into the backward will look like.
+[`run_functionalized_fw_and_collect_metadata`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/_aot_autograd/collect_metadata_analysis.py#L166)
+runs the forward once, without recording a graph, and answers those questions:
+
+```python
+def inner(*flat_args):
+    input_info, output_info = [], []
+    prior_grad_enabled = torch.is_grad_enabled()
+    mode = FunctionalTensorMode(_allow_token_discovery=True)
+    with disable_above, mode, suppress_pending, disable_autocast_cache():
+        # wrap each input in a FunctionalTensor
+        flat_f_args = pytree.tree_map(_to_fun, flat_args)
+        # run the user's forward once
+        flat_f_outs = f(*flat_f_args)
+
+    # --- inputs: inspect each FunctionalTensor wrapper after the run
+    for arg, f_arg in zip(flat_args, flat_f_args):
+        # was data written?
+        mutates_data = has_data_mutation(f_arg)
+        mutates_metadata = has_metadata_mutation(
+            f_arg, arg, check_only_storage_mutation=False
+        )
+        # ... storage mutations (set_), resize_, under-no_grad flags
+        input_info.append(
+            InputAliasInfo(
+                is_leaf=...,
+                mutates_data=mutates_data,
+                mutates_metadata=mutates_metadata,
+                requires_grad=isinstance(f_arg, Tensor)
+                and f_arg.requires_grad,
+                keep_input_mutations=keep_input_mutations,
+                ...,
+            )
+        )
+
+    # --- outputs: classify each by comparing storages with the inputs'
+    inp_storage_refs = {
+        StorageWeakRef(inpt.untyped_storage()): idx
+        for idx, inpt in enumerate(flat_f_args)
+        if isinstance(inpt, Tensor)
+    }
+    for o in flat_f_outs:
+        curr_storage = StorageWeakRef(o.untyped_storage())
+        # shares memory with an input
+        if curr_storage in inp_storage_refs:
+            base_idx = inp_storage_refs[curr_storage]
+            output_type = (
+                OutputType.is_input
+                if id(o) in inp_tensor_ids
+                else OutputType.alias_of_input
+            )
+        elif (
+            o._base is not None
+            and o.requires_grad
+            and o._base.requires_grad
+        ):
+            # a view of an intermediate
+            output_type = ...
+        else:
+            output_type, base_idx = OutputType.non_alias, None
+        output_info.append(
+            OutputAliasInfo(
+                output_type=output_type,
+                base_idx=base_idx,
+                requires_grad=o.requires_grad,
+                ...,
+            )
+        )
+
+    # --- tangents: one per mutated input that needs grad (when the
+    # mutation is not kept in the graph), then one per non-aliased
+    # output that needs grad
+    f_tangents = f_input_tangents + f_output_tangents + intermediate_bases
+    traced_tangents = pytree.tree_map(from_fun, f_tangents)
+    traced_tangents = [
+        coerce_tangent_and_suggest_memory_format(t)[0]
+        for t in traced_tangents
+    ]
+
+    return ViewAndMutationMeta(
+        input_info=input_info,
+        output_info=output_info,
+        traced_tangents=traced_tangents,
+        ...,
+    )
+```
+
+Line by line:
+
+- **`FunctionalTensorMode`** turns on functionalization (next section). Each input is wrapped in
+  a `FunctionalTensor`, a wrapper that records every in-place op applied to it instead of
+  performing it.
+- **`f(*flat_f_args)`** runs the forward on those wrappers. Nothing is traced; this run exists only
+  for its side effects on the wrappers.
+- **The input loop** asks each wrapper what happened to it. `has_data_mutation` is true if any
+  in-place op wrote the tensor's data; `has_metadata_mutation` if its sizes, strides or storage
+  offset changed (`transpose_`, `resize_`).
+- **The output loop** decides aliasing by storage identity. If an output's storage is an input's
+  storage, the output is either that input (`is_input`) or a view of it (`alias_of_input`). If it
+  is a view of a tensor created inside the function, it is an alias of an intermediate; when
+  several such outputs share a base, the base is added as an extra hidden output so the views can
+  be rebuilt from it.
+- **The tangents** are fake tensors shaped like the gradients the backward will receive. A view
+  of an input gets no tangent, because its gradient flows through the regenerated view instead.
+
+For `rms_silu` the result is short:
+
+| Field | Value |
+| --- | --- |
+| `input_info[0..2]` | `mutates_data=False`, `requires_grad=True`, `NOT_MUTATED` for `x`, `g`, `w` |
+| `output_info[0]` | `non_alias`, `requires_grad=True` |
+| `traced_tangents` | one `FakeTensor(4, 8)`, the gradient of the output |
+
+### Functionalization
+
+The metadata pass and the trace that follows both run under functionalization, because
+compilers prefer **functional** programs, where no op writes into an existing tensor: then every
+node is a pure value that can be reordered, fused or recomputed. PyTorch programs are full of
+in-place ops (`add_`, `copy_`) and views that share storage. **Functionalization** rewrites them:
+an in-place op becomes its out-of-place version, and later reads of the mutated tensor read the
+new value instead. Step through a function that mutates an input, mutates an intermediate and
+returns a view of an input:
+
+<CodeStages stages={mutStages} tags={mutTags} step={0} title="Functionalizing mutations and aliases" />
+
+Three rewrites happen. `t.mul_(2)` on an intermediate simply becomes `mul = sin * 2`; nothing
+outside the graph can see `t`, so nothing else is needed. `buf.add_(1)` becomes `add = buf + 1`,
+and the mutation of the *input* is kept as a single `copy_` at the end of the graph. And the
+second output, a view of `x`, is traced as a `view` node, but the metadata pass marked it
+`alias_of_input`. The metadata for this function, as printed during the compile:
+
+| Field | Value |
+| --- | --- |
+| `input_info[0]` (`buf`) | `mutates_data=True`, `requires_grad=False`, `MUTATED_IN_GRAPH` |
+| `input_info[1]` (`x`) | `mutates_data=False`, `requires_grad=True`, `NOT_MUTATED` |
+| `output_info[0]` | `non_alias` |
+| `output_info[1]` | `alias_of_input`, `base_idx=1` |
+
+`MUTATED_IN_GRAPH` comes from
+[`_check_if_mutation_can_be_in_graph`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/_aot_autograd/functional_utils.py#L621),
+which decides per input where its mutation is applied:
+
+```python
+if keep_input_mutations:  # Inductor passes True
+    in_graph = (
+        mutates_data
+        or mutates_storage_metadata
+        or mutation_inductor_storage_resize
+    ) and (
+        # a data-only write to a non-grad input
+        (not mutates_metadata and not requires_grad)
+        # e.g. x.detach().mul_(2)
+        or mutations_hidden_from_autograd
+        or mutations_under_no_grad_or_inference_mode
+    )
+else:
+    # always replay the mutation in the epilogue
+    in_graph = False
+```
+
+When the mutation stays **in the graph**, the trace itself has to write the new value back into
+the input. That happens in
+[`create_functionalized_fn`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/_aot_autograd/graph_capture_wrappers.py#L848),
+which wraps the function that is traced:
+
+```python
+# args = (primals, tangents)
+def _functionalized_f_helper(*args):
+    # functionalize this call only
+    with disable_above:
+        # inputs -> FunctionalTensor
+        f_args = pytree.tree_map(to_fun, args)
+        if trace_joint and has_input_mutated_in_graph and joint_fn_handle:
+            # create_joint calls this after the forward
+            def _post_forward(primals):
+                primals_after_forward = pytree.tree_map(from_fun, primals)
+                # how many writes so far
+                f_args_mutation_counters_after_forward = [...]
+
+            joint_fn_handle.post_forward = _post_forward
+        # forward + backward
+        f_outs, f_outs_descs = call_and_expect_output_descs(fn, f_args)
+    # ... checks that the backward did not mutate inputs in unsupported ways
+    if aot_config.keep_inference_input_mutations:
+        # 1. Writes the forward made: copy the value the input had
+        # after the forward.
+        for idx, (f_inpt, before, after, info) in enumerate(
+            zip(
+                f_args_after_forward,
+                primals_before,
+                primals_after_forward,
+                meta.input_info,
+            )
+        ):
+            if info.mutation_type != MutationType.MUTATED_IN_GRAPH:
+                continue
+            with set_partitioner_tag_must_be_in_forward():
+                apply_in_graph_mutations(
+                    info, before, after, f_inpt, idx, ...
+                )
+                # -> before.copy_(after), recorded as a copy_ node
+        # 2. Writes made later, by the backward: same, tagged
+        # must_be_in_backward.
+        # ...
+    return pytree.tree_map(from_fun, f_outs), f_outs_descs
+```
+
+`to_fun` wraps a tensor; `from_fun` unwraps and syncs it, returning a plain tensor that holds the
+latest value. During tracing, the latest value of `buf` is the output of the out-of-place `add`.
+The hook only snapshots that value; the `copy_` itself is emitted after the whole joint function
+has run, which is why it prints at the very end of the joint graph. Its `partitioner_tag` is
+`must_be_in_forward` (I printed the tags with `torch._functorch.config.joint_custom_pass`), and
+graph extraction honours the tag, so the `copy_` lands in the forward graph where it belongs.
+`copy_` into an input is the only mutating op allowed in the final graph.
+
+When the mutation goes to the **epilogue** instead, the forward graph returns the new value as an
+extra first output, and the runtime wrapper copies it into the input; we will see the generated
+code for that in [The runtime wrapper](#the-runtime-wrapper).
+
+### The joint function
+
+[`aot_stage1_graph_capture`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/_aot_autograd/graph_compile.py#L191)
+runs two **compiler wrappers** and then traces:
+
+```python
+def aot_stage1_graph_capture(aot_state, orig_flat_fn):
+    # also return a descriptor per output
+    def orig_flat_fn2(*args):
+        out = orig_flat_fn(*args)
+        return out, [PlainAOTOutput(i) for i in range(len(out))]
+
+    wrappers = [
+        AOTDedupeWrapper(),
+        AOTSyntheticBaseWrapper(trace_joint=needs_autograd),
+    ]
+    (
+        flat_fn,
+        aot_state.flat_args,
+        aot_state.flat_args_descs,
+        aot_state.fw_metadata,
+    ) = pre_compile(
+        wrappers,
+        orig_flat_fn2,
+        aot_state.flat_args,
+        aot_state.flat_args_descs,
+        aot_config,
+        fw_metadata=aot_state.fw_metadata,
+    )
+
+    with maybe_skip_decompose(aot_config) as graph_capture_aot_config:
+        if aot_state.needs_autograd and not aot_config.pre_dispatch:
+            (
+                graph,
+                updated_flat_args,
+                updated_flat_args_descs,
+                maybe_subclass_meta,
+            ) = aot_dispatch_autograd_graph(
+                flat_fn,
+                aot_state.flat_args,
+                aot_state.flat_args_descs,
+                graph_capture_aot_config,
+                fw_metadata=aot_state.fw_metadata,
+            )
+        else:
+            # inference: forward only
+            graph, ... = aot_dispatch_base_graph(...)
+    return AOTGraphCapture(
+        wrappers=wrappers,
+        graph_module=graph,
+        updated_flat_args=updated_flat_args,
+        ...,
+    )
+```
+
+A **compiler wrapper** has a `pre_compile` method that may rewrite the function and its inputs
+before tracing, and a `post_compile` method that wraps the compiled result so that the caller
+never notices the rewrite. The two that always run handle inputs that alias each other:
+
+- [`AOTDedupeWrapper`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/_aot_autograd/runtime_wrappers.py#L1540)
+  looks for the same tensor passed twice, as in `f(x, x)`. If neither copy is mutated it just
+  passes a detached alias for the second; if one is mutated it removes the duplicate
+  (`keep_arg_mask`) and its `post_compile` puts it back at run time (`add_dupe_map`).
+- [`AOTSyntheticBaseWrapper`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/_aot_autograd/runtime_wrappers.py#L1801)
+  handles distinct inputs that are views of the same storage when one is mutated: it passes their
+  common base instead and rebuilds the views inside the graph, so the trace sees the aliasing.
+
+Neither fires for `rms_silu`, so `pre_compile` returns its inputs unchanged.
+[`aot_dispatch_autograd_graph`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/_aot_autograd/graph_capture.py#L471)
+then builds the function to trace in three layers and traces it:
+
+```python
+def aot_dispatch_autograd_graph(
+    flat_fn, flat_args, flat_args_descs, aot_config, *, fw_metadata
+):
+    # (primals, tangents)
+    joint_inputs = (flat_args, fw_metadata.traced_tangents)
+    # layer 1
+    fn_prepared_for_autograd = fn_prepped_for_autograd(
+        flat_fn, flat_args_descs, fw_metadata, aot_config
+    )
+    # layer 2
+    joint_fn_to_trace = create_joint(
+        fn_prepared_for_autograd, flat_args_descs, aot_config=aot_config
+    )
+    # layer 3
+    tracing_state = _prepare_graph_capture_tracing(
+        joint_fn_to_trace, joint_inputs, ..., trace_joint=True, ...
+    )
+    fx_g, saved_updated_joint_inputs = _create_graph_and_save_traced_inputs(
+        tracing_state.fn_to_trace,
+        tracing_state.flat_args,
+        ...,
+        aot_config=aot_config,
+    )
+    # ... stream assignment for multi-stream backward
+    fx_g.graph.eliminate_dead_code()
+    # no mutating op except copy_ into inputs
+    assert_functional_graph(fx_g.graph)
+    fx_g.recompile()
+    return fx_g, saved_updated_joint_inputs, ...
+```
+
+**Layer 1**,
+[`fn_prepped_for_autograd`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/_aot_autograd/graph_capture_wrappers.py#L166),
+runs the forward and lays out its outputs in the order the compiled forward will return them:
+first the inputs whose mutation is replayed in the epilogue, then the user outputs, then hidden
+intermediate bases. Alongside it returns a mask of which of those outputs receive a tangent: a
+user output gets one only if it is `non_alias` (or one of two similar kinds), is a tensor, and
+requires grad.
+
+**Layer 2**,
+[`create_joint`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/_aot_autograd/graph_capture_wrappers.py#L294),
+is the heart of AOTAutograd. Trimmed:
+
+```python
+def inner_fn(primals, tangents):
+    (outs, tangent_mask), (outs_descs, _) = call_and_expect_output_descs(
+        fn, primals
+    )
+    # the make_fx tracer recording this call
+    mode = get_proxy_mode()
+    # everything recorded so far is forward
+    for node in mode.tracer.graph.nodes:
+        node.meta["partitioner_tag"] = (
+            "is_backward" if _is_tangent(node) else "is_forward"
+        )
+
+    outs_to_grad = [
+        o for needs_tangent, o in zip(tangent_mask, outs) if needs_tangent
+    ]
+    grad_primals, inputs_needs_grads = [], []
+    # which inputs get a gradient
+    for p in primals:
+        if isinstance(p, Tensor) and p.requires_grad:
+            inputs_needs_grads.append(True)
+            grad_primals.append(p)
+        else:
+            inputs_needs_grads.append(False)
+
+    needed_outs, needed_tangents = [], []
+    for out, tangent in zip(outs_to_grad, tangents):
+        if isinstance(out, Tensor) and out.requires_grad:
+            needed_outs.append(out)
+            needed_tangents.append(tangent)
+
+    backward_out = ()
+    if grad_primals:
+        with (
+            set_partitioner_tag_is_backward(),
+            fx_traceback.preserve_node_meta(),
+        ):
+            # run the real autograd engine
+            backward_out = torch.autograd.grad(
+                needed_outs,
+                grad_primals,
+                grad_outputs=needed_tangents,
+                allow_unused=True,
+            )
+    backward_out_iter = iter(backward_out)
+    return (
+        outs,
+        [
+            next(backward_out_iter) if i else None
+            for i in inputs_needs_grads
+        ],
+    ), ...
+```
+
+The forward call builds an ordinary autograd graph as it runs, because the fake inputs require
+grad: each op records a backward node and the tensors its derivative needs. Then
+`torch.autograd.grad` walks that autograd graph exactly as `loss.backward()` would. The trick is
+that every derivative formula it executes (`mm` against a transposed weight for the matmul,
+the `sigmoid` arithmetic of SiLU's derivative) is itself a call to ATen ops on fake tensors, and those
+calls go through the same proxy mode. So the backward is recorded into the same graph, right
+after the forward, and the tangents become graph inputs. The final list has one entry per
+primal: a gradient, or `None` for inputs that do not need one.
+
+**Layer 3**,
+[`_prepare_graph_capture_tracing`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/_aot_autograd/graph_capture.py#L213),
+adds the functionalization wrapper from the previous section, then
+`aot_dispatch_subclass` (which flattens tensor subclasses such as DTensor into their inner plain
+tensors) and `handle_effect_tokens_fn` (which threads ordering tokens through ops with side
+effects). Neither changes anything for plain tensors.
+
+Finally
+[`_create_graph`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/_aot_autograd/graph_capture.py#L92)
+runs the whole stack under `make_fx`, the tracer described in the [FX post](/blog/torch-fx-graph/):
+
+```python
+ctx = FunctionalTensorMode(
+    pre_dispatch=aot_config.pre_dispatch,
+    export=aot_config.is_export,
+    _allow_token_discovery=True,
+)
+with enable_python_dispatcher(), ctx:
+    fx_g = make_fx(
+        inner_f,
+        decomposition_table=aot_config.decompositions,
+        record_module_stack=True,
+        pre_dispatch=aot_config.pre_dispatch,
+    )(*args)
+```
+
+`make_fx` creates one FX placeholder per input, named `primals_1`, `primals_2`, ... and
+`tangents_1`, ..., after the two lists it is called with. As ATen ops run, the proxy mode looks
+each one up in `decomposition_table`; if it has an entry (as `aten.silu` does in Inductor's
+table) the decomposition runs instead and its smaller ops are recorded. Anything else is recorded
+as one node, with the fake result stored in `node.meta["val"]`. Those `val`s are what the
+partitioner later reads to compute sizes.
+
+Step 2 of the [running example](#the-running-example) shows the result for `rms_silu`. Read it
+from the top. The first twelve ops are the forward. `torch.rsqrt(...)` became `pow`, `mean`,
+`add`, `rsqrt`; `F.silu` was decomposed into `mm / (1 + exp(-mm))`. From `sigmoid` on,
+everything is backward; `tangents_1` is first read by `mul_2`. The graph returns the forward
+output `div` followed by one gradient per primal: `add_3` for `x`, `view` for `g` and `mm_1`
+for `w`. After tracing, the inputs that stage 1 returns are the fake primals (detached, so
+`requires_grad=False` now) and the one fake tangent: `[[(4, 16), (16,), (16, 8)], [(4, 8)]]`.
+
+Three details of the joint graph matter for what follows:
+
+- The backward **reads forward values** directly: `mm` (in `sigmoid` and `mul_3`), `mul_1`
+  (through `permute`), `mul` (in `mul_5`), `rsqrt` and the primals. In a single graph that is
+  just a data edge. After a split, each such edge must cross from one graph to the other.
+- Some backward ops **do not depend on the tangents**: `sigmoid(mm)`, `1 - sigmoid`,
+  `pow(rsqrt, 3)`, `permute(w)`. They could run in either half.
+- Every node carries `meta["partitioner_tag"]`: `is_forward` or `is_backward`. The default
+  partitioner uses it; the min-cut partitioner ignores it.
+
+## Stage 2: partitioning and compiling
+
+[`aot_stage2_autograd`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/_aot_autograd/graph_compile.py#L2421)
+is a straight sequence of helper calls:
+
+```python
+def aot_stage2_autograd(
+    aot_state, aot_graph_capture, partition_fn, fw_compiler, bw_compiler
+):
+    fx_g = aot_graph_capture.graph_module
+    # dynamic-shape scalar cleanup
+    _apply_tensorify_python_scalars(fx_g)
+    # 2a: split the joint graph
+    (
+        fw_module,
+        bw_module,
+        num_fw_outs_saved_for_bw,
+        num_symints_saved_for_bw,
+        _indices_of_inps_to_detach,
+        adjusted_flat_args,
+    ) = _aot_stage2a_partition(
+        fx_g,
+        aot_graph_capture.updated_flat_args,
+        maybe_subclass_meta,
+        fw_metadata,
+        aot_config,
+        partition_fn,
+    )
+    # 2b: compile the forward now, prepare the backward
+    fwd_output_strides, compiled_fw_func = _aot_stage2b_fw_compile(
+        fw_module,
+        adjusted_flat_args,
+        maybe_subclass_meta,
+        fw_metadata,
+        num_fw_outs_saved_for_bw,
+        aot_config,
+        fw_compiler,
+    )
+    lazy_backward_info, compiled_bw_func = _aot_stage2b_bw_compile(
+        bw_module,
+        maybe_subclass_meta,
+        fw_metadata,
+        fwd_output_strides,
+        num_symints_saved_for_bw,
+        aot_config,
+        bw_compiler,
+    )
+    # cache entry for AOTAutogradCache
+    try_save_cache_entry, entry = _cache_autograd_info(...)
+    # 2c: wrap everything in an autograd.Function plus runtime wrappers
+    return _aot_stage2c_make_autograd_function(
+        aot_config,
+        aot_state.flat_args,
+        fw_metadata,
+        maybe_subclass_meta,
+        aot_graph_capture.wrappers,
+        compiled_fw_func,
+        compiled_bw_func,
+        bw_compiler,
+        lazy_backward_info,
+        try_save_cache_entry,
+        entry,
+        _indices_of_inps_to_detach,
+        num_symints_saved_for_bw,
+    )
+```
+
+### Partitioning
+
+[`_aot_stage2a_partition`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/_aot_autograd/graph_compile.py#L2160)
+runs under `torch.no_grad()` and calls
+[`_partition_joint_graph_into_fw_bw`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/_aot_autograd/graph_compile.py#L1897):
+
+```python
+def _partition_joint_graph_into_fw_bw(
+    fx_g, joint_inputs, inner_meta, fw_metadata, aot_config, partition_fn
+):
+    # How many forward outputs the user (and the runtime) will see.
+    # Values for rms_silu in the comments.
+    num_inner_fwd_outputs = (
+        len(mutated_inp_runtime_indices)  # epilogue mutations: 0
+        + inner_meta.num_outputs  # user outputs: 1
+        + inner_meta.num_intermediate_bases  # 0
+        + inner_meta.num_outputs_rng_offset  # 0
+        + num_tokens  # 0
+    )
+    fx_g = run_joint_graph_passes_on_hops(
+        fx_g, joint_inputs, aot_config, ...
+    )
+    if callable(torch._functorch.config.joint_custom_pass):
+        fx_g = torch._functorch.config.joint_custom_pass(fx_g, joint_inputs)
+    fw_module, bw_module = partition_fn(
+        fx_g,
+        joint_inputs,
+        num_fwd_outputs=num_inner_fwd_outputs,
+        static_lifetime_input_indices=fw_metadata.static_input_indices,
+    )
+    return fw_module, bw_module, num_inner_fwd_outputs
+```
+
+`num_fwd_outputs` tells the partitioner where, in the joint graph's output tuple, the forward
+outputs end and the gradients begin. For `rms_silu` it is 1. The forward graph the partitioner
+returns will produce exactly those outputs followed by the saved values, so the runtime knows
+that everything from index 1 on is to be saved. `partition_fn` is Inductor's
+[`partition_fn`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/compile_fx.py#L2273),
+which runs Inductor's joint-graph passes (pattern rewrites, removal of no-op ops such as the
+`alias` nodes) and then calls `min_cut_rematerialization_partition`.
+
+A **partitioner** takes the joint graph and returns two graphs. The forward graph takes the
+primals and returns the user outputs followed by the **saved values**. The backward graph takes
+the saved values and the tangents and returns the gradients. So a partitioner's real output is
+one list: the saved values. Every value the backward reads must be either saved or
+**recomputable** in the backward from saved values and tangents, and it is a trade-off: a saved
+value occupies memory from the moment the forward computes it until the backward uses it, while a
+recomputed one costs extra work in the backward.
+
+#### The default partitioner
+
+[`default_partition`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/partitioners.py#L1248)
+does what eager autograd does:
+
+```python
+forward_nodes, last_node = [], None
+# the last node tagged forward (or a primal)
+for node in joint_module.graph.nodes:
+    if (
+        _has_tag_is_forward(node)
+        or _is_primal(node)
+        or _is_fwd_seed_offset(node)
+    ):
+        last_node = node
+# forward = everything up to it,
+for node in joint_module.graph.nodes:
+    # except the tangent placeholders
+    if not _is_tangent(node):
+        forward_nodes.append(node)
+    if node is last_node:
+        break
+forward_node_names = OrderedSet(
+    n.name for n in forward_nodes if n.op != "output"
+)
+# ...
+for node in joint_module.graph.nodes:
+    if node.name not in forward_node_names:
+        continue
+    # SymInts go to ctx.symints
+    if is_sym_node(node):
+        saved_sym_nodes.append(node)
+        continue
+    if node.meta.get("recompute") == CheckpointPolicy.MUST_SAVE:
+        saved_values.append(node)
+        continue
+    # ... impure ops, opaque objects
+    backward_usages = [
+        n for n in node.users if n.name not in forward_node_names
+    ]
+    if all(is_sym_node(n) for n in backward_usages):
+        # backward only needs its sizes
+        saved_sym_nodes.extend(backward_usages)
+        continue
+    if not must_recompute(node):
+        # candidate: every forward tensor
+        saved_values.append(node)
+fw_module, bw_module = _extract_fwd_bwd_modules(
+    joint_module, saved_values, ...
+)
+```
+
+It makes every forward tensor a candidate, and `_extract_fwd_bwd_modules` (below) later drops
+the candidates the backward never reads. Steps 3 and 4 of the
+[running example](#the-running-example) show the result. The forward returns `div` and then eight
+values: the three primals, `rsqrt`, its `alias`, `mul` (that is $x \cdot r$, where $r$ is
+`rstd`), `mul_1` ($h$) and `mm`.
+
+This is safe and recomputes nothing, but it is wasteful in two ways. It saves `mul`, a full
+$4 \times 16$ tensor, although `mul` is one multiply away from `x` and `rsqrt`, which are both
+saved anyway. And the backward computes `sigmoid(mm)` from scratch even though nothing forces it
+there: the default partitioner never asks whether moving work between the halves would help.
+
+#### Why recompute
+
+On a GPU, recomputing a pointwise op in the backward is almost free when a compiler fuses it.
+`mul = x * rstd` costs nothing extra if the kernel that consumes it reads `x` and `rstd` and does
+the multiply in registers. Saving `mul` instead costs a write of $N \cdot D$ elements in the
+forward, a read in the backward, and $N \cdot D$ elements of memory held in between, for every
+layer of the model. The ops in a backward are mostly memory-bound, so the trade is lopsided:
+recompute cheap pointwise ops, save the outputs of expensive ones like matmuls. This is
+**activation checkpointing** (also called **rematerialization**) done automatically, at the
+granularity of single ops, and the [min-cut partitioner](#the-min-cut-partitioner) below decides
+it with a graph cut.
+
+### Extracting the two graphs
+
+Whatever partitioner runs, the two graphs are built by
+[`_extract_fwd_bwd_modules`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/partitioners.py#L1006)
+from the saved-value list:
+
+```python
+fwd_outputs, bwd_outputs, ... = _extract_fwd_bwd_outputs(
+    joint_module, num_fwd_outputs=...
+)
+primal_inputs = [*filter(_is_primal, placeholders)]
+tangent_inputs = [*filter(_is_tangent, placeholders)]
+
+# 1. A first backward graph, to see which saved values it actually reads.
+bwd_graph = _extract_graph_with_inputs_outputs(
+    joint_module.graph,
+    saved_sym_nodes + saved_values + tangent_inputs,
+    bwd_outputs,
+    ...,
+)
+for node in bwd_graph.find_nodes(op="placeholder"):
+    # saved but never read: drop it
+    if not node.users:
+        _remove_by_name(saved_values, node.name)
+        _remove_by_name(saved_sym_nodes, node.name)
+
+# 2. Save every SymInt that a saved tensor's shape mentions.
+# 3. Order saved tensors: version-counter-checked first, unchecked after.
+saved_values = saved_values_with_vc_check + saved_values_no_vc_check
+
+# 4. The real graphs.
+fwd_graph = _extract_graph_with_inputs_outputs(
+    joint_module.graph,
+    primal_inputs,
+    fwd_outputs + saved_values + saved_opaque_nodes + saved_sym_nodes,
+    ...,
+)
+bwd_graph = _extract_graph_with_inputs_outputs(
+    joint_module.graph,
+    saved_sym_nodes + saved_values + tangent_inputs,
+    bwd_outputs,
+    ...,
+)
+fwd_module = fx._lazy_graph_module._make_graph_module(
+    joint_module, fwd_graph
+)
+bwd_module = fx._lazy_graph_module._make_graph_module(
+    joint_module, bwd_graph
+)
+```
+
+The workhorse is
+[`_extract_graph_with_inputs_outputs`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/partitioners.py#L294).
+It copies the joint graph into a new one in which the given nodes, even if they are ordinary ops
+in the joint graph, become placeholders:
+
+```python
+new_graph, env = fx.Graph(), {}
+# chosen inputs become placeholders
+for node in inputs:
+    env[node] = new_graph.placeholder(node.name)
+for node in joint_graph.nodes:
+    if (
+        _must_be_in_backward(node)
+        and subgraph != "backward"
+        and node not in inputs
+    ):
+        env[node] = InvalidNode
+        continue  # honour partitioner tags
+    if node in env:
+        continue
+    elif node.op == "placeholder":
+        # any other input is unavailable
+        env[node] = InvalidNode
+    elif node.op == "call_function":
+        if any(
+            isinstance(env[a], InvalidNodeBase) for a in node_args(node)
+        ):
+            # depends on something unavailable
+            env[node] = InvalidNode
+            continue
+        # computable: copy it
+        env[node] = new_graph.node_copy(node, lambda x: env[x])
+new_graph.output(tuple(env[x] for x in outputs))
+# keep only what the outputs need
+new_graph.eliminate_dead_code()
+```
+
+This is how recomputation happens without any special code. For the min-cut backward, the inputs
+are `primals_1`, `primals_2`, `rsqrt`, `mm`, `permute`, `permute_1` and `tangents_1`. The loop
+reaches `mul = aten.mul(primals_1, rsqrt)`; both arguments are valid, so `mul` is copied into the
+backward graph. That copy *is* the recomputation. `mul_1`, by contrast, is never needed, because
+its only backward use went through `permute`, which is an input.
+
+Back in stage 2a,
+[`_categorize_saved_tensors_for_backward`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/_aot_autograd/graph_compile.py#L1983)
+counts what the forward returns after the user outputs and records it in the metadata. For
+`rms_silu`, the forward returns `div, primals_1, primals_2, rsqrt, mm, permute, permute_1`:
+`num_fw_outs_saved_for_bw = 6`, no SymInts, and `tensors_saved_for_backwards_slice =
+slice(1, None)`. It also finds **donated buffers**: saved tensors that alias no input and no
+output, whose memory the backward may reuse in place once it has read them. Here those are
+indices `[2, 3, 4]` of the backward's inputs (`rsqrt`, `mm` and `permute`). `primals_*` and
+`permute_1` are inputs or views of inputs, so they cannot be donated.
+
+### Compiling the halves
+
+`_aot_stage2b_fw_compile` calls the forward compiler (Inductor's `compile_fx_inner`) on the
+forward graph with the fake primals, and records the strides of the forward's outputs.
+[`_aot_stage2b_bw_compile`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/_aot_autograd/graph_compile.py#L2261)
+does not compile the backward yet:
+
+```python
+# fake inputs of the backward
+placeholder_list = fx_placeholder_vals(bw_module)
+# Saved tensors will arrive with the strides the *compiled* forward
+# gave them, which may differ from the traced ones: patch the fake
+# inputs to those strides.
+for i, ph_arg in enumerate(placeholder_list):
+    real_stride = forward_saved_for_backwards_strides[
+        i - num_symints_saved_for_bw
+    ]
+    if stride_different(ph_arg, real_stride):
+        placeholder_list[i] = ph_arg.as_strided(ph_arg.size(), real_stride)
+compiled_bw_func = None
+if (
+    num_symints_saved_for_bw > 0
+    or aot_config.force_non_lazy_backward_lowering
+):
+    compiled_bw_func = bw_compiler(
+        copy.deepcopy(bw_module), placeholder_list
+    )
+lazy_backward_info = AutogradLazyBackwardCompileInfo(
+    bw_module, placeholder_list, saved_context, saved_compile_context
+)
+# -> (info, None) for rms_silu
+return lazy_backward_info, compiled_bw_func
+```
+
+The backward is compiled **lazily**, on the first call to `backward()`. The exception is a
+backward that receives saved SymInts (dynamic shapes): a code comment explains that Inductor
+might then specialize a symbolic size and add guards, which must happen while the forward is
+still being compiled. `force_non_lazy_backward_lowering` forces eager compilation too.
+
+## The min-cut partitioner
+
+[`min_cut_rematerialization_partition`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/partitioners.py#L3725)
+is the partitioner Inductor uses for every training graph. It runs CSE (common subexpression
+elimination) on the joint graph, classifies the nodes, builds a flow network, and calls
+`networkx.minimum_cut`. This section builds up the ideas first, then shows each piece of the
+code, then runs the whole thing on the example.
+
+### Cuts and flows
+
+Take a directed graph with two special vertices, a **source** $s$ and a **sink** $t$, and a
+**capacity** $c(u, v) \ge 0$ on each edge. An **$s$-$t$ cut** splits the vertices into two sets,
+$S$ containing $s$ and $T$ containing $t$. Its **capacity** is the total capacity of the edges
+that go from $S$ to $T$:
+
+$$
+c(S, T) = \sum_{u \in S,\ v \in T} c(u, v).
+$$
+
+Removing those edges leaves no path from $s$ to $t$, and the **minimum cut** is the cheapest way
+to do that.
+
+Here is the link to partitioning. Put the forward's inputs at the source and everything the
+backward needs at the sink. Give each tensor a capacity equal to the cost of saving it, and every
+data edge infinite capacity. A cut of finite capacity cuts only tensors, and the tensors it cuts
+are a valid set of saved values: once they are saved, nothing on the $T$ side needs anything
+from the $S$ side except through them, so the $T$ side can be computed in the backward from saved
+values alone. The minimum cut is the cheapest valid set.
+
+The simplest example is `x.sin().sin().sin()`. Its backward needs $\cos$ of each sine's input:
+`cos(x)`, `cos(sin)` and `cos(sin_1)`. The default partitioner saves `x`, `sin` and `sin_1`,
+three tensors. Step through the network the min-cut partitioner builds for it:
+
+<MinCutSteps nodes={sinChainNodes} edges={sinChainEdges} wide={false} title="x.sin().sin().sin(): save one input, recompute two sines" />
+
+The only edge into the network leaves the source through `primals_1` (that is `x`), so a cut
+through `primals_1` alone, of capacity 281, separates everything. The partitioner saves only `x`,
+and the backward recomputes `sin` and `sin_1` before taking their cosines. The capacities (281
+for `x`, 562 for the others) come from the formula in [Capacities](#capacities); for now, just
+note that each is roughly the tensor's 256 bytes.
+
+#### Max-flow and min-cut
+
+How do we find a minimum cut? Through its dual. A **flow** assigns each edge a value
+$0 \le f(u, v) \le c(u, v)$ such that at every vertex other than $s$ and $t$, flow in equals flow
+out. The **value** of a flow is the total that leaves $s$. Think of capacities as pipe widths
+and the flow as water.
+
+Every unit of flow from $s$ to $t$ must cross every cut, so for any flow $f$ and any cut,
+$|f| \le c(S, T)$. The **max-flow min-cut theorem** says that the largest flow equals the smallest
+cut, and gives a way to find both.<Sidenote>Ford and Fulkerson, 1956. The proof is the algorithm
+below: when no augmenting path is left, the vertices reachable from $s$ in the residual graph form
+a cut whose edges are all saturated, so its capacity equals the flow.</Sidenote>
+
+The classic algorithm is **augmenting paths**. Keep a **residual graph**: for each edge, the
+spare capacity $c(u, v) - f(u, v)$ forwards, and the current flow $f(u, v)$ backwards (pushing
+flow backwards along an edge means undoing it). Then repeat:
+
+1. Find a path from $s$ to $t$ in the residual graph using only edges with spare capacity. If
+   there is none, stop.
+2. The path's **bottleneck** is its smallest spare capacity. Push that much flow along it.
+
+**Edmonds–Karp** finds each path with breadth-first search, which bounds the number of rounds by
+$O(VE)$. When no path is left, the flow is maximal, and the saturated edges between the vertices
+that can still be reached and those that cannot form a minimum cut.
+
+Two facts about the real implementation matter here.
+`networkx.minimum_cut` uses **preflow-push** (push–relabel) by default, not augmenting paths;
+both find a maximum flow, and the cut is read off the residual graph either way. And networkx
+reads it off from the sink's side: $T$ is the set of vertices that can still *reach* $t$ in the
+residual graph.<Sidenote>[`networkx/algorithms/flow/maxflow.py`](https://github.com/networkx/networkx/blob/networkx-3.6.1/networkx/algorithms/flow/maxflow.py):
+it removes saturated edges and takes `shortest_path_length(R, target=t)`. This set is the same for
+every maximum flow, which is why the figures here, which use Edmonds–Karp, reproduce networkx's
+cuts exactly. I checked this on the real networks and on 300 random ones.</Sidenote> When several
+cuts tie for minimum, this picks the one closest to the sink. For the partitioner that means:
+among equally cheap choices, save values as late in the forward as possible.
+
+### Building the network
+
+[`solve_min_cut`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/partitioners.py#L2106)
+turns the joint graph into a `networkx.DiGraph`. Capacities in a flow network sit on edges, but
+here the cost belongs to a tensor, that is, to a node. So each FX node `X` is **split** into two
+vertices, `X_in` and `X_out`, joined by one edge whose capacity is the cost of saving `X`. Data
+edges run from the producer's `_out` to the consumer's `_in` with infinite capacity. A finite cut
+can then only cut `X_in → X_out` edges, so it cuts nodes, not dependencies.
+
+Which nodes connect to the terminals is decided by
+[`classify_nodes`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/partitioners.py#L3660),
+which sorts every node of the joint graph into three sets:
+
+- **required forward**: nodes on some path from the primals to the forward outputs (found by
+  extracting the forward-only graph);
+- **required backward**: the tangents and every node that depends on them (their *closure*), plus
+  the gradient outputs;
+- **unclaimed**: everything else, such as `sigmoid(mm)` or `permute(w)`, which the backward uses
+  but which does not depend on a tangent.
+
+From those sets `solve_min_cut` adds these edges, all of infinite capacity:
+
+| Edge | When | Meaning |
+| --- | --- | --- |
+| `source → X_in` | `X` is a primal, or banned from recomputation | `X` is always available in the forward |
+| `X_out → Y_in` | `Y` uses `X` | data dependency |
+| `X_in → sink` | `X` depends on a tangent | `X` must be computed in the backward |
+| `X_out → sink` | `X` is a gradient output that does not depend on a tangent | `X`'s value must reach the backward |
+| `X_in → sink` | the user marked `X` `MUST_RECOMPUTE` | forces recomputation |
+
+Unclaimed nodes get no terminal edge at all. They float: the cut decides whether they run in the
+forward (and maybe get saved) or in the backward. This is how the min-cut partitioner can move a
+backward op such as `sigmoid(mm)` into the forward when saving its output is cheaper, or keep a
+forward op such as `mul` out of the saved set by recomputing it.
+
+After the cut, a node on the source side whose output edge is cut is **saved**; the rest of the
+source side runs only in the forward; the sink side runs in the backward, which is exactly where
+recomputation happens.
+
+### Capacities
+
+The capacity of `X_in → X_out` comes from
+[`get_node_weight`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/partitioners.py#L2265):
+
+```python
+# bytes of node.meta["val"]
+mem_sz = _size_of(node)
+if (
+    config.treat_parameters_as_free_to_save
+    and node in static_lifetime_input_nodes
+):
+    # parameters live anyway
+    return 0
+if config.recompute_views and op_types.is_view(node):
+    return math.inf  # off by default
+mem_sz = int(mem_sz * (1.1 ** max(min(node.dist_from_bw, 100), 1)))
+if is_materialized(node):
+    return mem_sz
+else:
+    return mem_sz * 2
+```
+
+So the capacity starts from the tensor's size in bytes and applies two adjustments.
+
+- **Distance to the backward.** `dist_from_bw` is the number of hops from the node to the nearest
+  node outside the required forward set (0 for those nodes, $10^9$ for nodes with no path to the
+  backward). The factor $1.1^{d}$, with $d$ clamped to $[1, 100]$, makes values far from the
+  backward slightly more expensive to save, since they would be held in memory longer.
+- **Materialization.** A node is **materialized** when at least one user cannot fuse with it (a
+  matmul, say) or it is a graph input: its output will be written to memory anyway. A node whose
+  users are all fusible pointwise ops would otherwise never be written, so saving it costs an
+  extra write, and its capacity is doubled.
+
+Check two entries of the running example. `mm` is $4 \times 8$ float32, 128 bytes, one hop from
+the backward and materialized (it is a matmul, which nothing fuses into):
+$\lfloor 128 \times 1.1 \rfloor = 140$. `mean` is $4 \times 1$, 16 bytes, three hops away, and
+its only user `add` is fusible: $\lfloor 16 \times 1.1^3 \rfloor = \lfloor 21.3 \rfloor = 21$,
+doubled to 42.
+
+### Banning recomputation
+
+Bytes are only half the story. Some values must never be recomputed, whatever they cost to save.
+[`should_ban_recomputation`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/partitioners.py#L2200)
+decides, for each node in the required forward set, and a banned node gets an edge
+`source → X_in` of infinite capacity. The node can then only end up on the source side: it is
+either saved or not needed. The reasons it checks, in order:
+
+| Reason | Rule | Config flag (default) |
+| --- | --- | --- |
+| marked `MUST_SAVE` | a checkpoint policy said so | none |
+| not in the allowlist | op is not in the recomputable list (`mm`, convolutions, attention, ... are not) | `ban_recompute_not_in_allowlist` (on) |
+| materialized in backward | some backward user cannot fuse with it, so recomputing it would mean writing it again | `ban_recompute_materialized_backward` (on) |
+| reduction | output is over 4× smaller than its inputs, so saving it is cheap | `ban_recompute_reductions` (on) |
+| used far apart | a fusible user of some value runs after the first unfusible op in that value's chain of users, so recomputing it would not fuse with the other uses | `ban_recompute_used_far_apart` (on) |
+| long fusible chains | a chain of over 100 fusible ops would be recomputed | `ban_recompute_long_fusible_chains` (on) |
+
+The **allowlist** comes from
+[`get_default_op_list`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/partitioners.py#L2826):
+pointwise math, casts, views, cheap reductions like `sum` and `amax`, indexing. Matmuls and
+convolutions are **compute-intensive** and never recomputed; random ops such as dropout are
+banned so that the backward does not draw different random numbers. With all flags on, a node
+must pass every test to be recomputable.<Sidenote>There is also a "too far from backward" check
+on `dist_from_bw`. With the default `max_dist_from_bw = 1000` its condition
+`dist < 1000 and dist > 1000` can never hold, so it is effectively off; a comment in the code says
+it stopped mattering after PR #121692.</Sidenote>
+
+In the running example, six nodes are banned, each for a different reason:
+
+| Node | Reason |
+| --- | --- |
+| `primals_1`, `primals_2`, `primals_3` | primal inputs |
+| `mm` | not in the recomputable allowlist |
+| `mul_1` ($h$) | materialized in backward: its user `permute` feeds a matmul |
+| `mean` | reduction: 16 bytes out of 256 bytes in |
+
+### Running it on the example
+
+Here is the network `solve_min_cut` built for `rms_silu`, reduced to one box per FX node: each
+box is a node's `X_in → X_out` pair with its capacity, the backward nodes that depend on tangents
+are merged into the sink, and nodes on no source-to-sink path (the forward's SiLU tail) are
+dropped.<MarginNote>Merging is safe: those nodes connect to the sink with infinite capacity, so an
+edge into one of them is the same as an edge into the sink.</MarginNote> Step through the six
+augmenting paths that Edmonds–Karp finds, and hover a box to see where its capacity comes from.
+
+<MinCutSteps nodes={rmsSiluNodes} edges={rmsSiluEdges} title="The min-cut network for rms_silu, path by path" />
+
+The first four paths are short: each primal, and `mul_1`, is banned (an edge from the source)
+and feeds the backward directly or through one transpose. Path 3 is the first interesting one:
+`primals_3` and its transpose `permute_1` both have capacity 563, so the path fills both. Either
+would be a valid cut; networkx's sink-side rule picks `permute_1`, the one nearer the backward. It
+costs the same, since a transpose is a view of `w`.
+
+Paths 5 and 6 decide the activations. Check path 6 by hand: it runs source → `mean` → `add` →
+`rsqrt` → sink. `mean` is banned as a reduction, so the source feeds it with unlimited capacity;
+the boxes on the way have capacities 42, 38 and 34; the bottleneck is `rsqrt` at 34
+($\lfloor 16 \times 1.1 \rfloor \times 2$). After it, no path from the source reaches the sink,
+and the total flow is
+
+$$
+281 + 70 + 563 + 281 + 140 + 34 = 1369,
+$$
+
+which is the cut value networkx returned during the real compile.
+
+Now look at what was *not* cut. `mul` ($x \cdot r$, capacity 562) sits on the sink side, because
+everything it needs, `primals_1` and `rsqrt`, is saved and the path through it is blocked at
+those two boxes. So the backward recomputes it. The same holds for `sigmoid`, `sub`, `mul_3`,
+`add_2`, `pow_2`, `pow_3` and `mul_11`: they are backward ops that could have been run in the
+forward and saved, but recomputing them from `mm`, `rsqrt` and `x` is free, so they stay in the
+backward.
+
+#### The result
+
+Steps 5 and 6 of the [running example](#the-running-example) show the partitioned graphs. The
+forward returns `rsqrt`, `mm`, the transposed $h$ and the transposed $w$ along with the inputs;
+the backward recomputes `mul = primals_1 * rsqrt` and goes on exactly as before. Compared with
+the default partitioner:
+
+| Saved activations | Default | Min-cut |
+| --- | ---: | ---: |
+| `rsqrt` ($N \times 1$) | 16 B | 16 B |
+| `mul` = $x \cdot r$ ($N \times D$) | 256 B | recomputed |
+| `mul_1` = $h$ ($N \times D$) | 256 B | 256 B (as `permute`) |
+| `mm` ($N \times F$) | 128 B | 128 B |
+| **Total** | **656 B** | **400 B** |
+
+That is 39% less activation memory for one extra multiply in the backward. At a realistic size
+the saving is one $N \times D$ tensor per block. With $N = 8192$ tokens, $D = 4096$, $F = 11008$
+in bfloat16, the default partitioner would keep 300 MiB of these activations per block and the
+min-cut partitioner 236 MiB: 64 MiB, or 21%, less.<Sidenote>Computed from the shapes in the
+table, not measured; inputs and their views are not counted because they are kept alive by the
+caller anyway. A real block has more ops, and the saving depends on how many cheap intermediates
+it has.</Sidenote>
+
+## The memory budget
+
+The min-cut partitioner as described minimizes memory subject to the bans, which mostly protect
+runtime. Sometimes memory matters more: the model must fit. `torch._functorch.config.activation_memory_budget`
+(default `1.0`) asks for less.
+[`choose_saved_values_set`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/partitioners.py#L3110)
+reads it as a fraction between two extremes: $0$ means save only the inputs and recompute
+everything, $1$ means the runtime-optimized cut above.
+
+For a budget between them it tries progressively more aggressive cuts:
+
+1. Solve the min cut with the "used far apart", "long fusible chains" and "materialized in
+   backward" bans turned off. If that fits the budget, use it.
+2. Also turn off the allowlist ban. If that fits, use it.
+3. Otherwise treat the remaining banned nodes (matmuls and other expensive ops) as items in a
+   **0/1 knapsack**: each has a memory size (normalized to the range between the two extremes)
+   and a runtime estimate (by default from a FLOP count). The solver (dynamic programming by
+   default) picks which ones to recompute so that the saved memory fits the budget while the
+   recomputed runtime is smallest. Those nodes are un-banned and the min cut is solved one last
+   time.
+
+To see it work, I stacked four residual copies of the example block (64 tokens, width 128, hidden
+256) and swept the budget. Activation bytes count only saved values that are not inputs or views
+of inputs; the last column counts the ops in the backward graph, a rough measure of the work it
+recomputes:
+
+| Budget | Saved activations | Backward ops | What is saved |
+| ---: | ---: | ---: | --- |
+| 1.0 | 737 KiB | 101 | `rsqrt`, `mm`, residual sums, normalized inputs |
+| 0.8 | 353 KiB | 131 | `rsqrt` and the seven `mm` outputs the backward reads |
+| 0.5 | 353 KiB | 131 | same |
+| 0.4 | 288 KiB | 149 | six of those `mm` outputs |
+| 0.3 | 192 KiB | 153 | four `mm` |
+| 0.2 | 129 KiB | 139 | three `mm` and every `rsqrt` |
+| 0.1 | 65 KiB | 141 | two `mm` and every `rsqrt` |
+| 0.0 | 0 KiB | 162 | nothing but the inputs |
+
+The budget is coarse: 0.8 and 0.5 give the same answer because the first relaxation already
+fits both. Below 0.5 the knapsack starts recomputing matmuls, which is real extra compute, unlike
+the pointwise recomputation the default budget allows.
+
+## Stage 3: the runtime
+
+Stage 2c,
+`_aot_stage2c_make_autograd_function`, turns the two compiled graphs into something PyTorch can
+call. It packs them into an `AOTDispatchAutogradCompileSpec` and calls
+`AOTDispatchAutograd.post_compile`, which does two things:
+
+```python
+def post_compile(spec):
+    compiled_function_cls = _AOTDispatchAutogradFunctionFactory(
+        spec
+    ).build()
+    return RuntimeWrapper(
+        indices_of_inps_to_detach=spec.indices_of_inps_to_detach,
+        trace_joint=True,
+        disable_amp=spec.disable_amp,
+    ).post_compile(
+        compiled_function_cls.apply,
+        spec.aot_config,
+        runtime_metadata=spec.fw_metadata,
+    )
+```
+
+Then the stage-1 wrappers' `post_compile` methods wrap the result in reverse order (synthetic
+bases, then dedupe), and `aot_module_simplified` adds the parameter-prepending `forward` from
+[stage 0](#stage-0-the-entry-point). A call from Dynamo therefore passes through four layers:
+`forward` → (dedupe and synthetic-base wrappers, no-ops here) → the runtime wrapper →
+`CompiledFunction.apply`.
+
+Much of this layer is **generated code**. Rather than branching on the metadata at every call,
+AOTAutograd writes small Python functions specialized to this graph, compiles them with `exec`,
+and calls those (`_compile_and_exec_source` in `subclass_codegen.py`). Run with
+`TORCH_LOGS="+torch._functorch._aot_autograd.subclass_codegen"` to see them; the listings below
+are the ones generated for `rms_silu` and for the mutation example.
+
+### CompiledFunction
+
+[`_AOTDispatchAutogradFunctionFactory.build`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/_aot_autograd/runtime_wrappers.py#L3270)
+defines a fresh `torch.autograd.Function` subclass for every compiled graph:
+
+```python
+class CompiledFunction(torch.autograd.Function):
+    compiled_fw = compiled_fw_func  # the Inductor-compiled forward
+    compiled_bw = compiled_bw_func  # None until the first backward
+    # the ViewAndMutationMeta from stage 1
+    metadata = fw_metadata
+
+    @staticmethod
+    def forward(ctx, *deduped_flat_tensor_args):
+        return CompiledFunction._fwd_fn(
+            ctx,
+            deduped_flat_tensor_args,
+            rng_state.add_forward_args,
+            saved_state.save_from_forward,
+            forward_epilogue.finalize,
+            CompiledFunction.compiled_fw,
+        )
+
+    @staticmethod
+    def backward(ctx, *flat_args):
+        return CompiledFunction._bwd_fn(
+            flat_args,
+            ctx,
+            CompiledFunction._bw_prologue_fn,
+            rng_state.add_backward_args,
+            CompiledFunction._backward_impl,
+            CompiledFunction._bw_epilogue_fn,
+            CompiledFunction._double_backward,
+        )
+```
+
+Because it is an ordinary `autograd.Function`, autograd records a single node for the whole
+compiled region; that node prints as `CompiledFunctionBackward` in `out.grad_fn`.
+
+#### The forward call
+
+`_fwd_fn` is this generated function, identical for `rms_silu` and the mutation example:
+
+```python
+def _compiled_forward(
+    ctx, args, _rng_add_, _save_, _finalize_, _compiled_fw_
+):
+    # run the compiled forward graph
+    fw_outs = _compiled_fw_(list(args))
+    if isinstance(fw_outs, tuple):  # normalize to a list
+        fw_outs = list(fw_outs)
+    elif not isinstance(fw_outs, list):
+        fw_outs = [fw_outs]
+    # stash the saved values on ctx
+    _save_(ctx, fw_outs)
+    # return only what the user should see
+    return _finalize_(ctx, fw_outs)
+```
+
+Lines that would handle RNG state, autocast and `BackwardState` are generated only when the graph
+needs them, which is why they are missing here. `autograd.Function.apply` runs `forward` with
+grad mode off, so nothing inside builds an autograd graph.
+
+For `rms_silu`, `fw_outs` has seven entries: `[div, primals_1, primals_2, rsqrt, mm, permute,
+permute_1]`. `_save_` is
+[`_AutogradSavedState.save_from_forward`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/_aot_autograd/runtime_wrappers.py#L2570):
+
+```python
+def save_from_forward(self, ctx, fw_outs):
+    tensors_saved_with_vc_check = fw_outs[
+        self.metadata.tensors_saved_for_backwards_with_vc_check_slice
+    ]
+    # -> fw_outs[1:7]: primals_1, primals_2, rsqrt, mm, permute, permute_1
+    tensors_saved_no_vc_check = fw_outs[
+        self.metadata.tensors_saved_for_backwards_no_vc_check_slice
+    ]
+    tensors_to_save = [
+        x.detach() if x._is_view() else x
+        for x in tensors_saved_with_vc_check
+    ]
+    # autograd's version-counter check applies
+    ctx.save_for_backward(*tensors_to_save)
+    ctx._tensors_no_vc_check = tensors_no_vc_check
+    # -> []
+    ctx.symints = fw_outs[self.metadata.symints_saved_for_backwards_slice]
+    ctx.opaque_objects = fw_outs[
+        self.metadata.opaque_objects_saved_for_backwards_slice
+    ]
+```
+
+The slices come from the counts made in stage 2a. Views (`permute`, `permute_1`) are detached
+before saving, so each saved tensor carries no autograd history of its own. `save_for_backward` gives the usual safety check: mutate a saved tensor
+in place before calling backward and you get the same error as in eager mode.
+
+`_finalize_` keeps `fw_outs[:num_forward_returns]` (here just `div`), wraps outputs that alias
+inputs in `TensorAlias` so that `autograd.Function` treats them as plain values, and calls
+`ctx.mark_non_differentiable` on outputs that do not require grad. The generated helper it uses
+for the mutation example shows the aliasing case:
+
+```python
+def _transform_raw_returns(raw_returns):
+    # output 1 is a view of x: hide it
+    raw_returns[1] = TensorAlias(raw_returns[1])
+    # every output requires grad
+    non_diff = []
+    return non_diff
+```
+
+#### The backward call
+
+When autograd reaches `CompiledFunctionBackward`, it calls `backward`, whose `_bwd_fn` is:
+
+```python
+def _compiled_backward(
+    _flat_args_,
+    _ctx_,
+    _prologue_,
+    _rng_add_,
+    _impl_,
+    _epilogue_,
+    _double_bw_,
+):
+    # incoming gradients, as one mutable list
+    grad_args = _flat_args_[0]
+    del _flat_args_
+    # unpack (and version-check) saved tensors
+    _saved = _ctx_.saved_tensors
+    all_args = _prologue_(
+        _saved, _ctx_.symints, _ctx_.opaque_objects, grad_args
+    )
+    del _saved
+
+    def impl_fn(double_ctx=None):
+        # compile if needed, then run the backward
+        out = _impl_(_ctx_, all_args)
+        return _epilogue_(out)
+
+    # ... run inside a user context object if one is installed
+    if torch.is_grad_enabled():  # backward(create_graph=True)
+        return _double_bw_(_ctx_, impl_fn, all_args)
+    return impl_fn()
+```
+
+The prologue arranges the inputs in the order the backward graph expects. Generated for
+`rms_silu`, after two checks (no `vmap`/`grad` transform active, same deterministic-algorithms
+setting as when it was traced):
+
+```python
+def _backward_prologue(
+    ctx_saved_tensors, ctx_symints, ctx_opaque_objects, flat_args
+):
+    # ... the two checks
+    if len(flat_args) != 1:
+        raise AssertionError(f'expected 1 grad_outs, got {len(flat_args)}')
+    # the one tangent: d loss / d div
+    _bw_grads = [flat_args[0]]
+    if isinstance(flat_args, list):
+        # drop the caller's reference early
+        flat_args.clear()
+    _n_saved = len(ctx_saved_tensors)
+    all_args = [
+        *ctx_symints,
+        *ctx_saved_tensors,
+        *ctx_opaque_objects,
+        *_bw_grads,
+    ]
+    del ctx_saved_tensors
+    _ts = len(ctx_symints) + _n_saved + len(ctx_opaque_objects)
+    # make each tangent match the traced one
+    for j in range(1):
+        _i = _ts + j
+        all_args[_i] = _process_tangent_(
+            all_args[_i], _tangent_metas_[j], j, ...
+        )[0]
+    return all_args
+```
+
+So the backward graph receives `[primals_1, primals_2, rsqrt, mm, permute, permute_1,
+tangents_1]`, exactly its placeholder list. `_process_tangent_` is there because the backward was
+traced with a guessed tangent: the gradient that actually arrives might have a different memory
+format, so it is converted to the one recorded at trace time (`coerce_to_expected_memory_format`);
+for tensor subclasses a mismatch raises an error that names the offending output. For the mutation example the prologue checks for two
+gradients but keeps only the first, because output 1 aliases an input and has no tangent.
+
+`_impl_` is `_backward_impl`. It calls
+[`_AutogradBackwardCompiler.get_or_compile`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/_aot_autograd/runtime_wrappers.py#L2798),
+which on the first call restores the tracing and compile contexts saved in stage 2b and runs the
+backward compiler on a deep copy of `bw_module` with the stride-corrected fake inputs; later calls
+return the cached result. It then runs the compiled backward with `steal_args=True`, handing over
+the `all_args` list so that the backward can free each saved tensor as soon as it is done with
+it, and, for the donated buffers, reuse their memory. That is only safe if nobody will run this
+backward again, so a backward compiled with donated buffers raises an error under
+`retain_graph=True`.
+
+The epilogue turns the output list into a tuple, one gradient per input of `CompiledFunction`.
+If grad mode is on during backward (`create_graph=True`), `_double_bw_` wraps the call in another
+`autograd.Function` whose own backward raises "torch.compile with aot_autograd does not currently
+support double backward".
+
+### The runtime wrapper
+
+The outermost AOTAutograd layer is the runtime wrapper built by
+[`_create_runtime_wrapper`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/_aot_autograd/runtime_wrappers.py#L899).
+Its body is generated too. For `rms_silu`, which mutates nothing and returns no aliases:
+
+```python
+def _runtime_wrapper(_compiled_fn_, _first_ctx_, _on_before_call_, args):
+    # inputs needed after the call: none
+    orig_inputs = {}
+    # first call only: check custom-op aliasing
+    with _first_ctx_():
+        args_ = list(args)
+        prev_view_replay_enabled = torch._C._is_view_replay_enabled()
+        try:
+            if not prev_view_replay_enabled:
+                torch._C._set_view_replay_enabled(True)
+            # autograd must record CompiledFunction
+            with torch.enable_grad():
+                _on_before_call_()  # profiler marker
+                all_outs = _compiled_fn_(args_)  # CompiledFunction.apply
+                # ... normalize to a list
+        finally:
+            if (
+                torch._C._is_view_replay_enabled()
+                != prev_view_replay_enabled
+            ):
+                torch._C._set_view_replay_enabled(prev_view_replay_enabled)
+    del args
+    if len(all_outs) != 1:
+        raise AssertionError(f"expected 1 outputs, got {len(all_outs)}")
+    fw_outs = all_outs
+    ret_outs = fw_outs
+    return ret_outs
+```
+
+`enable_grad` is unconditional; a comment in the reference implementation explains that a joint
+graph can be traced inside a user's `no_grad()` region that contains a nested `enable_grad()`,
+which still makes some outputs require gradients. View replay makes autograd rebuild views by
+replaying the view ops rather than with `as_strided`, which matters for the aliased outputs
+below.
+
+For the mutation example, the wrapper gains three lines:
+
+```python
+def _runtime_wrapper(_compiled_fn_, _first_ctx_, _on_before_call_, args):
+    # keep x: output 1 is a view of it
+    orig_inputs = {1: args[1]}
+    # buf was mutated in the graph: bump its version
+    _increment_version_((args[0],))
+    # ... same call as above
+    if len(all_outs) != 2:
+        raise AssertionError(f"expected 2 outputs, got {len(all_outs)}")
+    fw_outs = all_outs
+    ret_outs = _replay_aliases_(orig_inputs, fw_outs)
+    return ret_outs
+
+
+def _alias_fn(orig_inputs, fw_outs):  # _replay_aliases_
+    ret_outs = []
+    ret_outs.append(fw_outs[0])  # t + buf: returned as is
+    # x.view(-1): rebuilt from the real x
+    ret_outs.append(
+        gen_alias_from_base(
+            orig_inputs[1],
+            _unwrap_tensoralias(fw_outs[1]),
+            True,
+            _vms_1,
+            replay_views=True,
+        )
+    )
+    return ret_outs
+```
+
+`_increment_version_` exists because the compiled graph wrote `buf` with a `copy_` that autograd
+never saw. Bumping the version counter tells autograd that `buf` changed, as an in-place op in
+eager mode would, so that a stale saved copy of `buf` elsewhere is caught by the usual check.
+`gen_alias_from_base` replays the recorded view functions (`_vms_1`, a `ViewMetaSequence`
+holding the one `view(-1)`) on the real `x`, so the returned tensor really shares `x`'s storage
+and has `ViewBackward0` as its `grad_fn`. I checked both after the compile: `v._base is x` is
+`True`, and `out.grad_fn` is `CompiledFunctionBackward`.
+
+When a mutation is not kept in the graph, the forward returns the new value as an extra first
+output and the wrapper applies it after the call. Compiling `buf.add_(1); return x.sin() * buf`
+with `aot_function` (which defaults to `keep_inference_input_mutations=False`) gives a forward
+graph that returns `(add, mul, primals_1, add)`: updated `buf`, user output, two saved values.
+The wrapper then splits and applies it:
+
+```python
+# end of _runtime_wrapper:
+updated_inputs = all_outs[:1]  # [add]: the new value of buf
+fw_outs = all_outs[1:]  # [mul]: what the user sees
+_apply_mutations_(orig_inputs, updated_inputs)
+ret_outs = fw_outs
+
+
+def _apply_mutations(orig_inputs, updated_inputs):
+    if orig_inputs[1].requires_grad:
+        orig_inputs[1].detach().copy_(updated_inputs[0])
+    else:
+        orig_inputs[1].copy_(updated_inputs[0])
+```
+
+`orig_inputs[1]` is `buf` in the function's own argument order, and the copy is a real
+`copy_` in eager mode, outside the compiled region. That costs an extra kernel launch and a pass
+over `buf`, which is why Inductor keeps such mutations in the graph whenever the rules above
+allow it.
+
+## Using AOTAutograd directly
+
+`torch.compile` hides all of this, but the pieces are public enough to experiment with.
+`aot_function` takes any function plus your own compilers and partitioner. Compilers receive an FX
+graph and example inputs and return a callable; `make_boxed_func` adapts a plain `forward` to the
+boxed calling convention (one list argument) that AOTAutograd uses:
+
+```python
+import torch
+from functorch.compile import (
+    aot_function,
+    make_boxed_func,
+    min_cut_rematerialization_partition,
+)
+from torch._inductor.decomposition import select_decomp_table
+
+
+def show(name):
+    def compiler(gm, example_inputs):
+        print(name, gm.code)
+        return make_boxed_func(gm.forward)
+
+    return compiler
+
+
+f = aot_function(
+    rms_silu,
+    show("fw"),
+    show("bw"),
+    partition_fn=min_cut_rematerialization_partition,
+    decompositions=select_decomp_table(),
+)
+f(x, g, w).sum().backward()
+```
+
+This is how the default-partitioner graphs in this post were produced, with `default_partition`
+swapped in. For a model compiled with `torch.compile`, these switches show what AOTAutograd did:
+
+| Tool | What it shows |
+| --- | --- |
+| `TORCH_LOGS=aot_joint_graph` | the joint graph before partitioning |
+| `TORCH_LOGS=aot_graphs` | the metadata, and the forward and backward graphs |
+| `AOT_PARTITIONER_DEBUG=1` | banned ops, saved bytes, counts of recomputed ops |
+| `activation_memory_budget` | the knapsack trade-off above |
+
+To steer the partitioner per region, wrap code in `torch.utils.checkpoint.checkpoint` with a
+`context_fn` from `create_selective_checkpoint_contexts`. Its policy tags nodes `MUST_SAVE`,
+`PREFER_SAVE`, `MUST_RECOMPUTE` or `PREFER_RECOMPUTE`, and both partitioners read the tags: a
+must-recompute node gets an edge `X_in → sink`, a must-save node is banned from recomputation.
+
+## Summary
+
+- AOTAutograd traces the forward **and** the autograd engine's backward on fake tensors into one
+  functional **joint graph**, with primals and tangents as inputs. Functionalization removes
+  mutations; a metadata pass records what must be replayed at run time.
+- `create_joint` gets the backward by calling the real `torch.autograd.grad` while `make_fx`
+  records, so every derivative formula becomes ATen nodes in the same graph.
+- A **partitioner** splits the joint graph; its only real decision is the list of **saved
+  values**. `_extract_graph_with_inputs_outputs` then copies every op computable from the chosen
+  inputs, which is how recomputation happens. The default partitioner saves what eager autograd
+  would.
+- At run time a per-graph `CompiledFunction` saves the extra forward outputs with
+  `ctx.save_for_backward` and compiles the backward on first use. Generated wrapper code around
+  it replays input mutations and rebuilds aliased outputs.
+- Inductor's **min-cut partitioner** splits each node into an `in → out` edge weighted by the
+  bytes of its output, connects primals and **banned** nodes (matmuls, reductions, random ops,
+  values materialized in the backward) to the source and tangent-dependent nodes to the sink, and
+  saves the nodes on a minimum cut. Cheap pointwise ops end up recomputed and fused into backward
+  kernels.
+- The minimum cut is found as a **maximum flow**; ties go to the cut nearest the backward. On the
+  example, the flow is 1369 and the saved activations drop from 656 to 400 bytes.
+- `activation_memory_budget` relaxes the bans and then solves a **knapsack** over the expensive
+  nodes, trading real recomputation for memory.
+
+## References
+
+- PyTorch source at [`cf30153c`](https://github.com/pytorch/pytorch/tree/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch):
+  [`partitioners.py`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/partitioners.py),
+  [`aot_autograd.py`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/aot_autograd.py),
+  [`_aot_autograd/`](https://github.com/pytorch/pytorch/tree/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_functorch/_aot_autograd),
+  [`_inductor/compile_fx.py`](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/torch/_inductor/compile_fx.py#L2273).
+- Horace He, [Min-cut optimal(*) recomputation (i.e. activation checkpointing) with AOTAutograd](https://dev-discuss.pytorch.org/t/min-cut-optimal-recomputation-i-e-activation-checkpointing-with-aotautograd/467),
+  PyTorch dev-discuss, 2022: the original description of the approach.
+- J. Ansel et al., [PyTorch 2: Faster Machine Learning Through Dynamic Python Bytecode Transformation and Graph Compilation](https://doi.org/10.1145/3620665.3640366),
+  ASPLOS 2024: AOTAutograd's place in `torch.compile`.
+- L. R. Ford and D. R. Fulkerson, "Maximal flow through a network", *Canadian Journal of
+  Mathematics* 8, 1956; J. Edmonds and R. M. Karp, "Theoretical improvements in algorithmic
+  efficiency for network flow problems", *Journal of the ACM* 19(2), 1972.
+- [networkx `minimum_cut`](https://networkx.org/documentation/stable/reference/algorithms/generated/networkx.algorithms.flow.minimum_cut.html),
+  version 3.6.1 was used here.

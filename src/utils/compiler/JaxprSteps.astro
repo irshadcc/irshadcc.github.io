@@ -1,0 +1,199 @@
+---
+// Step through a program transformation one equation at a time: the top listing is the program
+// being read (Python source, or a jaxpr), the bottom listing is the program being written (the
+// jaxpr a trace builds, a JVP or a transposed jaxpr). Each step highlights the lines read, reveals
+// the lines written and shows a table of values (tracers, primals and tangents, cotangents).
+// Lines not yet written are kept in place but invisible, so the figure does not jump. Data
+// model and checks are in jaxprSteps.ts; the JAX post's data is built in jaxFigures.ts.
+// Usage in .mdx:
+//   import JaxprSteps from "../../utils/compiler/JaxprSteps.astro";
+//   import { traceSteps } from "../../utils/compiler/jaxFigures";
+//   <JaxprSteps data={traceSteps} title="Tracing loss into a jaxpr" />
+import StepControls from "./StepControls.astro";
+import { type JaxprStepsData, validateJaxprSteps } from "./jaxprSteps";
+
+interface Props {
+	data: JaxprStepsData;
+	/** Step shown on load. */
+	step?: number;
+	title?: string;
+}
+
+const { data, step = 0, title } = Astro.props;
+const err = validateJaxprSteps(data);
+if (err) throw new Error(`JaxprSteps: ${err}`);
+const at = Math.max(0, Math.min(data.steps.length - 1, step));
+const plan = data.steps.map((s) => ({ t: s.top, s: s.shown, b: s.bottom }));
+const cur = data.steps[at];
+---
+
+<figure class="jxs" data-step={at} data-plan={JSON.stringify(plan)} tabindex="-1">
+	{title && <figcaption class="jxs-title">{title}</figcaption>}
+	<StepControls labels={data.steps.map((s) => s.label)} step={at} />
+	<p class="jxs-head">{data.top.title}</p>
+	<pre class="jxs-code jxs-top"><code>{
+		data.top.lines.map((l, i) => (
+			<span class:list={["jxs-ln", { hi: cur.top.includes(i) }]} data-i={i}>{l === "" ? " " : l}</span>
+		))
+	}</code></pre>
+	<p class="jxs-head">{data.bottom.title}</p>
+	<pre class="jxs-code jxs-bottom"><code>{
+		data.bottom.lines.map((l, i) => (
+			<span
+				class:list={["jxs-ln", { hi: cur.bottom.includes(i), ghost: !cur.shown.includes(i) }]}
+				data-i={i}
+			>{l === "" ? " " : l}</span>
+		))
+	}</code></pre>
+	<div class="jxs-tables">
+		{
+			data.steps.map((s, k) => (
+				<div class="jxs-scroll" data-k={k} hidden={k !== at}>
+					<table class="jxs-table">
+						<thead>
+							<tr>
+								{data.columns.map((c) => (
+									<th>{c}</th>
+								))}
+							</tr>
+						</thead>
+						<tbody>
+							{s.rows.map((r) => (
+								<tr class:list={{ hi: r.hi }}>
+									{r.cells.map((c) => (
+										<td>{c}</td>
+									))}
+								</tr>
+							))}
+						</tbody>
+					</table>
+				</div>
+			))
+		}
+	</div>
+	<div class="jxs-notes" aria-live="polite">
+		{data.steps.map((s, k) => <p class="jxs-note" data-k={k} hidden={k !== at} set:html={s.note} />)}
+	</div>
+</figure>
+
+<script>
+	import { bindStepper } from "./stepper";
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".jxs")) {
+		const plan: { t: number[]; s: number[]; b: number[] }[] = JSON.parse(fig.dataset.plan ?? "[]");
+		const top = [...fig.querySelectorAll<HTMLElement>(".jxs-top .jxs-ln")];
+		const bottom = [...fig.querySelectorAll<HTMLElement>(".jxs-bottom .jxs-ln")];
+		const panels = [...fig.querySelectorAll<HTMLElement>("[data-k]")];
+		bindStepper(fig, plan.length, (k) => {
+			const p = plan[k];
+			top.forEach((el, i) => el.classList.toggle("hi", p.t.includes(i)));
+			bottom.forEach((el, i) => {
+				el.classList.toggle("hi", p.b.includes(i));
+				el.classList.toggle("ghost", !p.s.includes(i));
+			});
+			for (const el of panels) el.hidden = Number(el.dataset.k) !== k;
+		});
+	}
+</script>
+
+<style>
+	.jxs {
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+		outline: none;
+	}
+	.jxs-title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.3rem;
+	}
+	.jxs-head {
+		margin: 0.6rem 0 0.2rem;
+		font-family: var(--mono);
+		font-size: 0.7rem;
+		color: var(--muted);
+	}
+	.jxs-code {
+		margin: 0;
+		padding: 0.5rem 0;
+		overflow-x: auto;
+		background: var(--surface);
+		border: 1px solid var(--faint);
+		border-radius: 8px;
+		font-family: var(--mono);
+		font-size: 0.7rem;
+		line-height: 1.55;
+	}
+	.jxs-code code {
+		display: block;
+		min-width: max-content;
+		background: none;
+		padding: 0;
+		font-size: inherit;
+	}
+	.jxs-ln {
+		display: block;
+		padding: 0 0.8rem;
+		white-space: pre;
+		transition:
+			background 150ms ease,
+			opacity 150ms ease;
+	}
+	.jxs-ln.hi {
+		background: color-mix(in oklch, var(--accent) 16%, transparent);
+		box-shadow: inset 3px 0 var(--accent);
+	}
+	.jxs-ln.ghost {
+		visibility: hidden;
+	}
+	.jxs-tables {
+		margin-top: 0.6rem;
+	}
+	.jxs-scroll {
+		overflow-x: auto;
+		border: 1px solid var(--faint);
+		border-radius: 8px;
+	}
+	.jxs-scroll[hidden],
+	.jxs-note[hidden] {
+		display: none;
+	}
+	.jxs-table {
+		width: 100%;
+		border-collapse: collapse;
+		margin: 0;
+		font-size: 0.74rem;
+	}
+	.jxs-table th,
+	.jxs-table td {
+		text-align: left;
+		padding: 0.25rem 0.6rem;
+		border-bottom: 1px solid var(--faint);
+		white-space: nowrap;
+	}
+	.jxs-table td {
+		font-family: var(--mono);
+		font-size: 0.7rem;
+	}
+	.jxs-table th {
+		font-weight: 600;
+		color: var(--muted);
+		font-size: 0.72rem;
+	}
+	.jxs-table tr:last-child td {
+		border-bottom: none;
+	}
+	.jxs-table tr.hi td {
+		background: color-mix(in oklch, var(--accent) 12%, transparent);
+	}
+	.jxs-notes {
+		margin-top: 0.6rem;
+		font-size: 0.82rem;
+		line-height: 1.5;
+		min-height: 3em;
+	}
+	.jxs-note :global(code) {
+		font-size: 0.75rem;
+	}
+</style>

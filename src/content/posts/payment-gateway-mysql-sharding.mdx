@@ -506,6 +506,28 @@ small, latency-critical transactions on data that fits in memory, with sub-secon
 a ledger, the usual answer is InnoDB on many servers with a routing layer, or one of the
 databases in the [next section](#databases-that-shard-for-you).
 
+### Internals of InnoDB and NDB
+
+To see why they behave so differently, look at their internal architectures. They were built for opposite environments: InnoDB for a single machine where disks are the bottleneck, and NDB for a cluster of memory-rich telecom servers.
+
+#### Inside InnoDB: Disks, B+Trees and MVCC
+
+InnoDB assumes data outgrows RAM. Its entire design revolves around minimizing random disk I/O and maximizing concurrency on a single server.
+
+- **Index-organized tables:** An InnoDB table does not exist separately from its primary key. The table *is* a B+tree ordered by the primary key, called the **clustered index**. The leaf nodes are 16 KiB pages containing the actual row data. Secondary indexes are also B+trees, but their leaves contain the primary key value, not a physical disk offset. This means a lookup by secondary index requires two tree traversals (one to find the primary key, one to find the row). It also means that inserting primary keys in random order (like UUIDv4) causes constant page splits and fragmentation, which is why the payment ID design earlier put time in the high bits.
+- **Buffer Pool and Redo Log:** Random disk writes are slow, so InnoDB avoids them on the critical path. When a transaction updates a row, the change is written to a 16 KiB page in memory (the **buffer pool**), marking the page as "dirty". To ensure the commit is not lost in a crash, InnoDB appends a tiny record to a sequential, append-only **redo log** on disk (Write-Ahead Logging). Flushing a sequential log is vastly faster than writing random 16 KiB pages. Background threads flush the dirty pages to disk later.
+- **Undo Logs and MVCC:** When an update overwrites a row, InnoDB copies the old version of the row to an **undo log** and leaves a hidden pointer in the new row. These pointers form a linked list of historical versions. When a concurrent transaction runs a `SELECT`, it is given a **read view** (a snapshot of which transactions were active when it started). If it encounters a row modified by a transaction newer than its snapshot, it follows the pointer into the undo log until it finds a version it is allowed to see. This is **Multi-Version Concurrency Control (MVCC)**: readers never block writers, and writers never block readers, yet everyone sees a consistent snapshot.
+
+#### Inside NDB: Memory, Hashes and 2PC
+
+NDB Cluster splits the database into distinct tiers. The `mysqld` processes become stateless **SQL nodes**: they parse SQL and build execution plans, but store nothing. The data lives on **Data nodes** (`ndbd` or `ndbmtd`), which communicate over a high-speed network.
+
+- **In-memory hash indexes:** Data nodes store rows primarily in RAM.<Sidenote>NDB does support "Disk Data" tables for non-indexed columns, but the primary keys and all indexes must remain in memory.</Sidenote> Data is partitioned by hashing the primary key. Within a partition, the primary index is a hash table, providing $O(1)$ lookups. Finding `payment_id = 123` means the SQL node hashes the ID, asks the exact data node holding that partition, and gets an instant response. However, range scans ("all payments between Tuesday and Friday") require the SQL node to broadcast the query to every data node, wait for all replies, and merge them.
+- **Distributed Two-Phase Commit:** Because a transaction might touch rows in several partitions across different data nodes, NDB must ensure they commit atomically. It appoints a Transaction Coordinator (TC) on one of the data nodes. The TC runs a distributed two-phase commit: it sends a `PREPARE` to the participating nodes, which acquire local row locks and write to their local redo logs. If all acknowledge, the TC logs the commit decision and sends `COMMIT` to finalize it.
+- **Pessimistic Concurrency (No MVCC):** Crucially, NDB does not keep undo logs for old versions of rows. There is no historical linked list to traverse. To read a consistent state, a transaction must acquire shared row locks, blocking concurrent writers. If it reads without locks—which is the default `READ COMMITTED` isolation—it simply reads the latest committed state. This is why NDB is vulnerable to the fractured read described earlier: a reader scanning across partitions can observe one data node before a 2PC commit arrives, and another data node after the commit finishes.
+
+These architectures dictate their limits. InnoDB's MVCC and B+trees make it a perfect fit for a complex financial ledger that needs strict isolation and range queries, while NDB's memory architecture and $O(1)$ hashing make it ideal for high-throughput, latency-critical key-value lookups like telecom routing tables or session state.
+
 ### Choosing the shard key
 
 The rule is to shard by the entity that transactions are about. Cash App describes the same

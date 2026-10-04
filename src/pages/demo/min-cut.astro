@@ -1,0 +1,83 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import MinCutSteps from "../../utils/compiler/MinCutSteps.astro";
+import {
+	rmsSiluEdges,
+	rmsSiluNodes,
+	sinChainEdges,
+	sinChainNodes,
+} from "../../utils/compiler/aotMinCutData";
+import type { FlowEdge, FlowNode } from "../../utils/compiler/minCut";
+
+// A hand-made network: b has no capacity (it can never be saved), so the cut has to go around it.
+const toyNodes: FlowNode[] = [
+	{
+		id: "x",
+		label: "x",
+		op: "input",
+		cap: 8,
+		kind: "input",
+		note: "x: an input, size 8.",
+	},
+	{
+		id: "a",
+		label: "a",
+		op: "sin",
+		cap: 8,
+		kind: "fwd",
+		note: "a = sin(x), size 8.",
+	},
+	{
+		id: "b",
+		label: "b",
+		op: "item",
+		cap: null,
+		kind: "fwd",
+		note: "b cannot be saved.",
+	},
+	{
+		id: "c",
+		label: "c",
+		op: "sum",
+		cap: 1,
+		kind: "fwd",
+		note: "c = sum(a), size 1.",
+	},
+	{
+		id: "d",
+		label: "d",
+		op: "cos",
+		cap: 8,
+		kind: "bwd",
+		note: "d = cos(x), needed by the backward.",
+	},
+];
+const toyEdges: FlowEdge[] = [
+	{ from: "source", to: "x" },
+	{ from: "source", to: "c" },
+	{ from: "x", to: "a" },
+	{ from: "x", to: "d" },
+	{ from: "a", to: "b" },
+	{ from: "a", to: "c" },
+	{ from: "b", to: "sink" },
+	{ from: "c", to: "sink" },
+	{ from: "d", to: "sink" },
+];
+---
+
+<Layout title="Min-cut partitioner demo">
+	<h1>Min-cut partitioner demo</h1>
+	<p>
+		<code>MinCutSteps</code> runs Edmonds-Karp on a node-capacitated network (logic in
+		<code>minCut.ts</code>, data in <code>aotMinCutData.ts</code>) and steps through each augmenting path.
+	</p>
+
+	<h2>sin(sin(sin(x))): one path</h2>
+	<MinCutSteps nodes={sinChainNodes} edges={sinChainEdges} title="x.sin().sin().sin()" wide={false} />
+
+	<h2>RMSNorm, linear, SiLU: starting at the cut</h2>
+	<MinCutSteps nodes={rmsSiluNodes} edges={rmsSiluEdges} step={7} title="rms_silu" />
+
+	<h2>A hand-made network with an unsaveable node</h2>
+	<MinCutSteps nodes={toyNodes} edges={toyEdges} wide={false} />
+</Layout>

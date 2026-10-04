@@ -1,0 +1,18 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import NegativeSamplingExplorer from "../../utils/probability/NegativeSamplingExplorer.astro";
+---
+
+<Layout title="Negative sampling explorer">
+	<main>
+		<h1>Negative sampling explorer</h1>
+		<h2>Uniform, rate 0.02 (default)</h2>
+		<NegativeSamplingExplorer />
+		<h2>Optimal, rate 0.05, rarer events</h2>
+		<NegativeSamplingExplorer alpha={-6} n={100000} rho={0.05} scheme="optimal" repeats={100} />
+	</main>
+</Layout>
+
+<style>
+	main { max-width: 780px; margin: 3rem auto; padding: 0 1rem; }
+</style>

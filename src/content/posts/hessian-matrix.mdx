@@ -1,0 +1,434 @@
+---
+title: "The Hessian Matrix: Curvature, Classification, and Optimization"
+description: "A geometric and algebraic guide to the Hessian, with proofs of the directional-curvature, second-derivative, and convexity tests, plus worked optimization examples."
+date: 2026-10-04
+tags: [Math, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import LineChart from "../../utils/charts/LineChart.astro";
+import SurfacePlot from "../../utils/charts/3DSurfacePlot.astro";
+
+## Background
+
+For a function of one variable, the second derivative answers a familiar question: does the
+graph bend upward or downward? A function of many variables can bend differently in every
+direction. One second derivative is no longer enough.
+
+The **Hessian matrix** collects all second partial derivatives of a scalar-valued function. It
+matters because the same matrix classifies stationary points, detects convexity, measures how
+sensitive a gradient is, and chooses the scale and direction of a Newton optimization step. In
+machine learning, it also explains why some parameter directions are stiff while others are
+nearly flat.
+
+This post builds the Hessian from directional derivatives, proves the main curvature tests, and
+works through a quadratic example with real numbers. We then prove its link to convexity, derive
+Newton's method, and finish with the practical reason large models usually use Hessian--vector
+products rather than constructing the whole matrix. For a shape-first introduction to gradients,
+Jacobians, and automatic differentiation, see [Matrix Calculus](/blog/matrix-calculus/).
+
+## From a second derivative to a matrix
+
+Let $f:\mathbb{R}^n\to\mathbb{R}$ have continuous second partial derivatives. Its **gradient**
+$\nabla f(x)$ is the vector of first partial derivatives. The Hessian is the Jacobian of that
+gradient:
+
+$$
+H_f(x)=\nabla^2 f(x)
+=\begin{bmatrix}
+\frac{\partial^2 f}{\partial x_1^2} & \cdots & \frac{\partial^2 f}{\partial x_1\partial x_n}\\
+\vdots & \ddots & \vdots\\
+\frac{\partial^2 f}{\partial x_n\partial x_1} & \cdots & \frac{\partial^2 f}{\partial x_n^2}
+\end{bmatrix}.
+$$
+
+For $f(x,y)=x^2+xy+3y^2$, differentiate once:
+
+$$
+\nabla f(x,y)=\begin{bmatrix}2x+y\\x+6y\end{bmatrix},
+$$
+
+and differentiate each gradient entry again:
+
+$$
+H_f(x,y)=\begin{bmatrix}2&1\\1&6\end{bmatrix}.
+$$
+
+The diagonal entries measure bending along the coordinate axes. The off-diagonal entries are
+**mixed partial derivatives**: they measure how the slope in one coordinate changes as another
+coordinate moves. The $xy$ term above creates both off-diagonal ones.
+
+### Why the Hessian is symmetric
+
+If the mixed second partial derivatives are continuous near $x$, Clairaut's theorem gives
+
+$$
+\frac{\partial^2 f}{\partial x_i\partial x_j}
+=\frac{\partial^2 f}{\partial x_j\partial x_i}.
+$$
+
+Therefore $H_{ij}=H_{ji}$, so $H=H^T$. Continuity is a sufficient condition, not decoration:
+without suitable regularity, both mixed partials can exist at a point and disagree. Symmetry is
+what lets us use real eigenvalues and perpendicular eigenvectors to describe curvature.
+
+## The Hessian measures directional curvature
+
+A direction is a unit vector $u$. Restrict the multivariable function to the line through $x$ in
+that direction:
+
+$$
+g(t)=f(x+tu).
+$$
+
+This turns the problem back into one-variable calculus. Apply the chain rule once:
+
+$$
+g'(t)=\nabla f(x+tu)^T u.
+$$
+
+Apply it again. The derivative of the gradient is the Hessian, so
+
+$$
+g''(t)=u^T H_f(x+tu)u.
+$$
+
+At $t=0$ we obtain the central identity
+
+$$
+\boxed{D_u^2 f(x)=u^T H_f(x)u}.
+$$
+
+This is a proof, not an analogy: the quadratic form $u^THu$ is exactly the ordinary second
+derivative seen by an observer walking along $u$.
+
+For our example, take $u=(3/5,4/5)$. Then
+
+$$
+Hu=\begin{bmatrix}2&1\\1&6\end{bmatrix}
+\begin{bmatrix}0.6\\0.8\end{bmatrix}
+=\begin{bmatrix}2.0\\5.4\end{bmatrix},
+\qquad
+u^THu=0.6(2.0)+0.8(5.4)=5.52.
+$$
+
+So a slice of the surface in this direction has second derivative $5.52$.
+
+<SurfacePlot
+  fn={(x, y) => x * x + x * y + 3 * y * y}
+  x={[-2, 2]}
+  y={[-2, 2]}
+  title="f(x,y) = x² + xy + 3y²: positive curvature in every direction"
+  xLabel="x"
+  yLabel="y"
+  zLabel="f"
+  height={390}
+/>
+
+Drag the surface and look along different horizontal directions. Every slice bends upward, but
+not by the same amount. The Hessian's eigenvectors identify the least- and most-curved slices.
+
+### Eigenvalues are the principal curvatures
+
+Because a real symmetric Hessian has an orthonormal eigendecomposition $H=Q\Lambda Q^T$, write
+$u=Qz$. Orthogonal matrices preserve length, so $\lVert z\rVert=\lVert u\rVert=1$. Then
+
+$$
+u^THu=z^T\Lambda z=\sum_{i=1}^n\lambda_i z_i^2.
+$$
+
+The nonnegative weights $z_i^2$ sum to one. Directional curvature is therefore a weighted
+average of the eigenvalues, and
+
+$$
+\lambda_{\min}\le u^THu\le\lambda_{\max}.
+$$
+
+Equality occurs at the corresponding eigenvectors. For our $2\times2$ Hessian, the eigenvalues
+are $4-\sqrt5\approx1.764$ and $4+\sqrt5\approx6.236$. These are the smallest and largest
+possible curvatures of any unit-length slice.
+
+## The quadratic approximation
+
+The gradient gives the best local linear model. The Hessian supplies the missing bend. For a
+small displacement $h$, second-order Taylor expansion says
+
+$$
+f(x+h)=f(x)+\nabla f(x)^Th+\frac12h^TH_f(x)h+r(h),
+$$
+
+where $r(h)/\lVert h\rVert^2\to0$ as $h\to0$. The notation says that the remainder becomes
+negligible relative to a squared step.
+
+One way to prove the formula is to define $\phi(t)=f(x+th)$ and apply the one-variable Taylor
+theorem at $t=0$. The chain-rule identities above give $\phi'(0)=\nabla f(x)^Th$ and
+$\phi''(0)=h^TH_f(x)h$. Substituting $t=1$ yields the displayed expansion.<Sidenote>The precise
+remainder can also be written as an integral involving the Hessian along the segment from $x$ to
+$x+h$. Continuity of the Hessian makes it little-o of $\lVert h\rVert^2$.</Sidenote>
+
+At $x=(1,-1)$, our quadratic has $f(x)=3$ and $\nabla f(x)=(1,-5)$. Choose
+$h=(-0.2,0.1)$. The three terms are
+
+| contribution | value |
+| --- | ---: |
+| current value, $f(x)$ | $3.00$ |
+| linear change, $\nabla f(x)^Th$ | $-0.70$ |
+| curvature correction, $\tfrac12h^THh$ | $0.05$ |
+| predicted $f(x+h)$ | $2.35$ |
+
+The function is already quadratic, so the remainder is zero and the prediction is exact:
+$f(0.8,-0.9)=2.35$. For a general smooth function it is a local approximation.
+
+<LineChart
+  x={() => Array.from({ length: 121 }, (_, i) => -1.5 + i * 0.025)}
+  series={[
+    { name: "f(t) = eᵗ", fn: (t) => Math.exp(t) },
+    { name: "linear at 0", fn: (t) => 1 + t },
+    { name: "quadratic at 0", fn: (t) => 1 + t + 0.5 * t * t },
+  ]}
+  title="The Hessian term restores the local bend"
+  xLabel="step t"
+  yLabel="value"
+  height={330}
+/>
+
+This one-dimensional slice isolates the role of the second-order term. Near zero, the quadratic
+model follows $e^t$ much more closely than the tangent line. A multivariable Hessian produces
+the same correction along every possible slice at once.
+
+## Classifying stationary points
+
+A **stationary point** $x_\star$ satisfies $\nabla f(x_\star)=0$. At such a point the linear
+Taylor term vanishes, leaving
+
+$$
+f(x_\star+h)-f(x_\star)=\frac12h^TH_f(x_\star)h+r(h).
+$$
+
+The signs of the Hessian eigenvalues now classify the local shape:
+
+| Hessian at $x_\star$ | eigenvalue signs | conclusion |
+| --- | --- | --- |
+| positive definite | all positive | strict local minimum |
+| negative definite | all negative | strict local maximum |
+| indefinite | both signs | saddle point |
+| semidefinite but not definite | zeros and one sign | test is inconclusive |
+
+### Proof of the second-derivative test
+
+Suppose the smallest eigenvalue is $\lambda_{\min}>0$. The eigenvalue bound gives
+$h^THh\ge\lambda_{\min}\lVert h\rVert^2$. Because
+$r(h)=o(\lVert h\rVert^2)$, there is a small enough neighborhood in which
+
+$$
+|r(h)|\le\frac14\lambda_{\min}\lVert h\rVert^2.
+$$
+
+For every nonzero $h$ in that neighborhood,
+
+$$
+f(x_\star+h)-f(x_\star)
+\ge\frac12\lambda_{\min}\lVert h\rVert^2
+-\frac14\lambda_{\min}\lVert h\rVert^2>0.
+$$
+
+Thus $x_\star$ is a strict local minimum. Applying the same argument to $-f$ proves the maximum
+case. If $H$ is indefinite, choose unit eigenvectors $v_+$ and $v_-$ with positive and negative
+eigenvalues. For sufficiently small $t$, the leading $t^2$ term makes
+$f(x_\star+tv_+)-f(x_\star)$ positive and
+$f(x_\star+tv_-)-f(x_\star)$ negative. Every neighborhood contains values on both sides, so the
+point is a saddle.
+
+<SurfacePlot
+  fn={(x, y) => x * x - y * y}
+  x={[-2, 2]}
+  y={[-2, 2]}
+  title="f(x,y) = x² − y²: an indefinite Hessian makes a saddle"
+  xLabel="x"
+  yLabel="y"
+  zLabel="f"
+  height={390}
+  diverging={true}
+/>
+
+Along the $x$-axis this surface curves upward; along the $y$-axis it curves downward. Its Hessian
+$\operatorname{diag}(2,-2)$ records both facts, so the origin cannot be a minimum or maximum.
+
+### Why a zero eigenvalue is inconclusive
+
+Positive semidefinite means only $h^THh\ge0$; it gives no positive quadratic lower bound in a
+zero-curvature direction. In one dimension, all three functions $x^4$, $-x^4$, and $x^3$ have
+$f'(0)=f''(0)=0$, yet the origin is respectively a strict minimum, a strict maximum, and neither.
+Higher-order terms decide the result.
+
+## Convexity: a global consequence of local curvature
+
+A function is **convex** on a convex set when every chord lies above its graph:
+
+$$
+f((1-t)x+ty)\le(1-t)f(x)+tf(y),\qquad 0\le t\le1.
+$$
+
+For a twice continuously differentiable function on an open convex domain,
+
+$$
+f\text{ is convex}\quad\Longleftrightarrow\quad H_f(x)\succeq0
+\text{ for every }x.
+$$
+
+Here $H\succeq0$ means **positive semidefinite**: $u^THu\ge0$ for every $u$.
+
+### Proof in both directions
+
+Fix any points $x,y$ and restrict $f$ to their line segment:
+
+$$
+g(t)=f(x+t(y-x)),\qquad 0\le t\le1.
+$$
+
+If every Hessian is positive semidefinite, then
+
+$$
+g''(t)=(y-x)^TH_f(x+t(y-x))(y-x)\ge0.
+$$
+
+A twice differentiable one-variable function with nonnegative second derivative is convex, so
+$g(t)\le(1-t)g(0)+tg(1)$. Substituting the definition of $g$ proves convexity of $f$.
+
+Conversely, suppose $f$ is convex. Its restriction $g(t)=f(x+tu)$ to every line is convex.
+Where $g''(0)$ exists, one-variable convexity gives $g''(0)\ge0$. But
+$g''(0)=u^TH_f(x)u$. This holds for every $u$, so the Hessian is positive semidefinite.
+
+This theorem is stronger than the stationary-point test. A positive definite Hessian at one
+point proves only a local minimum there. A positive semidefinite Hessian throughout a convex
+domain proves a global shape, so every local minimum is global.
+
+## Newton's method uses curvature to choose a step
+
+At a current point $x$, replace $f(x+p)$ by its quadratic Taylor model
+
+$$
+m(p)=f(x)+g^Tp+\frac12p^THp,
+$$
+
+where $g=\nabla f(x)$ and $H=H_f(x)$. Differentiate this model with respect to $p$:
+
+$$
+\nabla_p m(p)=g+Hp.
+$$
+
+If $H$ is positive definite, the model has a unique minimum. Setting its gradient to zero gives
+
+$$
+\boxed{Hp_N=-g}.
+$$
+
+The **Newton step** $p_N$ is found by solving this linear system, not by explicitly forming
+$H^{-1}$. Gradient descent uses only $-g$ and one global learning rate. Newton's method divides
+the gradient by curvature in each eigenvector direction: large-curvature directions get short
+steps and flat directions get long ones.
+
+Return to $f(x,y)=x^2+xy+3y^2$ at $(1,-1)$. We already found
+$g=(1,-5)$, so
+
+$$
+\begin{bmatrix}2&1\\1&6\end{bmatrix}p_N
+=-\begin{bmatrix}1\\-5\end{bmatrix}
+\quad\Longrightarrow\quad
+p_N=\begin{bmatrix}-1\\1\end{bmatrix}.
+$$
+
+One step reaches $(0,0)$, the exact minimizer. This always happens for a strictly convex
+quadratic because its Taylor model is the function itself. For a nonquadratic objective, the
+model is only local; line searches, trust regions, or damping are commonly used to stop an
+overconfident step when the Hessian is indefinite or poorly conditioned.
+
+### A small logistic-regression example
+
+For binary labels $y_i\in\{-1,1\}$, feature rows $x_i^T$, and $L_2$ regularization $\lambda>0$,
+consider
+
+$$
+L(w)=\sum_i\log(1+e^{-y_i x_i^Tw})+\frac\lambda2\lVert w\rVert^2.
+$$
+
+Writing $p_i=\sigma(x_i^Tw)$ and $W=\operatorname{diag}(p_i(1-p_i))$, differentiation gives
+
+$$
+\nabla^2L(w)=X^TWX+\lambda I.
+$$
+
+This Hessian is positive definite when $\lambda>0$. Indeed, for nonzero $v$,
+
+$$
+v^T\nabla^2L(w)v=(Xv)^TW(Xv)+\lambda\lVert v\rVert^2>0,
+$$
+
+because every diagonal entry of $W$ is nonnegative. The proof simultaneously establishes strict
+convexity and uniqueness of the minimizer.
+
+Take feature rows $(1,0),(1,1),(1,2),(1,3)$, labels $(-1,-1,1,1)$, $w=(0,0)$, and
+$\lambda=0.5$. Since every $p_i=0.5$, a direct computation gives
+
+$$
+g=\begin{bmatrix}0\\-2\end{bmatrix},\qquad
+H=\begin{bmatrix}1.5&1.5\\1.5&4.0\end{bmatrix},\qquad
+p_N=\begin{bmatrix}-0.8\\0.8\end{bmatrix}.
+$$
+
+Its eigenvalues are approximately $0.797$ and $4.703$, both positive. The intercept and slope
+are coupled through the off-diagonal $1.5$, and the Newton solve accounts for that coupling.
+
+## Large problems: use the Hessian without storing it
+
+An $n$-parameter model has an $n\times n$ Hessian. Storing it costs $O(n^2)$ numbers and a dense
+factorization costs $O(n^3)$ operations, which is unrealistic for modern neural networks.
+
+Many algorithms need only a **Hessian--vector product** (HVP), $Hv$. It is the directional
+derivative of the gradient:
+
+$$
+Hv=\left.\frac{d}{dt}\nabla f(x+tv)\right|_{t=0}.
+$$
+
+Automatic differentiation can compute this product without materializing all $n^2$ entries.
+Krylov methods such as conjugate gradients then approximately solve $Hp=-g$ using repeated HVPs.
+The approach preserves useful curvature information while keeping memory closer to that of a
+gradient computation.<Sidenote>PyTorch exposes full Hessians and HVPs through function transforms.
+Its documentation shows an HVP as a Jacobian--vector product of the gradient, which is precisely
+the identity above.</Sidenote>
+
+The Hessian also explains conditioning. For a positive definite quadratic, the condition number
+$\kappa(H)=\lambda_{\max}/\lambda_{\min}$ measures the ratio between the stiffest and flattest
+directions. A large ratio makes fixed-step gradient descent zig-zag or crawl. Newton scaling
+normalizes those unequal curvatures in the ideal quadratic case, though solving the Newton system
+can itself become numerically difficult when $\lambda_{\min}$ is tiny.
+
+## What the Hessian does not tell you
+
+- It is local. Curvature at one point does not describe a distant part of a nonconvex surface.
+- A positive semidefinite Hessian at one stationary point does not prove a minimum; zero
+  eigenvalues leave room for higher-order behavior.
+- The simple eigenvalue picture assumes a symmetric Hessian, which follows under the usual
+  continuity conditions on mixed partials.
+- Parameters can create symmetries and redundant directions. A zero eigenvalue may reflect a
+  reparameterization rather than an interesting flat basin.
+- An indefinite Hessian makes the raw Newton direction unreliable for minimization, because the
+  quadratic model is unbounded below along a negative-curvature direction.
+
+## Summary
+
+- The Hessian is the Jacobian of the gradient and collects every second partial derivative.
+- The identity $D_u^2f(x)=u^TH_f(x)u$ turns the matrix into curvature along any direction; its
+  eigenvectors give the principal directions and its eigenvalues give their curvatures.
+- At a stationary point, definite Hessians prove strict minima or maxima, indefinite Hessians
+  prove saddles, and zero eigenvalues make the test inconclusive.
+- A twice differentiable function on a convex domain is convex exactly when its Hessian is
+  positive semidefinite everywhere.
+- Newton's method minimizes the local quadratic model by solving $Hp=-g$; large-scale methods
+  often access the same curvature through Hessian--vector products.
+
+## References
+
+- Stephen Boyd and Lieven Vandenberghe, [*Convex Optimization*](https://web.stanford.edu/~boyd/cvxbook/), especially Sections 3.1.4 and 9.5.
+- MIT OpenCourseWare, [*18.02 Supplementary Notes: The Second Derivative Test*](https://math.mit.edu/~jorloff/suppnotes/suppnotes02/sd.pdf).
+- PyTorch, [*Jacobians, Hessians, HVPs, VHPs, and more*](https://docs.pytorch.org/tutorials/intermediate/jacobians_hessians.html).

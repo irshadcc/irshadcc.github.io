@@ -8,6 +8,7 @@
 //   import { saxpyStages, saxpyTags } from "../../utils/compiler/llvmData";
 //   <CodeStages stages={saxpyStages} tags={saxpyTags} step={0} title="saxpy, from CUDA to PTX" />
 import { Code } from "astro:components";
+import { mlir } from "../mlir/shikiMlir";
 import StepControls from "./StepControls.astro";
 import type { CodeStage, StageTag } from "./llvmData";
 import { ptx, tablegen } from "./shikiLangs";
@@ -24,7 +25,7 @@ interface Props {
 const { stages, tags = [], step = 0, title, maxLines = 24 } = Astro.props;
 const at = Math.max(0, Math.min(stages.length - 1, step));
 const colour = new Map(tags.map((t, i) => [t.tag, i]));
-const langs = { tablegen, ptx } as const;
+const langs = { tablegen, ptx, mlir } as const;
 const rows = Math.min(
 	maxLines,
 	Math.max(...stages.map((s) => s.code.trimEnd().split("\n").length)),

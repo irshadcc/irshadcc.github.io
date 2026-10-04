@@ -1,0 +1,331 @@
+---
+// One FX graph traced with symbolic sizes, run at several input sizes. Each row is a node with
+// its code, its symbolic type (as print_readable prints it) and the concrete type it has for
+// the selected inputs. Below the table, every guard the tracer recorded is checked against the
+// selected sizes: if one fails, Dynamo would compile a new graph. Buttons switch the input
+// sizes; hovering (or tapping) a symbol highlights it everywhere. Data and checks live in
+// symbolicShapes.ts; the post's data is generated into fxFigures.ts.
+// Usage in .mdx:
+//   import SymbolicShapes from "../../utils/compiler/SymbolicShapes.astro";
+//   import { dynamoShapes } from "../../utils/compiler/fxFigures";
+//   <SymbolicShapes data={dynamoShapes} config={0} title="One graph, many sizes" />
+import {
+	type SymbolicShapesData,
+	splitSymbols,
+	validateShapes,
+	verdict,
+} from "./symbolicShapes";
+
+interface Props {
+	data: SymbolicShapesData;
+	/** Config selected on load. */
+	config?: number;
+	title?: string;
+}
+
+const { data, config = 0, title } = Astro.props;
+const err = validateShapes(data);
+if (err) throw new Error(`SymbolicShapes: ${err}`);
+const at = Math.max(0, Math.min(data.configs.length - 1, config));
+const names = data.symbols.map((s) => s.name);
+const seg = (t: string) => splitSymbols(t, names);
+const verdicts = data.configs.map((_, i) => verdict(data, i));
+---
+
+<figure class="sys" data-at={at} data-verdicts={JSON.stringify(verdicts)}>
+	{title && <figcaption class="sys-title">{title}</figcaption>}
+	<div class="sys-tabs" role="tablist" aria-label="Input sizes">
+		{
+			data.configs.map((c, i) => (
+				<button type="button" role="tab" class="sys-tab" data-i={i} aria-selected={i === at ? "true" : "false"}>
+					{c.label}
+				</button>
+			))
+		}
+	</div>
+	<ul class="sys-legend">
+		{
+			data.symbols.map((s, i) => (
+				<li class={`sym s${i}`} data-sym={i} tabindex="0">
+					<b>{s.name}</b> = {s.source} ={" "}
+					<span class="sys-val" data-v={JSON.stringify(data.configs.map((c) => c.values[s.name]))}>
+						{data.configs[at].values[s.name]}
+					</span>
+				</li>
+			))
+		}
+	</ul>
+	<div class="sys-scroll">
+		<table class="sys-table">
+			<thead>
+				<tr>
+					<th>node</th>
+					<th>code</th>
+					<th>symbolic type</th>
+					<th>this call</th>
+				</tr>
+			</thead>
+			<tbody>
+				{
+					data.rows.map((r) => (
+						<tr>
+							<td class="mono">{r.name}</td>
+							<td class="mono">
+								{seg(r.code).map((p) => (p.sym === undefined ? p.text : <span class={`sym s${p.sym}`} data-sym={p.sym}>{p.text}</span>))}
+							</td>
+							<td class="mono">
+								{seg(r.symbolic).map((p) =>
+									p.sym === undefined ? p.text : <span class={`sym s${p.sym}`} data-sym={p.sym}>{p.text}</span>,
+								)}
+							</td>
+							<td class="mono sys-conc" data-v={JSON.stringify(r.concrete)}>
+								{r.concrete[at]}
+							</td>
+						</tr>
+					))
+				}
+			</tbody>
+		</table>
+	</div>
+	<p class="sys-head">Guards recorded while tracing</p>
+	<ul class="sys-guards">
+		{
+			data.guards.map((g) => (
+				<li class:list={["sys-guard", { fail: !g.holds[at] }]} data-h={g.holds.map((h) => (h ? 1 : 0)).join("")}>
+					<span class="sys-mark" aria-hidden="true" />
+					<span class="mono">
+						{seg(g.expr).map((p) => (p.sym === undefined ? p.text : <span class={`sym s${p.sym}`} data-sym={p.sym}>{p.text}</span>))}
+					</span>
+					{g.why && <span class="sys-why">{g.why}</span>}
+				</li>
+			))
+		}
+	</ul>
+	<p class="sys-verdict" aria-live="polite">{verdicts[at]}</p>
+</figure>
+
+<script>
+	for (const fig of document.querySelectorAll<HTMLElement>(".sys")) {
+		const verdicts: string[] = JSON.parse(fig.dataset.verdicts ?? "[]");
+		const tabs = [...fig.querySelectorAll<HTMLElement>(".sys-tab")];
+		const show = (i: number) => {
+			fig.dataset.at = String(i);
+			for (const t of tabs) t.setAttribute("aria-selected", String(Number(t.dataset.i) === i));
+			for (const el of fig.querySelectorAll<HTMLElement>("[data-v]")) {
+				const v = JSON.parse(el.dataset.v ?? "[]");
+				el.textContent = String(v[i]);
+			}
+			for (const g of fig.querySelectorAll<HTMLElement>(".sys-guard")) {
+				g.classList.toggle("fail", g.dataset.h?.[i] === "0");
+			}
+			const out = fig.querySelector(".sys-verdict");
+			if (out) out.textContent = verdicts[i] ?? "";
+			fig.classList.toggle("bad", (verdicts[i] ?? "").includes("fail"));
+		};
+		for (const t of tabs) t.addEventListener("click", () => show(Number(t.dataset.i)));
+		show(Number(fig.dataset.at ?? 0));
+
+		// Hover or tap a symbol to highlight it everywhere in the figure.
+		let pinned: string | undefined;
+		const focus = (s?: string) => {
+			if (s === undefined) delete fig.dataset.focus;
+			else fig.dataset.focus = s;
+			for (const el of fig.querySelectorAll<HTMLElement>(".sym")) {
+				el.classList.toggle("on", el.dataset.sym === s);
+			}
+		};
+		for (const el of fig.querySelectorAll<HTMLElement>(".sym")) {
+			el.addEventListener("mouseenter", () => focus(el.dataset.sym));
+			el.addEventListener("mouseleave", () => focus(pinned));
+			el.addEventListener("focus", () => focus(el.dataset.sym));
+			el.addEventListener("blur", () => focus(pinned));
+			el.addEventListener("click", () => {
+				pinned = pinned === el.dataset.sym ? undefined : el.dataset.sym;
+				focus(pinned);
+			});
+		}
+	}
+</script>
+
+<style>
+	.sys {
+		--s0: #2f6fb0;
+		--s1: #b8742a;
+		--s2: #2f8a5b;
+		--s3: #b33b5e;
+		--s4: #7a62b8;
+		--ok: #2f8a5b;
+		--bad: #b33b5e;
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+		font-size: 0.82rem;
+	}
+	@media (prefers-color-scheme: dark) {
+		.sys {
+			--s0: #6aa8e6;
+			--s1: #e0a25e;
+			--s2: #5fc08b;
+			--s3: #e2708f;
+			--s4: #a993e6;
+			--ok: #5fc08b;
+			--bad: #e2708f;
+		}
+	}
+	.sys-title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.4rem;
+	}
+	.sys-tabs {
+		display: flex;
+		gap: 0.4rem;
+		justify-content: center;
+		flex-wrap: wrap;
+		margin-bottom: 0.6rem;
+	}
+	.sys-tab {
+		font: 0.78rem var(--sans);
+		padding: 0.25rem 0.7rem;
+		border-radius: 999px;
+		border: 1px solid var(--faint);
+		background: var(--bg);
+		color: var(--text);
+		cursor: pointer;
+	}
+	.sys-tab[aria-selected="true"] {
+		background: var(--accent);
+		border-color: var(--accent);
+		color: var(--bg);
+	}
+	.sys-legend {
+		list-style: none;
+		padding: 0;
+		margin: 0 0 0.6rem;
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.4rem 1rem;
+		justify-content: center;
+		font-family: var(--mono);
+		font-size: 0.75rem;
+	}
+	.sys-legend li {
+		padding: 0.1rem 0.45rem;
+		border-radius: 6px;
+		cursor: pointer;
+	}
+	.sys-legend b {
+		font-weight: 600;
+	}
+	.mono {
+		font-family: var(--mono);
+		font-size: 0.74rem;
+	}
+	.sys-scroll {
+		overflow-x: auto;
+		border: 1px solid var(--faint);
+		border-radius: 10px;
+		background: var(--surface);
+	}
+	.sys-table {
+		width: 100%;
+		border-collapse: collapse;
+		margin: 0;
+	}
+	.sys-table th,
+	.sys-table td {
+		text-align: left;
+		padding: 0.3rem 0.6rem;
+		border-bottom: 1px solid var(--faint);
+		white-space: nowrap;
+	}
+	.sys-table tr:last-child td {
+		border-bottom: none;
+	}
+	.sys-table th {
+		font-weight: 600;
+		color: var(--muted);
+		font-size: 0.72rem;
+	}
+	.sys-conc {
+		font-weight: 600;
+	}
+	.sym {
+		color: var(--sc);
+		font-weight: 600;
+		border-radius: 3px;
+		cursor: pointer;
+		transition: background 120ms ease;
+	}
+	.sym.on {
+		background: color-mix(in oklch, var(--sc) 22%, transparent);
+	}
+	.s0 {
+		--sc: var(--s0);
+	}
+	.s1 {
+		--sc: var(--s1);
+	}
+	.s2 {
+		--sc: var(--s2);
+	}
+	.s3 {
+		--sc: var(--s3);
+	}
+	.s4 {
+		--sc: var(--s4);
+	}
+	.sys-legend .sym {
+		color: var(--text);
+		box-shadow: inset 3px 0 var(--sc);
+		font-weight: 400;
+	}
+	.sys-legend .sym b {
+		color: var(--sc);
+	}
+	.sys-head {
+		margin: 0.8rem 0 0.3rem;
+		font-size: 0.75rem;
+		font-weight: 600;
+		color: var(--muted);
+	}
+	.sys-guards {
+		list-style: none;
+		padding: 0;
+		margin: 0;
+	}
+	.sys-guard {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: baseline;
+		gap: 0.2rem 0.6rem;
+		padding: 0.15rem 0;
+	}
+	.sys-mark::before {
+		content: "✓";
+		color: var(--ok);
+		font-weight: 700;
+	}
+	.sys-guard.fail .sys-mark::before {
+		content: "✗";
+		color: var(--bad);
+	}
+	.sys-guard.fail > .mono {
+		text-decoration: underline wavy var(--bad);
+		text-underline-offset: 3px;
+	}
+	.sys-why {
+		color: var(--muted);
+		font-size: 0.74rem;
+	}
+	.sys-verdict {
+		margin: 0.6rem 0 0;
+		padding: 0.35rem 0.6rem;
+		border-left: 3px solid var(--ok);
+		background: var(--surface);
+		font-size: 0.8rem;
+	}
+	.sys.bad .sys-verdict {
+		border-left-color: var(--bad);
+	}
+</style>

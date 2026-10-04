@@ -1,0 +1,693 @@
+---
+title: "Matrix Calculus: Derivatives, Gradients, and Backpropagation"
+description: "A shape-first guide to matrix calculus: Jacobians, differentials, trace identities, matrix gradients, reverse-mode autodiff, Hessians, and worked examples with real numbers."
+date: 2026-10-04
+tags: [Math, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import MatrixCalculusFlow from "../../utils/matrix/MatrixCalculusFlow.astro";
+
+## Background
+
+Ordinary calculus asks how a scalar output changes when a scalar input moves. Machine learning,
+statistics, and numerical computing ask the same question with vectors and matrices: how does a
+loss change when every entry of a weight matrix moves, and how can we compute that change without
+writing millions of scalar derivatives?
+
+**Matrix calculus** is the language for answering those questions. It explains the gradients in
+least squares, the backward pass of a neural-network layer, the derivative of an inverse, and the
+Hessian information used by second-order optimization. The difficult part is usually not the
+calculus. It is keeping shapes, transposes, and derivative conventions consistent.
+
+This post starts with derivatives as linear maps, then introduces Jacobians and differentials. We
+will learn a small set of differential and trace rules, use them to derive gradients of scalar
+losses, work through a complete linear-layer backward pass, connect the result to forward- and
+reverse-mode automatic differentiation, and finish with Hessians and gradient checking. Every
+numeric result comes from a verification script; the examples stay small enough to check by hand.
+
+## One derivative, four shapes
+
+The derivative always answers one question: *what is the first-order output change caused by a
+small input change?* The shapes of the input and output determine how we represent that answer.
+The table below uses input type along the horizontal axis and output type along the vertical axis.
+
+| output $\downarrow$ / input $\rightarrow$ | scalar $x\in\mathbb R$ | vector $x\in\mathbb R^n$ | matrix $X\in\mathbb R^{p\times q}$ |
+| --- | --- | --- | --- |
+| **scalar** $f\in\mathbb R$ | **Scalar derivative**<br/>$f'(x)\in\mathbb R$<br/>$df=f'(x)\,dx$ | **Gradient**<br/>$\nabla_xf\in\mathbb R^n$<br/>$df=(\nabla_xf)^Tdx$ | **Matrix gradient**<br/>$\nabla_Xf\in\mathbb R^{p\times q}$<br/>$df=\operatorname{tr}((\nabla_Xf)^TdX)$ |
+| **vector** $y\in\mathbb R^m$ | **Derivative vector**<br/>$dy/dx\in\mathbb R^m$<br/>$dy=(dy/dx)\,dx$ | **Jacobian matrix**<br/>$J\in\mathbb R^{m\times n}$<br/>$dy=J\,dx$ | **Third-order derivative**<br/>$\mathcal J\in\mathbb R^{m\times p\times q}$<br/>or $J\in\mathbb R^{m\times pq}$ after flattening $X$ |
+| **matrix** $Y\in\mathbb R^{r\times s}$ | **Derivative matrix**<br/>$dY/dx\in\mathbb R^{r\times s}$<br/>$dY=(dY/dx)\,dx$ | **Third-order derivative**<br/>$\mathcal J\in\mathbb R^{r\times s\times n}$<br/>maps $dx$ to $dY$ | **Fourth-order derivative**<br/>$\mathcal J\in\mathbb R^{r\times s\times p\times q}$<br/>maps $dX$ to $dY$ |
+
+The order of a derivative structure counts its independent axes. A scalar derivative has no
+array axis. A gradient or derivative vector has one, a Jacobian matrix has two, and differentiating
+a matrix with respect to a matrix appears to require four. In the last two columns, $\mathcal J$
+denotes a higher-order derivative tensor, not an ordinary matrix.
+
+In practice, we rarely build those third- and fourth-order arrays. We keep the derivative as a
+**linear operator** that accepts a perturbation and returns the resulting output change. If a
+two-dimensional representation is required, flatten the input and output consistently:
+
+$$
+\operatorname{vec}(dY)
+=J\operatorname{vec}(dX),
+\qquad
+J\in\mathbb R^{(rs)\times(pq)}.
+$$
+
+The operator view preserves the natural matrix shapes and avoids committing to a row-major or
+column-major flattening convention until an implementation actually needs one.
+
+The most useful unifying definition treats a **derivative as a linear map**. Near $x$, a small
+perturbation $dx$ produces
+
+$$
+f(x+dx)=f(x)+Df(x)[dx]+o(\lVert dx\rVert).
+$$
+
+$Df(x)[dx]$ is linear in the perturbation $dx$. The remainder
+$o(\lVert dx\rVert)$ becomes negligible compared with $\lVert dx\rVert$ as the perturbation
+shrinks. In one dimension, the linear map is multiplication by $f'(x)$. For vector inputs and
+outputs, it can be represented by a Jacobian matrix.
+
+<MatrixCalculusFlow initial="derivative" />
+
+Switch the figure between its four views. The same local linear map appears in each one; only the
+quantity we feed through it changes. This viewpoint also fixes a common misconception: the
+Jacobian matrix is not the derivative itself. It is the derivative's coordinate representation.
+
+### The Jacobian stores output-by-input derivatives
+
+Let $y=f(x)$ with $x\in\mathbb R^n$ and $y\in\mathbb R^m$. This post uses the
+**numerator-layout Jacobian**
+
+$$
+J_f(x)=\frac{\partial y}{\partial x}
+=
+\begin{bmatrix}
+\partial y_1/\partial x_1 & \cdots & \partial y_1/\partial x_n\\
+\vdots & \ddots & \vdots\\
+\partial y_m/\partial x_1 & \cdots & \partial y_m/\partial x_n
+\end{bmatrix}
+\in\mathbb R^{m\times n}.
+$$
+
+Each row belongs to one output; each column belongs to one input. This convention makes the
+differential relation $dy=J_f(x)dx$ type-check: $(m\times n)(n\times1)=m\times1$.
+Some books transpose this definition, which is why memorized formulas can appear to disagree.
+State the convention, then let dimensions catch mistakes.
+
+Consider
+
+$$
+f(x_1,x_2)=
+\begin{bmatrix}
+x_1x_2\\
+\sin x_1+x_2^2
+\end{bmatrix}.
+$$
+
+Its Jacobian is
+
+$$
+J_f(x)=
+\begin{bmatrix}
+x_2 & x_1\\
+\cos x_1 & 2x_2
+\end{bmatrix}.
+$$
+
+At $x=(2,3)$, using radians,
+
+$$
+J_f(2,3)=
+\begin{bmatrix}
+3 & 2\\
+-0.416147 & 6
+\end{bmatrix}.
+$$
+
+For the direction $v=(0.1,-0.2)$, the **directional derivative** is the
+Jacobian--vector product (JVP)
+
+$$
+J_fv=
+\begin{bmatrix}
+3(0.1)+2(-0.2)\\
+-0.416147(0.1)+6(-0.2)
+\end{bmatrix}
+=
+\begin{bmatrix}-0.1\\-1.241615\end{bmatrix}.
+$$
+
+Check the first entry: $x_1x_2$ gains $3(0.1)$ when $x_1$ moves and loses $2(0.2)$ when
+$x_2$ moves, for a net change of $-0.1$ per unit step along $v$.
+
+### A gradient is shaped like its input
+
+When $f:\mathbb R^n\to\mathbb R$ has one output, its Jacobian is a $1\times n$ row. We usually
+store its transpose as the **gradient**
+
+$$
+\nabla_x f=
+\begin{bmatrix}
+\partial f/\partial x_1\\
+\vdots\\
+\partial f/\partial x_n
+\end{bmatrix},
+\qquad
+df=(\nabla_x f)^Tdx.
+$$
+
+The gradient has the same shape as $x$. It points in the direction of steepest increase under the
+usual Euclidean inner product. Therefore $-\nabla f$ is the steepest local descent direction.
+This geometric statement depends on the chosen inner product; changing the geometry changes what
+"steepest" means.<Sidenote>The natural gradient and preconditioned methods exploit this fact. They
+change the metric or rescale the gradient rather than changing the underlying differential.</Sidenote>
+
+## Differentials: calculate without giant Jacobians
+
+A **differential** names the first-order change itself. The notation behaves like familiar algebra
+as long as order is preserved. That last clause matters because matrix multiplication is not
+commutative.
+
+The core rules are
+
+$$
+\begin{aligned}
+d(A+B) &= dA+dB,\\
+d(cA) &= c\,dA && \text{for constant }c,\\
+d(AB) &= (dA)B+A(dB),\\
+d(A^T) &= (dA)^T,\\
+d\,\phi(A) &= \phi'(A)\odot dA && \text{for elementwise }\phi.
+\end{aligned}
+$$
+
+$\odot$ is the **Hadamard product**, or entrywise multiplication. The product rule keeps factor
+order: $(dA)B+A(dB)$, not $B(dA)+(dB)A$.
+
+### The chain rule composes linear maps
+
+If $y=g(x)$ and $z=h(y)$, then
+
+$$
+dz=Dh(y)[dy]=Dh(y)[Dg(x)[dx]].
+$$
+
+In Jacobian coordinates,
+
+$$
+J_{h\circ g}(x)=J_h(g(x))J_g(x).
+$$
+
+The order follows the computation: $dx$ meets $J_g$ first, then $J_h$. If
+$J_g\in\mathbb R^{k\times n}$ and $J_h\in\mathbb R^{m\times k}$, their product is
+$m\times n$, exactly the shape needed to map $n$ inputs to $m$ outputs.
+
+### Broadcasting is a linear map too
+
+Suppose a batch $X\in\mathbb R^{b\times d}$ receives a bias $b\in\mathbb R^d$:
+
+$$
+Y=X+\mathbf 1b^T.
+$$
+
+The forward pass copies $b$ into every row. The backward pass is the adjoint operation: sum the
+row gradients,
+
+$$
+\nabla_b L=(\nabla_Y L)^T\mathbf 1.
+$$
+
+This is why an autodiff system reduces gradients over broadcast dimensions. A broadcast is not
+"free" from the calculus viewpoint; it has a definite linear transpose.
+
+## From a differential to a matrix gradient
+
+For matrices, the ordinary dot product becomes the **Frobenius inner product**
+
+$$
+\langle A,B\rangle_F
+=\sum_{i,j}A_{ij}B_{ij}
+=\operatorname{tr}(A^TB).
+$$
+
+If $L$ is scalar and $X$ is a matrix, define $\nabla_XL$ by
+
+$$
+dL=\langle\nabla_XL,dX\rangle_F
+=\operatorname{tr}((\nabla_XL)^TdX).
+$$
+
+This is the pattern to aim for. Derive $dL$, rearrange it until $dX$ is the final factor inside a
+trace, then read off the matrix that transposes to the coefficient of $dX$.
+
+The trace makes this rearrangement possible because
+
+$$
+\operatorname{tr}(ABC)=\operatorname{tr}(BCA)=\operatorname{tr}(CAB),
+$$
+
+but it does **not** allow arbitrary swaps: generally
+$\operatorname{tr}(ABC)\ne\operatorname{tr}(ACB)$. The trace of a scalar is the scalar itself,
+and $\operatorname{tr}(A)=\operatorname{tr}(A^T)$.
+
+### Warm-up: a bilinear form
+
+Let $L=x^TAy$, where $x$ and $y$ are constant and $A$ varies. Then
+
+$$
+\begin{aligned}
+dL &= x^T(dA)y\\
+   &= \operatorname{tr}(x^T(dA)y)\\
+   &= \operatorname{tr}(yx^T dA).
+\end{aligned}
+$$
+
+Compare this with $dL=\operatorname{tr}((\nabla_A L)^TdA)$. Therefore
+
+$$
+\nabla_A L=xy^T.
+$$
+
+The shape check is decisive: $x\in\mathbb R^m$ and $y\in\mathbb R^n$, so $xy^T$ is
+$m\times n$, the shape of $A$.
+
+### Quadratic forms and symmetry
+
+For $L=x^TAx$ with constant $A$,
+
+$$
+\begin{aligned}
+dL
+&=(dx)^TAx+x^TA(dx)\\
+&=x^TA^Tdx+x^TAdx\\
+&=\big((A+A^T)x\big)^Tdx.
+\end{aligned}
+$$
+
+Hence
+
+$$
+\nabla_xL=(A+A^T)x.
+$$
+
+Only when $A$ is symmetric does this simplify to $2Ax$. The familiar rule is not wrong; it has a
+hidden assumption. With the conventional factor $L=\tfrac12x^TAx$ and symmetric $A$, the
+gradient is simply $Ax$.
+
+## Worked example: matrix least squares
+
+Consider
+
+$$
+L(X)=\frac12\lVert AX-B\rVert_F^2,
+$$
+
+where $A$ and $B$ are constant. Define the residual $R=AX-B$. First differentiate each stage:
+
+$$
+dR=A\,dX,
+$$
+
+and
+
+$$
+dL=\langle R,dR\rangle_F
+=\operatorname{tr}(R^TA\,dX)
+=\operatorname{tr}((A^TR)^TdX).
+$$
+
+Therefore
+
+$$
+\boxed{\nabla_XL=A^T(AX-B)}.
+$$
+
+Now use real numbers:
+
+$$
+A=\begin{bmatrix}1&2\\0&-1\\2&1\end{bmatrix},\quad
+X=\begin{bmatrix}1&-1\\2&0\end{bmatrix},\quad
+B=\begin{bmatrix}1&0\\2&-1\\0&3\end{bmatrix}.
+$$
+
+The forward pass is
+
+$$
+AX=\begin{bmatrix}5&-1\\-2&0\\4&-2\end{bmatrix},
+\qquad
+R=AX-B=\begin{bmatrix}4&-1\\-4&1\\4&-5\end{bmatrix}.
+$$
+
+Thus
+
+$$
+L=\frac12(4^2+(-1)^2+(-4)^2+1^2+4^2+(-5)^2)=37.5,
+$$
+
+and
+
+$$
+\nabla_XL=A^TR
+=\begin{bmatrix}12&-11\\16&-8\end{bmatrix}.
+$$
+
+Check one entry by hand. The $(1,1)$ entry is the first column of $A$ dotted with the first
+column of $R$: $1(4)+0(-4)+2(4)=12$.
+
+We can also check the whole gradient in the direction
+
+$$
+D=\begin{bmatrix}0.2&-0.1\\0.3&0.4\end{bmatrix}.
+$$
+
+The analytic directional derivative is
+
+$$
+\langle\nabla_XL,D\rangle_F
+=12(0.2)+(-11)(-0.1)+16(0.3)+(-8)(0.4)=5.1.
+$$
+
+The one-sided finite difference $[L(X+\epsilon D)-L(X)]/\epsilon$ equals $5.1955$ at
+$\epsilon=10^{-1}$, $5.100955$ at $10^{-3}$, and $5.100010$ at $10^{-5}$. It converges to the
+analytic value as the neglected second-order term shrinks.
+
+## A complete linear-layer backward pass
+
+A dense layer over a batch computes
+
+$$
+Y=XW+\mathbf 1b^T,
+$$
+
+with $X\in\mathbb R^{N\times D}$, $W\in\mathbb R^{D\times K}$,
+$b\in\mathbb R^K$, and $Y\in\mathbb R^{N\times K}$. Use the squared-error loss
+
+$$
+L=\frac12\lVert Y-T\rVert_F^2.
+$$
+
+Let $E=Y-T$. The loss differential is $dL=\operatorname{tr}(E^TdY)$, while the layer differential
+is
+
+$$
+dY=(dX)W+X(dW)+\mathbf 1(db)^T.
+$$
+
+Substitute and separate the three independent perturbations:
+
+$$
+\begin{aligned}
+dL
+&=\operatorname{tr}(E^T(dX)W)
+ +\operatorname{tr}(E^TX(dW))
+ +\operatorname{tr}(E^T\mathbf 1(db)^T)\\
+&=\operatorname{tr}((EW^T)^TdX)
+ +\operatorname{tr}((X^TE)^TdW)
+ +(E^T\mathbf 1)^Tdb.
+\end{aligned}
+$$
+
+Read off all three gradients:
+
+$$
+\boxed{
+\nabla_XL=EW^T,\qquad
+\nabla_WL=X^TE,\qquad
+\nabla_bL=E^T\mathbf 1.
+}
+$$
+
+The shapes explain the transposes:
+
+| gradient | multiplication | resulting shape |
+| --- | --- | ---: |
+| $\nabla_XL$ | $(N\times K)(K\times D)$ | $N\times D$ |
+| $\nabla_WL$ | $(D\times N)(N\times K)$ | $D\times K$ |
+| $\nabla_bL$ | $(K\times N)(N\times1)$ | $K\times1$ |
+
+For a concrete batch, choose
+
+$$
+X=\begin{bmatrix}1&2\\0&-1\\3&1\end{bmatrix},\quad
+W=\begin{bmatrix}2&-1\\1&3\end{bmatrix},\quad
+b=\begin{bmatrix}0.5\\-0.5\end{bmatrix},\quad
+T=\begin{bmatrix}3&4\\-1&-3\\7&0\end{bmatrix}.
+$$
+
+Then
+
+$$
+Y=\begin{bmatrix}4.5&4.5\\-0.5&-3.5\\7.5&-0.5\end{bmatrix},\qquad
+E=Y-T=\begin{bmatrix}1.5&0.5\\0.5&-0.5\\0.5&-0.5\end{bmatrix},
+$$
+
+and $L=1.75$. The backward pass gives
+
+$$
+\nabla_WL=\begin{bmatrix}3&-1\\3&1\end{bmatrix},\qquad
+\nabla_bL=\begin{bmatrix}2.5\\-0.5\end{bmatrix},\qquad
+\nabla_XL=\begin{bmatrix}2.5&3\\1.5&-1\\1.5&-1\end{bmatrix}.
+$$
+
+Check one weight gradient: $W_{11}$ connects the first input feature to the first output. Its
+gradient is $1(1.5)+0(0.5)+3(0.5)=3$, the first input column dotted with the first error column.
+This is exactly the $(1,1)$ entry of $X^TE$.
+
+## Why backpropagation uses vector--Jacobian products
+
+Suppose a computation is a chain
+
+$$
+x\xrightarrow{g}u\xrightarrow{h}y\xrightarrow{\ell}L.
+$$
+
+Writing the complete Jacobian gives
+
+$$
+\frac{\partial L}{\partial x}
+=\frac{\partial L}{\partial y}
+ \frac{\partial y}{\partial u}
+ \frac{\partial u}{\partial x}.
+$$
+
+An autodiff system need not construct those middle matrices. **Forward-mode automatic
+differentiation** starts with a chosen input tangent $v$ and repeatedly computes JVPs:
+
+$$
+v\mapsto J_gv\mapsto J_h(J_gv).
+$$
+
+One forward sweep answers, "how do all outputs respond to this one input direction?" It is
+attractive when there are few input directions and many outputs.
+
+**Reverse-mode automatic differentiation**, also called backpropagation or the adjoint method,
+starts with an output cotangent $\bar y$ and repeatedly computes vector--Jacobian products (VJPs):
+
+$$
+\bar y^T\mapsto\bar y^TJ_h\mapsto\bar y^TJ_hJ_g.
+$$
+
+For a scalar loss, the initial cotangent is just $1$. One reverse sweep accumulates derivatives
+with respect to every input and parameter. This is why reverse mode fits machine learning: a model
+can have billions of parameters but typically ends in one scalar loss. PyTorch's autograd API
+describes its core operation as a VJP.<Sidenote>Libraries differ in whether cotangents are written
+as rows or stored in arrays shaped like the corresponding value. The computation is the same;
+the latter avoids exposing transposed storage conventions.</Sidenote>
+
+Reverse mode trades memory for work. It usually stores or reconstructs forward-pass values needed
+by local backward rules. Activation checkpointing makes this trade explicit: save fewer values,
+then recompute some of them during the backward pass.
+
+## Useful matrix derivatives, derived
+
+Formula tables are helpful after the method is clear. The differential derivations below show the
+assumptions and transpose placement that a table can hide.
+
+### Inverse
+
+Let $Y=X^{-1}$ for invertible square $X$. Start from $XY=I$:
+
+$$
+d(XY)=(dX)Y+X(dY)=0.
+$$
+
+Multiply on the left by $X^{-1}$ and substitute $Y=X^{-1}$:
+
+$$
+\boxed{d(X^{-1})=-X^{-1}(dX)X^{-1}}.
+$$
+
+The order is essential. In practice, avoid forming an inverse merely to evaluate this rule;
+linear solves are normally more stable and efficient.
+
+### Determinant and log-determinant
+
+Jacobi's formula gives
+
+$$
+d\det X=\det(X)\operatorname{tr}(X^{-1}dX).
+$$
+
+Therefore
+
+$$
+\nabla_X\det X=\det(X)X^{-T}.
+$$
+
+For positive-determinant $X$, the log-determinant removes the leading determinant:
+
+$$
+d\log\det X=\operatorname{tr}(X^{-1}dX),
+\qquad
+\boxed{\nabla_X\log\det X=X^{-T}}.
+$$
+
+For $X=\begin{bmatrix}2&1\\1&3\end{bmatrix}$, $\det X=5$ and
+
+$$
+X^{-T}=\begin{bmatrix}0.6&-0.2\\-0.2&0.4\end{bmatrix}.
+$$
+
+Check the top-left partial directly: changing $X_{11}$ changes the determinant
+$X_{11}X_{22}-X_{12}X_{21}$ at rate $X_{22}=3$. The derivative of $\log\det X$ is therefore
+$3/5=0.6$, matching the matrix above.
+
+### Elementwise nonlinearities and softmax
+
+For an elementwise function $y=\phi(x)$,
+
+$$
+J_\phi(x)=\operatorname{diag}(\phi'(x)),
+$$
+
+so a backward pass multiplies the incoming gradient entrywise by $\phi'(x)$. There is rarely a
+reason to materialize the diagonal matrix.
+
+Softmax is not elementwise because every output depends on every logit. If
+$p_i=e^{z_i}/\sum_j e^{z_j}$, then
+
+$$
+\frac{\partial p_i}{\partial z_j}=p_i(\delta_{ij}-p_j),
+\qquad
+J_{\text{softmax}}=\operatorname{diag}(p)-pp^T.
+$$
+
+Combine softmax with cross-entropy $L=-\log p_t$ for a one-hot target $t$, and the chain rule
+simplifies to
+
+$$
+\boxed{\nabla_zL=p-e_t}.
+$$
+
+At $z=(1,2,-1)$ with target class 2, softmax is approximately
+$(0.259496,0.705385,0.035119)$, the loss is $0.349012$, and
+
+$$
+\nabla_zL=(0.259496,-0.294615,0.035119).
+$$
+
+The entries sum to zero. Adding the same constant to every logit leaves softmax unchanged, so the
+direction $(1,1,1)$ must have zero directional derivative; the zero sum confirms it.
+
+## Hessians and second-order information
+
+For scalar $f:\mathbb R^n\to\mathbb R$, the **Hessian** differentiates the gradient:
+
+$$
+H_f(x)=\nabla_x^2f,
+\qquad
+(H_f)_{ij}=\frac{\partial^2f}{\partial x_i\partial x_j}.
+$$
+
+Where the mixed partial derivatives are continuous, $H_f$ is symmetric. Its quadratic form gives
+the second-order term in the local Taylor approximation:
+
+$$
+f(x+\Delta x)\approx f(x)+\nabla f(x)^T\Delta x
++\frac12\Delta x^TH_f(x)\Delta x.
+$$
+
+Positive curvature means the function bends upward along a direction; negative curvature means it
+bends downward. At a stationary point, a positive-definite Hessian identifies a strict local
+minimum, while an indefinite Hessian identifies a saddle.
+
+For
+
+$$
+f(x)=\frac12x^THx+q^Tx,qquad
+H=\begin{bmatrix}4&1\\1&2\end{bmatrix},\quad
+q=\begin{bmatrix}-1\\3\end{bmatrix},
+$$
+
+we have $\nabla f=Hx+q$ and $\nabla^2f=H$. At $x=(2,-1)$, the gradient is $(6,3)$. For the
+direction $v=(1,2)$, the **Hessian--vector product** (HVP) is
+
+$$
+Hv=\begin{bmatrix}4&1\\1&2\end{bmatrix}
+\begin{bmatrix}1\\2\end{bmatrix}
+=\begin{bmatrix}6\\5\end{bmatrix}.
+$$
+
+Many second-order algorithms need $Hv$, not every entry of $H$. Automatic differentiation can
+compute an HVP by differentiating the scalar $\nabla f(x)^Tv$, avoiding an $n\times n$ matrix.
+That distinction is crucial when $n$ is millions or billions.
+
+## How to derive and debug gradients reliably
+
+A repeatable process prevents most matrix-calculus mistakes:
+
+1. **Write every shape.** If a proposed gradient does not have the input's shape, it is wrong.
+2. **Name intermediate values.** For $L=\ell(AX+b)$, write $z=AX+b$ first. Local rules stay small.
+3. **Take differentials.** Apply the sum, product, transpose, and elementwise rules without
+   commuting matrix factors.
+4. **Collect one perturbation at a time.** Rewrite a scalar differential as
+   $\operatorname{tr}(G^TdX)$, then read off $G=\nabla_XL$.
+5. **Check a single entry.** Expand one partial derivative as a scalar sum. This catches misplaced
+   transposes.
+6. **Check one random direction.** Compare $\langle\nabla_XL,D\rangle_F$ with a finite difference.
+
+Use the centered finite difference when possible:
+
+$$
+\frac{L(X+\epsilon D)-L(X-\epsilon D)}{2\epsilon}
+\approx\langle\nabla_XL,D\rangle_F.
+$$
+
+It has $O(\epsilon^2)$ truncation error, compared with $O(\epsilon)$ for a one-sided difference.
+Do not make $\epsilon$ arbitrarily tiny: subtracting nearly equal floating-point values eventually
+causes roundoff error to dominate. A sweep over several powers of ten should show an interval where
+the error falls, followed by a roundoff floor.
+
+Also test non-generic cases deliberately: a broadcast dimension of one, repeated indices, a zero
+input, or a non-symmetric matrix in a quadratic form. These are where a superficially plausible
+formula often fails.
+
+## Summary
+
+- A derivative is a local linear map. A Jacobian is its matrix representation, and a gradient is
+  the same-shape representation used for a scalar output.
+- Differentials plus the Frobenius identity
+  $dL=\operatorname{tr}((\nabla_XL)^TdX)$ turn matrix-gradient derivations into systematic algebra.
+- Shapes determine transpose placement. Preserve matrix order, and state the Jacobian convention
+  before comparing formulas from different sources.
+- Forward mode pushes an input direction through JVPs. Reverse mode pulls a loss sensitivity
+  through VJPs, which makes it efficient for scalar-loss models with many parameters.
+- Full Jacobians and Hessians are often unnecessary. JVPs, VJPs, and HVPs compute the products an
+  algorithm actually needs.
+
+## References
+
+- Alan Edelman, Steven G. Johnson, and Paige Bright,
+  [Matrix Calculus for Machine Learning and Beyond](https://ocw.mit.edu/courses/18-s096-matrix-calculus-for-machine-learning-and-beyond-january-iap-2023/resources/lecture-notes/),
+  MIT OpenCourseWare, 2023. The course develops derivatives as linear operators, adjoints, matrix
+  functions, and automatic differentiation.
+- Kaare Brandt Petersen and Michael Syskind Pedersen,
+  [The Matrix Cookbook](https://www.cs.toronto.edu/~bonner/courses/2018s/csc338/matrix_cookbook.pdf), 2012. A compact
+  reference for matrix identities and derivatives.
+- Terence Parr and Jeremy Howard,
+  [The Matrix Calculus You Need for Deep Learning](https://arxiv.org/abs/1802.01528), 2018. A
+  pedagogical treatment connecting matrix derivatives to neural networks.
+- PyTorch,
+  [Jacobians, Hessians, VJPs, JVPs, and HVPs](https://docs.pytorch.org/tutorials/intermediate/jacobians_hessians.html).
+  The tutorial shows how these products map to current autodiff transforms.

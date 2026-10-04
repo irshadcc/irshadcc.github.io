@@ -1,0 +1,1974 @@
+---
+title: "Nonuniform Negative Sampling and Log Odds Correction"
+description: "A guided reading of Wang, Zhang and Wang (NeurIPS 2021): why rare-event models learn only from their positives, how to throw away negatives optimally, and why correcting the log odds beats inverse probability weighting. Every theorem, assumption and proof, explained from first principles."
+date: 2026-10-04
+tags: [Machine learning, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import LineChart from "../../utils/charts/LineChart.astro";
+import NegativeSamplingExplorer from "../../utils/probability/NegativeSamplingExplorer.astro";
+import {
+	VF,
+	phiOptimal,
+	phiProbability,
+	phiUniform,
+	ratioToC,
+	sigmoid,
+	trace2,
+	varianceIpw,
+	varianceLik,
+} from "../../utils/probability/negativeSampling";
+
+## Background
+
+An ad system logs every **impression**, meaning every time an ad is shown. Only a tiny fraction
+of impressions end in a click. A click-through-rate (CTR) model is trained on billions of
+**negative** examples (no click) and comparatively few **positive** examples (a click). Most
+production systems therefore throw most of the negatives away before training. This is
+**negative sampling**. It cuts storage and training time, and it seems to cost little accuracy.
+Why does it cost so little? How much can we throw away? Which negatives should we keep? And
+after sampling, how do we correct the model so that its probabilities are right again?
+
+The paper *Nonuniform Negative Sampling and Log Odds Correction with Rare Events Data* by HaiYing
+Wang, Aonan Zhang and Chong Wang (NeurIPS 2021) answers all four questions with theorems.
+Its main results are:
+
+1. With rare events, the precision of a model is set by the number of positives $N_1$, not by
+   the total number of examples $N$ (Theorem 1).
+2. Negatives can be thrown away aggressively at almost no cost. The cost only becomes visible
+   when the kept negatives are about as few as the positives (Theorem 2).
+3. When negatives are kept with unequal probabilities, there is a best choice of probabilities
+   (Theorem 3).
+4. Instead of reweighting the kept examples (inverse probability weighting), it is better to
+   shift the model's log odds by $-\log \pi(x)$. This estimator is never worse, and it is the
+   best in a large class (Theorems 4, 5 and 6).
+5. These results still hold when the sampling probabilities are computed from a rough pilot
+   estimate (Theorems 7 and 8).
+
+This post goes through each result: what it says, what it assumes, a worked example with real
+numbers, and the proof. The proofs use some asymptotic statistics, so there is a short toolkit
+section first that explains each tool in plain terms. You only need basic probability
+(expectation, variance, the normal distribution), basic calculus (derivatives, Taylor's
+formula) and a little linear algebra. Related posts on this blog cover
+[importance sampling](/blog/importance-sampling/), which is the idea behind inverse probability
+weighting, and [online learning with FTRL](/blog/online-learning-regret-ftrl/), the classic
+way CTR models are trained.
+
+## A warm-up: estimating one click rate
+
+Here is the paper's main idea in its simplest form. Suppose every impression has the same
+click probability $p = 0.001$ and we observe $N = 10^6$ impressions. The natural estimate is the
+fraction of clicks, $\hat p = N_1 / N$. Its **standard error**, the typical size of its error, is
+
+$$
+\text{SE}(\hat p) = \sqrt{\frac{p(1-p)}{N}} = \sqrt{\frac{0.001 \times 0.999}{10^6}} \approx 3.16 \times 10^{-5}.
+$$
+
+That number looks tiny, but $p$ is tiny too. Relative to $p$ the error is
+$3.16 \times 10^{-5} / 0.001 = 3.16\%$. Now notice that
+
+$$
+\frac{\text{SE}(\hat p)}{p} = \sqrt{\frac{1-p}{Np}} \approx \frac{1}{\sqrt{Np}} = \frac{1}{\sqrt{\mathbb E N_1}},
+$$
+
+and $\mathbb E N_1 = Np = 1000$ is the expected number of clicks. The relative precision depends
+only on the number of positives. A million impressions with 1,000 clicks are about as
+informative as 1,000 clicks with only a few thousand non-clicks.
+
+Now throw away negatives. Keep every click, and keep each non-click with probability $\rho$.
+The kept negatives $K$ estimate the total number of negatives as $K / \rho$. The estimated
+odds are $N_1 / (K/\rho)$. Its relative error is roughly
+$\sqrt{1/N_1 + 1/K}$.<Sidenote>By the delta method: $\log(\text{odds}) = \log N_1 - \log K + \log
+\rho$, and a count with mean $m$ has $\operatorname{Var}(\log \text{count}) \approx 1/m$ when it is
+roughly Poisson. Simulated with 20,000 repetitions, the relative errors were 3.16%, 3.17%, 3.31%
+and 4.48%, matching the table.</Sidenote>
+
+| Negatives kept ($\rho$) | Kept negatives $K$ | Relative error of $\hat p$ |
+| ----------------------: | -----------------: | -------------------------: |
+|                    100% |            999,000 |                      3.16% |
+|                     10% |             99,900 |                      3.18% |
+|                      1% |              9,990 |                      3.32% |
+|                    0.1% |                999 |                      4.47% |
+
+Keeping 1% of the negatives (a 99% smaller dataset) raises the error from 3.16% to 3.32%. Only
+when the kept negatives are as few as the positives (the last row) does the error grow
+noticeably, by a factor of $\sqrt{2}$. The rest of the paper turns this calculation into
+theorems for a full model with features, and then asks which negatives to keep.
+
+## Setup and notation
+
+#### The binary response model
+
+We have $N$ training examples $(x_i, y_i)$. $x_i$ is a vector of features and $y_i \in \{0, 1\}$
+is the label: $1$ for a positive (click), $0$ for a negative. The model says
+
+$$
+\Pr(y = 1 \mid x) = p(x; \theta),
+$$
+
+where $\theta$ is an unknown $d$-dimensional parameter. The true value is written $\theta^*$.
+
+The **odds** of an event with probability $p$ are $p / (1-p)$, and the **log odds** (or
+**logit**) are $\log\{p/(1-p)\}$. The paper assumes the log odds split into an intercept and
+everything else:
+
+$$
+g(x; \theta) := \log \frac{p(x; \theta)}{1 - p(x; \theta)} = \alpha + f(x; \beta), \qquad \theta = (\alpha, \beta).
+$$
+
+Solving for $p$ gives the familiar sigmoid, $p = 1 / (1 + e^{-g})$. If $f(x;\beta) = x^\top \beta$
+this is **logistic regression**. But $f$ can be any smooth function, for example a neural
+network whose last layer feeds a sigmoid.
+
+Two pieces of notation appear everywhere. $\dot g(x;\theta)$ is the **gradient** of $g$ with
+respect to $\theta$: the vector of partial derivatives. $\ddot g(x;\theta)$ is the **Hessian**,
+the matrix of second derivatives. Because $\alpha$ enters $g$ with coefficient 1, the first
+entry of $\dot g$ is always $1$: $\dot g = (1, \partial f / \partial \beta)$. For a vector $v$,
+$v^{\otimes 2} := v v^\top$ is the matrix whose $(j, k)$ entry is $v_j v_k$. The counts are
+$N_1 = \sum_i y_i$ positives and $N_0 = N - N_1$ negatives.
+
+#### The rare-event regime
+
+How do we describe "positives are rare" in a theorem? The paper lets the data grow
+($N \to \infty$) while the positive rate shrinks, so that $N_1 / N_0 \to 0$. It does this by
+letting the intercept drift down, $\alpha^* \to -\infty$, while $\beta^*$ stays fixed.
+
+The key fact used in every proof: **when $g$ is very negative, the probability is almost
+exactly $e^g$**. Since $p = e^g / (1 + e^g)$ and $e^g$ is tiny, the denominator is almost 1:
+
+$$
+p(x; \theta^*) = \frac{e^{\alpha^*} e^{f(x;\beta^*)}}{1 + e^{\alpha^* + f(x;\beta^*)}} \approx e^{\alpha^*} \, e^{f(x;\beta^*)}.
+$$
+
+So in the rare-event regime the probability factors into a tiny global scale $e^{\alpha^*}$ times
+a fixed shape $e^{f(x;\beta^*)}$. Lowering $\alpha^*$ by 1 divides every probability by
+$e \approx 2.7$, but it does not change which $x$ are relatively more likely to be positive. The
+figure plots this on a log scale for the running example below ($f(x) = x$). The three curves
+are the same shape shifted down; they only bend at the top right, where $p$ is no longer small.
+
+<LineChart
+	x={() => Array.from({ length: 121 }, (_, i) => -3 + i * 0.05)}
+	series={[
+		{ name: "α = −3", fn: (x) => Math.log10(sigmoid(-3 + x)) },
+		{ name: "α = −5", fn: (x) => Math.log10(sigmoid(-5 + x)) },
+		{ name: "α = −7", fn: (x) => Math.log10(sigmoid(-7 + x)) },
+	]}
+	title="log₁₀ p(x) for g(x) = α + x"
+	xLabel="feature x"
+	yLabel="log₁₀ Pr(y = 1 | x)"
+	height={280}
+/>
+
+Summing the approximation over the data gives the number of positives:
+
+$$
+N_1 \approx \sum_{i=1}^N e^{\alpha^*} e^{f(x_i;\beta^*)} \approx N e^{\alpha^*} \, \mathbb E\{e^{f(x;\beta^*)}\}.
+$$
+
+The proofs abbreviate $a_N := \sqrt{N e^{\alpha^*}}$, so that
+$N_1 \approx a_N^2 \, \mathbb E\{e^{f(x;\beta^*)}\}$. Read $a_N^2$ as "roughly the number of
+positives".<Sidenote>Equation (S.1) in the supplement. The ratio $N_1 / (N e^{\alpha^*})$
+converges to $\mathbb E\{e^{f}\}$ in probability: its mean converges by dominated convergence
+(see the toolkit), and its variance is at most $\mathbb E\{e^f\} / (N e^{\alpha^*}) \to 0$.</Sidenote>
+
+The paper notes when this regime is realistic. Phone calls while driving raise the chance of a
+crash, but a crash is still rare among drivers on the phone, so the regime fits. Diseases that
+cause symptoms fit too: by Bayes' rule
+$\alpha + f(x) = \log\{\Pr(y=1)/\Pr(y=0)\} + \log\{\Pr(x \mid y=1)/\Pr(x \mid y=0)\}$, and only the
+first term (the prevalence) changes. It does not fit when one feature turns a rare event into a
+likely one. COVID infection is rare in the population but likely if someone in your household
+tested positive.
+
+**The running example.** Throughout this post we use one feature $x \sim N(0, 1)$, true slope
+$\beta^* = 1$, and $f(x;\beta) = \beta x$. So $g = \alpha + \beta x$, $\dot g = (1, x)$, and every
+quantity in the theorems can be computed exactly. Two facts about the standard normal
+distribution do most of the work: $\mathbb E\{e^{x}\} = e^{1/2}$ and, more generally,
+$\mathbb E\{e^{sx} x\} = s e^{s^2/2}$ and $\mathbb E\{e^{sx} x^2\} = (1 + s^2) e^{s^2/2}$.<Sidenote>These
+follow from the moment generating function $\mathbb E e^{sx} = e^{s^2/2}$ by differentiating in $s$
+once and twice. All numbers in this post were computed by scripts (Gauss–Hermite quadrature and
+simulation) and cross-checked against these closed forms.</Sidenote>
+
+#### The full-data estimator
+
+The standard estimate of $\theta$ is the **maximum likelihood estimator** (MLE). The
+**likelihood** is the probability the model assigns to the labels we actually saw, viewed as a
+function of $\theta$. The MLE is the $\theta$ that makes the observed labels most probable. For
+one example, the probability of its label is $p^{y}(1-p)^{1-y}$. Taking logs and writing $p$ in
+terms of $g$ gives the log-likelihood of the full data:
+
+$$
+\ell(\theta) = \sum_{i=1}^N \Big[ y_i \, g(x_i;\theta) - \log\{1 + e^{g(x_i;\theta)}\} \Big],
+\qquad
+\hat\theta_f := \arg\max_\theta \ell(\theta).
+$$
+
+This is the usual binary cross-entropy loss with the sign flipped. $\hat\theta_f$ is what you would
+get by training on all the data. It is the benchmark that the sampling methods are compared
+against.
+
+## A toolkit for reading the proofs
+
+The theorems describe what happens "as $N \to \infty$". This section explains the handful of ideas
+the proofs rely on. Each idea is stated in plain words first, then precisely.
+
+### Convergence in probability and in distribution
+
+A sequence of random quantities $Z_N$ **converges in probability** to a constant $z$ if it ends
+up close to $z$ with high probability: for every tolerance $\epsilon > 0$,
+$\Pr(|Z_N - z| > \epsilon) \to 0$. The **law of large numbers** is the classic example: the
+average of $N$ independent draws converges in probability to the expectation. The paper writes
+$o_P(1)$ for "some quantity that converges in probability to 0". So $Z_N = z + o_P(1)$ means
+$Z_N \to z$ in probability, and $Z_N = z\{1 + o_P(1)\}$ means the ratio $Z_N / z \to 1$.
+
+A sequence **converges in distribution** to a distribution $D$ if its histogram (over many
+repetitions of the experiment) looks more and more like $D$. This is weaker: the values do not
+settle down, only their spread does.
+
+All the main theorems have the same form, called **asymptotic normality**:
+
+$$
+\sqrt{N_1}\,(\hat\theta - \theta^*) \longrightarrow N(0, V) \quad \text{in distribution}.
+$$
+
+Read it as: for large data, $\hat\theta \approx \theta^* + \text{noise}$, where the noise is
+approximately normal with mean 0 and **covariance matrix** $V / N_1$. The factor $\sqrt{N_1}$
+is the **rate**: the error shrinks like $1/\sqrt{N_1}$. The matrix $V$ is the **asymptotic
+variance**. Comparing two estimators with the same rate means comparing their $V$; a smaller
+$V$ means a more precise estimator for the same amount of data.
+
+### Central limit theorems
+
+The **central limit theorem** (CLT) says that a sum of many independent, mean-zero terms is
+approximately normal, whatever the distribution of each term. If the terms $\xi_i$ have
+covariance $\Sigma$, then $N^{-1/2}\sum_{i=1}^N \xi_i \to N(0, \Sigma)$.
+
+The proofs need a slightly stronger version. In the rare-event regime $\alpha^*$ changes with
+$N$, so the distribution of each term changes as $N$ grows. A sum of terms whose distribution
+depends on $N$ is called a **triangular array**. The **Lindeberg–Feller CLT** handles it. Let
+$s_N^2$ be the total variance of the sum. If the variance converges after scaling, and the
+**Lindeberg condition** holds,
+
+$$
+\sum_{i=1}^N \mathbb E\Big[\|\xi_{i}\|^2 \, \mathbb 1\big(\|\xi_{i}\| > \epsilon s_N\big)\Big] = o(s_N^2) \quad \text{for every } \epsilon > 0,
+$$
+
+then the scaled sum is asymptotically normal. $\mathbb 1(\cdot)$ is the **indicator**: 1 if the
+condition holds, 0 otherwise. In words, the condition says *no single term is a big share of
+the whole sum*: the part of the variance that comes from unusually large terms is negligible.
+The CLT can fail without it. For example, if one term is a coin flip and the rest are
+negligible, the sum is a coin flip, not a normal variable.
+
+### Four tools used in every proof
+
+**Slutsky's theorem.** If $Z_N \to Z$ in distribution and $A_N \to A$ in probability, where $A$ is
+a constant matrix, then $A_N Z_N \to A Z$ in distribution. Adding an $o_P(1)$ term does not
+change a limit either. Combined with a fact about normal vectors, $Z \sim N(0, \Sigma)$ implies
+$AZ \sim N(0, A \Sigma A^\top)$, this turns "the score is normal" into "the estimator is normal".
+
+**Taylor's formula and the argmax of a quadratic.** Near a point, a smooth function is close to a
+quadratic: $h(\theta^* + \Delta) = h(\theta^*) + \Delta^\top \nabla h + \tfrac12 \Delta^\top H \Delta +
+R$, where $\nabla h$ is the gradient, $H$ the Hessian, and the remainder $R$ involves third
+derivatives at some point between $\theta^*$ and $\theta^* + \Delta$. The proofs show that, after
+rescaling, the log-likelihood near $\theta^*$ is a random quadratic
+
+$$
+\gamma_N(u) = u^\top S_N - \tfrac12 u^\top H u + o_P(1).
+$$
+
+A one-dimensional quadratic $s u - \tfrac12 h u^2$ is maximized where its derivative
+$s - hu$ is zero, at $u = s / h$. In several dimensions the gradient is $s - Hu$, so the maximizer
+is $u = H^{-1} s$. A result of Hjort and Pollard (their "Basic Corollary") makes this rigorous for
+random functions. Suppose:
+
+1. $\gamma_N(u)$ is concave in $u$;
+2. for each fixed $u$, $\gamma_N(u) = u^\top S_N - \tfrac12 u^\top H u + r_N(u)$ with
+   $r_N(u) = o_P(1)$;
+3. $H$ is a fixed positive definite matrix;
+4. $S_N$ converges in distribution.
+
+Then the maximizer of $\gamma_N$ equals $H^{-1} S_N + o_P(1)$. The surprising part is condition 2:
+the leftover only has to be small at each fixed $u$ separately, not uniformly over all $u$ at once.
+Concavity supplies the rest. A concave function that is close to a concave quadratic at every
+point of a fine grid is close to it everywhere in between, because a concave function cannot rise
+much above the straight lines joining its grid values. So its peak cannot wander far from the
+quadratic's peak.<Sidenote>Hjort and Pollard state the result for convex functions (minimizers); a
+concave log-likelihood is the same thing with the sign flipped. The log-likelihood is concave in
+$\theta$ when $f$ is linear (logistic regression). For a general nonlinear $f$ the paper applies
+the corollary without discussing concavity, so for neural networks the theorems should be read as
+local results.</Sidenote>
+
+**Markov's and Chebyshev's inequalities.** For a non-negative random variable $Z$,
+$\Pr(Z \ge t) \le \mathbb E Z / t$ (Markov). So if $\mathbb E Z \to 0$, then $Z = o_P(1)$. For any
+random variable, $\Pr(|Z - \mathbb E Z| \ge t) \le \operatorname{Var}(Z) / t^2$ (Chebyshev). So
+if $\operatorname{Var}(Z) \to 0$, then $Z$ converges in probability to its mean. The proofs use
+these to show that the leftover terms vanish.
+
+**Dominated convergence.** Suppose $h_N(x) \to h(x)$ for every $x$, and every $h_N$ fits under one
+"roof": $|h_N(x)| \le B(x)$ with $\mathbb E B(x) < \infty$. Then
+$\mathbb E h_N(x) \to \mathbb E h(x)$: we may take the limit inside the expectation. The proofs use
+this constantly with $\alpha^* \to -\infty$. For example
+$e^{f} / (1 + e^{\alpha^* + f})^2 \to e^{f}$ for every $x$, and it is always below the roof $e^f$.
+
+### Matrices as variances
+
+For a vector estimator, the variance is a **covariance matrix** $V$: variances of each component
+on the diagonal, covariances off it. The variance of any linear combination $v^\top \hat\theta$
+is $v^\top V v$.
+
+A symmetric matrix $A$ is **positive definite** if $v^\top A v > 0$ for every nonzero $v$, and
+**positive semidefinite** (or non-negative definite) if $v^\top A v \ge 0$. Writing $A \ge B$
+means $A - B$ is positive semidefinite. For covariance matrices, $V_1 \ge V_2$ means estimator 2 is
+at least as precise as estimator 1 *for every linear combination of the parameters at once*. This
+is the strongest sense in which one estimator can beat another.
+
+The **trace** $\operatorname{tr}(V)$, the sum of the diagonal, is the sum of the component
+variances. For an unbiased estimator it is the expected squared error:
+$\mathbb E\|\hat\theta - \theta^*\|^2 \approx \operatorname{tr}(V) / N_1$. When one sampling scheme
+has to be chosen, the paper minimizes this single number.
+
+### Likelihood, score and information
+
+The **score** is the gradient of the log-likelihood. For our model, differentiating one term
+$y g - \log(1 + e^g)$ with the chain rule gives
+
+$$
+\frac{\partial}{\partial\theta}\Big[y g - \log(1+e^{g})\Big] = y \dot g - \frac{e^g}{1+e^g}\dot g = (y - p)\,\dot g,
+$$
+
+and differentiating again gives the Hessian of one term:
+
+$$
+(y - p)\,\ddot g - p(1-p)\,\dot g \dot g^\top.
+$$
+
+Two facts follow and are used in every proof. At the true parameter, the score has **mean
+zero**, because $\mathbb E(y \mid x) = p$. And the variance of the score equals minus the expected
+Hessian: both are $\mathbb E\{p(1-p)\dot g^{\otimes 2}\}$ per example. This matrix is the
+**Fisher information**. The MLE's variance is approximately the inverse of the total Fisher
+information. In plain words: **information is how sharply the log-likelihood curves around its
+peak**. A sharp peak pins the parameter down.
+
+Here is the whole paper in one sentence: *one example's information is
+$p(1-p)\dot g^{\otimes 2} \approx p\, \dot g^{\otimes 2}$, and when $p$ is tiny this is tiny*.
+Negatives are individually almost worthless, because each one carries information proportional
+to its small $p$.
+
+## The assumptions
+
+The theorems rely on three assumptions plus the rare-event regime.
+
+**Assumption 1 (smoothness and tails).** *The first, second and third derivatives of
+$f(x;\beta)$ and $e^{f(x;\beta)} f(x;\beta)$ with respect to any components of $\beta$ are bounded
+by a square integrable random variable $B(x)$.*
+
+"Square integrable" means $\mathbb E\{B(x)^2\} < \infty$. The assumption says two things. First,
+$f$ is smooth in $\beta$, so Taylor's formula with three terms is accurate. Second, the features
+do not have tails so heavy that a few extreme $x$ dominate the averages. The proofs use it to
+bound the Taylor remainder and to guarantee that averages such as
+$\mathbb E\{e^{f}\|\dot g\|^2\}$ and $\mathbb E\{e^f \|\ddot g\|^2\}$ are finite. In the running
+example the derivatives of $f = \beta x$ are $x$, $0$, $0$, so $B(x)$ is built from $|x|$ and
+$|x| e^{\beta x}$, which have finite second moments when $x$ is normal.
+
+**Assumption 2 (identifiability).** *The matrix $\mathbb E\{\dot g^{\otimes 2}(x; \theta^*)\}$ is
+finite and positive definite.*
+
+If it were not positive definite, some direction $v$ would have
+$\mathbb E\{(v^\top \dot g)^2\} = 0$, meaning $v^\top \dot g = 0$ for almost every $x$. Moving
+$\theta$ in direction $v$ would then not change the log odds at all, and no amount of data
+could tell those parameter values apart. Two identical feature columns are the classic
+example. In the running example $\mathbb E\{(1, x)^{\otimes 2}\} = \left(\begin{smallmatrix}1 & 0\\ 0 & 1\end{smallmatrix}\right)$,
+which is positive definite. The supplement also notes a consequence used later:
+$\mathbb E\{v(x) \dot g^{\otimes 2}\}$ stays positive definite for any weight $v(x) > 0$. Proof: if
+$l^\top\mathbb E\{v\dot g^{\otimes 2}\}l = \mathbb E\{v\,(l^\top\dot g)^2\} = 0$ for some $l \ne 0$,
+then, since $v > 0$, $(l^\top\dot g)^2 = 0$ for almost every $x$, so
+$\mathbb E\{(l^\top\dot g)^2\} = 0$, contradicting Assumption 2. This is why the matrices $M_f$
+(with $v = e^f$) and $\Lambda_{\text{lik}}$ below can be inverted.
+
+**Assumption 3 (sampling rate).** *The negative sampling rate $\rho$ satisfies
+$c_N := e^{\alpha^*} / \rho \to c$ for a constant $0 \le c < \infty$.* (Used from Theorem 2
+onward.)
+
+This compares the sampling rate to the positive rate. The paper notes that
+$c_N \,\mathbb E\{e^{f}\} = N_1 / (N_0 \rho)\{1 + o_P(1)\}$, and $N_0\rho$ is the expected number of
+kept negatives. So
+
+$$
+c \, \mathbb E\{e^{f(x;\beta^*)}\} \approx \frac{\text{positives}}{\text{kept negatives}}.
+$$
+
+$c = 0$ means the kept negatives still vastly outnumber the positives, even if $\rho \to 0$.
+$0 < c < \infty$ means we keep about as many negatives as positives (or a fixed multiple). The
+assumption rules out keeping far fewer negatives than positives. In the running example
+$\mathbb E\{e^f\} = e^{1/2} \approx 1.65$, so a balanced subsample (one positive per kept
+negative) has $c = e^{-1/2} \approx 0.61$.
+
+## Theorem 1: only the positives count
+
+> **Theorem 1.** Let $M_f = \mathbb E\{e^{f(x;\beta^*)} \dot g^{\otimes 2}(x;\theta^*)\}$ and
+> $V_f = \mathbb E\{e^{f(x;\beta^*)}\} M_f^{-1}$. Under Assumptions 1 and 2, as $N \to \infty$,
+> $\sqrt{N_1}(\hat\theta_f - \theta^*) \to N(0, V_f)$ in distribution.
+
+**In words.** Even with all $N$ examples, the full-data estimate is only as precise as
+$N_1$ positives allow: its error shrinks like $1/\sqrt{N_1}$, not $1/\sqrt{N}$. $N$ does not
+appear in the result at all. This is the warm-up calculation, now for a full model with
+features. It is what justifies negative sampling: if the information is tied to $N_1$, most
+negatives can go.
+
+$M_f$ is the Fisher information with each example's $p(1-p)$ replaced by its "shape"
+$e^{f}$ (the scale $e^{\alpha^*}$ is factored out). It weights each $x$ by how likely it is to be
+positive, so features that only occur among near-certain negatives contribute little.
+
+**Worked example.** In the running example, using the normal-distribution facts above,
+
+$$
+M_f = \mathbb E\left\{e^{x}\begin{pmatrix}1 & x\\ x & x^2\end{pmatrix}\right\}
+= e^{1/2}\begin{pmatrix}1 & 1\\ 1 & 2\end{pmatrix},
+\qquad
+V_f = e^{1/2} M_f^{-1} = \begin{pmatrix}2 & -1\\ -1 & 1\end{pmatrix}.
+$$
+
+Check one entry by hand: the inverse of $\left(\begin{smallmatrix}1 & 1\\ 1 & 2\end{smallmatrix}\right)$ is
+$\left(\begin{smallmatrix}2 & -1\\ -1 & 1\end{smallmatrix}\right)$ (its determinant is $1$), and the
+$e^{1/2}$ factors cancel. So with $N_1$ positives, $\operatorname{Var}(\hat\alpha) \approx 2/N_1$,
+$\operatorname{Var}(\hat\beta) \approx 1/N_1$, and the expected squared error is
+$\operatorname{tr}(V_f)/N_1 = 3 / N_1$. With $N_1 = 1000$, the slope has a standard error of
+about $\sqrt{1/1000} \approx 0.032$, however many negatives there are.
+
+To check this, I simulated the full-data MLE 400 times at four sizes. $N$ grows tenfold each
+time while the expected number of positives only doubles ($\alpha^*$ is chosen to hit the
+target, as in the paper's Table 1). If Theorem 1 is right, $N_1 \operatorname{tr}(\hat V)$
+should stay near 3 while $N \operatorname{tr}(\hat V)$ explodes.
+
+|         $N$ | $\mathbb E N_1$ | $\alpha^*$ | $\operatorname{Var}(\hat\alpha)$ | $\operatorname{Var}(\hat\beta)$ | $N_1 \operatorname{tr}(\hat V)$ | $N \operatorname{tr}(\hat V)$ |
+| ----------: | --------------: | ---------: | -------------------------------: | ------------------------------: | ------------------------------: | ----------------------------: |
+|       1,000 |              32 |      −3.86 |                           0.0660 |                          0.0443 |                            3.53 |                           110 |
+|      10,000 |              64 |      −5.54 |                           0.0324 |                          0.0163 |                            3.12 |                           488 |
+|     100,000 |             128 |      −7.16 |                           0.0164 |                          0.0087 |                            3.21 |                         2,507 |
+|   1,000,000 |             256 |      −8.77 |                           0.0070 |                          0.0040 |                            2.81 |                        10,967 |
+
+At the largest size the theory predicts $\operatorname{Var}(\hat\beta) \approx 1/256 = 0.0039$;
+the simulation gives $0.0040$.<Sidenote>With 400 repetitions a simulated variance has a relative
+standard error of about $\sqrt{2/400} \approx 7\%$, so values between 2.8 and 3.5 are consistent
+with 3. The paper's Table 1 shows the same pattern for its own model.</Sidenote>
+
+#### Proof of Theorem 1
+
+The proof is a preliminary step and seven main steps. Every later proof reuses these steps,
+so this one is written out in full. Unless shown otherwise, $p_i$, $\dot g_i$ and $\ddot g_i$
+are evaluated at $(x_i, \theta^*)$. I write
+
+$$
+\psi_i := p_i(1 - p_i)
+$$
+
+for the variance of the label $y_i$ given $x_i$. The paper calls this $\phi$; I use $\psi$ so it
+cannot be confused with the sampling function $\varphi$ that appears later. The proof also
+needs the number of positives to grow: $a_N^2 = Ne^{\alpha^*} \to \infty$. The paper assumes this
+implicitly, and without it there would be nothing to take a limit of.
+
+**Three facts about $p$.** All three are exact, and the proofs use them over and over. Write
+$g = \alpha^* + f$ with $f = f(x;\beta^*)$.
+
+- **(F1)** $p = \dfrac{e^{\alpha^*+f}}{1 + e^{\alpha^*+f}} \le e^{\alpha^*}e^{f}$, because the
+  denominator is at least 1.
+- **(F2)** $e^{-\alpha^*}p = \dfrac{e^{f}}{1 + e^{\alpha^*+f}}$. As $\alpha^* \to -\infty$ this
+  tends to $e^{f}$, and it is never larger than $e^{f}$.
+- **(F3)** $\psi = p(1-p) = \dfrac{e^{\alpha^*+f}}{(1+e^{\alpha^*+f})^2}$, so
+  $e^{-\alpha^*}\psi = \dfrac{e^{f}}{(1+e^{\alpha^*+f})^2}$. This also tends to $e^f$ and is never
+  larger than $e^f$. Also $\psi \le p$, and $\psi^2 \le p^2 \le p$.
+
+The steps also need some expectations to be finite: $\mathbb E\{e^f\}$,
+$\mathbb E\{e^f\|\dot g\|^4\}$, $\mathbb E\{e^f\|\ddot g\|^2\}$ and
+$\mathbb E\{e^fB\}$.<Sidenote>The paper says these follow from Assumption 1. Read literally,
+Assumption 1 only gives $\mathbb E B^2 < \infty$, so it is safest to treat these finite moments as
+part of the assumption. In the running example they are all finite, because $e^{x}$ times a
+polynomial in $x$ has a finite mean under $N(0, 1)$.</Sidenote> Note that $\|\dot g\| \ge 1$,
+because the first entry of $\dot g$ is $1$. So $\|\dot g\|^2 \le \|\dot g\|^4$, and
+$\mathbb E\{e^f\|\dot g\|^2\}$ is finite too.
+
+**Step 0: $N_1 \approx a_N^2\,\mathbb E\{e^f\}$ (equation S.1).** $N_1 = \sum_i y_i$ is a sum of $N$
+independent 0/1 variables. Each equals 1 with probability $\bar p := \mathbb E\{p(x;\theta^*)\}$.
+So $\mathbb E N_1 = N\bar p$ and $\operatorname{Var}(N_1) = N\bar p(1 - \bar p) \le N\bar p$.
+Divide by $a_N^2 = Ne^{\alpha^*}$:
+
+$$
+\mathbb E\left(\frac{N_1}{a_N^2}\right) = e^{-\alpha^*}\bar p = \mathbb E\left\{\frac{e^{f}}{1 + e^{\alpha^*+f}}\right\} \longrightarrow \mathbb E\{e^f\}.
+$$
+
+The middle equality is (F2) inside the expectation. The limit is dominated convergence: the
+integrand tends to $e^f$ for every $x$, under the roof $e^f$. For the variance,
+
+$$
+\operatorname{Var}\left(\frac{N_1}{a_N^2}\right) \le \frac{N\bar p}{a_N^4} = \frac{1}{a_N^2}\,\mathbb E\left(\frac{N_1}{a_N^2}\right) \longrightarrow 0,
+$$
+
+because the expectation converges and $a_N^2 \to \infty$. By Chebyshev's inequality,
+$N_1/a_N^2 \to \mathbb E\{e^f\}$ in probability. In the paper's notation,
+$N_1 = a_N^2\,\mathbb E\{e^f\}\{1 + o_P(1)\}$.
+
+**Step 1: zoom in.** We expect $\hat\theta_f - \theta^*$ to be of size about $1/a_N$. Looking at it
+directly, everything shrinks to 0 and there is nothing to see. So we magnify by $a_N$. Write
+$\theta = \theta^* + u/a_N$, so $u = a_N(\theta - \theta^*)$ measures the distance from the
+truth in units of the expected error. Define
+
+$$
+\gamma(u) = \ell(\theta^* + a_N^{-1} u) - \ell(\theta^*).
+$$
+
+$\ell(\theta^*)$ is a constant, and subtracting it does not move the maximum. $\gamma$ is just
+$\ell$ in the new coordinates, so it is maximized at $\hat u = a_N(\hat\theta_f - \theta^*)$. We
+want the distribution of $\hat u$.
+
+**Step 2: Taylor expansion along a line.** Fix $u$ and look at $\ell$ along the segment from
+$\theta^*$ to $\theta^* + u/a_N$:
+
+$$
+h(s) = \ell(\theta^* + s\,u/a_N), \qquad 0 \le s \le 1, \qquad \gamma(u) = h(1) - h(0).
+$$
+
+$h$ is an ordinary function of one variable. Taylor's theorem with the Lagrange form of the
+remainder says that, for some $\tilde s$ between 0 and 1,
+
+$$
+h(1) = h(0) + h'(0) + \tfrac12 h''(0) + \tfrac16 h'''(\tilde s).
+$$
+
+By the chain rule, each derivative in $s$ is a derivative of $\ell$ in the direction $u$, with
+one factor $1/a_N$ per derivative:
+
+$$
+h'(0) = \frac{1}{a_N}u^\top\dot\ell(\theta^*), \qquad
+h''(0) = \frac{1}{a_N^2}u^\top\ddot\ell(\theta^*)\,u, \qquad
+h'''(\tilde s) = \frac{1}{a_N^3}\sum_{i=1}^N D_i(\tilde\theta),
+$$
+
+where $\tilde\theta = \theta^* + \tilde s u/a_N$ and $D_i$ is the third directional derivative of
+example $i$'s term (computed below). From the toolkit, example $i$'s gradient is
+$(y_i - p_i)\dot g_i$ and its Hessian is $(y_i - p_i)\ddot g_i - \psi_i\dot g_i\dot g_i^\top$. So
+
+$$
+u^\top\ddot\ell(\theta^*)u = \sum_{i=1}^N (y_i - p_i)\,u^\top\ddot g_i u - \sum_{i=1}^N \psi_i\,(u^\top\dot g_i)^2.
+$$
+
+Putting the pieces together:
+
+$$
+\gamma(u) = u^\top S_N - \tfrac12 u^\top H_N u + \Delta_\ell + R,
+$$
+
+with
+
+$$
+\begin{aligned}
+S_N &= \frac{1}{a_N}\sum_{i=1}^N (y_i - p_i)\dot g_i, &
+H_N &= \frac{1}{a_N^2}\sum_{i=1}^N \psi_i\,\dot g_i\dot g_i^\top, \\
+\Delta_\ell &= \frac{1}{2a_N^2}\sum_{i=1}^N (y_i - p_i)\,u^\top\ddot g_i u, &
+R &= \frac{1}{6a_N^3}\sum_{i=1}^N D_i(\tilde\theta).
+\end{aligned}
+$$
+
+($u^\top H_N u = a_N^{-2}\sum_i\psi_i(u^\top\dot g_i)^2$, because
+$u^\top\dot g\dot g^\top u = (u^\top\dot g)^2$.) $S_N$ is the rescaled score, $H_N$ the
+rescaled curvature, $\Delta_\ell$ the part of the Hessian that has mean zero, and $R$ the
+remainder.
+
+To get $D_i$, differentiate $u^\top\ddot\ell_i u = (y_i - p_i)\,u^\top\ddot g_iu - \psi_i(u^\top\dot g_i)^2$
+once more in direction $u$. Use $\partial p/\partial\theta = \psi\dot g$ and
+$\partial\psi/\partial\theta = \psi(1 - 2p)\dot g$ (both from the chain rule), and write
+$\dddot g_{jk}$ for the gradient of the $(j, k)$ entry of $\ddot g$:
+
+$$
+D_i = -\psi_i(1 - 2p_i)(u^\top\dot g_i)^3 - 3\psi_i(u^\top\dot g_i)(u^\top\ddot g_iu) + (y_i - p_i)\sum_{j,k}u_ju_k\,u^\top\dddot g_{i,jk}.
+$$
+
+The first term comes from differentiating $\psi$. The middle term collects one
+$-\psi(u^\top\dot g)(u^\top\ddot g u)$ from differentiating $y - p$ and two from differentiating
+$(u^\top\dot g)^2$. The last term comes from differentiating $\ddot g$.<Sidenote>I checked this
+formula against finite differences for a nonlinear $f$. The supplement writes the first two
+terms with plus signs and the middle coefficient as 1, and it writes the quadratic term of
+$\gamma$ with a plus sign. Signs and constant factors in $R$ do not matter, because $R$ is only
+bounded in absolute value. The quadratic term must have a minus sign, because the log-likelihood
+curves downward. The conclusion the paper draws, $\hat u \approx M_f^{-1}S_N$, is the one that
+holds with the correct sign.</Sidenote>
+
+**Step 3: the score is asymptotically normal.** $S_N = a_N^{-1}\sum_i\xi_i$ with
+$\xi_i = (y_i - p_i)\dot g_i$. The $\xi_i$ are independent and identically distributed, but their
+distribution depends on $N$ through $\alpha^*$. This is why we need the Lindeberg–Feller CLT.
+
+- *3a. Mean.* Given $x$, $y$ is 1 with probability $p$, so $\mathbb E(y - p \mid x) = 0$ and
+  $\mathbb E(\xi \mid x) = 0\cdot\dot g = 0$. Averaging over $x$: $\mathbb E\xi = 0$.
+- *3b. Variance.* The **law of total variance** says
+  $\operatorname{Var}(\xi) = \mathbb E\{\operatorname{Var}(\xi\mid x)\} + \operatorname{Var}\{\mathbb E(\xi \mid x)\}$.
+  The second part is 0 by 3a. Given $x$, $\dot g$ is fixed and $y - p$ has variance $\psi$, so
+  $\operatorname{Var}(\xi \mid x) = \psi\,\dot g\dot g^\top$. The $N$ terms are independent, so
+  their variances add:
+
+$$
+\operatorname{Var}(S_N) = \frac{N}{a_N^2}\,\mathbb E\{\psi\,\dot g\dot g^\top\}
+= \mathbb E\{e^{-\alpha^*}\psi\,\dot g\dot g^\top\}
+= \mathbb E\left\{\frac{e^{f}}{(1+e^{\alpha^*+f})^2}\dot g\dot g^\top\right\}.
+$$
+
+  The middle equality uses $N/a_N^2 = e^{-\alpha^*}$, and the last uses (F3). Each entry of the
+  matrix inside is at most $e^f\|\dot g\|^2$ in absolute value (because
+  $|\dot g_j\dot g_k| \le \|\dot g\|^2$), which has a finite mean. For every $x$ the integrand
+  tends to $e^f\dot g\dot g^\top$. By dominated convergence, applied entry by entry,
+  $\operatorname{Var}(S_N) \to \mathbb E\{e^f\dot g\dot g^\top\} = M_f$. This is where
+  $e^{\alpha^*}$ cancels and $N$ disappears from the answer.
+
+- *3c. Lindeberg condition.* The terms of $S_N$ are $\xi_i/a_N$, so the condition is
+  $\sum_i\mathbb E\{\|\xi_i/a_N\|^2\mathbb 1(\|\xi_i/a_N\| > \epsilon)\} \to 0$. Equivalently,
+  $L_N := \sum_i\mathbb E\{\|\xi_i\|^2\mathbb 1(\|\xi_i\| > \epsilon a_N)\} = o(a_N^2)$. $\xi$ has
+  only two possible values: $(1-p)\dot g$ when $y = 1$ (probability $p$) and $-p\dot g$ when
+  $y = 0$ (probability $1 - p$). So
+
+$$
+L_N = N\,\mathbb E\big\{p(1-p)^2\|\dot g\|^2\,\mathbb 1\big((1-p)\|\dot g\| > \epsilon a_N\big)\big\}
++ N\,\mathbb E\big\{(1-p)p^2\|\dot g\|^2\,\mathbb 1\big(p\|\dot g\| > \epsilon a_N\big)\big\}.
+$$
+
+  Since $0 \le p \le 1$: if $(1-p)\|\dot g\| > \epsilon a_N$ then certainly
+  $\|\dot g\| > \epsilon a_N$, and the same for $p\|\dot g\|$. So both indicators are at most
+  $\mathbb 1(\|\dot g\| > \epsilon a_N)$. Also $p(1-p)^2 \le p$ and $(1-p)p^2 \le p$. With (F1),
+
+$$
+\begin{aligned}
+L_N &\le 2N\,\mathbb E\{p\,\|\dot g\|^2\,\mathbb 1(\|\dot g\| > \epsilon a_N)\} \\
+&\le 2Ne^{\alpha^*}\,\mathbb E\{e^f\|\dot g\|^2\,\mathbb 1(\|\dot g\| > \epsilon a_N)\}
+= 2a_N^2\,\mathbb E\{e^f\|\dot g\|^2\,\mathbb 1(\|\dot g\| > \epsilon a_N)\}.
+\end{aligned}
+$$
+
+  $\dot g = \dot g(x;\theta^*)$ does not depend on $N$, because $\dot g = (1, \partial f/\partial\beta)$
+  and $\beta^*$ is fixed. So for every fixed $x$ the indicator is 0 once
+  $a_N > \|\dot g(x)\|/\epsilon$. The integrand therefore tends to 0, under the roof
+  $e^f\|\dot g\|^2$, and by dominated convergence the expectation tends to 0. Hence
+  $L_N = o(a_N^2)$.
+
+- *3d. Conclusion.* By the Lindeberg–Feller CLT, $S_N \to N(0, M_f)$ in distribution (equation
+  S.3). The CLT in the toolkit is for numbers; for vectors one uses the **Cramér–Wold device**:
+  a random vector converges to $N(0, \Sigma)$ if every fixed linear combination $l^\top S_N$
+  converges to $N(0, l^\top\Sigma l)$. Steps 3a–3c apply word for word to $l^\top\xi_i$.
+
+**Step 4: the curvature converges to $M_f$ (equation S.4).** The mean of $H_N$ is
+$(N/a_N^2)\,\mathbb E\{\psi\dot g\dot g^\top\}$, exactly the matrix in 3b, so
+$\mathbb E H_N \to M_f$. For each entry $(j, k)$, the $N$ terms are independent, so
+
+$$
+\begin{aligned}
+\operatorname{Var}\big((H_N)_{jk}\big) &= \frac{N}{a_N^4}\operatorname{Var}(\psi\,\dot g_j\dot g_k)
+\le \frac{N}{a_N^4}\mathbb E\{\psi^2\|\dot g\|^4\}
+\le \frac{N}{a_N^4}\mathbb E\{p\,\|\dot g\|^4\} \\
+&\le \frac{Ne^{\alpha^*}}{a_N^4}\mathbb E\{e^f\|\dot g\|^4\}
+= \frac{\mathbb E\{e^f\|\dot g\|^4\}}{a_N^2} \longrightarrow 0.
+\end{aligned}
+$$
+
+The steps use $\operatorname{Var}(Z) \le \mathbb E Z^2$, then $\psi^2 \le p$, then (F1), then
+$Ne^{\alpha^*} = a_N^2$. By Chebyshev, each entry of $H_N$ is close to its mean with high
+probability, and the means converge to $M_f$. So $H_N \to M_f$ in
+probability.<Sidenote>The supplement cites Lemma 28 of Wang (2019) for this step. The direct
+mean-and-variance argument here gives the same result.</Sidenote>
+
+**Step 5: the leftovers vanish.**
+
+*$\Delta_\ell$.* Each term contains $y_i - p_i$, which has conditional mean 0, so
+$\mathbb E\Delta_\ell = 0$. Given $x$, the variance of $(y - p)\,u^\top\ddot g u$ is
+$\psi\,(u^\top\ddot g u)^2$. Also $|u^\top\ddot g u| \le \|u\|^2\|\ddot g\|$ (Cauchy–Schwarz,
+with $\|\ddot g\|$ the Frobenius norm, the square root of the sum of squared entries). So
+
+$$
+\operatorname{Var}(\Delta_\ell) = \frac{N}{4a_N^4}\mathbb E\{\psi\,(u^\top\ddot g u)^2\}
+\le \frac{\|u\|^4N}{4a_N^4}\mathbb E\{p\,\|\ddot g\|^2\}
+\le \frac{\|u\|^4}{4a_N^2}\mathbb E\{e^f\|\ddot g\|^2\} \longrightarrow 0,
+$$
+
+and Chebyshev gives $\Delta_\ell = o_P(1)$.
+
+*$R$.* First bound each piece of $D_i$ in absolute value: $|u^\top\dot g| \le \|u\|\|\dot g\|$,
+$|u^\top\ddot g u| \le \|u\|^2\|\ddot g\|$, $|\sum_{jk}u_ju_k u^\top\dddot g_{jk}| \le \|u\|^3\sum_{jk}\|\dddot g_{jk}\|$,
+$|1 - 2p| \le 1$, $\psi \le p$, and $|y - p| \le y + p$. With
+$C(x, \theta) := \|\dot g\|^3 + \|\dot g\|\|\ddot g\| + \sum_{jk}\|\dddot g_{jk}\|$, this gives
+
+$$
+|D_i(\tilde\theta)| \le 3\|u\|^3\,p(x_i;\tilde\theta)\,C(x_i, \tilde\theta) + \|u\|^3\,y_i\sum_{jk}\|\dddot g_{jk}(x_i;\tilde\theta)\|.
+$$
+
+Two more facts. (i) The probability at the intermediate point is still small. Writing
+$\tilde\theta = (\tilde\alpha, \tilde\beta)$, we have $\tilde\alpha \le \alpha^* + \|u\|/a_N$, and
+$\tilde\beta$ is within $\|u\|/a_N$ of $\beta^*$. So, as in (F1),
+$p(x;\tilde\theta) \le e^{\tilde\alpha}e^{f(x;\tilde\beta)} \le e^{\alpha^*}e^{\|u\|/a_N}e^{f(x;\tilde\beta)}$.
+(ii) $\alpha$ enters $g$ linearly, so third derivatives of $g$ are third derivatives of $f$.
+Assumption 1 bounds each of them by $B(x)$, so $\sum_{jk}\|\dddot g_{jk}\| \le K B(x)$ for a
+constant $K$ that depends only on $d$. Summing over $i$ and dividing by $6a_N^3$, and using
+$e^{\alpha^*}/a_N^3 = 1/(Na_N)$:
+
+$$
+|R| \le \underbrace{\frac{\|u\|^3e^{\|u\|/a_N}}{2Na_N}\sum_{i=1}^N e^{f(x_i;\tilde\beta)}C(x_i, \tilde\theta)}_{\Delta_{R1}}
++ \underbrace{\frac{K\|u\|^3}{6a_N^3}\sum_{i=1}^N y_iB(x_i)}_{\Delta_{R2}}.
+$$
+
+This is where Assumption 1 does its main work. The paper uses it to bound
+$e^{f(x;\beta)}C(x, \theta)$ by $K'B(x)$ for parameters near the truth. Then
+$\mathbb E\Delta_{R1} \le K'\|u\|^3e^{\|u\|/a_N}\,\mathbb E B/(2a_N) \to 0$. For the second part,
+$\mathbb E(y_iB(x_i)) = \mathbb E\{pB\} \le e^{\alpha^*}\mathbb E\{e^fB\}$, so
+$\mathbb E\Delta_{R2} \le K\|u\|^3Ne^{\alpha^*}\mathbb E\{e^fB\}/(6a_N^3) = K\|u\|^3\mathbb E\{e^fB\}/(6a_N) \to 0$.
+Both are non-negative, so Markov's inequality gives $\Delta_{R1}, \Delta_{R2} = o_P(1)$, hence
+$R = o_P(1)$.
+
+**Step 6: take the argmax.** For each fixed $u$, combine Steps 2, 4 and 5:
+
+$$
+\gamma(u) = u^\top S_N - \tfrac12 u^\top M_f u + r_N(u), \qquad
+r_N(u) = -\tfrac12 u^\top(H_N - M_f)u + \Delta_\ell + R = o_P(1).
+$$
+
+Now check the conditions of the Hjort–Pollard corollary. $\gamma$ is concave in $u$ (for linear
+$f$; see the toolkit's sidenote). $M_f$ is positive definite (Assumption 2 and the remark after
+it, with $v(x) = e^{f}$). $S_N$ converges in distribution (Step 3). So
+
+$$
+\hat u = a_N(\hat\theta_f - \theta^*) = M_f^{-1}S_N + o_P(1). \tag{S.5}
+$$
+
+By Step 3 and the linear-transform fact, $M_f^{-1}S_N \to N(0, M_f^{-1}M_fM_f^{-1}) = N(0, M_f^{-1})$.
+(Here $(M_f^{-1})^\top = M_f^{-1}$ because $M_f$ is symmetric.) By Slutsky, adding the $o_P(1)$
+term does not change the limit, so $a_N(\hat\theta_f - \theta^*) \to N(0, M_f^{-1})$.
+
+**Step 7: change the scale to $\sqrt{N_1}$.** Write
+$\sqrt{N_1}(\hat\theta_f - \theta^*) = (\sqrt{N_1}/a_N)\cdot a_N(\hat\theta_f - \theta^*)$. By Step
+0, $N_1/a_N^2 \to \mathbb E\{e^f\}$ in probability. The square root is continuous, so
+$\sqrt{N_1}/a_N \to \sqrt{\mathbb E\{e^f\}}$. By Slutsky the product converges to
+$\sqrt{\mathbb E\{e^f\}}\,Z$ with $Z \sim N(0, M_f^{-1})$. Multiplying a normal vector by a number
+$k$ multiplies its covariance by $k^2$, so the limit is
+$N(0, \mathbb E\{e^f\}M_f^{-1}) = N(0, V_f)$. ∎
+
+## Negative sampling
+
+Theorem 1 says the information lives in the positives, so keep all of them and subsample the
+negatives. The paper allows **nonuniform** sampling: a negative at $x$ is kept with probability
+
+$$
+\pi(x) = \rho\, \varphi(x), \qquad \mathbb E\{\varphi(x)\} = 1.
+$$
+
+$\rho$ is the overall **sampling rate** (on average a fraction $\rho$ of the negatives is kept)
+and $\varphi(x) > 0$ is the **sampling function**, which says which negatives are favoured.
+Uniform sampling is $\varphi \equiv 1$. The condition $\mathbb E\varphi = 1$ fixes the budget, so
+schemes with the same $\rho$ keep the same expected number of negatives.
+
+**Algorithm 1 (negative sampling).** For each example $i = 1, \dots, N$:
+
+- if $y_i = 1$, keep it and record its probability $\pi(x_i, y_i) = 1$;
+- if $y_i = 0$, draw $u_i \sim \text{Uniform}(0, 1)$ and keep it if $u_i \le \rho\varphi(x_i)$,
+  recording $\pi(x_i, y_i) = \rho\varphi(x_i)$.
+
+Let $\delta_i = 1$ if example $i$ is kept and $0$ otherwise. In one line,
+$\pi(x_i, y_i) = y_i + (1 - y_i)\rho\varphi(x_i)$. Each example is handled independently, so this
+works in one pass over a stream.
+
+The explorer runs Algorithm 1 on a scaled-down version of the running example: $N = 50{,}000$
+examples with $\alpha^* = -5$, so about 1.1% are positive. The top panel is a histogram of $x$ on
+a log scale. For each bin, the left bar shows all negatives (grey) and the kept negatives (blue),
+and the right bar shows the positives (orange), all of which are kept. Under uniform sampling the
+blue bars are a constant fraction of the grey ones. Switch to **Optimal** and look at how the
+kept negatives move to the right, where positives live. The table fits three estimators to the
+subsample. Under uniform sampling the unweighted fit's $\hat\alpha$ lands near
+$\alpha^* - \log\rho$ (about $-1.1$ instead of $-5$ at $\rho = 0.02$) while its slope stays
+reasonable. Under optimal sampling its slope is badly wrong too. The next two sections fix this
+in two different ways. **Repeat** reruns the whole experiment 200 times and compares the average
+squared error with the predictions of Theorems 2 and 4.
+
+<NegativeSamplingExplorer alpha={-5} n={50000} rho={0.02} scheme="uniform" />
+
+## Theorem 2: what inverse probability weighting costs
+
+Fitting an ordinary model to the subsample gives the wrong answer. We threw away negatives, so
+positives look more common than they are, and the intercept comes out too high. The textbook
+fix is **inverse probability weighting** (IPW): weight each kept example by
+$1/\pi(x_i, y_i)$, so a kept negative that had a 1% chance of being kept counts as 100 negatives.
+This is [importance sampling](/blog/importance-sampling/) applied to the log-likelihood. The
+**IPW estimator** is
+
+$$
+\hat\theta_w = \arg\max_\theta \sum_{i=1}^N \frac{\delta_i}{\pi(x_i, y_i)} \Big[y_i g(x_i;\theta) - \log\{1 + e^{g(x_i;\theta)}\}\Big]. \tag{2}
+$$
+
+The weights make the weighted objective an unbiased estimate of the full-data objective:
+$\mathbb E(\delta_i / \pi_i \mid x_i, y_i) = 1$.
+
+> **Theorem 2.** Under Assumptions 1–3, if $\mathbb E[\{\varphi(x) + \varphi^{-1}(x)\} B^2(x)] < \infty$,
+> then $\sqrt{N_1}(\hat\theta_w - \theta^*) \to N(0, V_w)$ in distribution, where $V_w = V_f + V_{\text{sub}}$ and
+>
+> $$V_{\text{sub}} = c\, \mathbb E\{e^{f(x;\beta^*)}\}\, M_f^{-1}\, \mathbb E\{\varphi^{-1}(x)\, e^{2f(x;\beta^*)}\dot g^{\otimes 2}(x;\theta^*)\}\, M_f^{-1}.$$
+
+**In words.** The subsample estimator converges at the same $\sqrt{N_1}$ rate as the full-data
+estimator. The price of sampling is an extra variance $V_{\text{sub}}$, proportional to $c$:
+
+- If $c = 0$, the kept negatives still outnumber the positives by a growing factor, and
+  **there is no asymptotic loss at all**: $V_w = V_f$. This holds even when $\rho \to 0$, so we
+  may throw away almost all negatives. The choice of $\varphi$ hardly matters here.
+- If $0 < c < \infty$, the kept negatives are comparable in number to the positives and the
+  loss $V_{\text{sub}}$ is real. This is where a good $\varphi$ matters.
+
+The extra condition on $\varphi$ asks that $\varphi$ be neither huge nor tiny where $B(x)$ is
+large. A $\varphi$ close to 0 means some negatives get enormous weights $1/\pi$, and the theorem
+needs those to be rare enough.
+
+**Worked example.** Uniform sampling ($\varphi = 1$) in the running example. We need
+$\mathbb E\{e^{2x}(1, x)^{\otimes 2}\} = e^{2}\left(\begin{smallmatrix}1 & 2\\ 2 & 5\end{smallmatrix}\right)$,
+from the facts with $s = 2$. Then
+
+$$
+V_{\text{sub}} = c\,e^{1/2}\cdot e^{-1}\begin{pmatrix}2 & -1\\ -1 & 1\end{pmatrix} e^{2}\begin{pmatrix}1 & 2\\ 2 & 5\end{pmatrix}\begin{pmatrix}2 & -1\\ -1 & 1\end{pmatrix}
+= c\,e^{3/2}\begin{pmatrix}1 & -1\\ -1 & 2\end{pmatrix}.
+$$
+
+For a balanced subsample (one positive per kept negative), $c = e^{-1/2}$, so
+$V_{\text{sub}} = e\left(\begin{smallmatrix}1 & -1\\ -1 & 2\end{smallmatrix}\right)$. Check one entry:
+$\operatorname{Var}(\hat\beta_w) \approx (1 + 2e)/N_1 = 6.44/N_1$, against $1/N_1$ for the full
+data. The total, $\operatorname{tr}(V_w) = 3 + 3e \approx 11.2$, is 3.7 times the full-data
+value of 3. Uniform sampling down to a balanced dataset with IPW is expensive.
+
+The chart shows $\operatorname{tr}(V_w)$ for uniform sampling as the subsample gets more balanced.
+The horizontal axis is $c\,\mathbb E\{e^f\}$, the number of positives per kept negative. At 0.1 (ten
+kept negatives per positive) the loss is already small.
+
+<LineChart
+	x={() => Array.from({ length: 81 }, (_, i) => i * 0.025)}
+	series={[
+		{ name: "Full data, tr(V_f)", fn: () => trace2(VF) },
+		{ name: "Uniform sampling + IPW, tr(V_w)", fn: (r) => trace2(varianceIpw(phiUniform, ratioToC(r))) },
+	]}
+	title="Asymptotic squared error × N₁, running example"
+	xLabel="positives per kept negative, c·E{e^f}"
+	yLabel="tr(V)"
+	height={280}
+/>
+
+#### Proof of Theorem 2
+
+The proof runs the seven steps of Theorem 1 on the weighted log-likelihood
+
+$$
+\ell_w(\theta) = \sum_{i=1}^N \frac{\delta_i}{\pi_i}\Big[y_i g(x_i;\theta) - \log\{1 + e^{g(x_i;\theta)}\}\Big], \qquad \pi_i = \pi(x_i, y_i) = y_i + (1 - y_i)\rho\varphi(x_i).
+$$
+
+Two facts about the sampling drive everything. **(W1)** Algorithm 1 keeps example $i$ with
+probability $\pi_i$, so $\mathbb E(\delta_i \mid x_i, y_i) = \pi_i$, and therefore
+$\mathbb E(\delta_i/\pi_i \mid x_i, y_i) = 1$. **(W2)** $\delta_i$ is 0 or 1, so
+$\delta_i^2 = \delta_i$. Write $c_N = e^{\alpha^*}/\rho$, which tends to $c$ by Assumption 3, so
+it stays bounded.
+
+The extra moment condition $\mathbb E[\{\varphi + \varphi^{-1}\}B^2] < \infty$ is used through
+three consequences that the paper lists:
+$\mathbb E\{\varphi e^f\|\dot g\|^2\} < \infty$ (S.6),
+$\mathbb E\{(1 + \varphi^{-1})e^{2f}\|\dot g\|^4\} < \infty$ (S.7) and
+$\mathbb E\{\varphi^{-1}e^{2f}\|\ddot g\|^2\} < \infty$ (S.8). Since $\|\dot g\| \ge 1$, (S.7)
+also gives $\mathbb E\{\varphi^{-1}e^{2f}\|\dot g\|^2\} < \infty$.
+
+**Steps 0–2.** Step 0 is unchanged, since $N_1$ is still the number of positives in the full
+data. Define $\gamma_w(u) = \ell_w(\theta^* + u/a_N) - \ell_w(\theta^*)$, which is maximized at
+$a_N(\hat\theta_w - \theta^*)$. The weights $\delta_i/\pi_i$ do not depend on $\theta$, so every
+derivative in the Taylor expansion is Theorem 1's derivative with each example multiplied by its
+weight:
+
+$$
+\gamma_w(u) = u^\top S_w - \tfrac12 u^\top H_w u + \Delta_w + R_w,
+$$
+
+$$
+\begin{aligned}
+S_w &= \frac{1}{a_N}\sum_i\frac{\delta_i}{\pi_i}(y_i - p_i)\dot g_i, &
+H_w &= \frac{1}{a_N^2}\sum_i\frac{\delta_i}{\pi_i}\psi_i\dot g_i\dot g_i^\top, \\
+\Delta_w &= \frac{1}{2a_N^2}\sum_i\frac{\delta_i}{\pi_i}(y_i - p_i)u^\top\ddot g_iu, &
+R_w &= \frac{1}{6a_N^3}\sum_i\frac{\delta_i}{\pi_i}D_i(\tilde\theta).
+\end{aligned}
+$$
+
+**Step 3: the weighted score.** $S_w = a_N^{-1}\sum_i\eta_i$ with
+$\eta_i = (\delta_i/\pi_i)(y_i - p_i)\dot g_i$, independent and identically distributed.
+
+- *3a. Mean.* Given $(x, y)$, only $\delta$ is random, so by (W1)
+  $\mathbb E(\eta \mid x, y) = (y - p)\dot g\,\mathbb E(\delta/\pi \mid x, y) = (y - p)\dot g$.
+  Averaging over $y$ given $x$ gives 0, exactly as in Theorem 1.
+- *3b. Variance.* Since the mean is 0,
+  $\operatorname{Var}(\eta \mid x) = \mathbb E(\eta\eta^\top \mid x) = \mathbb E\{\delta(y-p)^2/\pi^2 \mid x\}\,\dot g\dot g^\top$.
+  By (W1), averaging $\delta$ first turns $\delta/\pi^2$ into $1/\pi$, so this is
+  $\mathbb E\{(y - p)^2/\pi \mid x\}\,\dot g\dot g^\top$. Now split by label. With probability
+  $p$, $y = 1$, $\pi = 1$ and $(y - p)^2 = (1 - p)^2$. With probability $1 - p$, $y = 0$,
+  $\pi = \rho\varphi(x)$ and $(y - p)^2 = p^2$. So
+
+$$
+\operatorname{Var}(\eta \mid x) = \Big\{p(1-p)^2 + \frac{(1-p)\,p^2}{\rho\varphi(x)}\Big\}\dot g\dot g^\top.
+$$
+
+  The first part is the positives' contribution, as in Theorem 1. The second is the kept
+  negatives': each is kept with probability $\rho\varphi$ but counted $1/(\rho\varphi)$ times,
+  and the two factors leave a net $1/(\rho\varphi)$. Multiply by $N/a_N^2 = e^{-\alpha^*}$ and
+  rewrite each part with (F2):
+
+$$
+\begin{aligned}
+e^{-\alpha^*}p(1-p)^2 &= \frac{e^{f}(1-p)^2}{1 + e^{\alpha^*+f}} \to e^{f}, \\
+e^{-\alpha^*}\frac{(1-p)p^2}{\rho\varphi} &= \frac{e^{\alpha^*}}{\rho}\cdot\frac{(e^{-\alpha^*}p)^2(1-p)}{\varphi}
+= c_N\,\frac{e^{2f}(1-p)}{(1 + e^{\alpha^*+f})^2\varphi} \to c\,\frac{e^{2f}}{\varphi}.
+\end{aligned}
+$$
+
+  The roofs are $e^f\|\dot g\|^2$ and $(\sup_N c_N)\,e^{2f}\|\dot g\|^2/\varphi$, both with
+  finite means. By dominated convergence,
+
+$$
+\operatorname{Var}(S_w) \to M_w := \mathbb E\{e^f\dot g\dot g^\top\} + c\,\mathbb E\{\varphi^{-1}e^{2f}\dot g\dot g^\top\} = \mathbb E\left[\Big\{1 + \frac{c\,e^{f}}{\varphi(x)}\Big\}e^{f}\dot g\dot g^\top\right].
+$$
+
+- *3c. Lindeberg condition.* $\eta$ now has three possible values: $(1-p)\dot g$ for a
+  positive (probability $p$), $-p\dot g/(\rho\varphi)$ for a kept negative (probability
+  $(1-p)\rho\varphi$), and $0$ for a dropped negative, which contributes nothing. So
+
+$$
+\begin{aligned}
+L_N = {}& N\,\mathbb E\big\{p(1-p)^2\|\dot g\|^2\,\mathbb 1\big((1-p)\|\dot g\| > \epsilon a_N\big)\big\} \\
+&+ N\,\mathbb E\left\{(1-p)\rho\varphi\cdot\frac{p^2\|\dot g\|^2}{(\rho\varphi)^2}\,\mathbb 1\Big(\frac{p\|\dot g\|}{\rho\varphi} > \epsilon a_N\Big)\right\}.
+\end{aligned}
+$$
+
+  The first part is at most $a_N^2\,\mathbb E\{e^f\|\dot g\|^2\mathbb 1(\|\dot g\| > \epsilon a_N)\} = o(a_N^2)$,
+  exactly as in Theorem 1. In the second, cancel one $\rho\varphi$, drop $1 - p \le 1$, and use
+  (F1) twice: once in $p^2 \le e^{2\alpha^*}e^{2f}$ and once inside the indicator, where
+  $p/(\rho\varphi) \le c_Ne^{f}/\varphi$. Then
+
+$$
+\begin{aligned}
+\text{second part} &\le \frac{Ne^{2\alpha^*}}{\rho}\,\mathbb E\left\{\frac{e^{2f}\|\dot g\|^2}{\varphi}\,\mathbb 1\Big(\frac{c_Ne^{f}\|\dot g\|}{\varphi} > \epsilon a_N\Big)\right\} \\
+&= a_N^2\,c_N\,\mathbb E\left\{\frac{e^{2f}\|\dot g\|^2}{\varphi}\,\mathbb 1\Big(\frac{c_Ne^{f}\|\dot g\|}{\varphi} > \epsilon a_N\Big)\right\},
+\end{aligned}
+$$
+
+  using $Ne^{2\alpha^*}/\rho = Ne^{\alpha^*}\cdot e^{\alpha^*}/\rho = a_N^2c_N$. Because $c_N$ stays
+  bounded and $a_N \to \infty$, the indicator tends to 0 for every $x$. The roof
+  $(\sup c_N)\,e^{2f}\|\dot g\|^2/\varphi$ has a finite mean, so by dominated convergence this
+  part is also $o(a_N^2)$.<Sidenote>I split $\eta$ by its three possible values. The supplement
+  groups the same terms slightly differently, but the bounds are the same.</Sidenote>
+- *3d.* By the Lindeberg–Feller CLT, $S_w \to N(0, M_w)$ in distribution (equation S.9).
+
+**Step 4: the curvature does not change.** By (W1), averaging the weight first gives
+$\mathbb E H_w = (N/a_N^2)\,\mathbb E\{\psi\dot g\dot g^\top\}$, the same mean as the unweighted
+$H_N$ of Theorem 1. So $\mathbb E H_w \to M_f$. For the variance of an entry, use
+$\operatorname{Var}(Z) \le \mathbb E Z^2$, then (W2) and (W1) to turn $\delta/\pi^2$ into $1/\pi$:
+
+$$
+\operatorname{Var}\big((H_w)_{jk}\big) \le \frac{N}{a_N^4}\mathbb E\left\{\frac{\psi^2\|\dot g\|^4}{\pi}\right\}.
+$$
+
+$\pi$ is either 1 or $\rho\varphi$, so $1/\pi \le 1 + 1/(\rho\varphi)$. With
+$\psi^2 \le p^2 \le e^{2\alpha^*}e^{2f}$ and $Ne^{2\alpha^*}/a_N^4 = 1/N$:
+
+$$
+\operatorname{Var}\big((H_w)_{jk}\big) \le \frac{1}{N}\mathbb E\left\{\Big(1 + \frac{1}{\rho\varphi}\Big)e^{2f}\|\dot g\|^4\right\}
+= \frac{1}{N\rho}\mathbb E\{(\rho + \varphi^{-1})e^{2f}\|\dot g\|^4\}.
+$$
+
+The expectation is finite by (S.7), since $\rho \le 1$. And $N\rho \to \infty$, because
+$N\rho = Ne^{\alpha^*}/c_N = a_N^2/c_N$ with $a_N \to \infty$ and $c_N$ bounded. So the variance
+tends to 0, and Chebyshev gives $H_w \to M_f$ in probability (equations S.10–S.12).
+
+**Step 5: the leftovers vanish.** *$\Delta_w$:* its mean is 0 by the same argument as 3a. For
+its variance, follow 3b with $u^\top\ddot g u$ in place of $\dot g$, and use
+$|u^\top\ddot g u| \le \|u\|^2\|\ddot g\|$:
+
+$$
+\begin{aligned}
+\operatorname{Var}(\Delta_w) &\le \frac{\|u\|^4N}{4a_N^4}\mathbb E\left[\Big\{p(1-p)^2 + \frac{(1-p)p^2}{\rho\varphi}\Big\}\|\ddot g\|^2\right]
+\le \frac{\|u\|^4N}{4a_N^4}\mathbb E\left[\Big\{1 + \frac{p}{\rho\varphi}\Big\}p\,\|\ddot g\|^2\right] \\
+&\le \frac{\|u\|^4}{4a_N^2}\mathbb E\left[\Big\{1 + \frac{c_Ne^{f}}{\varphi}\Big\}e^{f}\|\ddot g\|^2\right] \to 0.
+\end{aligned}
+$$
+
+The expectation is finite by (S.8). *$R_w$:* every term in Theorem 1's bound on $|R|$ is now
+multiplied by a weight $\delta_i/\pi_i \ge 0$, giving bounds $\Delta_{Rw1}$ and $\Delta_{Rw2}$. By
+(W1) the weights average to 1, so $\mathbb E\Delta_{Rw1} = \mathbb E\Delta_{R1} \to 0$ and
+$\mathbb E\Delta_{Rw2} = \mathbb E\Delta_{R2} \to 0$. Markov gives $R_w = o_P(1)$.
+
+**Step 6.** As in Theorem 1, $a_N(\hat\theta_w - \theta^*) = M_f^{-1}S_w + o_P(1)$, and this
+converges to $N(0, M_f^{-1}M_wM_f^{-1})$.
+
+**Step 7.** Multiplying by $\sqrt{N_1}/a_N \to \sqrt{\mathbb E e^f}$ multiplies the covariance
+by $\mathbb E\{e^f\}$:
+
+$$
+V_w = \mathbb E\{e^f\}M_f^{-1}M_wM_f^{-1}
+= \underbrace{\mathbb E\{e^f\}M_f^{-1}M_fM_f^{-1}}_{V_f} + \underbrace{c\,\mathbb E\{e^f\}M_f^{-1}\mathbb E\{\varphi^{-1}e^{2f}\dot g\dot g^\top\}M_f^{-1}}_{V_{\text{sub}}}. \;∎
+$$
+
+**Why the answer is a sandwich.** The curvature $M_f^{-1}$ is the bread and the score variance
+$M_w$ is the filling. For an ordinary MLE the two are equal (the information identity in the
+toolkit), and the sandwich collapses to $M_f^{-1}$. IPW keeps the curvature (Step 4) but inflates
+the score variance (Step 3b), and that mismatch is the variance inflation $V_{\text{sub}}$.
+
+## Theorem 3: the optimal sampling probability
+
+If the variance inflation matters (the $0 < c < \infty$ case), which $\varphi$ makes it smallest?
+The paper minimizes $\operatorname{tr}(V_w)$, the asymptotic expected squared error.<Sidenote>The
+paper motivates the trace through the tail probability of the error: if the eigenvalues of $V_w$
+are $\lambda_j$, the error behaves like $\sum_j \lambda_j z_j^2$ for independent standard normals
+$z_j$. A smaller trace makes this smaller *on average*, but not necessarily at every tail level,
+so "expected squared error" is the safer reading.</Sidenote>
+
+> **Theorem 3.** For a given sampling rate $\rho$, the asymptotically optimal $\varphi(x)$ that
+> minimizes $\operatorname{tr}(V_w)$ is
+>
+> $$\varphi_{os}(x) = \frac{\min\{t(x;\theta^*), T\}}{\mathbb E[\min\{t(x;\theta^*), T\}]}, \qquad t(x;\theta) = p(x;\theta)\,\|M_f^{-1}\dot g(x;\theta)\|,$$
+>
+> where $T$ is the largest number such that $\rho\min\{t(x;\theta^*), T\} \le \mathbb E[\min\{t(x;\theta^*), T\}]$ with probability one.
+
+**In words.** Keep a negative with probability proportional to
+$t(x) = p(x)\,\|M_f^{-1}\dot g(x)\|$. The score has two factors:
+
+- $p(x;\theta^*)$: **prefer negatives that look like positives**. A negative with a high
+  predicted click probability is a "hard negative". It is surprising, so it teaches the model
+  the most.
+- $\|M_f^{-1}\dot g(x;\theta^*)\|$: **prefer negatives whose gradient moves the parameters a
+  lot**, measured in the directions where the parameters are least certain. This is the
+  **A-optimality** criterion from the design of experiments ("A" for average variance).
+
+$T$ is a cap. A probability cannot exceed 1, so $\rho\varphi(x) \le 1$, and if some $t(x)$ is huge
+the formula would ask for more than certainty. The fix is to cap $t$ at $T$ and spread the
+budget over the rest. **Remark 1** in the paper notes that when $\rho \to 0$ the cap is never
+reached, so $T = \infty$ in practice for very imbalanced data. If $\rho$ does not go to 0, then
+$c = 0$ and sampling costs nothing anyway, so the cap only matters for mildly imbalanced data.
+
+The paper also mentions two cheaper variants. Replacing $\|M_f^{-1}\dot g\|$ with $\|\dot g\|$
+gives **L-optimality**, which avoids inverting $M_f$. Dropping the gradient term and using
+$\varphi \propto p(x)$ alone is not optimal but still beats uniform sampling, because it uses
+the model's structure. This is close in spirit to **local case-control sampling** (Fithian and
+Hastie, 2014). The paper's real-data experiment uses this simplest version.
+
+**Worked example.** In the running example
+$M_f^{-1}\dot g = e^{-1/2}(2 - x,\; x - 1)$, so
+
+$$
+\varphi_{os}(x) \propto e^{x}\sqrt{(2-x)^2 + (x-1)^2}.
+$$
+
+Normalizing so the mean is 1 gives $\varphi_{os}(0) = 0.89$, $\varphi_{os}(2) = 2.93$ and
+$\varphi_{os}(3) = 17.8$: a negative at $x = 3$ is kept 20 times as often as one at $x = 0$. The
+chart compares it with uniform sampling and with $\varphi \propto p(x)$.
+
+<LineChart
+	x={() => Array.from({ length: 121 }, (_, i) => -3 + i * 0.05)}
+	series={[
+		{ name: "uniform, φ = 1", fn: phiUniform },
+		{ name: "φ ∝ p(x)", fn: phiProbability },
+		{ name: "optimal φ_os (A-optimal)", fn: phiOptimal },
+	]}
+	title="Sampling functions for the running example (mean 1 under x ~ N(0, 1))"
+	xLabel="feature x"
+	yLabel="φ(x)"
+	height={300}
+/>
+
+The A-optimal curve rises like $e^x$ but is lifted at negative $x$. Negatives far to the left
+have tiny $p(x)$, yet they still carry information about the slope, because $\dot g = (1, x)$
+is large there.
+
+How much does it help? The minimum value of the inflation term is (shown in the proof below)
+$\operatorname{tr}(V_{\text{sub}}) = c\,\mathbb E\{e^f\}\,(\mathbb E h)^2$ with
+$h(x) = e^{f}\|M_f^{-1}\dot g\|$. Here $\mathbb E h = 1.530$. For a balanced subsample
+($c\,\mathbb E e^f = 1$) that is $1.530^2 = 2.34$, so $\operatorname{tr}(V_w) = 5.34$ against
+$11.16$ for uniform sampling, less than half. The simple rule $\varphi \propto p(x)$ gives
+exactly $V_w = (1 + c\,\mathbb E e^f)\, V_f$ in this example, a trace of $6.0$ at balance.<Sidenote>
+With $\varphi = e^{x}/e^{1/2}$, the middle matrix of $V_{\text{sub}}$ is
+$e^{1/2}\mathbb E\{e^{x}\dot g^{\otimes 2}\} = e^{1/2}M_f$, so
+$V_{\text{sub}} = c\,e\,M_f^{-1} = c\,e^{1/2}V_f$. This is the warm-up's $1 + N_1/K$ again.</Sidenote>
+
+#### Proof of Theorem 3
+
+**Step 1: only $V_{\text{sub}}$ matters.** $V_w = V_f + V_{\text{sub}}$, and $V_f$ does not involve
+$\varphi$. So minimizing $\operatorname{tr}(V_w)$ over $\varphi$ is the same as minimizing
+$\operatorname{tr}(V_{\text{sub}})$. If $c = 0$, $V_{\text{sub}} = 0$ for every $\varphi$ and
+there is nothing to choose, so assume $c > 0$.
+
+**Step 2: rewrite $V_{\text{sub}}$ with $p$.** From (F2), $e^{f} = e^{-\alpha^*}p\,(1 + e^{\alpha^*+f})$,
+so $e^{2f} = e^{-2\alpha^*}p^2\{1 + o(1)\}$, where the $o(1)$ is $(1+e^{\alpha^*+f})^2 - 1 \to 0$.
+Substituting into the formula for $V_{\text{sub}}$:
+
+$$
+V_{\text{sub}} = \underbrace{c\,\mathbb E\{e^f\}\,e^{-2\alpha^*}}_{\text{does not involve } \varphi}\;M_f^{-1}\,\mathbb E\{\varphi^{-1}p^2\dot g\dot g^\top\}\,M_f^{-1}\,\{1 + o(1)\}.
+$$
+
+The front factor is a positive constant, so it is enough to minimize the trace of
+$M_f^{-1}\mathbb E\{\varphi^{-1}p^2\dot g\dot g^\top\}M_f^{-1}$.
+
+**Step 3: turn the matrix into a number.** The trace is linear, so it can be moved inside the
+expectation:
+
+$$
+\operatorname{tr}\Big(M_f^{-1}\mathbb E\{\varphi^{-1}p^2\dot g\dot g^\top\}M_f^{-1}\Big)
+= \mathbb E\Big\{\varphi^{-1}p^2\operatorname{tr}\big(M_f^{-1}\dot g\dot g^\top M_f^{-1}\big)\Big\}.
+$$
+
+Let $v = M_f^{-1}\dot g$, a column vector. Since $M_f$ is symmetric,
+$\dot g^\top M_f^{-1} = v^\top$, so $M_f^{-1}\dot g\dot g^\top M_f^{-1} = vv^\top$. The trace of
+$vv^\top$ is $\sum_j v_j^2 = \|v\|^2$. Therefore
+
+$$
+p^2\operatorname{tr}\big(M_f^{-1}\dot g\dot g^\top M_f^{-1}\big) = \|p\,M_f^{-1}\dot g\|^2 = t^2(x;\theta^*),
+$$
+
+and the problem becomes
+
+$$
+\text{minimize } \mathbb E\left\{\frac{t^2(x)}{\varphi(x)}\right\} \quad\text{subject to}\quad \mathbb E\{\varphi(x)\} = 1 \text{ and } 0 < \varphi(x) \le \rho^{-1}.
+$$
+
+The budget $\mathbb E\varphi = 1$ comes from the definition of $\varphi$. The upper bound holds
+because $\pi = \rho\varphi$ is a probability, so $\rho\varphi \le 1$. (I write $t(x)$ for
+$t(x;\theta^*)$ from here on.)
+
+**Step 4: the case without the cap.** Suppose $\rho\,t(x) \le \mathbb E t$ for every $x$, so that
+$\varphi = t/\mathbb E t$ respects the upper bound. (Remark 1 says this is the typical case when
+$\rho \to 0$.) The **Cauchy–Schwarz inequality** for expectations says
+$(\mathbb E[AB])^2 \le \mathbb E[A^2]\,\mathbb E[B^2]$, with equality exactly when $A$ is a constant
+multiple of $B$.<Sidenote>Proof: for every number $\lambda$,
+$0 \le \mathbb E[(A - \lambda B)^2] = \mathbb E A^2 - 2\lambda\mathbb E[AB] + \lambda^2\mathbb E B^2$.
+A quadratic in $\lambda$ that is never negative has a discriminant that is not positive:
+$4(\mathbb E[AB])^2 - 4\,\mathbb E A^2\,\mathbb E B^2 \le 0$. Equality means some $\lambda$ makes
+$\mathbb E[(A - \lambda B)^2] = 0$, that is $A = \lambda B$.</Sidenote> Take
+$A = t/\sqrt\varphi$ and $B = \sqrt\varphi$, so $AB = t$:
+
+$$
+(\mathbb E\,t)^2 \le \mathbb E\left[\frac{t^2}{\varphi}\right]\mathbb E[\varphi] = \mathbb E\left[\frac{t^2}{\varphi}\right].
+$$
+
+The left side does not involve $\varphi$, so no admissible $\varphi$ can make the objective smaller
+than $(\mathbb E t)^2$. Equality needs $t/\sqrt\varphi = \lambda\sqrt\varphi$, that is
+$\varphi = t/\lambda$, and the budget $\mathbb E\varphi = 1$ forces $\lambda = \mathbb E t$. So
+$\varphi_{os} = t/\mathbb E t$ reaches the lower bound, and the minimum value is
+$(\mathbb E t)^2$.
+
+**Step 5: the general case, with the cap $T$.** Let $m(x) = \min\{t(x), T\}$ and
+$\zeta = 1/\mathbb E m$, a fixed positive number. First split $t^2$. If $t \le T$ then $m = t$; if
+$t > T$ then $m = T$. In both cases
+
+$$
+t^2 = m^2 + (t^2 - T^2)\,\mathbb 1(t > T).
+$$
+
+Next, an algebraic identity for any positive $\varphi$ and any $a$, checked by expanding the
+square:
+
+$$
+\Big(\sqrt\varphi - \frac{a}{\sqrt\varphi}\Big)^2 = \varphi - 2a + \frac{a^2}{\varphi}
+\quad\Longrightarrow\quad
+\frac{a^2}{\varphi} = \Big(\sqrt\varphi - \frac{a}{\sqrt\varphi}\Big)^2 - \varphi + 2a.
+$$
+
+Apply it with $a = \zeta m$, multiply the split of $t^2$ by $\zeta^2/\varphi$, and take
+expectations:
+
+$$
+\mathbb E\left\{\frac{\zeta^2t^2}{\varphi}\right\}
+= \mathbb E\left[\Big(\sqrt\varphi - \frac{\zeta m}{\sqrt\varphi}\Big)^2\right] - \mathbb E\varphi + 2\zeta\,\mathbb E m
++ \mathbb E\left[\frac{\zeta^2(t^2 - T^2)}{\varphi}\mathbb 1(t > T)\right]
+= E_1 + E_2 + 1.
+$$
+
+The $+1$ is $-\mathbb E\varphi + 2\zeta\mathbb E m = -1 + 2$. $E_1$ is the first expectation and
+$E_2$ the last. $\zeta^2$ is a positive constant, so minimizing the objective means minimizing
+$E_1 + E_2$. We show that $\varphi_{os} = \zeta m$ minimizes both at once.
+
+- *$E_1$.* It is an average of squares, so $E_1 \ge 0$, and $E_1 = 0$ exactly when
+  $\varphi = \zeta m$ everywhere. That choice is admissible: $\mathbb E\{\zeta m\} = 1$, and
+  $\zeta m \le \rho^{-1}$ is the same as $\rho m \le \mathbb E m$, which is how $T$ was defined.
+- *$E_2$.* If $t \le T$ everywhere, $E_2 = 0$ for every $\varphi$, and we are done. Otherwise
+  $t > T$ with positive probability. Then $\rho T = \mathbb E m$. To see why, note that $T$
+  satisfies $\rho\min(t, T) \le \mathbb E\min(t, T)$, and on the event $t \ge T$ the left side is
+  $\rho T$, so $\rho T \le \mathbb E m$. If the inequality were strict, then since
+  $T' \mapsto \rho T' - \mathbb E\min(t, T')$ is continuous, a slightly larger $T'$ would still
+  satisfy $\rho T' \le \mathbb E\min(t, T')$. That would give
+  $\rho\min(t, T') \le \rho T' \le \mathbb E\min(t, T')$, contradicting that $T$ is the largest
+  such number. So $\zeta T = 1/\rho$. On the event $t > T$, $\varphi_{os} = \zeta T = \rho^{-1}$,
+  the largest value allowed. The integrand of $E_2$ is a positive number divided by $\varphi$,
+  so no admissible $\varphi$ can make it smaller there.
+
+$\varphi_{os}$ minimizes $E_1$ and $E_2$ simultaneously, so it minimizes their sum. ∎
+
+**The minimum value**, used in the worked example. With $T = \infty$, the minimum of
+$\mathbb E\{t^2/\varphi\}$ is $(\mathbb E t)^2$. Undoing Step 2 (where
+$t = e^{\alpha^*}e^{f}\|M_f^{-1}\dot g\|\{1+o(1)\}$, so the $e^{\alpha^*}$ factors cancel) gives
+$\operatorname{tr}(V_{\text{sub}}) = c\,\mathbb E\{e^f\}(\mathbb E h)^2$ with
+$h = e^{f}\|M_f^{-1}\dot g\|$.
+
+## Correcting the log odds instead of weighting
+
+There is something odd about IPW combined with optimal sampling. $\varphi_{os}$ keeps the most
+informative negatives with high probability, and then IPW gives those same negatives the
+*smallest* weights $1/\pi$. Meanwhile a rarely sampled, uninformative negative that happens to be
+kept gets a huge weight and can dominate the objective. The paper proposes a different correction.
+
+**What does the model look like on the sampled data?** Use Bayes' rule on the kept examples.
+A positive at $x$ is kept with probability 1; a negative at $x$ is kept with probability $\pi(x)$:
+
+$$
+\Pr(y = 1 \mid x, \delta = 1)
+= \frac{\Pr(y=1\mid x)\cdot 1}{\Pr(y=1 \mid x)\cdot 1 + \Pr(y=0\mid x)\,\pi(x)}
+= \frac{p}{p + (1-p)\pi(x)}.
+$$
+
+Divide top and bottom by $1-p$ and use $p/(1-p) = e^{g}$:
+
+$$
+p_\pi(x;\theta) := \Pr(y = 1 \mid x, \delta = 1) = \frac{e^{g}}{e^{g} + \pi(x)} = \frac{1}{1 + e^{-g(x;\theta) - l}}, \qquad l = -\log \pi(x). \tag{4}
+$$
+
+So **the sampled data follow the same model with the log odds shifted up by $l = -\log\pi(x)$**.
+Keeping 1% of negatives adds $-\log 0.01 = 4.61$ to every log odds. The shift is the same at every
+$x$ under uniform sampling and depends on $x$ under nonuniform sampling.
+
+The chart shows this for the explorer's setting ($\alpha^* = -5$) with uniform $\rho = 0.01$. The
+sampled data's curve is the population curve shifted left by 4.61. A model fit naively to the
+subsample learns the shifted curve. Subtracting the shift recovers the population curve.
+
+<LineChart
+	x={() => Array.from({ length: 161 }, (_, i) => -4 + i * 0.05)}
+	series={[
+		{ name: "population, p(x)", fn: (x) => sigmoid(-5 + x) },
+		{ name: "sampled data, p_π(x) with π = 0.01", fn: (x) => sigmoid(-5 + x - Math.log(0.01)) },
+	]}
+	title="Uniform negative sampling shifts the log odds by −log π = 4.61"
+	xLabel="feature x"
+	yLabel="Pr(y = 1 | x)"
+	height={280}
+/>
+
+**The likelihood estimator** fits the corrected model (4) to the kept data, with no weights:
+
+$$
+\hat\theta_{\text{lik}} = \arg\max_\theta \sum_{i=1}^N \delta_i\Big[y_i g(x_i;\theta) - \log\{1 + e^{g(x_i;\theta) + l_i}\}\Big], \qquad l_i = -\log \pi(x_i). \tag{5}
+$$
+
+In practice this is ordinary logistic training with a fixed **offset** $l_i$ added to the logit of
+each kept example. Two details matter:
+
+- **The offset applies to the kept positives too.** $l_i = -\log\pi(x_i)$ uses the probability
+  that *a negative at $x_i$* would have been kept, even when example $i$ is a positive that was
+  kept with certainty. Equation (4) is a statement about every kept example at $x$, whatever its
+  label.<Sidenote>When I first coded the estimator I set the offset to 0 for positives (since
+  their $\pi(x, 1) = 1$). The estimates were badly wrong: the simulated error was more than 1,000
+  times too large. Equation (4) makes clear why.</Sidenote>
+- **At prediction time drop the offset.** The fitted $g(x;\hat\theta_{\text{lik}})$ estimates the
+  population log odds; the offset belongs only to the sampled data.
+
+Why should this help? In (2), $\pi(x_i)$ appears as $1/\pi$; in (5) it appears as $\log\pi$. As
+$\pi \to 0$, $1/\pi$ blows up much faster than $\log(1/\pi)$. A kept negative with tiny $\pi$ can
+dominate the IPW objective, but in the likelihood it just has a larger offset.
+
+The paper notes earlier corrections that do not apply here. The bias correction for local
+case-control sampling (Fithian and Hastie, 2014) and Wang (2019) does not work for Algorithm 1,
+even for logistic regression. The log odds idea is adapted from Han et al. (2020).
+
+## Theorem 4: the corrected likelihood estimator
+
+> **Theorem 4.** Under Assumptions 1–3, if $\mathbb E\{e^{f(x;\beta^*)}\varphi^{-1}(x)B(x)\} < \infty$,
+> then $\sqrt{N_1}(\hat\theta_{\text{lik}} - \theta^*) \to N(0, V_{\text{lik}})$ in distribution, where
+>
+> $$V_{\text{lik}} = \mathbb E\{e^{f(x;\beta^*)}\}\,\Lambda_{\text{lik}}^{-1}, \qquad \Lambda_{\text{lik}} = \mathbb E\left[\frac{e^{f(x;\beta^*)}\dot g^{\otimes 2}(x;\theta^*)}{1 + c\,\varphi^{-1}(x)\,e^{f(x;\beta^*)}}\right].$$
+
+**In words.** The likelihood estimator also converges at rate $\sqrt{N_1}$. Its variance is the
+inverse of an information matrix $\Lambda_{\text{lik}}$, just like a full-data MLE. Compare
+$\Lambda_{\text{lik}}$ with $M_f = \mathbb E\{e^f\dot g^{\otimes 2}\}$: each $x$ is discounted by
+the factor $1/\{1 + c\,e^{f}/\varphi\}$. Read $c\,e^{f(x)}/\varphi(x)$ as "positives per kept negative
+near $x$". Where many negatives were kept relative to positives ($\varphi$ large or $e^f$ small),
+the discount is near 1 and nothing is lost. Where the kept negatives became scarce, information
+is lost. When $c = 0$, $\Lambda_{\text{lik}} = M_f$ and $V_{\text{lik}} = V_f$.
+
+The moment condition is weaker than Theorem 2's: $\varphi^{-1}$ appears once and multiplies $B$,
+not $B^2$. Small sampling probabilities hurt the likelihood estimator less.
+
+**Worked example.** In the running example with uniform sampling at balance
+($c\,\mathbb E e^f = 1$), numerical integration gives $\operatorname{tr}(V_{\text{lik}}) = 6.32$,
+against $11.16$ for IPW. With optimal sampling, $\operatorname{tr}(V_{\text{lik}}) = 5.18$ against
+$5.34$ for IPW.
+
+#### Proof of Theorem 4
+
+**Equation (4) in full (supplement S.4).** Fix $x$. Algorithm 1 decides whether to keep an
+example using only its $(x, y)$ and an independent uniform draw. So
+$\Pr(\delta = 1 \mid x, y = 1) = \pi(x, 1) = 1$ and $\Pr(\delta = 1 \mid x, y = 0) = \pi(x, 0) = \pi(x)$.
+By the definition of conditional probability, then splitting the denominator by label, then
+using the product rule $\Pr(y, \delta \mid x) = \Pr(y \mid x)\Pr(\delta \mid x, y)$:
+
+$$
+\Pr(y=1 \mid x, \delta=1) = \frac{\Pr(y=1, \delta=1 \mid x)}{\Pr(y=1, \delta=1 \mid x) + \Pr(y=0, \delta=1 \mid x)}
+= \frac{p\cdot 1}{p\cdot 1 + (1-p)\,\pi(x)}.
+$$
+
+Divide the numerator and denominator by $1 - p$ and use $p/(1-p) = e^{g}$:
+$e^{g}/(e^{g} + \pi)$. Divide again by $\pi$ and write $1/\pi = e^{l}$ with $l = -\log\pi$:
+$e^{g+l}/(1 + e^{g+l})$. This is (4).
+
+**Notation.** In this proof $\pi = \pi(x) = \rho\varphi(x)$ is the negative-class probability,
+$l = -\log\pi(x)$, $p_\pi = p_\pi(x;\theta^*)$ and $\psi_\pi = p_\pi(1 - p_\pi)$. Four exact facts
+replace (F1)–(F3).
+
+- **(G1)** $p\,(1 - p_\pi) = (1 - p)\,\pi\,p_\pi$ (equation S.19). Proof: from (4),
+  $p_\pi = e^g/(e^g + \pi)$ and $1 - p_\pi = \pi/(e^g + \pi)$; also $p = e^g/(1+e^g)$ and
+  $1 - p = 1/(1+e^g)$. Then
+  $p(1-p_\pi) = \dfrac{e^g}{1+e^g}\cdot\dfrac{\pi}{e^g+\pi}$ and
+  $(1-p)\pi p_\pi = \dfrac{1}{1+e^g}\cdot\pi\cdot\dfrac{e^g}{e^g+\pi}$, which are the same product.
+- **(G2)** $\pi\,p_\pi = e^{g}(1 - p_\pi) \le e^{\alpha^*}e^{f}$ (equation S.26). Proof: multiply
+  $p_\pi = e^g/(e^g+\pi)$ by $\pi$, and compare with $1 - p_\pi = \pi/(e^g+\pi)$.
+- **(G3)** $1 - p_\pi = \dfrac{\pi}{\pi + e^{g}} = \dfrac{1}{1 + c_N\,e^{f}/\varphi}$, where
+  $c_N = e^{\alpha^*}/\rho$. Proof: divide the numerator and denominator by $\rho\varphi$ and use
+  $e^g/(\rho\varphi) = (e^{\alpha^*}/\rho)\,e^f/\varphi$. As $N \to \infty$ this tends to
+  $1/\{1 + c\,e^f/\varphi\}$.
+- **(G4)** $\Pr(\delta = 1 \mid x) = p + (1-p)\pi$: positives are always kept, negatives with
+  probability $\pi$.
+
+**Step 2: derivatives.** Example $i$'s term in $\ell_{\text{lik}}$ is
+$\delta_i[y_ig_i - \log(1 + e^{g_i + l_i})]$, and $l_i$ does not depend on $\theta$. By the chain
+rule, $\partial\log(1 + e^{g+l})/\partial\theta = \dfrac{e^{g+l}}{1+e^{g+l}}\dot g = p_\pi\dot g$.
+So the gradient is $\delta(y - p_\pi)\dot g$, and differentiating again gives the Hessian
+$\delta\{(y - p_\pi)\ddot g - \psi_\pi\dot g\dot g^\top\}$. These are Theorem 1's formulas with
+$p$ replaced by $p_\pi$. The Taylor expansion of
+$\gamma_{\text{lik}}(u) = \ell_{\text{lik}}(\theta^* + u/a_N) - \ell_{\text{lik}}(\theta^*)$ is therefore
+
+$$
+\gamma_{\text{lik}}(u) = u^\top S_{\text{lik}} - \tfrac12u^\top H_{\text{lik}}u + \Delta_{\text{lik}} + R_{\text{lik}},
+$$
+
+$$
+S_{\text{lik}} = \frac{1}{a_N}\sum_i\delta_i(y_i - p_{\pi,i})\dot g_i, \quad
+H_{\text{lik}} = \frac{1}{a_N^2}\sum_i\delta_i\psi_{\pi,i}\dot g_i\dot g_i^\top, \quad
+\Delta_{\text{lik}} = \frac{1}{2a_N^2}\sum_i\delta_i(y_i - p_{\pi,i})u^\top\ddot g_iu,
+$$
+
+and $R_{\text{lik}}$ is $(6a_N^3)^{-1}\sum_i\delta_iD_i$ with $p$ replaced by $p_\pi$ inside $D_i$.
+
+**Step 3a: the score has mean zero.** Average over the two labels and over $\delta$ given $x$.
+A positive ($y = 1$, probability $p$) is always kept and contributes $1 - p_\pi$. A negative
+($y = 0$, probability $1 - p$) is kept with probability $\pi$ and contributes $0 - p_\pi$. So
+
+$$
+\mathbb E\{\delta(y - p_\pi)\dot g \mid x\} = \big\{p\,(1 - p_\pi) - (1-p)\,\pi\,p_\pi\big\}\dot g = 0
+$$
+
+by (G1) (equation S.18). This is the precise sense in which (4) is the right model for the
+sampled data: at $\theta^*$, its predicted probability agrees with the sampled labels on average.
+
+**Step 3b: the score's variance.** The mean is 0, so the variance is the mean of the square. Use
+the same two cases, and note $\delta^2 = \delta$:
+
+$$
+\operatorname{Var}\{\delta(y - p_\pi)\dot g \mid x\} = \big\{p\,(1 - p_\pi)^2 + (1 - p)\,\pi\,p_\pi^2\big\}\dot g\dot g^\top. \tag{S.20}
+$$
+
+In the second term write $(1-p)\pi p_\pi^2 = \{(1-p)\pi p_\pi\}\,p_\pi = p(1 - p_\pi)\,p_\pi$ by
+(G1). The bracket becomes
+$p(1-p_\pi)\{(1 - p_\pi) + p_\pi\} = p(1 - p_\pi)$. Multiply by $N/a_N^2 = e^{-\alpha^*}$ and use
+(F2), $e^{-\alpha^*}p = e^f/(1 + e^{\alpha^*+f})$:
+
+$$
+\operatorname{Var}(S_{\text{lik}}) = \mathbb E\left\{\frac{e^{f}(1 - p_\pi)}{1 + e^{\alpha^*+f}}\dot g\dot g^\top\right\}
+\longrightarrow \mathbb E\left\{\frac{e^{f}\dot g\dot g^\top}{1 + c\,e^{f}/\varphi}\right\} = \Lambda_{\text{lik}}.
+$$
+
+The limit uses (G3) for $1 - p_\pi$ and dominated convergence. The roof is $e^f\|\dot g\|^2$,
+because $1 - p_\pi \le 1$, and it does not involve $\varphi$ at all.
+
+**Step 3c: Lindeberg.** A kept positive gives $(1 - p_\pi)\dot g$ (probability $p$). A kept
+negative gives $-p_\pi\dot g$ (probability $(1-p)\pi$). A dropped example gives 0. So
+
+$$
+L_N = N\,\mathbb E\big\{p(1 - p_\pi)^2\|\dot g\|^2\mathbb 1\big((1-p_\pi)\|\dot g\| > \epsilon a_N\big)\big\}
++ N\,\mathbb E\big\{(1-p)\pi p_\pi^2\|\dot g\|^2\mathbb 1\big(p_\pi\|\dot g\| > \epsilon a_N\big)\big\}.
+$$
+
+In the first part use $(1 - p_\pi)^2 \le 1$ and $p \le e^{\alpha^*}e^f$. In the second use
+$(1-p)\pi p_\pi^2 \le \pi p_\pi \le e^{\alpha^*}e^{f}$ by (G2). Both indicators are at most
+$\mathbb 1(\|\dot g\| > \epsilon a_N)$. So
+$L_N \le 2a_N^2\,\mathbb E\{e^f\|\dot g\|^2\mathbb 1(\|\dot g\| > \epsilon a_N)\} = o(a_N^2)$, exactly
+as in Theorem 1. No $1/\pi$ appears anywhere. This is why the likelihood estimator tolerates small
+sampling probabilities.
+
+**Step 3d.** By the Lindeberg–Feller CLT, $S_{\text{lik}} \to N(0, \Lambda_{\text{lik}})$ (S.15).
+
+**Step 4: the curvature equals the score variance.** By (G4),
+
+$$
+\mathbb E H_{\text{lik}} = \frac{N}{a_N^2}\mathbb E\big[\{p + (1-p)\pi\}\,p_\pi(1 - p_\pi)\,\dot g\dot g^\top\big].
+$$
+
+Expand the bracket: $p\,p_\pi(1 - p_\pi) + (1-p)\pi p_\pi\,(1 - p_\pi)$. By (G1) the second piece is
+$p(1 - p_\pi)(1 - p_\pi)$. The sum is $p(1-p_\pi)\{p_\pi + 1 - p_\pi\} = p(1 - p_\pi)$, the same
+bracket as in 3b. So $\mathbb E H_{\text{lik}} = \operatorname{Var}(S_{\text{lik}})$ exactly, and
+both tend to $\Lambda_{\text{lik}}$ (S.27). This is the **information identity** of the toolkit,
+now holding for the sampled data. It holds because $\ell_{\text{lik}}$ is the true log-likelihood
+of the sampled labels; the IPW objective is not, and for IPW the identity fails.
+
+For the variance of an entry, use $\operatorname{Var} \le$ mean square, $\delta^2 = \delta$,
+$\psi_\pi^2 \le p_\pi$ and (G4):
+
+$$
+\operatorname{Var}\big((H_{\text{lik}})_{jk}\big) \le \frac{N}{a_N^4}\mathbb E\big[\{p + (1-p)\pi\}\,p_\pi\,\|\dot g\|^4\big]
+\le \frac{2N}{a_N^4}\mathbb E\{p\,\|\dot g\|^4\} \le \frac{2}{a_N^2}\mathbb E\{e^f\|\dot g\|^4\} \to 0. \tag{S.28}
+$$
+
+The middle step uses $p\,p_\pi \le p$ and $(1-p)\pi p_\pi = p(1 - p_\pi) \le p$ (G1). Chebyshev
+gives $H_{\text{lik}} \to \Lambda_{\text{lik}}$ in probability (S.16).
+
+**Step 5: the leftovers vanish.** *$\Delta_{\text{lik}}$:* its mean is 0 by the computation in
+3a, with $u^\top\ddot g u$ in place of $\dot g$. Its variance, by the computation in 3b, is
+
+$$
+\operatorname{Var}(\Delta_{\text{lik}}) \le \frac{\|u\|^4N}{4a_N^4}\mathbb E\{p(1 - p_\pi)\|\ddot g\|^2\} \le \frac{\|u\|^4}{4a_N^2}\mathbb E\{e^f\|\ddot g\|^2\} \to 0.
+$$
+
+*$R_{\text{lik}}$:* the bound on $|D_i|$ from Theorem 1 holds with $p_\pi$ in place of $p$:
+$|D_i| \le 3\|u\|^3p_\pi(x_i;\tilde\theta)C(x_i,\tilde\theta) + \|u\|^3y_iKB(x_i)$. Positives are always
+kept, so $\delta_iy_i = y_i$, and the second part is exactly Theorem 1's $\Delta_{R2} = o_P(1)$. For
+the first part, (4) gives $p_\pi \le e^{g+l} = e^{g}/\pi$. At the intermediate point that is at most
+$e^{\alpha^*}e^{\|u\|/a_N}e^{f(x;\tilde\beta)}/\{\rho\varphi(x)\}$. Following Theorem 1,
+
+$$
+\Delta_{R\text{lik}1} \le \frac{K'\|u\|^3e^{\|u\|/a_N}}{2a_N}\cdot\frac{1}{N\rho}\sum_{i=1}^N\frac{\delta_iB(x_i)}{\varphi(x_i)}.
+$$
+
+By (G4) the average has mean
+
+$$
+\frac{1}{\rho}\mathbb E\left[\{p + (1-p)\rho\varphi\}\frac{B}{\varphi}\right] \le \frac{e^{\alpha^*}}{\rho}\mathbb E\left\{\frac{e^{f}B}{\varphi}\right\} + \mathbb E B = c_N\,\mathbb E\left\{\frac{e^{f}B}{\varphi}\right\} + \mathbb E B,
+$$
+
+which stays bounded. This is exactly where the theorem's condition
+$\mathbb E\{e^f\varphi^{-1}B\} < \infty$ is used. With the factor $1/a_N$ in front,
+$\mathbb E\Delta_{R\text{lik}1} \to 0$, and Markov gives $R_{\text{lik}} = o_P(1)$.
+
+**Step 6.** $\Lambda_{\text{lik}}$ is positive definite (the remark after Assumption 2 with
+$v = e^f/(1 + c\,e^f/\varphi) > 0$). The argmax result gives
+$a_N(\hat\theta_{\text{lik}} - \theta^*) = \Lambda_{\text{lik}}^{-1}S_{\text{lik}} + o_P(1)$ (S.17),
+which converges to $N(0, \Lambda_{\text{lik}}^{-1}\Lambda_{\text{lik}}\Lambda_{\text{lik}}^{-1}) = N(0, \Lambda_{\text{lik}}^{-1})$.
+Because score variance and curvature are the same matrix, the sandwich collapses.
+
+**Step 7.** Multiplying by $\sqrt{N_1}/a_N \to \sqrt{\mathbb E e^f}$ gives
+$V_{\text{lik}} = \mathbb E\{e^f\}\Lambda_{\text{lik}}^{-1}$. ∎
+
+## Theorem 5: the likelihood estimator never loses
+
+> **Theorem 5.** If $V_w$ and $V_{\text{lik}}$ are finite and positive definite, then
+> $V_{\text{lik}} \le V_w$, i.e. $V_w - V_{\text{lik}}$ is non-negative definite. Equality holds when
+> $c = 0$, and then $V_{\text{lik}} = V_w = V_f$.
+
+**In words.** For *any* sampling function $\varphi$, correcting the log odds is at least as precise
+as weighting, for every linear combination of the parameters. The two coincide only when sampling
+costs nothing anyway ($c = 0$).
+
+**Worked example.** The chart shows $\operatorname{tr}(V)$ for all four combinations in the running
+example. At balance (1 on the horizontal axis): uniform IPW 11.16, uniform likelihood 6.32,
+optimal IPW 5.34, optimal likelihood 5.18. Both improvements stack: optimal sampling helps a lot,
+and the likelihood correction helps further. The likelihood correction matters most for uniform
+sampling, where IPW's weights are most wasteful.
+
+<LineChart
+	x={() => Array.from({ length: 81 }, (_, i) => i * 0.025)}
+	series={[
+		{ name: "uniform + IPW", fn: (r) => trace2(varianceIpw(phiUniform, ratioToC(r))) },
+		{ name: "uniform + likelihood", fn: (r) => trace2(varianceLik(phiUniform, ratioToC(r))) },
+		{ name: "optimal + IPW", fn: (r) => trace2(varianceIpw(phiOptimal, ratioToC(r))) },
+		{ name: "optimal + likelihood", fn: (r) => trace2(varianceLik(phiOptimal, ratioToC(r))) },
+		{ name: "full data", fn: () => trace2(VF) },
+	]}
+	title="Asymptotic squared error × N₁ for four sampling–estimator pairs"
+	xLabel="positives per kept negative, c·E{e^f}"
+	yLabel="tr(V)"
+	height={320}
+/>
+
+#### Proof of Theorem 5
+
+**Step 1: put both variances in a common form.** Define the inflation factor
+
+$$
+\kappa(x) = 1 + c\,\varphi^{-1}(x)\,e^{f(x;\beta^*)} \ge 1.
+$$
+
+From the proof of Theorem 2, $M_w = \mathbb E\{(1 + c\,e^f/\varphi)e^f\dot g\dot g^\top\} = \mathbb E\{\kappa\,e^f\dot g\dot g^\top\}$,
+and $V_w = \mathbb E\{e^f\}M_f^{-1}M_wM_f^{-1}$. From Theorem 4,
+$\Lambda_{\text{lik}} = \mathbb E\{\kappa^{-1}e^f\dot g\dot g^\top\}$ and
+$V_{\text{lik}} = \mathbb E\{e^f\}\Lambda_{\text{lik}}^{-1}$. Dividing by the positive number
+$\mathbb E\{e^f\}$ does not change which matrix is bigger, so we must show
+
+$$
+M_f^{-1}\,\mathbb E\{\kappa\,e^f\dot g\dot g^\top\}\,M_f^{-1} \;\ge\; \Big[\mathbb E\{\kappa^{-1}e^f\dot g\dot g^\top\}\Big]^{-1},
+\qquad M_f = \mathbb E\{e^f\dot g\dot g^\top\}.
+$$
+
+The three matrices weight the same $e^f\dot g\dot g^\top$ by $\kappa$, by 1 and by $1/\kappa$.
+
+**Step 2: the one-dimensional case.** If $d = 1$, write $h = e^f\dot g^2 \ge 0$. The claim
+becomes $\mathbb E[\kappa h]/(\mathbb E h)^2 \ge 1/\mathbb E[h/\kappa]$, that is,
+$(\mathbb E h)^2 \le \mathbb E[\kappa h]\,\mathbb E[h/\kappa]$. This is Cauchy–Schwarz with
+$A = \sqrt{\kappa h}$ and $B = \sqrt{h/\kappa}$, whose product is $AB = h$. Equality needs
+$\sqrt{\kappa h} \propto \sqrt{h/\kappa}$, that is, $\kappa$ constant wherever $h > 0$.
+
+**Step 3: the matrix case.** Write $A = M_f^{-1}$ and $B = \Lambda_{\text{lik}}^{-1}$; both are
+symmetric. For any random matrix $Q$, $\mathbb E[QQ^\top]$ is positive semidefinite, because for
+every vector $v$, $v^\top\mathbb E[QQ^\top]v = \mathbb E[(Q^\top v)^\top(Q^\top v)] = \mathbb E\|Q^\top v\|^2 \ge 0$.
+Choose the column vector
+
+$$
+Q = \big(\kappa^{1/2}A - \kappa^{-1/2}B\big)\,e^{f/2}\dot g.
+$$
+
+Then $QQ^\top = (\kappa^{1/2}A - \kappa^{-1/2}B)\,e^{f}\dot g\dot g^\top\,(\kappa^{1/2}A - \kappa^{-1/2}B)$,
+since $A$ and $B$ are symmetric. Multiply out the four products. In the cross terms
+$\kappa^{1/2}\kappa^{-1/2} = 1$:
+
+$$
+QQ^\top = \kappa\,A\,e^f\dot g\dot g^\top A \;-\; A\,e^f\dot g\dot g^\top B \;-\; B\,e^f\dot g\dot g^\top A \;+\; \kappa^{-1}B\,e^f\dot g\dot g^\top B.
+$$
+
+$A$ and $B$ are fixed matrices, so the expectation passes through them, and each term becomes a
+known matrix:
+
+- $\mathbb E\{\kappa\,A e^f\dot g\dot g^\top A\} = A M_w A = V_w/\mathbb E\{e^f\}$;
+- $\mathbb E\{A e^f\dot g\dot g^\top B\} = A M_f B = M_f^{-1}M_f B = B$, and likewise
+  $\mathbb E\{B e^f\dot g\dot g^\top A\} = B M_f M_f^{-1} = B$;
+- $\mathbb E\{\kappa^{-1}B e^f\dot g\dot g^\top B\} = B\Lambda_{\text{lik}}B = \Lambda_{\text{lik}}^{-1}\Lambda_{\text{lik}}\Lambda_{\text{lik}}^{-1} = B$.
+
+Adding up,
+
+$$
+0 \le \mathbb E[QQ^\top] = \frac{V_w}{\mathbb E e^f} - B - B + B = \frac{V_w - V_{\text{lik}}}{\mathbb E e^f}.
+$$
+
+So $V_w - V_{\text{lik}}$ is positive semidefinite.
+
+**Step 4: equality when $c = 0$.** Then $\kappa = 1$, so $M_w = M_f$ and $\Lambda_{\text{lik}} = M_f$,
+and both variances equal $\mathbb E\{e^f\}M_f^{-1} = V_f$ (equation S.29). ∎
+
+I checked Step 3 numerically for the running example: $\mathbb E[QQ^\top]$ computed by quadrature
+equals $(V_w - V_{\text{lik}})/\mathbb E e^f$, and its eigenvalues are positive.
+
+## Theorem 6: the best in a large class
+
+Theorem 5 compares two specific estimators. Theorem 6 says the likelihood estimator beats a whole
+class of them.
+
+> **Theorem 6.** Let $X = (x_1, \dots, x_N)^\top$ be the features and $\mathcal D_\delta$ the
+> sampled data. Let $\hat\theta_U$ be a subsample estimator with
+>
+> $$\hat\theta_U = U(\theta^*; \mathcal D_\delta) + N_1^{-1/2}o_P(1),$$
+>
+> where $\operatorname{Var}\{U(\theta^*;\mathcal D_\delta)\}$ exists, $\mathbb E\{U(\theta^*;\mathcal D_\delta)\mid X\} = \theta^*$,
+> and $\mathbb E\{\dot U(\theta^*;\mathcal D_\delta)\mid X\} = 0$ with
+> $\dot U = \partial U/\partial\theta^{*\top}$. If $N_1\operatorname{Var}\{U(\theta^*;\mathcal D_\delta)\} \to V_U$
+> in probability, then $V_U \ge V_{\text{lik}}$.
+
+**In words.** Consider any estimator that, up to a negligible error, behaves like some function
+$U$ of the sampled data that is unbiased for $\theta^*$ given the features. None of them can have
+a smaller asymptotic variance than $\hat\theta_{\text{lik}}$. The second condition,
+$\mathbb E(\dot U \mid X) = 0$, is a technical requirement; the paper's Remark 2 reads it as
+saying that the derivative of the negligible error term is negligible too, which holds whenever
+that term is exactly zero. According to Remark 2, the class includes both $\hat\theta_w$ and
+$\hat\theta_{\text{lik}}$.
+
+This is the **Cramér–Rao bound** in disguise: no unbiased estimator has a variance below the
+inverse Fisher information. Because $\hat\theta_{\text{lik}}$ maximizes the true conditional
+likelihood of the sampled labels, its variance attains that bound.
+
+#### Proof of Theorem 6
+
+**What is held fixed.** The argument conditions on the features $X$ and treats the labels of
+the sampled points as the random part. Given $X$, the probability of the sampled labels is a
+product over kept points of $p_\pi^{y}(1 - p_\pi)^{1-y}$. Its log for one point is
+$y(g + l) - \log(1 + e^{g+l})$, which is one term of $\ell_{\text{lik}}$ plus $yl$. So the
+probability of the sampled labels, as a function of $\theta$, is
+
+$$
+L_\theta(\mathbf y) = \exp\Big\{\ell_{\text{lik}}(\theta) + \sum_i\delta_iy_il_i\Big\}.
+$$
+
+The extra term $\sum_i\delta_iy_il_i$ does not depend on $\theta$.<Sidenote>Strictly, "the
+sampled points" depends on the labels too, since a negative may be dropped. The paper writes the
+density this way and treats it as the conditional likelihood of the sampled data. I follow the
+paper.</Sidenote> The labels take finitely many values, so every expectation given $X$ is a
+finite sum: $\mathbb E\{G \mid X\} = \sum_{\mathbf y}G(\mathbf y)L_\theta(\mathbf y)$. Finite sums
+can be differentiated term by term, which justifies every interchange below.
+
+**Step 1: the score has mean zero given $X$.** Differentiate $\sum_{\mathbf y}L_\theta(\mathbf y) = 1$
+in $\theta$. Since $\partial L_\theta/\partial\theta = L_\theta\,\dot\ell_{\text{lik}}(\theta)$ (the
+derivative of $e^{\text{something}}$ is $e^{\text{something}}$ times the derivative of the
+something), we get $\mathbb E\{\dot\ell_{\text{lik}}(\theta) \mid X\} = 0$.
+
+**Step 2: unbiasedness forces a fixed covariance with the score (S.30).** The assumption
+$\mathbb E\{U(\theta;\mathcal D_\delta) \mid X\} = \theta$ holds at the true parameter, whatever
+that value is, so we may differentiate both sides in $\theta$. The right side gives the identity
+matrix $I$. On the left, $\theta$ appears twice, inside $U$ and inside $L_\theta$, so the product
+rule gives two terms:
+
+$$
+I = \frac{\partial}{\partial\theta^\top}\sum_{\mathbf y}U\,L_\theta
+= \sum_{\mathbf y}\dot U\,L_\theta + \sum_{\mathbf y}U\,\dot\ell_{\text{lik}}^\top L_\theta
+= \mathbb E\{\dot U \mid X\} + \mathbb E\{U\dot\ell_{\text{lik}}^\top \mid X\}.
+$$
+
+The first term is 0 by the theorem's second condition. Hence
+$\mathbb E\{U\dot\ell_{\text{lik}}^\top \mid X\} = I$. Because the score has mean zero (Step 1),
+this is the covariance: $\operatorname{Cov}(U, \dot\ell_{\text{lik}} \mid X) = I$.
+
+**Step 3: the one-dimensional version.** With $d = 1$, Step 2 says
+$\operatorname{Cov}(U, S) = 1$, where $S$ is the score. By Cauchy–Schwarz applied to the centred
+variables, $\operatorname{Cov}(U, S)^2 \le \operatorname{Var}(U)\operatorname{Var}(S)$, so
+$\operatorname{Var}(U) \ge 1/\operatorname{Var}(S)$. The score's variance is the Fisher
+information, so no unbiased estimator beats the inverse information. This is the
+**Cramér–Rao bound**.
+
+**Step 4: the matrix version.** Let $W = U - a_N^{-2}\Lambda_{\text{lik}}^{-1}\dot\ell_{\text{lik}}$.
+A covariance matrix is positive semidefinite, so $\operatorname{Var}(W \mid X) \ge 0$. Expand it
+with $\operatorname{Var}(Y - CZ) = \operatorname{Var}Y + C\operatorname{Var}(Z)C^\top - \operatorname{Cov}(Y,Z)C^\top - C\operatorname{Cov}(Z,Y)$,
+with $C = a_N^{-2}\Lambda_{\text{lik}}^{-1}$ (symmetric). By Step 2 both covariance terms equal
+$a_N^{-2}\Lambda_{\text{lik}}^{-1}$:
+
+$$
+0 \le \operatorname{Var}(U \mid X) + a_N^{-4}\Lambda_{\text{lik}}^{-1}\operatorname{Var}(\dot\ell_{\text{lik}} \mid X)\Lambda_{\text{lik}}^{-1} - 2a_N^{-2}\Lambda_{\text{lik}}^{-1}.
+$$
+
+**Step 5: average over $X$.** Take the expectation over $X$ of each term.
+
+- By the law of total variance,
+  $\operatorname{Var}(U) = \mathbb E\{\operatorname{Var}(U \mid X)\} + \operatorname{Var}\{\mathbb E(U \mid X)\}$.
+  The last term is 0, because $\mathbb E(U \mid X) = \theta^*$ is a constant. So
+  $\mathbb E\{\operatorname{Var}(U \mid X)\} = \operatorname{Var}(U)$.
+- In the same way, since $\mathbb E(\dot\ell_{\text{lik}} \mid X) = 0$,
+  $\mathbb E\{\operatorname{Var}(\dot\ell_{\text{lik}} \mid X)\} = \operatorname{Var}(\dot\ell_{\text{lik}}) = a_N^2\operatorname{Var}(S_{\text{lik}}) = a_N^2\Lambda_{\text{lik}}\{1 + o(1)\}$,
+  by Step 3b of Theorem 4 (S.25).
+
+So the middle term becomes $a_N^{-2}\Lambda_{\text{lik}}^{-1}\{1 + o(1)\}$, and
+
+$$
+0 \le \operatorname{Var}(U) + a_N^{-2}\Lambda_{\text{lik}}^{-1}\{1 + o(1)\} - 2a_N^{-2}\Lambda_{\text{lik}}^{-1} = \operatorname{Var}(U) - a_N^{-2}\Lambda_{\text{lik}}^{-1}\{1 + o(1)\}.
+$$
+
+**Step 6: change the scale.** By Step 0 of Theorem 1, $a_N^{-2} = N_1^{-1}\mathbb E\{e^f\}\{1 + o_P(1)\}$,
+so $a_N^{-2}\Lambda_{\text{lik}}^{-1} = N_1^{-1}V_{\text{lik}}\{1 + o_P(1)\}$. Multiply the last
+inequality by $N_1$:
+$N_1\operatorname{Var}(U) \ge V_{\text{lik}}\{1 + o_P(1)\}$. The left side tends to $V_U$ by
+assumption, so $V_U \ge V_{\text{lik}}$.
+
+Finally, the representation $\hat\theta_U = U + N_1^{-1/2}o_P(1)$ means $\sqrt{N_1}(\hat\theta_U - \theta^*)$
+and $\sqrt{N_1}(U - \theta^*)$ differ by $o_P(1)$. So $V_U$ is the asymptotic variance of the
+estimator itself, and no estimator in the class beats $\hat\theta_{\text{lik}}$. ∎
+
+## Theorems 7 and 8: using a pilot estimate
+
+The optimal $\varphi_{os}$ depends on $\theta^*$, which is what we are trying to estimate. The
+practical recipe uses a rough **pilot** estimate first:
+
+1. Take a small **pilot sample**, uniformly from each class with equal expected sizes (the
+   simulations use about 100 of each).
+2. Fit $\tilde\theta$ on it. Because the pilot over-represents positives, correct the intercept by
+   the log of the ratio of the two classes' sampling rates (the same log odds shift as in (4)).
+3. Compute $\tilde t_i = p(\tilde x_i;\tilde\theta)\|\tilde M_f^{-1}\dot g(\tilde x_i;\tilde\theta)\|$
+   on the pilot points, where $\tilde M_f$ is the pilot's Hessian. If gradients are hard to record,
+   use $\tilde t_i = p(\tilde x_i;\tilde\theta)$.
+4. Estimate the normalizer $\mathbb E\{t\}$ by reweighting the two pilot classes to their population
+   shares, where $\tilde n$ is the pilot size:
+
+$$
+\tilde\omega = \frac{2N_1}{\tilde nN}\sum_{\tilde y_i = 1}\tilde t_i + \frac{2N_0}{\tilde nN}\sum_{\tilde y_i = 0}\tilde t_i. \tag{7}
+$$
+
+5. Sample negatives with a floor $\varrho$ and a cap at 1, writing $\tilde\vartheta = (\tilde\theta, \tilde\omega)$:
+
+$$
+\pi^{os}_\varrho(x;\tilde\vartheta) = \min\big[\max\{\rho\,\tilde\varphi_{os}(x), \varrho\}, 1\big], \qquad \tilde\varphi_{os}(x) = \tilde\omega^{-1}t(x;\tilde\theta). \tag{8}
+$$
+
+The floor $\varrho$ guarantees every negative has some chance of being kept. Online systems often
+treat $\tilde\omega$ as a tuning knob that sets the realized sampling rate.
+
+> **Theorem 7 (IPW with a pilot).** Assume the pilot $\tilde\vartheta$ is independent of the data,
+> $\tilde\varphi_{os}(x) \to \varphi_{\text{plt}}(x)$ in probability, and $\varrho/\rho \to c_l > 0$.
+> Under Assumptions 1–3, $\sqrt{N_1}(\hat\theta^{\tilde\vartheta}_w - \theta^*) \to N(0, V^{\text{plt}}_w)$,
+> where $V^{\text{plt}}_w$ is $V_w$ with $\varphi(x)$ replaced by $\max\{\varphi_{\text{plt}}(x), c_l\}$.
+> If $\Pr\{\varphi_{\text{plt}}(x) \ge c_l\} = 1$ and the pilot is consistent, $V^{\text{plt}}_w$
+> achieves the optimal variance.
+
+> **Theorem 8 (likelihood with a pilot).** Assume the pilot $\tilde\vartheta$ is independent of the
+> data, $\tilde\varphi_{os}(x) \to \varphi_{\text{plt}}(x)$ in probability, and $\varrho = o(\rho)$.
+> Under Assumptions 1–3, $\sqrt{N_1}(\hat\theta^{\tilde\vartheta}_{\text{lik}} - \theta^*) \to N(0, V^{\text{plt}}_{\text{lik}})$,
+> where $V^{\text{plt}}_{\text{lik}}$ is $V_{\text{lik}}$ with $\varphi$ replaced by $\varphi_{\text{plt}}$.
+> If the pilot is consistent, this is the variance with the optimal probability.
+
+**In words.** Both estimators stay $\sqrt{N_1}$-consistent and asymptotically normal *even if the
+pilot is wrong* (Remark 3). A **consistent** pilot, one that converges to $\theta^*$, is needed
+only to reach the optimal variance. A bad pilot costs efficiency, not correctness.
+
+The difference is in the floor. **IPW needs a floor comparable to $\rho$** ($c_l > 0$), and the
+floor stays in the limit as $\max\{\varphi_{\text{plt}}, c_l\}$. That generally makes IPW miss the
+optimum, because the optimal $\varphi_{os}$ goes to 0 for some $x$. **The likelihood estimator can
+use a vanishing floor** ($\varrho = o(\rho)$), so it reaches the optimum with a consistent pilot.
+
+#### Proof of Theorem 7
+
+**Step 1: condition on the pilot.** The pilot $\tilde\vartheta$ is computed from separate data,
+so it is independent of the full data. Fix its value. Then
+
+$$
+\pi_\varrho(x) := \pi^{os}_\varrho(x;\tilde\vartheta) = \min\big[\max\{\rho\,\tilde\varphi_{os}(x), \varrho\}, 1\big]
+$$
+
+is just a fixed function of $x$. Given $\tilde\vartheta$, the examples are still independent and
+identically distributed, and Algorithm 1 still keeps example $i$ with probability
+$\pi_\varrho(x_i, y_i) = y_i + (1-y_i)\pi_\varrho(x_i)$. So all the calculations in the proof of
+Theorem 2 go through given $\tilde\vartheta$, with $\pi_\varrho$ in place of $\rho\varphi$. In
+particular, (W1) still holds: the weights average to 1. What remains is to check that the bounds
+still work and to find the limit of the score variance. Write
+
+$$
+\frac{\pi_\varrho(x)}{\rho} = \min\Big[\max\Big\{\tilde\varphi_{os}(x), \frac{\varrho}{\rho}\Big\}, \frac{1}{\rho}\Big].
+$$
+
+As $N \to \infty$, $\tilde\varphi_{os} \to \varphi_{\text{plt}}$ and $\varrho/\rho \to c_l$. When
+$\rho \to 0$ the cap $1/\rho$ grows without bound and plays no role in the limit (Remark 1). So
+$\pi_\varrho/\rho \to \max\{\varphi_{\text{plt}}, c_l\}$. The floor gives the key bound: always
+$\pi_\varrho \ge \varrho$.
+
+**Step 2: the score variance (S.31).** As in Theorem 2 Step 3b, the conditional variance has a
+positive part, $e^{-\alpha^*}p(1-p)^2\dot g\dot g^\top \to e^f\dot g\dot g^\top$, and a negative
+part:
+
+$$
+e^{-\alpha^*}\frac{(1-p)p^2}{\pi_\varrho(x)}\dot g\dot g^\top
+= c_N\,\frac{e^{2f}(1-p)}{(1 + e^{\alpha^*+f})^2}\cdot\frac{1}{\pi_\varrho(x)/\rho}\,\dot g\dot g^\top
+\longrightarrow \frac{c\,e^{2f}}{\max\{\varphi_{\text{plt}}(x), c_l\}}\dot g\dot g^\top.
+$$
+
+For dominated convergence we need a roof that does not depend on the pilot. The floor provides
+one: $1/(\pi_\varrho/\rho) \le \rho/\varrho$, and $\rho/\varrho \to 1/c_l$ stays bounded. So the
+whole term is at most a constant times $e^{2f}\|\dot g\|^2$, which has a finite mean. **This is
+why IPW needs $c_l > 0$.** Without a floor of order $\rho$, the roof would be
+$e^{2f}\|\dot g\|^2/\tilde\varphi_{os}$. The pilot controls $\tilde\varphi_{os}$, and a poor pilot
+can make it tiny where $e^{2f}\|\dot g\|^2$ is large, which would leave no integrable roof. The
+limit is
+
+$$
+\Lambda^{\text{plt}}_w = \mathbb E\left[e^f\dot g\dot g^\top + \frac{c\,e^{2f}}{\max\{\varphi_{\text{plt}}(x), c_l\}}\dot g\dot g^\top\right],
+$$
+
+which is $M_w$ with $\varphi$ replaced by $\max\{\varphi_{\text{plt}}, c_l\}$.
+
+**Step 3: Lindeberg given the pilot.** The positives' part is as before. A kept negative
+contributes $\eta = -p\dot g/\pi_\varrho$, so its size is at most
+$p\|\dot g\|/\varrho \le (e^{\alpha^*}/\varrho)e^f\|\dot g\|$. Its part of $L_N$ is at most
+$N\,\mathbb E\{p^2\|\dot g\|^2/\pi_\varrho\,\mathbb 1(\cdot)\} \le (Ne^{2\alpha^*}/\varrho)\,\mathbb E\{e^{2f}\|\dot g\|^2\mathbb 1(\cdot)\}
+= a_N^2\,(e^{\alpha^*}/\varrho)\,\mathbb E\{e^{2f}\|\dot g\|^2\,\mathbb 1((e^{\alpha^*}/\varrho)e^f\|\dot g\| > \epsilon a_N)\}$.
+Here $e^{\alpha^*}/\varrho = c_N\,\rho/\varrho \to c/c_l$ is bounded, so the indicator tends to 0 and
+the part is $o(a_N^2)$.
+
+**Step 4: the curvature.** Its mean given the pilot is the same as in Theorem 1, because the
+weights average to 1, so it tends to $M_f$ (S.33). As in Theorem 2 Step 4, now with
+$1/\pi \le 1 + 1/\pi_\varrho \le 2/\varrho$, its entry variances are at most
+
+$$
+\frac{1}{N}\mathbb E\left\{\Big(1 + \frac{1}{\pi_\varrho}\Big)e^{2f}\|\dot g\|^4\right\} \le \frac{2}{N\varrho}\mathbb E\{e^{2f}\|\dot g\|^4\} \to 0,
+$$
+
+because $N\varrho = N\rho\cdot(\varrho/\rho) \to \infty$ (S.34).
+
+**Step 5: the leftovers.** $\operatorname{Var}(\Delta_w \mid \tilde\vartheta) \le \frac{\|u\|^4}{4a_N^2}\mathbb E[\{1 + (e^{\alpha^*}/\varrho)e^f\}e^f\|\ddot g\|^2] \to 0$,
+using $\pi_\varrho \ge \varrho$ in place of $\rho\varphi$. The remainder bound is Theorem 1's with
+weights that average to 1, so it is $o_P(1)$ as in Theorem 2.
+
+**Step 6: from "given the pilot" to unconditional.** Steps 1–5 show that, given $\tilde\vartheta$,
+$Z_N := \sqrt{N_1}(\hat\theta^{\tilde\vartheta}_w - \theta^*)$ converges in distribution to
+$Z \sim N(0, V^{\text{plt}}_w)$, with $V^{\text{plt}}_w = \mathbb E\{e^f\}M_f^{-1}\Lambda^{\text{plt}}_wM_f^{-1}$.
+The limit does not depend on the pilot's value. For any event $A$ that is a continuity set of the
+limit (for example $\{Z \le z\}$ componentwise),
+
+$$
+\Pr(Z_N \in A) = \mathbb E\big\{\Pr(Z_N \in A \mid \tilde\vartheta)\big\}.
+$$
+
+The inner probability tends to $\Pr(Z \in A)$ and is always between 0 and 1. So by dominated
+convergence (with roof 1) the outer expectation tends to $\Pr(Z \in A)$ as well. The same
+argument shows that a quantity that is $o_P(1)$ given the pilot is $o_P(1)$
+unconditionally.<Sidenote>The supplement cites Xiong and Li (2008) and Cheng et al. (2010) for
+this fact.</Sidenote>
+
+**Step 7: when it is optimal.** If the pilot is consistent, $\varphi_{\text{plt}} = \varphi_{os}$.
+If also $\varphi_{os} \ge c_l$ everywhere, then $\max\{\varphi_{\text{plt}}, c_l\} = \varphi_{os}$
+and $V^{\text{plt}}_w$ is the optimal variance of Theorem 3. ∎
+
+#### Proof of Theorem 8
+
+Condition on the pilot exactly as in Step 1 above. Now the offset is
+$\tilde l = -\log\pi_\varrho(x)$, and the proof of Theorem 4 goes through with $\pi_\varrho$ in place
+of $\rho\varphi$. The facts (G1), (G2) and (G4) hold for *any* function $\pi$, because their
+proofs never used the form $\rho\varphi$. Only the limits and one bound change.
+
+**The score has mean zero for any pilot.** Step 3a of Theorem 4 only used (G1). So the corrected
+likelihood is unbiased even if the pilot is badly wrong. A wrong pilot changes which negatives
+are kept, but (4) still describes the kept data exactly.
+
+**The score variance (S.41).** As in Theorem 4, the variance is
+$\mathbb E\{e^f(1 - \tilde p_\pi)/(1 + e^{\alpha^*+f})\,\dot g\dot g^\top\}$, and by (G3)
+
+$$
+1 - \tilde p_\pi = \frac{1}{1 + c_N\,e^{f}/(\pi_\varrho/\rho)}, \qquad
+\frac{\pi_\varrho}{\rho} = \max\Big\{\tilde\varphi_{os}, \frac{\varrho}{\rho}\Big\} \to \max\{\varphi_{\text{plt}}, 0\} = \varphi_{\text{plt}},
+$$
+
+since $\varrho = o(\rho)$. The roof is still $e^f\|\dot g\|^2$, because $1 - \tilde p_\pi \le 1$,
+**whatever** the pilot does. So the limit is
+$\Lambda^{\text{plt}}_{\text{lik}} = \mathbb E[e^f\dot g\dot g^\top/\{1 + c\,e^f/\varphi_{\text{plt}}\}]$,
+with no floor needed. This is the whole difference from Theorem 7.
+
+**Lindeberg and the curvature (S.38, S.39).** Theorem 4's bounds used only (G1), (G2) and
+$1 - \tilde p_\pi \le 1$, never $1/\pi$. So they hold unchanged. The curvature's mean again equals
+the score variance (S.42), and its entry variances are at most
+$2a_N^{-2}\mathbb E\{e^f\|\dot g\|^4\} \to 0$ (S.43).
+
+**The remainder.** The paper bounds $\tilde p_\pi \le 1$ and $C \le K B$, so
+$|R| \le (d+1)\|u\|^3(6a_N^3)^{-1}\sum_i\delta_iB(x_i)$. By (G4), with
+$\pi_\varrho \le \rho\tilde\varphi_{os} + \varrho$, its mean given the pilot is at most
+
+$$
+\frac{N}{a_N^3}\mathbb E\{(p + \pi_\varrho)B\} \le \frac{1}{a_N}\mathbb E\{e^fB\} + \frac{1}{a_N}\cdot\frac{\rho}{e^{\alpha^*}}\,\mathbb E\Big\{\Big(\tilde\varphi_{os} + \frac{\varrho}{\rho}\Big)B\Big\}.
+$$
+
+The first part tends to 0. In the second, $\rho/e^{\alpha^*} = 1/c_N \to 1/c$, so it tends to 0 when
+$c > 0$.<Sidenote>When $c = 0$, $\rho/e^{\alpha^*}$ grows, and this bound needs it to grow more
+slowly than $a_N$. The paper's supplement writes the same bound and does not discuss this case.
+For $c > 0$, the case where the choice of sampling probabilities matters, the bound tends to
+0.</Sidenote> Markov's inequality then gives $R = o_P(1)$.
+
+**Conclusion.** The argmax step gives $N(0, (\Lambda^{\text{plt}}_{\text{lik}})^{-1})$ given the
+pilot (S.40). Step 6 of Theorem 7 removes the conditioning, and rescaling gives
+$V^{\text{plt}}_{\text{lik}} = \mathbb E\{e^f\}(\Lambda^{\text{plt}}_{\text{lik}})^{-1}$, which is
+$V_{\text{lik}}$ with $\varphi_{\text{plt}}$ in place of $\varphi$. If the pilot is consistent,
+$\varphi_{\text{plt}} = \varphi_{os}$. ∎
+
+## Experiments
+
+### Simulation: theory against practice
+
+I reran a scaled-down version of the paper's simulation on the running example: $N = 500{,}000$,
+$x \sim N(0, 1)$, $\beta^* = 1$, $\alpha^* = -6.5$, which gives about 1,230 positives (1 positive
+per 405 negatives, close to the paper's 1:400). Each of 1,000 repetitions draws fresh data, fits a
+pilot on about 100 examples from each class, and then fits four estimators at five sampling rates:
+
+- **uniW** and **uniLik**: uniform sampling with the IPW and likelihood estimators;
+- **optW** and **optLik**: the pilot-based probabilities (8), with floor $\varrho = \rho/10$, and
+  $\tilde\omega$ set so that the expected number of kept negatives equals $\rho N_0$ for both
+  schemes, as the paper does in its real-data experiment.
+
+The table reports $N_1 \times \text{MSE}$, where MSE is the average of
+$\|\hat\theta - \theta^*\|^2$. Theorems 2 and 4 predict that this tends to $\operatorname{tr}(V)$,
+shown in brackets. The full-data MLE gave 3.21 (theory 3).
+
+|   $\rho$ | Expected kept negatives | Positives per kept negative |          uniW |        uniLik |          optW |        optLik |
+| -------: | ----------------------: | --------------------------: | ------------: | ------------: | ------------: | ------------: |
+|    0.002 |          1,000 |                        1.24 | 12.24 (13.11) |   7.28 (6.94) |   6.60 (5.90) |   6.27 (5.68) |
+|    0.004 |          2,000 |                        0.62 |   7.84 (8.05) |   5.58 (5.28) |   4.94 (4.45) |   4.79 (4.37) |
+|    0.006 |          3,000 |                        0.41 |   6.34 (6.37) |   4.94 (4.66) |   4.42 (3.97) |   4.34 (3.93) |
+|     0.01 |          5,000 |                        0.25 |   5.16 (5.02) |   4.37 (4.12) |   3.95 (3.58) |   3.92 (3.56) |
+|     0.02 |         10,000 |                        0.12 |   4.24 (4.01) |   3.90 (3.65) |   3.52 (3.29) |   3.51 (3.29) |
+
+For uniform sampling the simulation is within 7% of the theory. The optimal schemes come out
+8–12% above their predictions, because the theory assumes the pilot equals $\theta^*$, while here
+it is fit on about 200 points. The ordering is the same in every row:
+**optLik < optW < uniLik < uniW**. The gaps are largest at the smallest $\rho$, where kept
+negatives are as few as the positives, and shrink as $\rho$ grows, exactly as the $c\,V_{\text{sub}}$
+term predicts. By $\rho = 0.02$, ten kept negatives per positive, every method is close to the
+full-data value of 3.
+
+**A wrong pilot.** The paper also checks robustness by adding a random $U(0, 1.5)$ error to the
+pilot. Repeating that here (one draw added to each of $\tilde\alpha$ and $\tilde\beta$ per
+repetition) gives:
+
+|   $\rho$ |  uniW | uniLik |  optW | optLik |
+| -------: | ----: | -----: | ----: | -----: |
+|    0.002 | 12.26 |   7.25 |  8.61 |   8.10 |
+|    0.004 |  7.89 |   5.44 |  5.60 |   5.44 |
+|    0.006 |  6.24 |   4.86 |  4.91 |   4.81 |
+|     0.01 |  5.10 |   4.26 |  4.20 |   4.15 |
+|     0.02 |  4.07 |   3.76 |  3.61 |   3.60 |
+
+The estimators stay accurate, as Theorems 7 and 8 promise, but the optimal schemes lose most of
+their advantage. At the smallest rate, uniform sampling with the likelihood estimator (7.25)
+now beats both optimal schemes. The paper's supplement reports the same: with a badly perturbed
+pilot, uniLik can exceed optLik, and optW suffers most. Notice that uniLik needs no pilot at all
+and is still far better than uniW in every row.
+
+### The paper's experiments
+
+The paper's simulations (its Figure 1) use six normal, log-normal or $t_3$ features with the
+same 1:400 imbalance and report the same ordering: optLik is the best, and close to the full-data
+MLE at $\rho = 0.02$. The advantage over optW is largest for small $\rho$.
+
+The real-data experiment uses a CTR dataset from ByteDance with more than 0.3 trillion instances,
+299 raw features and about 1 positive per 80 negatives. A 3-layer network maps the features to a
+256-dimensional representation, followed by logistic regression. Because of storage limits,
+80% of negatives were first dropped uniformly, leaving 60 billion instances. Training is a single
+pass in timestamp order on 1,200 CPU cores. The sampling probability is (8) with the gradient term
+dropped, so $t(x;\tilde\theta) = p(x;\tilde\theta)$. The reported results (test AUC, which I could
+not reproduce):
+
+- At moderate sampling rates (0.01 to 0.05 of the original data, negatives still outnumber
+  positives), nonuniform sampling clearly beats uniform sampling, with a smaller further gain from
+  the likelihood estimator.
+- At extremely small rates (0.001 to 0.008, positives outnumber kept negatives), the gap between
+  nonuniform and uniform sampling narrows, but the likelihood estimator stays clearly ahead of IPW.
+- The floor $\varrho$ needs tuning by cross-validation. A moderate floor works best. The paper
+  connects this to Facebook's embedding-based retrieval (Huang et al., 2020), which mixes "easy"
+  negatives (small $p$) with "hard" ones (large $p$). The floor does exactly this: it guarantees
+  easy negatives a share of the sample.
+
+The paper notes that an AUC gain of 0.0005 is significant for revenue at this scale, and that the
+run-to-run variance was about 0.0001.
+
+### Limitations
+
+The authors list three:
+
+1. The model is assumed correct. The supplement's experiments with a nonlinear true model show
+   optLik still doing best in mild cases, but the theory does not cover misspecification.
+2. Oversampling positives, another common fix for imbalance, is not analysed.
+3. The regime assumes fixed $\beta^*$, so a positive is rare even given the features. As the COVID
+   example shows, this fails when some feature value makes the event likely.
+
+## Summary
+
+- With rare events, the precision of a model is set by the number of positives $N_1$, not by $N$
+  (Theorem 1). Each negative carries information proportional to its tiny $p(x)$.
+- Throwing away negatives costs nothing asymptotically while kept negatives still vastly outnumber
+  positives ($c = 0$). The cost appears only when they become comparable, as an added variance
+  $V_{\text{sub}}$ proportional to the positive-to-negative ratio of the subsample (Theorem 2).
+- The best sampling probability for a negative is proportional to $p(x)\|M_f^{-1}\dot g(x)\|$: keep
+  negatives that look positive and that move uncertain parameters (Theorem 3).
+- Don't reweight the kept data; shift the log odds by $-\log\pi(x)$ for every kept example. The
+  resulting likelihood estimator is never worse than IPW and is the best in a broad class of
+  estimators (Theorems 4–6).
+- A rough pilot is enough to compute the probabilities. The likelihood estimator tolerates tiny
+  sampling probabilities, while IPW needs a floor of the same order as $\rho$ (Theorems 7–8).
+
+## References
+
+- H. Wang, A. Zhang and C. Wang. [Nonuniform Negative Sampling and Log Odds Correction with Rare
+  Events Data](https://arxiv.org/abs/2110.13048). NeurIPS 2021. arXiv:2110.13048v1. All theorem
+  and equation numbers in this post follow this version and its supplement.
+- H. Wang. [Logistic regression for massive data with rare events](https://proceedings.mlr.press/v119/wang20a.html).
+  ICML 2020. Theorem 1 generalizes its result for linear logistic regression.
+- W. Fithian and T. Hastie. Local case-control sampling: efficient subsampling in imbalanced data
+  sets. *Annals of Statistics* 42(5), 2014.
+- L. Han, K. M. Tan, T. Yang and T. Zhang. Local uncertainty sampling for large-scale multiclass
+  logistic regression. *Annals of Statistics* 48(3), 2020.
+- N. L. Hjort and D. Pollard. [Asymptotics for minimisers of convex processes](https://arxiv.org/abs/1107.3806). 2011.
+- A. W. van der Vaart. *Asymptotic Statistics*. Cambridge University Press, 1998. Section 2.8 for
+  the Lindeberg–Feller CLT.
+- J.-T. Huang et al. Embedding-based retrieval in Facebook search. KDD 2020.

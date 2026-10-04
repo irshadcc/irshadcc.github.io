@@ -1,0 +1,193 @@
+---
+title: "Inside PyTorch's CUDACachingAllocator"
+description: "How PyTorch avoids the overhead of cudaMalloc and manages GPU memory with a caching allocator."
+date: 2026-10-04
+tags: ["Draft", "GPU"]
+---
+
+import BoxDiagram from "../../utils/payments/BoxDiagram.astro";
+import Sidenote from "../../components/Sidenote.astro";
+import MarginNote from "../../components/MarginNote.astro";
+import { allocatorNodes, allocatorEdges } from "../../utils/gpu/cudaAllocatorFigures";
+
+## Background
+
+When training a deep learning model on a GPU, allocating and freeing memory happens thousands of times a second. Every forward and backward pass creates intermediate tensors, and those need space.
+
+If PyTorch were to call `cudaMalloc` and `cudaFree` for every tensor, performance would plummet. <MarginNote>These CUDA API calls are expensive because they cross the CPU-GPU boundary and synchronise the device, blocking the CPU until previous GPU work completes.</MarginNote>
+
+Instead, PyTorch uses a custom **caching allocator**. It asks the OS for large chunks of memory up front via `cudaMalloc`, caches them, and hands out pieces to tensors instantly. When a tensor is deleted, its memory isn't returned to the OS; it goes back into PyTorch's cache to be reused. This post explores the core of `c10/cuda/CUDACachingAllocator.cpp` (which is over 5,600 lines long) to see exactly how memory pooling works.
+
+## Core concepts
+
+To understand the 5,600 lines of `CUDACachingAllocator.cpp`, you only need to understand three core structures: `Block`, `BlockPool`, and `DeviceCachingAllocator`.
+
+### The `Block`
+
+Every chunk of memory, whether free or in use, is represented by a `Block`. A block knows its memory address, size, and whether it is currently allocated.
+
+```cpp
+struct Block {
+  c10::DeviceIndex device; // GPU index
+  cudaStream_t stream; // Allocation stream
+  size_t size; // Block size in bytes
+  BlockPool* pool{nullptr}; // Owning memory pool
+  void* ptr{nullptr}; // Memory address
+  bool allocated{false}; // In-use flag
+  
+  Block* prev{nullptr}; // Prev block if split from a larger allocation
+  Block* next{nullptr}; // Next block if split from a larger allocation
+};
+```
+
+Notice the `prev` and `next` pointers. When PyTorch gets a large 256 MB block from the OS, it doesn't give the whole thing to a 10 MB tensor. It **splits** the block. The 10 MB chunk is handed to the tensor (and marked `allocated = true`), while the remaining 246 MB becomes a new free `Block` next to it.<Sidenote>This linked list allows PyTorch to merge adjacent free blocks back into a single large block when memory is freed.</Sidenote>
+
+### The `BlockPool`
+
+A `BlockPool` is a collection of unallocated, free blocks. It keeps them sorted by size, so when a new allocation is requested, the allocator can quickly find the smallest block that is large enough to fit the request.
+
+```cpp
+struct BlockPool {
+  BlockPool(bool small, PrivatePool* private_pool = nullptr)
+      : is_small(small), owner_PrivatePool(private_pool) {}
+
+  std::set<Block*, BlockComparatorSizeCounterAddress> blocks;
+  std::set<Block*, BlockComparatorAddress> blocks_by_addr;
+  const bool is_small;
+};
+```
+
+### The `DeviceCachingAllocator`
+
+This is the orchestrator. There is one `DeviceCachingAllocator` per GPU. It holds the `BlockPool`s and the mutex lock to ensure thread safety.
+
+```cpp
+class DeviceCachingAllocator {
+ private:
+  mutable std::recursive_mutex mutex;
+  
+  // Unallocated cached blocks > 1 MB
+  BlockPool large_blocks;
+
+  // Unallocated cached blocks <= 1 MB
+  BlockPool small_blocks;
+
+  // Holds all active allocations
+  ska::flat_hash_set<Block*> active_blocks;
+};
+```
+
+PyTorch separates pools by size to reduce fragmentation. Small tensors (like biases or scalars) are grouped in `small_blocks` (&lt;= 1 MB), while heavy data (like weight matrices) go to `large_blocks`. 
+
+## The allocation flow
+
+Let's see what happens when you run `torch.empty(1024, device="cuda")`. The request hits `DeviceCachingAllocator::malloc`. 
+
+<BoxDiagram nodes={allocatorNodes} edges={allocatorEdges} selected="api" title="The Caching Allocator Flow" />
+
+Here is the exact logic for how `malloc` selects a block. We've highlighted the crucial decision paths:
+
+```cpp
+Block* malloc(size_t orig_size, cudaStream_t stream) {
+    std::unique_lock<std::recursive_mutex> lock(mutex);
+
+    // 1. Determine size and pool
+    size_t size = round_size(orig_size);
+    auto& pool = get_pool(size, stream);
+    const size_t alloc_size = get_allocation_size(size);
+    
+    AllocParams params(device_id, size, stream, &pool, alloc_size, ...);
+
+    // 2. Try to get a block from the existing pool
+    bool block_found = get_free_block(params);
+
+    // 3. Fallback: OS Allocation & Cache Clearing
+    if (!block_found) {
+      // Allocate fresh memory from the OS
+      block_found = alloc_block(params, false, context, lock);
+
+      // If that fails, aggressively free cached memory and retry
+      if (!block_found && !params.oom_rejection_info.rejected) {
+        block_found =
+            try_mempool_fallback(params, context, lock)
+            || (release_available_cached_blocks(params, context) &&
+                alloc_block(params, false, context, lock))
+            || (release_cached_blocks(context) &&
+                alloc_block(params, true, context, lock));
+      }
+    }
+    // ...
+```
+
+Let's explain each method call in detail:
+1. **`round_size` & `get_pool`**: PyTorch rounds up requested bytes (to 512 bytes) so that blocks align perfectly. It then chooses either the small or large pool depending on whether the allocation is ≤ 1 MB.
+2. **`get_free_block`**: This method searches the `std::set` in the `BlockPool` for the smallest free block that is $\ge$ the requested size. If the found block is excessively large, `get_free_block` **splits** it. The exact chunk is returned, and the remainder goes back into the pool.
+3. **`alloc_block`**: If no block is found, PyTorch asks the OS for new memory via `cudaMalloc`.
+4. **`release_cached_blocks`**: If the OS denies the `cudaMalloc` (because the GPU is physically full of cached blocks), PyTorch will forcefully destroy unused free blocks across its pools by calling `cudaFree`, returning them to the OS, and then retries the allocation.
+
+## The deallocation flow
+
+When a tensor goes out of scope, PyTorch calls `free(void* ptr)`. But remember, `cudaFree` is not called! It eventually drops into `free_locked`.
+
+```cpp
+  void free_locked(Block* block, const std::shared_ptr<GatheredContext>& context) {
+    block->allocated = false;
+
+    // 1. Check CUDA stream synchronization
+    if (!block->stream_uses.empty()) {
+      if (C10_UNLIKELY(is_capture_context())) {
+        deferred_blocks.emplace(block, record_free_markers(block));
+      } else {
+        insert_events(block); // Synchronize streams before reusing
+      }
+    } else {
+      free_block(block, context);
+    }
+  }
+```
+
+The most interesting detail here is stream synchronisation. If a tensor was read by multiple CUDA streams (`block->stream_uses`), the memory cannot be safely reused yet, because those other streams might still be running asynchronous operations on it. PyTorch handles this by inserting CUDA events (`insert_events`) to force any future stream that takes this block to wait.
+
+Once the block is ready to be completely returned, it enters `free_block`:
+
+```cpp
+  void free_block(Block* block, const std::shared_ptr<GatheredContext>& context) {
+    auto& pool = *block->pool;
+
+    // 2. Merge adjacent blocks
+    const std::array<Block*, 2> merge_candidates = {block->prev, block->next};
+    for (Block* merge_candidate : merge_candidates) {
+      try_merge_blocks(block, merge_candidate, pool);
+    }
+
+    // 3. Return to pool
+    active_blocks.erase(block);
+    pool.insert_into_blocks(block);
+  }
+```
+
+1. **`try_merge_blocks`**: Because blocks maintain a doubly-linked list (`prev` and `next`), PyTorch looks at its physical memory neighbours. If a neighbour is also free, it fuses them into a single continuous `Block`.
+2. **`insert_into_blocks`**: The merged `Block` is finally inserted into the `BlockPool` set, making it available for the next `torch.empty()` call.
+
+## A worked example
+
+Let's work through an example with real numbers. Assume we are on a fresh GPU, and we want to allocate a 50 MB tensor, followed by a 10 MB tensor.
+
+1. **Allocate 50 MB:** 
+   - `large_blocks` is empty. 
+   - PyTorch calls `cudaMalloc` (`alloc_block`) to ask the OS for memory. However, to minimize OS calls, it rounds up and asks for a huge chunk, say 256 MB. 
+   - It creates a 256 MB `Block`. It then splits it into a 50 MB `Block` (returned to user) and a 206 MB `Block` (inserted into `large_blocks`).
+2. **Allocate 10 MB:** 
+   - PyTorch searches `large_blocks` (`get_free_block`) and finds the 206 MB block. 
+   - It splits it into a 10 MB `Block` (returned to user) and a 196 MB `Block` (inserted into `large_blocks`).
+3. **Free the 50 MB tensor:** 
+   - The 50 MB `Block` is marked free and enters `free_block`. Its `next` neighbor (the 10 MB block) is still in use, so it cannot be merged yet. It's simply re-inserted into `large_blocks`.
+
+By the end of this sequence, we did zero `cudaMalloc` calls for the second tensor, drastically speeding up execution.
+
+## Summary
+
+* PyTorch avoids slow OS-level synchronizations by pre-allocating large chunks of GPU memory.
+* **`Block`** tracks the metadata (size, pointer, stream) of every memory slice and maintains a doubly-linked list.
+* **`BlockPool`** categorizes free blocks by size (small $\le$ 1MB, large $>$ 1MB).
+* Allocations (`malloc`) **split** large free blocks into exact sizes. Deallocations (`free_locked`) **merge** adjacent free blocks back together to prevent fragmentation.

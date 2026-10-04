@@ -1,0 +1,91 @@
+---
+// Interactive comparison of a derivative, forward-mode JVP, reverse-mode VJP, and a matrix gradient.
+// Each tab shows which object moves in which direction and annotates every node with its shape.
+// Usage in .mdx:
+//   <MatrixCalculusFlow initial="derivative" />
+import katex from "katex";
+import { FLOW_SCENES, type FlowKind } from "./matrixCalculusFlow";
+
+interface Props {
+	initial?: FlowKind;
+}
+const { initial = "derivative" } = Astro.props;
+const kinds = Object.keys(FLOW_SCENES) as FlowKind[];
+const labels: Record<FlowKind, string> = {
+	derivative: "Local derivative",
+	forward: "Forward mode",
+	reverse: "Reverse mode",
+	matrix: "Matrix gradient",
+};
+const width = 820;
+const height = 205;
+---
+
+<figure class="mc-flow" data-initial={initial}>
+	<div class="tabs" role="tablist" aria-label="Matrix calculus views">
+		{kinds.map((kind) => <button type="button" role="tab" data-kind={kind} aria-selected={kind === initial}>{labels[kind]}</button>)}
+	</div>
+	{kinds.map((kind) => {
+		const scene = FLOW_SCENES[kind];
+		const byId = new Map(scene.nodes.map((node) => [node.id, node]));
+		const formula = katex.renderToString(scene.formula, { displayMode: true, throwOnError: true });
+		return <section class="scene" data-scene={kind} hidden={kind !== initial}>
+			<div class="scene-copy"><strong>{scene.title}</strong><span>{scene.intro}</span></div>
+			<div class="diagram-scroll"><svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={scene.title}>
+				<defs><marker id={`arrow-${kind}`} viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" /></marker></defs>
+				{scene.edges.map((edge) => {
+					const from = byId.get(edge.from)!; const to = byId.get(edge.to)!;
+					const reverse = edge.direction === "reverse";
+					const x1 = from.x + 135; const x2 = to.x; const y = from.y + 48;
+					return <g class:list={["edge", { reverse }]}><line x1={reverse ? x2 : x1} y1={y} x2={reverse ? x1 : x2} y2={y} marker-end={`url(#arrow-${kind})`} /><text x={(x1+x2)/2} y={y-10}>{edge.label}</text></g>;
+				})}
+				{scene.nodes.map((node) => <g class:list={["node", node.tone]} transform={`translate(${node.x} ${node.y})`}><rect width="135" height="96" rx="10" /><text class="title" x="67.5" y="25">{node.title}</text><text class="shape" x="67.5" y="51">{node.shape}</text><text class="detail" x="67.5" y="76">{node.detail}</text></g>)}
+			</svg></div>
+			<div class="formula" set:html={formula} />
+			<p class="note">{scene.note}</p>
+		</section>;
+	})}
+	<figcaption>Switch views and follow the labelled quantity: perturbations move forward; loss sensitivities move backward.</figcaption>
+</figure>
+
+<script>
+	document.querySelectorAll<HTMLElement>(".mc-flow").forEach((root) => {
+		const buttons = [...root.querySelectorAll<HTMLButtonElement>("[data-kind]")];
+		const scenes = [...root.querySelectorAll<HTMLElement>("[data-scene]")];
+		for (const button of buttons) button.addEventListener("click", () => {
+			const kind = button.dataset.kind;
+			for (const candidate of buttons) candidate.setAttribute("aria-selected", String(candidate === button));
+			for (const scene of scenes) scene.hidden = scene.dataset.scene !== kind;
+		});
+	});
+</script>
+
+<style>
+	.mc-flow { box-sizing: border-box; margin: 1.75rem 0; max-width: 100%; min-width: 0; border: 1px solid var(--faint); border-radius: 12px; background: var(--surface); overflow: hidden; }
+	.tabs { display: flex; gap: .35rem; padding: .65rem; border-bottom: 1px solid var(--faint); overflow-x: auto; }
+	button { border: 1px solid var(--faint); border-radius: 999px; background: transparent; color: var(--muted); padding: .4rem .75rem; white-space: nowrap; cursor: pointer; font: inherit; font-size: .82rem; }
+	button[aria-selected="true"] { color: var(--text); border-color: var(--accent); background: color-mix(in oklch, var(--accent) 12%, transparent); }
+	.scene[hidden] { display: none; }
+	.scene-copy { padding: .9rem 1rem 0; display: flex; gap: .5rem 1rem; align-items: baseline; flex-wrap: wrap; }
+	.scene-copy span { color: var(--muted); font-size: .9rem; }
+	svg { display: block; width: 100%; height: auto; min-width: 650px; }
+	.scene { min-width: 0; }
+	.diagram-scroll { max-width: 100%; overflow-x: auto; }
+	.node rect { fill: var(--bg); stroke: var(--faint); stroke-width: 1.5; }
+	.node.input rect { stroke: color-mix(in oklch, var(--accent) 70%, var(--faint)); }
+	.node.output rect { stroke: #34a37a; }
+	.node.gradient rect { stroke: #b168d4; }
+	.node text { text-anchor: middle; fill: var(--text); font-family: var(--mono); }
+	.node .title { font-weight: 650; font-size: 14px; }
+	.node .shape { font-size: 14px; fill: var(--accent); }
+	.node .detail { font-size: 11px; fill: var(--muted); }
+	.edge line { stroke: var(--muted); stroke-width: 1.7; }
+	.edge.reverse line { stroke: #b168d4; stroke-width: 2.2; }
+	.edge text { text-anchor: middle; fill: var(--muted); font: 11px var(--mono); }
+	marker path { fill: var(--muted); }
+	.formula { padding: 0 .75rem; overflow-x: auto; text-align: center; }
+	.formula :global(.katex-display) { margin: .35rem 0 .55rem; }
+	.note { max-width: 42rem; margin: 0 auto .85rem; padding: 0 1rem; color: var(--muted); font-size: .82rem; line-height: 1.45; text-align: center; }
+	figcaption { padding: 0 1rem 1rem; text-align: center; color: var(--muted); font-size: .82rem; }
+	@media (prefers-color-scheme: dark) { .node.output rect { stroke: #61c69f; } .node.gradient rect { stroke: #c78be3; } }
+</style>

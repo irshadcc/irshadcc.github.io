@@ -1,0 +1,76 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import SymbolicShapes from "../../utils/compiler/SymbolicShapes.astro";
+import { dynamoShapes } from "../../utils/compiler/fxFigures";
+import type { SymbolicShapesData } from "../../utils/compiler/symbolicShapes";
+
+// A small hand-written graph: cat of two inputs that share a column symbol.
+const cat: SymbolicShapesData = {
+	symbols: [
+		{ name: "s0", source: "a.size(0)" },
+		{ name: "s1", source: "b.size(0)" },
+		{ name: "s2", source: "a.size(1) = b.size(1)" },
+	],
+	configs: [
+		{
+			label: "a 3×4, b 5×4",
+			values: { s0: 3, s1: 5, s2: 4 },
+			recompiles: false,
+		},
+		{
+			label: "a 2×7, b 9×7",
+			values: { s0: 2, s1: 9, s2: 7 },
+			recompiles: false,
+		},
+		{
+			label: "a 1×4, b 5×4",
+			values: { s0: 1, s1: 5, s2: 4 },
+			recompiles: true,
+		},
+	],
+	rows: [
+		{
+			name: "a",
+			op: "placeholder",
+			code: "input a",
+			symbolic: "f32[s0, s2]",
+			concrete: ["f32[3, 4]", "f32[2, 7]", "f32[1, 4]"],
+		},
+		{
+			name: "b",
+			op: "placeholder",
+			code: "input b",
+			symbolic: "f32[s1, s2]",
+			concrete: ["f32[5, 4]", "f32[9, 7]", "f32[5, 4]"],
+		},
+		{
+			name: "cat",
+			op: "call_function",
+			code: "torch.cat([a, b])",
+			symbolic: "f32[s0 + s1, s2]",
+			concrete: ["f32[8, 4]", "f32[11, 7]", "f32[6, 4]"],
+		},
+	],
+	guards: [
+		{ expr: "2 <= s0", why: "0/1 specialization", holds: [true, true, false] },
+		{ expr: "2 <= s1", why: "0/1 specialization", holds: [true, true, true] },
+	],
+};
+---
+
+<Layout title="Symbolic shapes demo">
+	<h1>Symbolic shapes demo</h1>
+	<p>
+		<code>SymbolicShapes</code> from <code>src/utils/compiler</code>: an FX graph with symbolic sizes, the concrete
+		shapes for several inputs, and the guards checked against each. Hover a symbol to highlight it.
+	</p>
+
+	<h2>The Dynamo graph from the FX post</h2>
+	<SymbolicShapes data={dynamoShapes} title="relu((x @ w).reshape(2 * x.shape[0], -1)) + x.shape[0]" />
+
+	<h2>Same data, a failing config selected on load</h2>
+	<SymbolicShapes data={dynamoShapes} config={4} />
+
+	<h2>Hand-written data, no title</h2>
+	<SymbolicShapes data={cat} />
+</Layout>
