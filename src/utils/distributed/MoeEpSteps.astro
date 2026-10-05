@@ -1,0 +1,700 @@
+---
+import { NNGraph } from "../neuralnetwork/NNGraph";
+// Step-through of one expert-parallel MoE layer (EP = 4, 8 experts, top-2, 8 tokens) as Megatron-LM,
+// vLLM or SGLang runs it; the flows are defined in epFlows.ts, the shared example in
+// epDispatch.ts. The graph on top is a NeuralNetworkGraph with one column per rank; every token
+// copy is a chip, coloured by the rank that holds its expert, that moves between the graph's
+// nodes (dimmed: a copy this rank holds but skips; dashed: an empty capacity slot). Hovering or focusing a node shows the tensor
+// at that point. Below the graph, the code, with the line each step runs highlighted.
+// Usage in .mdx:
+//   <MoeEpSteps />
+//   <MoeEpSteps flow="vllm" title="vLLM's default EP path" />
+import NeuralNetworkGraph from "../neuralnetwork/NeuralNetworkGraph.astro";
+import { EP } from "./epDispatch";
+import { type FlowName, buildFlow } from "./epFlows";
+
+interface Props {
+	flow?: FlowName;
+	title?: string;
+}
+
+const { flow: flowName = "megatron", title } = Astro.props;
+const flow = buildFlow(flowName);
+const { steps, views } = flow;
+
+// Chip and tray sizes, in SVG units; must match the chip styles below.
+const CHIP = { w: 20, h: 15, dx: 22, dy: 18 };
+const tray = ([cols, rows]: [number, number]) => ({
+	width: cols * CHIP.dx + 2,
+	height: rows * CHIP.dy + 2,
+});
+
+const g = new NNGraph();
+const ranks = [...Array(EP).keys()];
+for (const n of flow.nodes)
+	g.node(n.kind, n.label, {
+		id: n.id,
+		detail: n.detail,
+		from: n.from,
+		tray: n.tray && tray(n.tray),
+	});
+
+const data = JSON.stringify({
+	chip: CHIP,
+	chips: flow.chips,
+	steps: steps.map((s) => ({
+		line: s.line,
+		active: s.active,
+		places: s.places,
+	})),
+});
+---
+
+<figure class="moe-ep" data-ep={data}>
+	{title && <figcaption class="title">{title}</figcaption>}
+	<div class="legend">
+		<span>chip = one token copy, labelled with its token; colour = rank that holds its expert:</span>
+		{
+			ranks.map((r) => (
+				<span class="key">
+					<i class={`sw d${r}`} />
+					{r}
+				</span>
+			))
+		}
+	</div>
+	<div class="graph">
+		<NeuralNetworkGraph graph={g} legend={false} keepOutputOrder rankSep={56} />
+		{
+			Object.entries(views).map(([id, v]) => {
+				const max = v.grid ? Math.max(...v.grid.values.flat()) : 1;
+				const fmtCell = (n: number) => (v.grid && v.grid.decimals > 0 ? (n ? n.toFixed(v.grid.decimals) : "·") : String(n));
+				const shade = (n: number) => `--a:${Math.round((n / max) * 60)}%`;
+				return (
+					<div class="ep-card" data-node={id} hidden>
+						<p class="card-title">{v.title}</p>
+						<p class="card-code">
+							<code>{v.code}</code> <span class="shape">{v.shape}</span>
+							<span class="words">{v.shapeWords}</span>
+						</p>
+						{v.groups && (
+							<div class="tensor">
+								{v.groups.map((grp) => (
+									<div class="tgroup">
+										{grp.label && <p class="glabel">{grp.label}</p>}
+										{grp.rows.map((row) => (
+											<div class={`trow ${row.rank === null ? "plain" : `d${row.rank}`}`}>
+												<span class="tchip">{row.t < 0 ? "pad" : `t${row.t}`}</span>
+												<span class="vec" aria-hidden="true">
+													{Array.from({ length: 8 }, () => (
+														<i />
+													))}
+												</span>
+												<span class="tnote">{row.note}</span>
+											</div>
+										))}
+									</div>
+								))}
+							</div>
+						)}
+						{v.grid && (
+							<table class="grid">
+								<thead>
+									<tr>
+										<th class="axis">
+											{v.grid.rowAxis} ↓ / {v.grid.colAxis} →
+										</th>
+										{v.grid.colLabels.map((l, j) => (
+											<th class={v.grid?.colRanks ? `col d${v.grid.colRanks[j]}` : "col"}>{l}</th>
+										))}
+										{v.grid.totals && <th class="tot">total</th>}
+									</tr>
+								</thead>
+								<tbody>
+									{v.grid.values.map((row, i) => (
+										<tr>
+											<th class="rlabel">{v.grid?.rowLabels[i]}</th>
+											{row.map((n) => (
+												<td class={n ? "" : "zero"} style={shade(n)}>
+													{fmtCell(n)}
+												</td>
+											))}
+											{v.grid?.totals && <td class="tot">{row.reduce((a, b) => a + b, 0)}</td>}
+										</tr>
+									))}
+									{v.grid.totals && (
+										<tr class="tot-row">
+											<th class="rlabel">total</th>
+											{v.grid.colLabels.map((_, j) => (
+												<td class="tot">{v.grid?.values.reduce((a, row) => a + row[j], 0)}</td>
+											))}
+											<td class="tot" />
+										</tr>
+									)}
+								</tbody>
+							</table>
+						)}
+						<p class="card-note">{v.note}</p>
+					</div>
+				);
+			})
+		}
+	</div>
+	<div class="controls">
+		<div class="buttons">
+			<button type="button" data-act="first" aria-label="First step">
+				<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 3v10M13 3 6 8l7 5z"></path></svg>
+			</button>
+			<button type="button" data-act="prev" aria-label="Previous step">
+				<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M11 3 4 8l7 5z"></path></svg>
+			</button>
+			<button type="button" data-act="play" class="play" aria-label="Play">
+				<svg class="i-play" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5v11L13.5 8z"></path></svg>
+				<svg class="i-pause" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 3h3v10H4zM9 3h3v10H9z"></path></svg>
+			</button>
+			<button type="button" data-act="next" aria-label="Next step">
+				<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 3l7 5-7 5z"></path></svg>
+			</button>
+		</div>
+		<div class="timeline" role="group" aria-label="Steps">
+			{steps.map((s, i) => <button type="button" class="seg" data-i={i} aria-label={s.head} title={s.head} />)}
+		</div>
+		<span class="counter"></span>
+	</div>
+	<div class="narration" aria-live="polite">
+		<p class="head"></p>
+		<p class="body"></p>
+	</div>
+	<pre class="code" aria-label="MoE forward pass, condensed"><code>{flow.code.map((l, i) => <span class="ln" data-line={i}>{l}{"\n"}</span>)}</code></pre>
+	<p class="source">{flow.source}</p>
+	<div class="store" hidden>
+		{steps.map((s) => <span data-head={s.head}>{s.body}</span>)}
+	</div>
+</figure>
+
+<script>
+	const SVG = "http://www.w3.org/2000/svg";
+
+	interface Place {
+		node: string;
+		col: number;
+		row: number;
+		state: "on" | "dim" | "plain" | "hidden";
+		nudge?: number;
+	}
+	interface Data {
+		chip: { w: number; h: number; dx: number; dy: number };
+		chips: { t: number; dest: number; pad?: boolean }[];
+		steps: { line: number; active: string[]; places: Place[] }[];
+	}
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".moe-ep")) {
+		const data: Data = JSON.parse(fig.dataset.ep ?? "{}");
+		const svg = fig.querySelector<SVGSVGElement>(".graph svg");
+		if (!svg) continue;
+		const nodes = new Map<string, SVGGElement>();
+		for (const n of svg.querySelectorAll<SVGGElement>(".node")) nodes.set(n.dataset.id ?? "", n);
+		const trays = new Map<string, number[]>();
+		for (const [id, n] of nodes) if (n.dataset.tray) trays.set(id, n.dataset.tray.split(" ").map(Number));
+
+		// One chip per token copy, on a layer above the graph.
+		const layer = document.createElementNS(SVG, "g");
+		layer.setAttribute("class", "ep-chips");
+		const { w, h, dx, dy } = data.chip;
+		const chips = data.chips.map((c) => {
+			const chip = document.createElementNS(SVG, "g");
+			chip.setAttribute("class", `ep-chip d${c.dest}${c.pad ? " pad" : ""}`);
+			const rect = document.createElementNS(SVG, "rect");
+			rect.setAttribute("width", String(w));
+			rect.setAttribute("height", String(h));
+			rect.setAttribute("rx", "3");
+			const text = document.createElementNS(SVG, "text");
+			text.setAttribute("x", String(w / 2));
+			text.setAttribute("y", String(h / 2 + 3.4));
+			text.textContent = c.pad ? "" : String(c.t);
+			chip.append(rect, text);
+			layer.append(chip);
+			return chip;
+		});
+		svg.append(layer);
+
+		// Hover cards: the tensor at each node. They replace the graph's plain tooltips.
+		const graph = fig.querySelector<HTMLElement>(".graph");
+		const cards = new Map<string, HTMLElement>();
+		for (const c of fig.querySelectorAll<HTMLElement>(".ep-card")) cards.set(c.dataset.node ?? "", c);
+		const showCard = (id: string | null, n?: SVGGElement) => {
+			for (const c of cards.values()) c.hidden = true;
+			const card = id ? cards.get(id) : undefined;
+			if (!card || !n || !graph) return;
+			card.hidden = false;
+			const g = graph.getBoundingClientRect();
+			const b = n.getBoundingClientRect();
+			// Below the node, kept inside the figure; above it if there's no room below.
+			const left = Math.min(Math.max(0, b.left - g.left + b.width / 2 - card.offsetWidth / 2), g.width - card.offsetWidth);
+			const below = b.bottom - g.top + 6;
+			const top = below + card.offsetHeight > g.height ? b.top - g.top - card.offsetHeight - 6 : below;
+			card.style.left = `${Math.max(0, left)}px`;
+			card.style.top = `${Math.max(0, top)}px`;
+		};
+		for (const [id, n] of nodes) {
+			n.querySelector("title")?.remove();
+			n.addEventListener("pointerenter", () => showCard(id, n));
+			n.addEventListener("focus", () => showCard(id, n));
+			n.addEventListener("pointerleave", () => showCard(null));
+			n.addEventListener("blur", () => showCard(null));
+		}
+
+		const lines = [...fig.querySelectorAll<HTMLElement>(".code .ln")];
+		const segs = [...fig.querySelectorAll<HTMLButtonElement>(".seg")];
+		const store = [...fig.querySelectorAll<HTMLElement>(".store span")];
+		const head = fig.querySelector(".narration .head");
+		const body = fig.querySelector(".narration .body");
+		const counter = fig.querySelector(".counter");
+		const play = fig.querySelector<HTMLButtonElement>("[data-act=play]");
+		const last = data.steps.length - 1;
+		let at = 0;
+		let timer: number | undefined;
+
+		const go = (i: number) => {
+			at = Math.min(Math.max(0, i), last);
+			const s = data.steps[at];
+			s.places.forEach((p, id) => {
+				const t = trays.get(p.node);
+				if (!t) return;
+				// A token's copies share a cell before routing and after the sum: the nudge offsets
+				// them slightly, so the stack reads as one token with several parts.
+				const shift = p.nudge ?? 0;
+				const x = t[0] + 2 + p.col * dx + shift;
+				const y = t[1] + 2 + p.row * dy + shift;
+				chips[id].style.transform = `translate(${x}px, ${y}px)`;
+				chips[id].classList.toggle("plain", p.state === "plain");
+				chips[id].classList.toggle("dim", p.state === "dim");
+				chips[id].classList.toggle("gone", p.state === "hidden");
+			});
+			const active = new Set(s.active);
+			for (const [id, n] of nodes) n.classList.toggle("ep-active", active.has(id));
+			lines.forEach((l, k) => l.classList.toggle("on", k === s.line));
+			segs.forEach((b, k) => {
+				b.classList.toggle("done", k <= at);
+				b.setAttribute("aria-current", String(k === at));
+			});
+			if (head) head.textContent = store[at]?.dataset.head ?? "";
+			if (body) body.textContent = store[at]?.textContent ?? "";
+			if (counter) counter.textContent = `${at + 1} / ${last + 1}`;
+		};
+		const stop = () => {
+			if (timer !== undefined) clearInterval(timer);
+			timer = undefined;
+			play?.classList.remove("playing");
+			play?.setAttribute("aria-label", "Play");
+		};
+		const start = () => {
+			if (at >= last) go(0);
+			play?.classList.add("playing");
+			play?.setAttribute("aria-label", "Pause");
+			timer = window.setInterval(() => {
+				if (at >= last) stop();
+				else go(at + 1);
+			}, 2600);
+		};
+		for (const b of fig.querySelectorAll<HTMLButtonElement>("[data-act]"))
+			b.addEventListener("click", () => {
+				const act = b.dataset.act;
+				if (act === "play") return timer === undefined ? start() : stop();
+				stop();
+				if (act === "first") go(0);
+				if (act === "prev") go(at - 1);
+				if (act === "next") go(at + 1);
+			});
+		for (const b of segs)
+			b.addEventListener("click", () => {
+				stop();
+				go(Number(b.dataset.i));
+			});
+		fig.addEventListener("keydown", (e) => {
+			if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+			e.preventDefault();
+			stop();
+			go(at + (e.key === "ArrowRight" ? 1 : -1));
+		});
+		// Place the chips without animating them in.
+		for (const c of chips) c.style.transition = "none";
+		go(0);
+		requestAnimationFrame(() => {
+			for (const c of chips) c.style.transition = "";
+		});
+	}
+</script>
+
+<style>
+	.moe-ep {
+		/* One colour per EP rank (destination of a copy). */
+		--d0: #2a78d6;
+		--d1: #eb6834;
+		--d2: #1baf7a;
+		--d3: #eda100;
+		--d4: #e87ba4;
+		--d5: #008300;
+		--d6: #4a3aa7;
+		--d7: #e34948;
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+	}
+	@media (prefers-color-scheme: dark) {
+		.moe-ep {
+			--d0: #3987e5;
+			--d1: #d95926;
+			--d2: #199e70;
+			--d3: #c98500;
+			--d4: #d55181;
+			--d5: #2ea043;
+			--d6: #9085e9;
+			--d7: #e66767;
+		}
+	}
+	.title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.4rem;
+	}
+	.legend {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		align-items: center;
+		gap: 0.25rem 0.6rem;
+		font-size: 0.72rem;
+		color: var(--muted);
+	}
+	.key {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.2rem;
+		font-family: var(--mono);
+	}
+	.sw {
+		width: 0.75rem;
+		height: 0.6rem;
+		border-radius: 2px;
+		background: var(--c);
+	}
+	.moe-ep :global(.d0) {
+		--c: var(--d0);
+	}
+	.moe-ep :global(.d1) {
+		--c: var(--d1);
+	}
+	.moe-ep :global(.d2) {
+		--c: var(--d2);
+	}
+	.moe-ep :global(.d3) {
+		--c: var(--d3);
+	}
+	.moe-ep :global(.d4) {
+		--c: var(--d4);
+	}
+	.moe-ep :global(.d5) {
+		--c: var(--d5);
+	}
+	.moe-ep :global(.d6) {
+		--c: var(--d6);
+	}
+	.moe-ep :global(.d7) {
+		--c: var(--d7);
+	}
+	.graph {
+		position: relative;
+	}
+	.graph :global(.nn-graph) {
+		margin: 0.3rem 0 0;
+	}
+	.ep-card {
+		position: absolute;
+		z-index: 5;
+		width: max-content;
+		max-width: min(28rem, 100%);
+		padding: 0.5rem 0.65rem;
+		border: 1px solid var(--faint);
+		border-radius: 8px;
+		background: var(--bg);
+		box-shadow: 0 6px 20px rgb(0 0 0 / 0.18);
+		font-size: 0.72rem;
+		pointer-events: none;
+	}
+	.ep-card[hidden] {
+		display: none;
+	}
+	.card-title {
+		margin: 0;
+		font-size: 0.8rem;
+		font-weight: 700;
+	}
+	.card-code {
+		margin: 0.1rem 0 0.45rem;
+		color: var(--muted);
+	}
+	.card-code code {
+		font-size: 0.68rem;
+	}
+	.card-code .shape {
+		font-family: var(--mono);
+		font-size: 0.68rem;
+		margin-right: 0.35rem;
+	}
+	.card-code .words {
+		font-size: 0.7rem;
+	}
+	.card-note {
+		margin: 0.45rem 0 0;
+		color: var(--muted);
+		line-height: 1.4;
+	}
+	.glabel {
+		margin: 0.3rem 0 0.15rem;
+		font-size: 0.66rem;
+		font-weight: 600;
+		text-transform: uppercase;
+		letter-spacing: 0.03em;
+		color: var(--muted);
+	}
+	.tgroup + .tgroup {
+		margin-top: 0.15rem;
+	}
+	.trow {
+		display: flex;
+		align-items: center;
+		gap: 0.4rem;
+		margin: 0.12rem 0;
+		--c: var(--muted);
+	}
+	.tchip {
+		min-width: 1.6rem;
+		padding: 0 0.25rem;
+		border-radius: 3px;
+		background: var(--c);
+		color: #fff;
+		font-family: var(--mono);
+		font-size: 0.66rem;
+		font-weight: 700;
+		text-align: center;
+	}
+	.vec {
+		display: inline-flex;
+		gap: 1px;
+	}
+	.vec i {
+		width: 0.42rem;
+		height: 0.8rem;
+		border-radius: 1px;
+		background: color-mix(in srgb, var(--c) 35%, transparent);
+	}
+	.tnote {
+		font-family: var(--mono);
+		font-size: 0.68rem;
+		white-space: nowrap;
+	}
+	.grid {
+		width: auto;
+		margin: 0;
+		border-collapse: separate;
+		border-spacing: 2px;
+		font-family: var(--mono);
+		font-size: 0.68rem;
+	}
+	.grid th,
+	.grid td {
+		padding: 0.12rem 0.35rem;
+		border: 0;
+		text-align: center;
+		white-space: nowrap;
+	}
+	.grid th {
+		font-family: var(--sans);
+		font-weight: 600;
+		color: var(--muted);
+	}
+	.grid th.axis {
+		font-weight: 400;
+		font-size: 0.62rem;
+		text-align: left;
+	}
+	.grid th.col {
+		border-bottom: 3px solid var(--c, var(--faint));
+	}
+	.grid th.rlabel {
+		text-align: right;
+	}
+	.grid td {
+		border-radius: 3px;
+		background: color-mix(in srgb, var(--accent) var(--a, 0%), transparent);
+	}
+	.grid td.zero {
+		color: var(--faint);
+	}
+	.grid .tot {
+		font-weight: 700;
+		background: none;
+		color: var(--text);
+	}
+
+	/* Chips are created by the script, so their styles must be global (scoped under the figure). */
+	.moe-ep :global(.ep-chip) {
+		pointer-events: none;
+		transition: transform 650ms cubic-bezier(0.4, 0, 0.2, 1);
+	}
+	.moe-ep :global(.ep-chip rect) {
+		fill: var(--c);
+		stroke: var(--bg);
+		stroke-width: 0.8;
+	}
+	.moe-ep :global(.ep-chip text) {
+		font-family: var(--mono);
+		font-size: 10px;
+		font-weight: 600;
+		text-anchor: middle;
+		fill: #fff;
+	}
+	.moe-ep :global(.ep-chip.pad rect) {
+		fill: none;
+		stroke: var(--muted);
+		stroke-dasharray: 2 2;
+	}
+	.moe-ep :global(.ep-chip.plain rect) {
+		fill: var(--muted);
+	}
+	.moe-ep :global(.ep-chip.dim) {
+		opacity: 0.22;
+	}
+	.moe-ep :global(.ep-chip.gone) {
+		opacity: 0;
+	}
+	.moe-ep :global(.ep-chip) {
+		transition-property: transform, opacity;
+	}
+	.moe-ep :global(.node.ep-active rect:not(.tray)) {
+		stroke: var(--text);
+		stroke-width: 2.2;
+	}
+	.moe-ep :global(.node.ep-active text.label) {
+		font-weight: 700;
+	}
+
+	.controls {
+		display: flex;
+		align-items: center;
+		gap: 0.75rem;
+		margin-top: 0.5rem;
+	}
+	.buttons {
+		display: flex;
+		gap: 0.3rem;
+	}
+	.buttons button {
+		display: grid;
+		place-items: center;
+		width: 2rem;
+		height: 2rem;
+		padding: 0;
+		border: 1px solid var(--faint);
+		border-radius: 8px;
+		background: var(--bg);
+		color: var(--text);
+		cursor: pointer;
+		transition: border-color 150ms ease;
+	}
+	.buttons button:hover {
+		border-color: var(--accent);
+	}
+	.buttons svg {
+		width: 0.8rem;
+		height: 0.8rem;
+		fill: currentColor;
+		stroke: currentColor;
+		stroke-width: 1.2;
+		stroke-linejoin: round;
+	}
+	.buttons .play {
+		width: 2.6rem;
+		background: var(--accent);
+		border-color: var(--accent);
+		color: var(--bg);
+	}
+	.play .i-pause,
+	.play.playing .i-play {
+		display: none;
+	}
+	.play.playing .i-pause {
+		display: block;
+	}
+	.timeline {
+		flex: 1;
+		display: flex;
+		gap: 3px;
+	}
+	.seg {
+		flex: 1;
+		height: 0.55rem;
+		padding: 0;
+		border: 0;
+		border-radius: 3px;
+		background: var(--faint);
+		cursor: pointer;
+	}
+	.seg.done {
+		background: var(--accent);
+	}
+	.seg[aria-current="true"] {
+		outline: 2px solid var(--text);
+		outline-offset: 1px;
+	}
+	.counter {
+		font-family: var(--mono);
+		font-size: 0.75rem;
+		color: var(--muted);
+		min-width: 3.2rem;
+		text-align: right;
+	}
+	.narration {
+		margin-top: 0.5rem;
+		font-size: 0.8rem;
+		min-height: 4.6rem;
+	}
+	.narration p {
+		margin: 0.15rem 0;
+	}
+	.narration .head {
+		font-weight: 600;
+	}
+	.code {
+		margin: 0.5rem 0 0;
+		padding: 0.6rem 0;
+		overflow-x: auto;
+		font-size: 0.72rem;
+		line-height: 1.55;
+		border: 1px solid var(--faint);
+		border-radius: 8px;
+		background: var(--surface);
+	}
+	.code code {
+		display: block;
+		min-width: max-content;
+	}
+	.ln {
+		display: block;
+		padding: 0 0.8rem;
+		border-left: 3px solid transparent;
+		color: var(--muted);
+		transition: background 200ms ease;
+	}
+	.ln.on {
+		border-left-color: var(--accent);
+		background: color-mix(in srgb, var(--accent) 16%, transparent);
+		color: var(--text);
+	}
+	.source {
+		margin: 0.3rem 0 0;
+		font-size: 0.72rem;
+		color: var(--muted);
+	}
+</style>

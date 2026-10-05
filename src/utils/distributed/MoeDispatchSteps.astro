@@ -1,0 +1,590 @@
+---
+// Step-through of one MoE layer on one device: route, lay the token copies out for the experts,
+// run the experts and combine the results. Two modes share the same routing (softmax top-2 on the
+// 8-token, 4-expert example from moeRouting.ts):
+//   capacity – GShard / Switch style: fixed buffers of `capacity` slots per expert; first choices
+//              are seated before second choices; copies past the capacity are dropped and slots
+//              left over are padding.
+//   dropless – Megatron-LM / MegaBlocks style: a stable sort by expert id, variable-sized groups
+//              and a grouped GEMM; nothing dropped, nothing padded.
+// Usage in .mdx:
+//   <MoeDispatchSteps />
+//   <MoeDispatchSteps mode="dropless" factor={1.25} title="Dispatch and combine" />
+import {
+	type DispatchPlan,
+	EXAMPLE,
+	capacityOf,
+	dispatch,
+	softmaxTopK,
+} from "./moeRouting";
+
+interface Props {
+	mode?: "capacity" | "dropless";
+	/** Capacity factor for the capacity mode. */
+	factor?: number;
+	title?: string;
+}
+
+const { mode = "capacity", factor = 1, title } = Astro.props;
+const { words, logits } = EXAMPLE;
+const K = 2;
+const T = logits.length;
+const E = logits[0].length;
+const routing = softmaxTopK(logits, K);
+const capacity = capacityOf(T, K, E, factor);
+const plans: Record<"capacity" | "dropless", DispatchPlan> = {
+	capacity: dispatch(routing, capacity),
+	dropless: dispatch(routing, null),
+};
+const g2 = (v: number) => v.toFixed(2).replace(/^0/, "");
+const ord = ["1st", "2nd", "3rd"];
+
+interface Step {
+	head: string;
+	body: string;
+}
+const steps = (m: "capacity" | "dropless"): Step[] => {
+	const p = plans[m];
+	const lost = p.dropped
+		.map((i) => `${words[p.copies[i].t]} → expert ${p.copies[i].e}`)
+		.join(", ");
+	const pads = p.buffers.flat().filter((i) => i < 0).length;
+	return [
+		{
+			head: "1. Route",
+			body: `The router gives each token its 2 experts and their gates (softmax top-2). That makes ${p.copies.length} token copies: experts 0–3 are asked for ${routing.load.join(", ")} of them.`,
+		},
+		m === "capacity"
+			? {
+					head: "2. Assign slots",
+					body: `Capacity = ceil(${T} tokens × ${K} / ${E} experts × ${factor}) = ${capacity} slots per expert. A cumulative sum over the dispatch mask numbers each copy within its expert: all 1st choices first, then the 2nd choices. Copies that would get slot ${capacity} or later are dropped: ${lost || "none"}.`,
+				}
+			: {
+					head: "2. Sort by expert",
+					body: `A stable argsort of the expert ids lines the copies up by expert, keeping token order within each. The counts per expert, ${routing.load.join(", ")}, become the group sizes.`,
+				},
+		m === "capacity"
+			? {
+					head: "3. Dispatch into buffers",
+					body: `Each expert gets an input of exactly ${capacity} rows, an ${E} × ${capacity} × d tensor. The shapes are static, which is what TPUs and CUDA graphs need, but ${pads} of the ${E * capacity} rows are padding and ${p.dropped.length} copies didn't fit.`,
+				}
+			: {
+					head: "3. Gather into one tensor",
+					body: `One gather builds a ${p.copies.length} × d tensor, grouped by expert. Nothing is padded or dropped, but the group sizes change with every batch.`,
+				},
+		{
+			head: "4. Run the experts",
+			body:
+				m === "capacity"
+					? `Each expert multiplies its whole buffer, padding included: one batched matrix multiply over ${E} equal-sized buffers.`
+					: `A grouped GEMM runs each expert's weights on its own group of rows (${routing.load.join(", ")}) in one kernel launch.`,
+		},
+		{
+			head: "5. Combine",
+			body:
+				m === "capacity"
+					? `Each output row goes back to its token and is scaled by its gate, and each token sums its copies. A dropped copy adds nothing, and the gates are not renormalized, so ${p.dropped.map((i) => words[p.copies[i].t]).join(", ")} keep only their first expert's share of the output.`
+					: "Each output row goes back to its token (a scatter-add over the same indices) and is scaled by its gate, and each token sums its 2 copies.",
+		},
+	];
+};
+const texts = { capacity: steps("capacity"), dropless: steps("dropless") };
+---
+
+<figure class="moe-dc" data-mode={mode}>
+	{title && <figcaption class="title">{title}</figcaption>}
+	<div class="modes" role="tablist">
+		<button type="button" role="tab" data-mode="capacity" aria-selected={String(mode === "capacity")}>
+			capacity factor {factor}
+		</button>
+		<button type="button" role="tab" data-mode="dropless" aria-selected={String(mode === "dropless")}>
+			dropless
+		</button>
+	</div>
+
+	{
+		(["capacity", "dropless"] as const).map((m) => {
+			const p = plans[m];
+			const chip = (i: number, label: string, extra = "") => {
+				const c = p.copies[i];
+				return (
+					<span class={`chip e${c.e} ${c.slot < 0 ? "dropped" : ""} ${extra}`}>
+						{label}
+					</span>
+				);
+			};
+			const groups = p.buffers.map((b, e) => ({ e, rows: b }));
+			return (
+				<div class="mode" data-mode={m} hidden={m !== mode}>
+					<div class="stage" data-i="0">
+						<div class="tokens">
+							{routing.choice.map((es, t) => (
+								<div class="tok">
+									<span class="w">{words[t]}</span>
+									{es.map((e) => (
+										<span class={`chip e${e}`}>
+											E{e} <b>{g2(routing.gates[t][e])}</b>
+										</span>
+									))}
+								</div>
+							))}
+						</div>
+					</div>
+
+					<div class="stage" data-i="1" hidden>
+						{m === "capacity" ? (
+							<div class="list">
+								{[0, 1].map((r) => (
+									<div class="row">
+										<span class="lab">{ord[r]} choices</span>
+										{p.copies.map((c, i) =>
+											c.rank === r
+												? chip(i, `${words[c.t]}→E${c.e} #${c.slot < 0 ? "×" : c.slot}`)
+												: null,
+										)}
+									</div>
+								))}
+							</div>
+						) : (
+							<div class="list">
+								<div class="row">
+									<span class="lab">sorted</span>
+									{p.order.map((i) => chip(i, `${words[p.copies[i].t]}→E${p.copies[i].e}`))}
+								</div>
+							</div>
+						)}
+					</div>
+
+					{[2, 3].map((si) => (
+						<div class="stage" data-i={si} hidden>
+							<div class="buffers">
+								{groups.map(({ e, rows }) => (
+									<div class={`buf e${e}`}>
+										<span class="lab">
+											expert {e}
+											<small>{m === "capacity" ? `${rows.filter((i) => i >= 0).length} / ${capacity}` : `${rows.length} rows`}</small>
+										</span>
+										{rows.map((i) =>
+											i < 0 ? (
+												<span class="chip pad">{si === 3 ? "E(0)" : "pad"}</span>
+											) : (
+												chip(i, si === 3 ? `E${e}(${words[p.copies[i].t]})` : words[p.copies[i].t], si === 3 ? "out" : "")
+											),
+										)}
+									</div>
+								))}
+							</div>
+							{m === "capacity" && p.dropped.length > 0 && (
+								<p class="dropline">
+									dropped: {p.dropped.map((i) => chip(i, `${words[p.copies[i].t]}→E${p.copies[i].e}`))}
+								</p>
+							)}
+						</div>
+					))}
+
+					<div class="stage" data-i="4" hidden>
+						<div class="sums">
+							{routing.choice.map((es, t) => (
+								<div class="sum">
+									<span class="w">y({words[t]})</span> =
+									{es.map((e, r) => {
+										const i = p.copies.findIndex((c) => c.t === t && c.e === e);
+										const kept = p.copies[i].slot >= 0;
+										return (
+											<>
+												{r > 0 && " + "}
+												<span class={`term e${e} ${kept ? "" : "dropped"}`}>
+													{g2(routing.gates[t][e])}·E{e}
+												</span>
+											</>
+										);
+									})}
+								</div>
+							))}
+						</div>
+					</div>
+
+					<div class="store" hidden>
+						{texts[m].map((s) => (
+							<span data-head={s.head}>{s.body}</span>
+						))}
+					</div>
+				</div>
+			);
+		})
+	}
+
+	<div class="controls">
+		<div class="buttons">
+			<button type="button" data-act="first" aria-label="First step">
+				<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 3v10M13 3 6 8l7 5z"></path></svg>
+			</button>
+			<button type="button" data-act="prev" aria-label="Previous step">
+				<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M11 3 4 8l7 5z"></path></svg>
+			</button>
+			<button type="button" data-act="play" class="play" aria-label="Play">
+				<svg class="i-play" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5v11L13.5 8z"></path></svg>
+				<svg class="i-pause" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 3h3v10H4zM9 3h3v10H9z"></path></svg>
+			</button>
+			<button type="button" data-act="next" aria-label="Next step">
+				<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 3l7 5-7 5z"></path></svg>
+			</button>
+		</div>
+		<div class="timeline" role="group" aria-label="Steps">
+			{texts.capacity.map((s, i) => <button type="button" class="seg" data-i={i} aria-label={s.head} title={s.head} />)}
+		</div>
+		<span class="counter"></span>
+	</div>
+	<div class="narration" aria-live="polite">
+		<p class="head"></p>
+		<p class="body"></p>
+	</div>
+</figure>
+
+<script>
+	for (const fig of document.querySelectorAll<HTMLElement>(".moe-dc")) {
+		const modes = [...fig.querySelectorAll<HTMLElement>(".mode")];
+		const tabs = [...fig.querySelectorAll<HTMLButtonElement>(".modes [role=tab]")];
+		const segs = [...fig.querySelectorAll<HTMLButtonElement>(".seg")];
+		const head = fig.querySelector(".narration .head");
+		const body = fig.querySelector(".narration .body");
+		const counter = fig.querySelector(".counter");
+		const play = fig.querySelector<HTMLButtonElement>("[data-act=play]");
+		const last = segs.length - 1;
+		let mode = fig.dataset.mode ?? "capacity";
+		let at = 0;
+		let timer: number | undefined;
+		const go = (i: number) => {
+			at = Math.min(Math.max(0, i), last);
+			for (const m of modes) {
+				m.hidden = m.dataset.mode !== mode;
+				for (const s of m.querySelectorAll<HTMLElement>(".stage")) s.hidden = Number(s.dataset.i) !== at;
+			}
+			segs.forEach((b, k) => {
+				b.classList.toggle("done", k <= at);
+				b.setAttribute("aria-current", String(k === at));
+			});
+			const s = fig.querySelectorAll<HTMLElement>(`.mode[data-mode=${mode}] .store span`)[at];
+			if (head) head.textContent = s?.dataset.head ?? "";
+			if (body) body.textContent = s?.textContent ?? "";
+			if (counter) counter.textContent = `${at + 1} / ${last + 1}`;
+		};
+		const stop = () => {
+			if (timer !== undefined) clearInterval(timer);
+			timer = undefined;
+			play?.classList.remove("playing");
+			play?.setAttribute("aria-label", "Play");
+		};
+		const start = () => {
+			if (at >= last) go(0);
+			play?.classList.add("playing");
+			play?.setAttribute("aria-label", "Pause");
+			timer = window.setInterval(() => {
+				if (at >= last) stop();
+				else go(at + 1);
+			}, 2500);
+		};
+		for (const t of tabs)
+			t.addEventListener("click", () => {
+				mode = t.dataset.mode ?? "capacity";
+				for (const u of tabs) u.setAttribute("aria-selected", String(u === t));
+				go(at);
+			});
+		for (const b of fig.querySelectorAll<HTMLButtonElement>("[data-act]"))
+			b.addEventListener("click", () => {
+				const act = b.dataset.act;
+				if (act === "play") return timer === undefined ? start() : stop();
+				stop();
+				if (act === "first") go(0);
+				if (act === "prev") go(at - 1);
+				if (act === "next") go(at + 1);
+			});
+		for (const b of segs)
+			b.addEventListener("click", () => {
+				stop();
+				go(Number(b.dataset.i));
+			});
+		go(0);
+	}
+</script>
+
+<style>
+	.moe-dc {
+		--e0: #4c6ef5;
+		--e1: #2f9e44;
+		--e2: #e8590c;
+		--e3: #a86ad8;
+		--drop: #d0574f;
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+		font-size: 0.8rem;
+	}
+	@media (prefers-color-scheme: dark) {
+		.moe-dc {
+			--e0: #748ffc;
+			--e1: #5cc46c;
+			--e2: #ff8a4c;
+			--e3: #b98ae3;
+			--drop: #ff7b72;
+		}
+	}
+	.title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.5rem;
+	}
+	.modes {
+		display: flex;
+		justify-content: center;
+		gap: 0.3rem;
+		margin-bottom: 0.6rem;
+	}
+	.modes button {
+		font: inherit;
+		font-size: 0.75rem;
+		padding: 0.2rem 0.7rem;
+		border: 1px solid var(--faint);
+		border-radius: 999px;
+		background: var(--bg);
+		color: var(--muted);
+		cursor: pointer;
+	}
+	.modes button[aria-selected="true"] {
+		background: var(--accent);
+		border-color: var(--accent);
+		color: var(--bg);
+	}
+	.stage {
+		min-height: 13rem;
+		display: flex;
+		flex-direction: column;
+		justify-content: center;
+		align-items: center;
+	}
+	.stage[hidden],
+	.mode[hidden] {
+		display: none;
+	}
+	.chip {
+		--c: var(--muted);
+		display: inline-block;
+		margin: 0.12rem;
+		padding: 0.1rem 0.4rem;
+		border: 1px solid var(--c);
+		border-left-width: 4px;
+		border-radius: 4px;
+		font-family: var(--mono);
+		font-size: 0.72rem;
+		white-space: nowrap;
+		background: color-mix(in srgb, var(--c) 12%, transparent);
+	}
+	.e0 {
+		--c: var(--e0);
+	}
+	.e1 {
+		--c: var(--e1);
+	}
+	.e2 {
+		--c: var(--e2);
+	}
+	.e3 {
+		--c: var(--e3);
+	}
+	.chip.dropped {
+		border-color: var(--drop);
+		border-style: dashed;
+		text-decoration: line-through;
+		color: var(--drop);
+		background: none;
+	}
+	.chip.pad {
+		border-style: dashed;
+		border-left-width: 1px;
+		color: var(--muted);
+		background: none;
+	}
+	.chip.out {
+		font-weight: 600;
+	}
+	.chip b {
+		font-weight: 700;
+	}
+	.tokens {
+		display: grid;
+		grid-template-columns: repeat(2, auto);
+		gap: 0.2rem 1.5rem;
+	}
+	.tok,
+	.sum {
+		font-family: var(--mono);
+		font-size: 0.75rem;
+	}
+	.tok .w {
+		display: inline-block;
+		min-width: 2.5rem;
+		text-align: right;
+		margin-right: 0.3rem;
+		font-weight: 600;
+	}
+	.list .row {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		justify-content: center;
+		margin: 0.25rem 0;
+	}
+	.lab {
+		margin-right: 0.4rem;
+		font-size: 0.72rem;
+		font-weight: 600;
+		color: var(--muted);
+	}
+	.lab small {
+		display: block;
+		font-weight: 400;
+		font-family: var(--mono);
+	}
+	.buffers {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		align-items: flex-start;
+		gap: 0.6rem;
+	}
+	.buf {
+		display: flex;
+		flex-direction: column;
+		align-items: stretch;
+		padding: 0.3rem;
+		border: 1px solid var(--c);
+		border-radius: 6px;
+		min-width: 5.5rem;
+	}
+	.buf .lab {
+		margin: 0 0 0.2rem;
+		text-align: center;
+		color: var(--c);
+	}
+	.buf .chip {
+		text-align: center;
+	}
+	.dropline {
+		margin: 0.5rem 0 0;
+		font-size: 0.72rem;
+		color: var(--drop);
+	}
+	.sums {
+		display: grid;
+		grid-template-columns: repeat(2, auto);
+		gap: 0.25rem 1.5rem;
+	}
+	.sum .w {
+		display: inline-block;
+		min-width: 4.2rem;
+		text-align: right;
+		font-weight: 600;
+	}
+	.term {
+		color: var(--c);
+		font-weight: 600;
+	}
+	.term.dropped {
+		color: var(--drop);
+		text-decoration: line-through;
+		font-weight: 400;
+	}
+	@media (max-width: 560px) {
+		.tokens,
+		.sums {
+			grid-template-columns: auto;
+		}
+	}
+
+	.controls {
+		display: flex;
+		align-items: center;
+		gap: 0.75rem;
+		margin-top: 0.5rem;
+	}
+	.buttons {
+		display: flex;
+		gap: 0.3rem;
+	}
+	.buttons button {
+		display: grid;
+		place-items: center;
+		width: 2rem;
+		height: 2rem;
+		padding: 0;
+		border: 1px solid var(--faint);
+		border-radius: 8px;
+		background: var(--bg);
+		color: var(--text);
+		cursor: pointer;
+		transition: border-color 150ms ease;
+	}
+	.buttons button:hover {
+		border-color: var(--accent);
+	}
+	.buttons svg {
+		width: 0.8rem;
+		height: 0.8rem;
+		fill: currentColor;
+		stroke: currentColor;
+		stroke-width: 1.2;
+		stroke-linejoin: round;
+	}
+	.buttons .play {
+		width: 2.6rem;
+		background: var(--accent);
+		border-color: var(--accent);
+		color: var(--bg);
+	}
+	.play .i-pause,
+	.play.playing .i-play {
+		display: none;
+	}
+	.play.playing .i-pause {
+		display: block;
+	}
+	.timeline {
+		flex: 1;
+		display: flex;
+		gap: 3px;
+	}
+	.seg {
+		flex: 1;
+		height: 0.55rem;
+		padding: 0;
+		border: 0;
+		border-radius: 3px;
+		background: var(--faint);
+		cursor: pointer;
+	}
+	.seg.done {
+		background: var(--accent);
+	}
+	.seg[aria-current="true"] {
+		outline: 2px solid var(--text);
+		outline-offset: 1px;
+	}
+	.counter {
+		font-family: var(--mono);
+		font-size: 0.75rem;
+		color: var(--muted);
+		min-width: 3.2rem;
+		text-align: right;
+	}
+	.narration {
+		margin-top: 0.5rem;
+		font-size: 0.8rem;
+		min-height: 4.6rem;
+	}
+	.narration p {
+		margin: 0.15rem 0;
+	}
+	.narration .head {
+		font-weight: 600;
+	}
+</style>

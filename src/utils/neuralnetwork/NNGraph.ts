@@ -50,6 +50,8 @@ export interface GraphNode {
 	formula?: string;
 	/** The node's parameters; the hover card shows their distribution and rank. */
 	weights?: NodeWeights;
+	/** Empty space reserved below the text, for figures that draw on top of the graph. */
+	tray?: { width: number; height: number };
 }
 
 export interface GraphEdge {
@@ -73,6 +75,7 @@ export interface NodeOptions {
 	group?: string;
 	formula?: string;
 	weights?: NodeWeights;
+	tray?: { width: number; height: number };
 	/** Explicit id; defaults to an auto-generated one. Ids must be unique. */
 	id?: string;
 }
@@ -91,7 +94,7 @@ export class NNGraph {
 				`NNGraph: node "${label}" is in unknown group "${opts.group}"`,
 			);
 		}
-		const { detail, shape, group, formula, weights } = opts;
+		const { detail, shape, group, formula, weights, tray } = opts;
 		this.nodes.push({
 			id,
 			kind,
@@ -101,6 +104,7 @@ export class NNGraph {
 			group,
 			formula,
 			weights,
+			tray,
 		});
 		for (const from of [opts.from ?? []].flat()) this.edge(from, id);
 		return id;

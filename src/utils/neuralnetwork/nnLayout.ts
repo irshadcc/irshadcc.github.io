@@ -17,8 +17,10 @@ export interface PlacedNode extends GraphNode {
 	h: number;
 	/** Drawn as a circle: a 1–2 character op such as "+". */
 	circle: boolean;
-	/** Text lines with their baselines, stacked around the centre. */
+	/** Text lines with their baselines, stacked around the centre (above the tray, if any). */
 	lines: { cls: LineClass; text: string; y: number }[];
+	/** The node's tray (see GraphNode.tray): top-left corner and size. */
+	trayBox?: { x: number; y: number; w: number; h: number };
 }
 
 export interface PlacedEdge extends GraphEdge {
@@ -51,6 +53,7 @@ const LINE: Record<LineClass, number> = { label: 16, detail: 14, shape: 14 };
 const CHAR: Record<LineClass, number> = { label: 7.3, detail: 6.1, shape: 6.4 };
 const CIRCLE = 30;
 const GROUP_PAD = { side: 8, top: 20, bottom: 8 };
+const TRAY_PAD = 8;
 
 const isCircle = (n: GraphNode) => n.kind === "op" && [...n.label].length <= 2;
 
@@ -72,17 +75,32 @@ function size(n: GraphNode) {
 		...ls.map((l) => [...l.text].length * CHAR[l.cls] + 24),
 	);
 	const height = ls.reduce((h, l) => h + LINE[l.cls], 14);
-	return { width: Math.round(width), height };
+	if (!n.tray) return { width: Math.round(width), height };
+	return {
+		width: Math.round(Math.max(width, n.tray.width + 2 * TRAY_PAD)),
+		height: height + n.tray.height + TRAY_PAD,
+	};
 }
 
-export function layoutGraph(graph: NNGraph, direction: Direction): GraphLayout {
+export interface LayoutOptions {
+	/** Also keep each node's outputs in the order they were added (see outputOrder). */
+	keepOutputOrder?: boolean;
+	/** Gap between ranks (rows, for top-to-bottom flows); more room lets fan-out edges arrive from above. */
+	rankSep?: number;
+}
+
+export function layoutGraph(
+	graph: NNGraph,
+	direction: Direction,
+	options: LayoutOptions = {},
+): GraphLayout {
 	// Groups become compound (parent) nodes so dagre keeps their members together and reports
 	// a bounding box for each.
 	const g = new graphlib.Graph({ compound: true, multigraph: true });
 	g.setGraph({
 		rankdir: direction,
 		nodesep: 22,
-		ranksep: 34,
+		ranksep: options.rankSep ?? 34,
 		edgesep: 14,
 		marginx: 12,
 		marginy: 12,
@@ -96,7 +114,11 @@ export function layoutGraph(graph: NNGraph, direction: Direction): GraphLayout {
 	// Edge labels get no room in the layout (reserving it bends the edge around a phantom box);
 	// they are drawn beside the middle of the finished curve instead, see placeEdge.
 	graph.edges.forEach((e, i) => g.setEdge(e.from, e.to, {}, `e${i}`));
-	layout(g, { constraints: inputOrder(graph) });
+	const constraints = [
+		...inputOrder(graph),
+		...(options.keepOutputOrder ? outputOrder(graph) : []),
+	];
+	layout(g, { constraints });
 
 	const groups = graph.groups.map((grp): PlacedGroup => {
 		const b = g.node(grp.id);
@@ -113,6 +135,14 @@ export function layoutGraph(graph: NNGraph, direction: Direction): GraphLayout {
 	const nodes = graph.nodes.map((n): PlacedNode => {
 		const b = g.node(n.id);
 		const [x, y] = [b.x!, b.y!];
+		// With a tray, the text keeps its usual height at the top and the tray fills the rest.
+		const trayH = n.tray ? n.tray.height + TRAY_PAD : 0;
+		const trayBox = n.tray && {
+			x: x - n.tray.width / 2,
+			y: y + b.height / 2 - trayH,
+			w: n.tray.width,
+			h: n.tray.height,
+		};
 		return {
 			...n,
 			x,
@@ -120,7 +150,8 @@ export function layoutGraph(graph: NNGraph, direction: Direction): GraphLayout {
 			w: b.width,
 			h: b.height,
 			circle: isCircle(n),
-			lines: stack(n, y),
+			lines: stack(n, y - trayH / 2),
+			trayBox,
 		};
 	});
 
@@ -160,6 +191,19 @@ function inputOrder(graph: NNGraph) {
 			.filter((e) => e.to === n.id && !e.label)
 			.map((e) => e.from);
 		return ins.slice(1).map((right, i) => ({ left: ins[i], right }));
+	});
+}
+
+/**
+ * The same for outputs: the nodes a node feeds keep the order they were added in. Useful when one
+ * node fans out to many parallel branches (a collective feeding one column per rank).
+ */
+function outputOrder(graph: NNGraph) {
+	return graph.nodes.flatMap((n) => {
+		const outs = graph.edges
+			.filter((e) => e.from === n.id && !e.label)
+			.map((e) => e.to);
+		return outs.slice(1).map((right, i) => ({ left: outs[i], right }));
 	});
 }
 

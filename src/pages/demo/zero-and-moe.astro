@@ -2,12 +2,15 @@
 import Layout from "../../layouts/Layout.astro";
 import EplbPlacement from "../../utils/distributed/EplbPlacement.astro";
 import MoeDispatch from "../../utils/distributed/MoeDispatch.astro";
+import MoeDispatchSteps from "../../utils/distributed/MoeDispatchSteps.astro";
+import MoeEpSteps from "../../utils/distributed/MoeEpSteps.astro";
+import MoeRouters from "../../utils/distributed/MoeRouters.astro";
 import ZeroMemory from "../../utils/distributed/ZeroMemory.astro";
 ---
 
 <Layout title="ZeRO and MoE demo">
 	<h1>ZeRO and MoE demo</h1>
-	<p>Figures from <code>zero.ts</code>, <code>moe.ts</code> and <code>eplb.ts</code>.</p>
+	<p>Figures from <code>zero.ts</code>, <code>moe.ts</code>, <code>moeRouting.ts</code>, <code>epDispatch.ts</code>, <code>epFlows.ts</code> and <code>eplb.ts</code>.</p>
 
 	<h2>EplbPlacement</h2>
 	<EplbPlacement />
@@ -23,4 +26,31 @@ import ZeroMemory from "../../utils/distributed/ZeroMemory.astro";
 
 	<h2>MoeDispatch with a capacity factor</h2>
 	<MoeDispatch skew={1} capacity={1.25} capacityControl />
+
+	<h2>MoeRouters</h2>
+	<MoeRouters title="Six routers on one batch" />
+
+	<h2>MoeRouters, opened on the bias tab with a larger step</h2>
+	<MoeRouters initial="bias" gamma={0.05} steps={12} />
+
+	<h2>MoeDispatchSteps</h2>
+	<MoeDispatchSteps title="Dispatch and combine, capacity factor 1" />
+
+	<h2>MoeDispatchSteps, dropless first, capacity factor 1.25</h2>
+	<MoeDispatchSteps mode="dropless" factor={1.25} />
+
+	<h2>MoeEpSteps</h2>
+	<MoeEpSteps title="One MoE layer in Megatron-LM, EP = 4" />
+
+	<h2>MoeEpSteps, vLLM's default path</h2>
+	<MoeEpSteps flow="vllm" />
+
+	<h2>MoeEpSteps, SGLang's default path</h2>
+	<MoeEpSteps flow="sglang" />
+
+	<h2>MoeEpSteps, DeepSpeed's capacity buffers</h2>
+	<MoeEpSteps flow="deepspeed" />
+
+	<h2>MoeEpSteps, DeepSeek-V3's two-hop dispatch</h2>
+	<MoeEpSteps flow="deepseek" />
 </Layout>

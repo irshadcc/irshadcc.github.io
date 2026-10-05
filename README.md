@@ -1,8 +1,8 @@
 # irshadcc.github.io
 
-A minimal technical blog built with [Astro](https://astro.build), loosely inspired by
-[siboehm.com](https://siboehm.com). Deployed to GitHub Pages by `.github/workflows/astro.yml`
-on every push to `main`.
+ML Systems is a one of the most rapidly evolving fields in Computer Science with a lot of research focusing on scaling and optimisation. 
+This repository contains some public and private posts (this is for mostly for note taking purposes and correctness is not guaranteed). The public posts are available on irshadcc.github.io/blogs
+Please note that most of the content are created using LLMs.
 
 ## Commands
 

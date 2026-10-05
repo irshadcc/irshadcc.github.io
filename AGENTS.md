@@ -114,11 +114,14 @@ has a demo page under `src/pages/demo/`, listed at `/demo`.
 | `LayoutGrid` | `src/utils/matrix/LayoutGrid.astro` | A flat rank-2 CuTe layout as a grid of offsets |
 | `Matrix2D` | `src/utils/matrix/Matrix2D.astro` | Nested rank-2 layouts, with per-cell values and coloured group labels (tiles, threads) |
 | `GpuGemmDataflow` | `src/utils/gpu/GpuGemmDataflow.astro` | Step-through tiled GEMM on one SM |
-| `FeedForward`, `NeuralNetworkGraph`, `SelfAttention` | `src/utils/neuralnetwork/` | Networks, weights and attention |
+| `FeedForward`, `NeuralNetworkGraph`, `SelfAttention` | `src/utils/neuralnetwork/` | Networks, weights and attention (nodes can reserve a `tray` for overlays; `keepOutputOrder` and `rankSep` tune the layout) |
 | `LogicalDistributedTopology` | `src/utils/distributed/LogicalDistributedTopology.astro` | A training job's TP/CP/EP/DP/PP groups, with hop counts |
 | `PhysicalClusterTopology` | `src/utils/distributed/PhysicalClusterTopology.astro` | Servers, switches and links of a cluster |
 | `CollectiveSteps` | `src/utils/distributed/CollectiveSteps.astro` | Step-through broadcast, reduce, reduce-scatter, all-gather, all-reduce, all-to-all with α–β cost |
 | `PipelineSchedule` | `src/utils/distributed/PipelineSchedule.astro` | Pipeline-parallel schedules as timelines |
+| `MoeRouters` | `src/utils/distributed/MoeRouters.astro` | Six MoE routers (softmax top-k, Switch, sigmoid + bias with a bias-update slider, expert choice, Sinkhorn, hash) on one 8-token batch: scores, chosen experts, gates, load per expert |
+| `MoeDispatchSteps` | `src/utils/distributed/MoeDispatchSteps.astro` | Step-through MoE dispatch and combine on one device, fixed capacity (padding, dropped copies) vs dropless (sort + grouped GEMM) |
+| `MoeEpSteps` | `src/utils/distributed/MoeEpSteps.astro` | Step-through of one MoE layer at EP = 4 as Megatron-LM (all-to-all), DeepSpeed (fixed capacity), DeepSeek/DeepEP (two-hop RDMA + NVLink), vLLM (all-gather + reduce-scatter) or SGLang (all-reduce) runs it (`flow` prop): token-copy chips move through a NeuralNetworkGraph (one column per rank) while the matching code line is highlighted; hovering a node shows its tensor |
 | `SequenceSteps` | `src/utils/payments/SequenceSteps.astro` | Step-through sequence diagram (participants, messages, replies, lost messages) |
 | `BoxDiagram` | `src/utils/payments/BoxDiagram.astro` | Clickable boxes-and-arrows diagram on a grid: architectures, state machines, deployments |
 | `DependencyGraph` | `src/utils/graph/DependencyGraph.astro` | Code or build dependency graph laid out by dagre: icon cards, bare icons, placeholders, junctions, right-angled (optionally directed) wires, clickable active node, dark/light theme |

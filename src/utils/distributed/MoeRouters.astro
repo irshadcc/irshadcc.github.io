@@ -1,0 +1,416 @@
+---
+// Six MoE routers on the same batch of 8 tokens and 4 experts (data and logic in moeRouting.ts).
+// Each tab shows the router's score for every (token, expert) pair, highlights the experts it
+// picks with their gate weights, and counts how many token copies each expert receives. The
+// "sigmoid + bias" tab has a slider that runs the auxiliary-loss-free bias update step by step.
+// Usage in .mdx:
+//   <MoeRouters />
+//   <MoeRouters initial="bias" gamma={0.02} title="Routers on one batch" />
+import {
+	EXAMPLE,
+	type Routing,
+	biasSteps,
+	expertChoice,
+	hashRoute,
+	maxVio,
+	sinkhornTopK,
+	softmaxTopK,
+} from "./moeRouting";
+
+interface Props {
+	/** Which tab to open first. */
+	initial?: "softmax" | "switch" | "bias" | "choice" | "sinkhorn" | "hash";
+	/** Bias update speed for the "sigmoid + bias" tab. */
+	gamma?: number;
+	/** Number of bias update steps the slider offers. */
+	steps?: number;
+	title?: string;
+}
+
+const { initial = "softmax", gamma = 0.02, steps = 8, title } = Astro.props;
+const { words, ids, logits } = EXAMPLE;
+const E = logits[0].length;
+const K = 2;
+
+interface Panel {
+	key: string;
+	label: string;
+	scoreName: string;
+	note: string;
+	routing: Routing;
+	gateName: string;
+	capacity?: number;
+}
+
+const bias = biasSteps(logits, K, gamma, steps);
+const panels: Panel[] = [
+	{
+		key: "softmax",
+		label: "softmax top-2",
+		scoreName: "softmax probability p",
+		gateName: "gate = p renormalized over the 2 chosen",
+		note: "Each token keeps its 2 most likely experts. Nothing limits an expert's share: expert 2 gets 7 of the 16 copies.",
+		routing: softmaxTopK(logits, K),
+	},
+	{
+		key: "switch",
+		label: "Switch top-1",
+		scoreName: "softmax probability p",
+		gateName: "gate = p (not renormalized)",
+		note: "One expert per token, half the copies. The gate stays the raw probability: renormalizing one number would make it 1 and cut the router's gradient.",
+		routing: softmaxTopK(logits, 1, false),
+	},
+	{
+		key: "bias",
+		label: "sigmoid + bias",
+		scoreName: "sigmoid affinity s (bias b only shifts the choice)",
+		gateName: "gate = s normalized over the 2 chosen",
+		note: "DeepSeek-V3. The top 2 are chosen from s + b, the gates come from s alone. After each step, overloaded experts lose γ of bias and underloaded ones gain γ.",
+		routing: bias[0],
+	},
+	{
+		key: "choice",
+		label: "expert choice",
+		scoreName: "softmax probability p",
+		gateName: "gate = p",
+		note: "Each expert takes its 4 highest-scoring tokens. Load is perfectly even, but 'The' and '.' get 1 expert while 'sat' and 'It' get 3.",
+		routing: expertChoice(logits, (logits.length * K) / E),
+		capacity: (logits.length * K) / E,
+	},
+	{
+		key: "sinkhorn",
+		label: "Sinkhorn",
+		scoreName: "Sinkhorn-balanced score × 8 (each column sums to 2)",
+		gateName: "gate = softmax p",
+		note: "Megatron-LM's Sinkhorn router rescales the rows and columns of exp(logits) until every expert has the same total score, then takes each token's top 2 in that matrix.",
+		routing: sinkhornTopK(logits, K),
+	},
+	{
+		key: "hash",
+		label: "hash",
+		scoreName: "GPT-2 token id mod 4",
+		gateName: "gate = 1",
+		note: "Hash layers: the expert is a fixed function of the token id, with nothing learned. The load depends only on which tokens appear.",
+		routing: hashRoute(ids, E),
+	},
+];
+const fmt = (v: number) => (v === 1 ? "1" : v.toFixed(2).replace(/^0/, ""));
+const fmtBias = (b: number) =>
+	b === 0
+		? "0"
+		: `${b > 0 ? "+" : "−"}${Math.abs(b).toFixed(2).replace(/^0/, "")}`;
+const mean = (r: Routing) => r.load.reduce((a, b) => a + b, 0) / E;
+const maxLoad = Math.max(
+	...panels.flatMap((p) => p.routing.load),
+	...bias.flatMap((r) => r.load),
+);
+---
+
+<figure class="moe-routers" data-initial={initial}>
+	{title && <figcaption class="title">{title}</figcaption>}
+	<div class="tabs" role="tablist">
+		{
+			panels.map((p) => (
+				<button type="button" role="tab" data-key={p.key} aria-selected={String(p.key === initial)}>
+					{p.label}
+				</button>
+			))
+		}
+	</div>
+	{
+		panels.map((p) => {
+			const views = p.key === "bias" ? bias : [p.routing];
+			return (
+				<div class="panel" data-key={p.key} hidden={p.key !== initial}>
+					{p.key === "bias" && (
+						<label class="knob">
+							bias update step
+							<input type="range" min="0" max={steps} step="1" value="0" />
+							<output>0</output>
+							<span class="gamma">γ = {gamma}</span>
+						</label>
+					)}
+					{views.map((r, vi) => (
+						<div class="view" data-step={vi} hidden={vi !== 0}>
+							<table>
+								<thead>
+									<tr>
+										<th class="tok">token</th>
+										{r.load.map((_, e) => (
+											<th>expert {e}</th>
+										))}
+										<th class="n">experts</th>
+									</tr>
+									{r.bias && (
+										<tr class="bias-row">
+											<th class="tok">bias b</th>
+											{r.bias.map((b) => (
+												<td class={b > 0 ? "up" : b < 0 ? "down" : ""}>{fmtBias(b)}</td>
+											))}
+											<td />
+										</tr>
+									)}
+								</thead>
+								<tbody>
+									{r.scores.map((row, t) => (
+										<tr>
+											<th class="tok">
+												<span class="w">{words[t]}</span>
+												{p.key === "hash" && <span class="id">{ids[t]}</span>}
+											</th>
+											{row.map((v, e) => {
+												const g = r.gates[t][e];
+												return (
+													<td class={g > 0 ? "pick" : ""}>
+														<span class="s">{p.key === "hash" ? (v ? "✓" : "") : fmt(v)}</span>
+														{g > 0 && <span class="g">{fmt(g)}</span>}
+													</td>
+												);
+											})}
+											<td class="n">{r.choice[t].length}</td>
+										</tr>
+									))}
+								</tbody>
+								<tfoot>
+									<tr>
+										<th class="tok">copies</th>
+										{r.load.map((c) => (
+											<td class={c > mean(r) ? "over" : ""}>
+												<span class="bar" style={`--h:${c / maxLoad}`} />
+												<span class="c">{c}</span>
+											</td>
+										))}
+										<td class="n">{r.load.reduce((a, b) => a + b, 0)}</td>
+									</tr>
+								</tfoot>
+							</table>
+							<p class="stats">
+								mean {mean(r)} per expert · busiest {Math.max(...r.load)} · MaxVio {maxVio(r.load).toFixed(2)}
+							</p>
+						</div>
+					))}
+					<p class="key">
+						<span class="sw pick" /> chosen, with its gate · cells show the {p.scoreName} · {p.gateName}
+					</p>
+					<p class="note">{p.note}</p>
+				</div>
+			);
+		})
+	}
+</figure>
+
+<script>
+	for (const fig of document.querySelectorAll<HTMLElement>(".moe-routers")) {
+		const tabs = [...fig.querySelectorAll<HTMLButtonElement>("[role=tab]")];
+		const panels = [...fig.querySelectorAll<HTMLElement>(".panel")];
+		const show = (key: string) => {
+			for (const t of tabs) t.setAttribute("aria-selected", String(t.dataset.key === key));
+			for (const p of panels) p.hidden = p.dataset.key !== key;
+		};
+		for (const t of tabs) t.addEventListener("click", () => show(t.dataset.key ?? ""));
+		for (const p of panels) {
+			const slider = p.querySelector<HTMLInputElement>("input[type=range]");
+			const out = p.querySelector("output");
+			if (!slider) continue;
+			const views = [...p.querySelectorAll<HTMLElement>(".view")];
+			slider.addEventListener("input", () => {
+				for (const v of views) v.hidden = v.dataset.step !== slider.value;
+				if (out) out.textContent = slider.value;
+			});
+		}
+	}
+</script>
+
+<style>
+	.moe-routers {
+		--over: #d0574f;
+		--up: #2f9e44;
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+		font-size: 0.8rem;
+	}
+	@media (prefers-color-scheme: dark) {
+		.moe-routers {
+			--over: #ff7b72;
+			--up: #5cc46c;
+		}
+	}
+	.title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.5rem;
+	}
+	.tabs {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.3rem;
+		margin-bottom: 0.6rem;
+	}
+	.tabs button {
+		font: inherit;
+		font-size: 0.75rem;
+		padding: 0.2rem 0.6rem;
+		border: 1px solid var(--faint);
+		border-radius: 999px;
+		background: var(--bg);
+		color: var(--muted);
+		cursor: pointer;
+	}
+	.tabs button[aria-selected="true"] {
+		background: var(--accent);
+		border-color: var(--accent);
+		color: var(--bg);
+	}
+	.knob {
+		display: flex;
+		justify-content: center;
+		align-items: center;
+		gap: 0.5rem;
+		margin-bottom: 0.4rem;
+		font-size: 0.75rem;
+		color: var(--muted);
+	}
+	.knob input {
+		width: 9rem;
+		accent-color: var(--accent);
+	}
+	.knob output {
+		font-family: var(--mono);
+		color: var(--text);
+		min-width: 1ch;
+	}
+	.gamma {
+		font-family: var(--mono);
+	}
+	.view {
+		overflow-x: auto;
+	}
+	table {
+		width: auto;
+		margin: 0 auto;
+		border-collapse: separate;
+		border-spacing: 3px;
+		font-family: var(--mono);
+		font-size: 0.75rem;
+	}
+	th {
+		font-family: var(--sans);
+		font-weight: 600;
+		color: var(--muted);
+		font-size: 0.72rem;
+		padding: 0 0.3rem;
+		border-bottom: 0;
+	}
+	td {
+		padding: 0;
+		border-bottom: 0;
+	}
+	th.tok {
+		text-align: right;
+	}
+	.tok .id {
+		display: block;
+		font-family: var(--mono);
+		font-weight: 400;
+		font-size: 0.65rem;
+		color: var(--muted);
+	}
+	.tok .w {
+		color: var(--text);
+	}
+	tbody td {
+		width: 3.6rem;
+		height: 2.2rem;
+		text-align: center;
+		vertical-align: middle;
+		border: 1px solid var(--faint);
+		border-radius: 5px;
+		color: var(--muted);
+		line-height: 1.1;
+	}
+	tbody td.pick {
+		background: color-mix(in srgb, var(--accent) 20%, transparent);
+		border-color: var(--accent);
+		color: var(--text);
+	}
+	td .s,
+	td .g {
+		display: block;
+	}
+	td .g {
+		font-weight: 700;
+		color: var(--accent);
+	}
+	td.n {
+		width: auto;
+		border: 0;
+		color: var(--muted);
+		text-align: center;
+	}
+	.bias-row td {
+		text-align: center;
+		color: var(--muted);
+	}
+	.bias-row td.up {
+		color: var(--up);
+	}
+	.bias-row td.down {
+		color: var(--over);
+	}
+	tfoot td {
+		position: relative;
+		height: 2.8rem;
+		text-align: center;
+		vertical-align: bottom;
+		font-weight: 700;
+	}
+	tfoot .bar {
+		position: absolute;
+		left: 25%;
+		right: 25%;
+		bottom: 1.25rem;
+		height: calc(var(--h) * 1.4rem);
+		background: var(--accent);
+		border-radius: 2px 2px 0 0;
+		opacity: 0.55;
+	}
+	tfoot td.over {
+		color: var(--over);
+	}
+	tfoot td.over .bar {
+		background: var(--over);
+	}
+	tfoot .c {
+		position: relative;
+	}
+	.stats {
+		margin: 0.2rem 0 0;
+		text-align: center;
+		font-family: var(--mono);
+		font-size: 0.72rem;
+		color: var(--muted);
+	}
+	.key {
+		margin: 0.3rem 0 0;
+		text-align: center;
+		font-size: 0.72rem;
+		color: var(--muted);
+	}
+	.sw.pick {
+		display: inline-block;
+		width: 0.8rem;
+		height: 0.8rem;
+		vertical-align: -0.1rem;
+		border: 1px solid var(--accent);
+		border-radius: 3px;
+		background: color-mix(in srgb, var(--accent) 20%, transparent);
+	}
+	.note {
+		margin: 0.3rem auto 0;
+		max-width: 36rem;
+		text-align: center;
+		font-size: 0.78rem;
+	}
+</style>

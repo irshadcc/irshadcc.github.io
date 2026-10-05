@@ -12,6 +12,9 @@ import Legend from "./Legend.astro";
 //   nnInteraction.ts  highlighting and card placement in the browser
 //   nnPalette.css     the colour of each node kind
 //
+// A node can reserve a "tray" (GraphNode.tray), an empty box below its text that other figures
+// draw on top of; its position is in the node's data-tray attribute (see MoeEpSteps).
+//
 // Usage in .mdx:
 //   <NeuralNetworkGraph graph={alexnet} title="AlexNet" />
 import type { GraphNode, NNGraph } from "./NNGraph";
@@ -27,10 +30,24 @@ interface Props {
 	title?: string;
 	/** Show the legend of node kinds. */
 	legend?: boolean;
+	/** Keep the outputs of fan-out nodes in the order they were added, as inputs always are. */
+	keepOutputOrder?: boolean;
+	/** Gap between ranks of the layout, in px (default 34). */
+	rankSep?: number;
 }
 
-const { graph, direction = "TB", title, legend = true } = Astro.props;
-const { nodes, edges, groups, box } = layoutGraph(graph, direction);
+const {
+	graph,
+	direction = "TB",
+	title,
+	legend = true,
+	keepOutputOrder = false,
+	rankSep,
+} = Astro.props;
+const { nodes, edges, groups, box } = layoutGraph(graph, direction, {
+	keepOutputOrder,
+	rankSep,
+});
 
 const hasCard = (n: GraphNode) => !!(n.formula || n.weights);
 /** What the browser's tooltip says for nodes without a card. */
@@ -108,6 +125,7 @@ const cardId = (id: string) => `nn-card-${hash}-${id}`;
 					<g
 						class={`node ${kindClass(n.kind)}`}
 						data-id={n.id}
+						data-tray={n.trayBox && [n.trayBox.x, n.trayBox.y, n.trayBox.w, n.trayBox.h].join(" ")}
 						tabindex="0"
 						aria-describedby={hasCard(n) ? cardId(n.id) : undefined}
 					>
@@ -121,6 +139,9 @@ const cardId = (id: string) => `nn-card-${hash}-${id}`;
 						{/* A dot in the corner marks nodes that have a card. */}
 						{hasCard(n) && !n.circle && (
 							<circle class="has-card" cx={n.x + n.w / 2 - 6} cy={n.y - n.h / 2 + 6} r="2.5" />
+						)}
+						{n.trayBox && (
+							<rect class="tray" x={n.trayBox.x} y={n.trayBox.y} width={n.trayBox.w} height={n.trayBox.h} rx="4" />
 						)}
 						{n.lines.map((l) => (
 							<text class={l.cls} x={n.x} y={l.y}>
@@ -204,6 +225,12 @@ const cardId = (id: string) => `nn-card-${hash}-${id}`;
 		fill: color-mix(in oklch, var(--c) 16%, var(--bg));
 		stroke: color-mix(in oklch, var(--c) 75%, var(--bg));
 		stroke-width: 1.5;
+	}
+	.node .tray {
+		fill: var(--bg);
+		stroke: color-mix(in oklch, var(--c) 35%, var(--bg));
+		stroke-width: 1;
+		stroke-dasharray: 3 2;
 	}
 	.node .has-card {
 		fill: var(--c);

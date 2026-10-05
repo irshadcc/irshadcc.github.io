@@ -1,0 +1,112 @@
+// Data for the Mega MoE figure in the expert-parallelism post: the path one token copy takes
+// through DeepGEMM's fused MoE kernel (deep_gemm/include/deep_gemm/impls/sm100_bf16_mega_moe.cuh),
+// from the source rank's input buffer to the expert rank and back. Drawn with BoxDiagram.
+import type { BoxEdge, BoxNode } from "../payments/boxDiagram";
+
+export const megaMoeNodes: BoxNode[] = [
+	{
+		id: "src",
+		label: "Source rank",
+		sub: "where the token lives",
+		col: 0,
+		row: 0,
+		w: 1,
+		h: 4,
+		group: -1,
+	},
+	{
+		id: "dst",
+		label: "Expert rank",
+		sub: "where its expert lives",
+		col: 1,
+		row: 0,
+		w: 3,
+		h: 3,
+		group: -1,
+	},
+	{
+		id: "in",
+		label: "Input buffer",
+		sub: "x, top-k ids, weights",
+		col: 0,
+		row: 0,
+		group: 0,
+		note: "Part of the symmetric buffer, so every peer can read it over NVLink. The caller copies the tokens and the router's output here before the launch (<code>buffer.x</code>, <code>buffer.topk_idx</code>, <code>buffer.topk_weights</code>).",
+	},
+	{
+		id: "l1",
+		label: "L1 ring buffer",
+		sub: "pulled token rows",
+		col: 1,
+		row: 0,
+		group: 1,
+		note: "The expert rank's dispatch warps <em>pull</em> each row from the source rank with a TMA load over NVLink and store it here, grouped by expert in blocks of <code>BLOCK_M</code> rows. It is a ring: a slot is reused once every N block of the first GEMM has consumed it (<code>l1_empty_count</code>).",
+	},
+	{
+		id: "w",
+		label: "Expert weights",
+		sub: "W1 (gate ‖ up), W2",
+		col: 3,
+		row: 0,
+		group: 2,
+		note: "Local HBM. A dedicated warp streams <code>BLOCK_N × BLOCK_K</code> tiles of them into shared memory with TMA, one stage at a time.",
+	},
+	{
+		id: "smem",
+		label: "Shared memory",
+		sub: "A and B tiles, staged",
+		col: 2,
+		row: 0,
+		group: 3,
+		note: "A multi-stage pipeline: the two TMA warps fill a stage and signal its <code>full_barrier</code>; the MMA warp consumes it and signals its <code>empty_barrier</code>. Token tiles are multicast to both CTAs of the 2-SM cluster.",
+	},
+	{
+		id: "tmem",
+		label: "Tensor memory",
+		sub: "FP32 accumulators",
+		col: 2,
+		row: 1,
+		group: 3,
+		note: "Blackwell's per-SM accumulator memory. One <code>tcgen05</code> MMA warp issues 2-SM UMMAs into it; the epilogue warps read finished tiles with <code>tcgen05.ld</code> while the next tile accumulates in the other stage.",
+	},
+	{
+		id: "l2",
+		label: "L2 ring buffer",
+		sub: "SwiGLU × weight",
+		col: 1,
+		row: 2,
+		group: 1,
+		note: "The first GEMM's epilogue applies SwiGLU, multiplies by the token's top-k weight, rounds to BF16 and stores the tile here with TMA. Each finished N block sets a bit in <code>l2_full_mask</code>, so the second GEMM can start on a K block as soon as the block that feeds it is done.",
+	},
+	{
+		id: "comb",
+		label: "Combine buffer",
+		sub: "[top-k, tokens, h]",
+		col: 0,
+		row: 2,
+		group: 0,
+		note: "The second GEMM's epilogue writes each output row straight into the source rank's buffer, at slot <code>[topk_idx][token_idx]</code>, with ordinary stores through the NVLink mapping. There is no separate combine all-to-all.",
+	},
+	{
+		id: "y",
+		label: "Output y",
+		sub: "[tokens, h], BF16",
+		col: 0,
+		row: 3,
+		group: 0,
+		note: "Once every expert rank has signalled that its writes are done, the source rank's epilogue warps load each token's top-k rows (double-buffered TMA loads), add them in FP32 and store the sum.",
+	},
+];
+
+export const megaMoeGrid = { cellW: 150, cellH: 50, gapX: 60, gapY: 52 };
+
+export const megaMoeEdges: BoxEdge[] = [
+	{ from: "in", to: "l1", label: "pull" },
+	{ from: "l1", to: "smem", label: "TMA" },
+	{ from: "w", to: "smem", label: "TMA" },
+	{ from: "smem", to: "tmem", label: "UMMA" },
+	{ from: "tmem", to: "l2", label: "epilogue 1" },
+	{ from: "l2", to: "smem", dashed: true },
+	{ from: "tmem", to: "comb", label: "epilogue 2: write" },
+	{ from: "comb", to: "y", label: "sum top-k" },
+];
