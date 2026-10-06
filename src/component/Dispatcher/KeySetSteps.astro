@@ -9,14 +9,14 @@
 //   <KeySetSteps />
 //   <KeySetSteps scenario="autocast" step={5} />
 //   <KeySetSteps only="cpu" />
-import { hex, keySetToString } from "./dispatchKeys";
-import { drawBits } from "./dispatcherDraw";
+import { hex, keySetToString } from "../../utils/dispatcher/dispatchKeys";
+import { drawBits } from "../../utils/dispatcher/dispatcherDraw";
 import {
 	keySetScenarios,
 	lookupMarks,
 	lookupText,
 	scenarioBits,
-} from "./dispatcherFigures";
+} from "../../utils/dispatcher/dispatcherFigures";
 
 interface Props {
 	scenario?: string;
@@ -67,9 +67,9 @@ const prev = at > 0 ? sc.stages[at - 1].ks : undefined;
 </figure>
 
 <script>
-	import { hex, keySetToString } from "./dispatchKeys";
-	import { drawBits } from "./dispatcherDraw";
-	import { keySetScenarios, lookupMarks, lookupText, scenarioBits } from "./dispatcherFigures";
+	import { hex, keySetToString } from "../../utils/dispatcher/dispatchKeys";
+	import { drawBits } from "../../utils/dispatcher/dispatcherDraw";
+	import { keySetScenarios, lookupMarks, lookupText, scenarioBits } from "../../utils/dispatcher/dispatcherFigures";
 
 	const scenarios = keySetScenarios();
 

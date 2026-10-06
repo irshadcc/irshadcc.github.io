@@ -6,9 +6,9 @@
 // Usage in .mdx:
 //   <KeySetWord />
 //   <KeySetWord example="AutogradCPU" />
-import { hex } from "./dispatchKeys";
-import { drawWord } from "./dispatcherDraw";
-import { wordExamples } from "./dispatcherFigures";
+import { hex } from "../../utils/dispatcher/dispatchKeys";
+import { drawWord } from "../../utils/dispatcher/dispatcherDraw";
+import { wordExamples } from "../../utils/dispatcher/dispatcherFigures";
 
 interface Props {
 	example?: string;
@@ -35,9 +35,9 @@ const ex = all.find((e) => e.id === example) ?? all[0];
 </figure>
 
 <script>
-	import { hex } from "./dispatchKeys";
-	import { drawWord } from "./dispatcherDraw";
-	import { wordExamples } from "./dispatcherFigures";
+	import { hex } from "../../utils/dispatcher/dispatchKeys";
+	import { drawWord } from "../../utils/dispatcher/dispatcherDraw";
+	import { wordExamples } from "../../utils/dispatcher/dispatcherFigures";
 
 	const all = wordExamples();
 	for (const fig of document.querySelectorAll<HTMLElement>(".ksw")) {

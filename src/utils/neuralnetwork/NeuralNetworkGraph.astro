@@ -20,7 +20,8 @@ import Legend from "./Legend.astro";
 import type { GraphNode, NNGraph } from "./NNGraph";
 import NodeCard from "./NodeCard.astro";
 import { kindClass } from "./kinds";
-import { type Direction, layoutGraph } from "./nnLayout";
+import { NN_ICONS } from "./nnIcons";
+import { type Direction, type Look, layoutGraph } from "./nnLayout";
 import "./nnPalette.css";
 
 interface Props {
@@ -34,6 +35,12 @@ interface Props {
 	keepOutputOrder?: boolean;
 	/** Gap between ranks of the layout, in px (default 34). */
 	rankSep?: number;
+	/**
+	 * "flat" (default); "glass": gradient sheen, accent bar, soft shadow, square corners;
+	 * "diagram": flat draw.io-style boxes coloured by kind, a large icon at the left, right-angled
+	 * edges.
+	 */
+	look?: Look;
 }
 
 const {
@@ -43,10 +50,12 @@ const {
 	legend = true,
 	keepOutputOrder = false,
 	rankSep,
+	look = "flat",
 } = Astro.props;
 const { nodes, edges, groups, box } = layoutGraph(graph, direction, {
 	keepOutputOrder,
 	rankSep,
+	look,
 });
 
 const hasCard = (n: GraphNode) => !!(n.formula || n.weights);
@@ -70,7 +79,7 @@ const arrowId = `nn-arrow-${hash}`;
 const cardId = (id: string) => `nn-card-${hash}-${id}`;
 ---
 
-<figure class="nn-graph">
+<figure class:list={["nn-graph", `look-${look}`]}>
 	{title && <figcaption class="title">{title}</figcaption>}
 	{legend && <Legend nodes={graph.nodes} />}
 	<div class="canvas">
@@ -94,6 +103,11 @@ const cardId = (id: string) => `nn-card-${hash}-${id}`;
 				>
 					<path class="arrowhead" d="M0,0.5 L8,4 L0,7.5 z" />
 				</marker>
+				<linearGradient id={`${arrowId}-sheen`} x1="0" y1="0" x2="0" y2="1">
+					<stop offset="0" stop-color="#fff" stop-opacity="0.16" />
+					<stop offset="0.55" stop-color="#fff" stop-opacity="0.02" />
+					<stop offset="1" stop-color="#000" stop-opacity="0.06" />
+				</linearGradient>
 			</defs>
 
 			{
@@ -134,7 +148,29 @@ const cardId = (id: string) => `nn-card-${hash}-${id}`;
 						{n.circle ? (
 							<circle cx={n.x} cy={n.y} r={n.w / 2} />
 						) : (
-							<rect x={n.x - n.w / 2} y={n.y - n.h / 2} width={n.w} height={n.h} rx="7" />
+							<rect class="body" x={n.x - n.w / 2} y={n.y - n.h / 2} width={n.w} height={n.h} rx={look === "flat" ? 7 : 0} />
+						)}
+						{look === "glass" && !n.circle && (
+							<>
+								<rect class="sheen" x={n.x - n.w / 2} y={n.y - n.h / 2} width={n.w} height={n.h} style={`fill:url(#${arrowId}-sheen)`} />
+								<path
+									class="bar"
+									d={`M${n.x - n.w / 2},${n.y - n.h / 2 + 1.25} H${n.x + n.w / 2}`}
+								/>
+							</>
+						)}
+						{n.iconAt && n.icon && (
+							<g
+								class="icon"
+								data-cx={n.x}
+								data-y={n.iconAt.y}
+								data-size={n.iconAt.size}
+								data-measure={look === "glass" ? "" : undefined}
+								transform={`translate(${n.iconAt.x} ${n.iconAt.y}) scale(${n.iconAt.size / 24})`}
+							>
+								{look === "diagram" && n.kind === "other" && <rect class="icon-tile" x="-3" y="-3" width="30" height="30" />}
+								<path d={NN_ICONS[n.icon]} />
+							</g>
 						)}
 						{/* A dot in the corner marks nodes that have a card. */}
 						{hasCard(n) && !n.circle && (
@@ -144,7 +180,7 @@ const cardId = (id: string) => `nn-card-${hash}-${id}`;
 							<rect class="tray" x={n.trayBox.x} y={n.trayBox.y} width={n.trayBox.w} height={n.trayBox.h} rx="4" />
 						)}
 						{n.lines.map((l) => (
-							<text class={l.cls} x={n.x} y={l.y}>
+							<text class={l.cls} x={l.x ?? n.x} y={l.y}>
 								{l.text}
 							</text>
 						))}
@@ -157,6 +193,19 @@ const cardId = (id: string) => `nn-card-${hash}-${id}`;
 </figure>
 
 <script>
+	// The layout only estimates label widths; measure the real label and centre icon + label.
+	for (const icon of document.querySelectorAll<SVGGElement>(".nn-graph .node .icon[data-measure]")) {
+		const label = icon.parentElement?.querySelector<SVGTextElement>("text.label");
+		if (!label) continue;
+		const size = Number(icon.dataset.size);
+		const gap = 5;
+		const w = label.getComputedTextLength();
+		if (!w) continue;
+		const start = Number(icon.dataset.cx) - (size + gap + w) / 2;
+		icon.setAttribute("transform", `translate(${start} ${icon.dataset.y}) scale(${size / 24})`);
+		label.setAttribute("x", String(start + size + gap));
+		label.style.textAnchor = "start";
+	}
 	import { attachInteractions } from "./nnInteraction";
 
 	for (const fig of document.querySelectorAll<HTMLElement>(".nn-graph")) attachInteractions(fig);
@@ -198,14 +247,16 @@ const cardId = (id: string) => `nn-card-${hash}-${id}`;
 		fill: var(--muted);
 	}
 
+	/* Looks restyle nodes and edges through these variables, so a figure's own rules (such as a
+	   highlight) still win without a specificity fight. */
 	.edge path {
 		fill: none;
-		stroke: var(--muted);
-		stroke-width: 1.3;
-		stroke-opacity: 0.75;
+		stroke: var(--edge-stroke, var(--muted));
+		stroke-width: var(--edge-sw, 1.3);
+		stroke-opacity: var(--edge-opacity, 0.75);
 	}
 	.arrowhead {
-		fill: var(--muted);
+		fill: var(--edge-stroke, var(--muted));
 	}
 	.edge-label {
 		font-size: 10px;
@@ -220,17 +271,103 @@ const cardId = (id: string) => `nn-card-${hash}-${id}`;
 		cursor: default;
 		outline: none;
 	}
-	.node rect,
-	.node circle {
-		fill: color-mix(in oklch, var(--c) 16%, var(--bg));
-		stroke: color-mix(in oklch, var(--c) 75%, var(--bg));
-		stroke-width: 1.5;
+	.node rect.body,
+	.node > circle:not(.has-card) {
+		fill: var(--node-fill, color-mix(in oklch, var(--c) 16%, var(--bg)));
+		stroke: var(--node-stroke, color-mix(in oklch, var(--c) 75%, var(--bg)));
+		stroke-width: var(--node-sw, 1.5);
+		filter: var(--node-filter, none);
 	}
+	/* The tray only reserves space; it draws nothing. */
 	.node .tray {
-		fill: var(--bg);
-		stroke: color-mix(in oklch, var(--c) 35%, var(--bg));
-		stroke-width: 1;
-		stroke-dasharray: 3 2;
+		fill: none;
+		stroke: none;
+	}
+	.node .icon path {
+		fill: none;
+		stroke: var(--icon-stroke, var(--c));
+		stroke-width: var(--icon-sw, 2);
+		stroke-linecap: round;
+		stroke-linejoin: round;
+	}
+
+	/* The "glass" look: brighter tinted bodies, a sheen, an accent bar and a soft shadow. */
+	.look-glass .node {
+		--node-fill: color-mix(in oklch, var(--c) 20%, var(--bg));
+		--node-stroke: color-mix(in oklch, var(--c) 55%, var(--bg));
+		--node-sw: 1.2;
+		--node-filter: drop-shadow(0 2px 5px color-mix(in oklch, var(--c) 28%, transparent));
+		--label-weight: 650;
+	}
+	.look-glass {
+		--edge-stroke: color-mix(in oklch, var(--muted) 85%, var(--accent));
+		--edge-sw: 1.4;
+	}
+	.node .sheen {
+		stroke: none;
+		pointer-events: none;
+	}
+	.node .bar {
+		stroke: var(--c);
+		stroke-width: 2.5;
+	}
+
+	/* The "diagram" look: flat draw.io-style colours per kind, dark icons, black right-angled
+	   edges. */
+	.look-diagram {
+		--edge-stroke: var(--text);
+		--edge-sw: 1;
+		--edge-opacity: 1;
+		--dg-icon: #23262b;
+		--dg-tile: #ffffff;
+	}
+	.look-diagram .node {
+		--node-sw: 1;
+		--icon-stroke: var(--dg-icon);
+		--icon-sw: 1.6;
+		--label-weight: 500;
+		--node-fill: var(--dg-fill, #f5f5f5);
+		--node-stroke: var(--dg-line, #666666);
+	}
+	.look-diagram .k-input {
+		--dg-fill: #f8cecc;
+		--dg-line: #b85450;
+	}
+	.look-diagram .k-linear,
+	.look-diagram .k-attention,
+	.look-diagram .k-embedding {
+		--dg-fill: #dae8fc;
+		--dg-line: #6c8ebf;
+	}
+	.look-diagram .k-other {
+		--dg-fill: #ffe6cc;
+		--dg-line: #d79b00;
+	}
+	.look-diagram .k-op {
+		--dg-fill: #d5e8d4;
+		--dg-line: #82b366;
+	}
+	.look-diagram .k-norm,
+	.look-diagram .k-activation {
+		--dg-fill: #e1d5e7;
+		--dg-line: #9673a6;
+	}
+	.look-diagram .node .detail {
+		fill: var(--text);
+	}
+	.node .icon-tile {
+		fill: var(--dg-tile);
+		stroke: none;
+	}
+	@media (prefers-color-scheme: dark) {
+		.look-diagram {
+			--dg-icon: #e8e6df;
+			--dg-tile: #2b2a27;
+		}
+		.look-diagram .node {
+			--node-fill: color-mix(in oklch, var(--dg-line, #666666) 26%, var(--bg));
+			--node-stroke: var(--dg-line, #8a8a8a);
+		}
 	}
 	.node .has-card {
 		fill: var(--c);
@@ -241,7 +378,7 @@ const cardId = (id: string) => `nn-card-${hash}-${id}`;
 	}
 	.node .label {
 		font-size: 12.5px;
-		font-weight: 500;
+		font-weight: var(--label-weight, 500);
 	}
 	.node .detail {
 		font-size: 10.5px;

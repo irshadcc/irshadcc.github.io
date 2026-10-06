@@ -159,7 +159,7 @@ function megatronFlow(): Flow {
 		...ranks.map((r) => ({
 			id: node.recv(r),
 			kind: "op" as const,
-			label: "Received",
+			label: "Sort chunks by expert",
 			tray: [TRAY_COLS, 2] as [number, number],
 			from: [node.dispatch],
 		})),
@@ -174,7 +174,7 @@ function megatronFlow(): Flow {
 		...ranks.map((r) => ({
 			id: node.unsort(r),
 			kind: "op" as const,
-			label: "Unsort",
+			label: "Sort chunks back",
 			tray: [TRAY_COLS, 2] as [number, number],
 			from: [node.experts(r)],
 		})),
@@ -387,8 +387,8 @@ function vllmFlow(): Flow {
 		...ranks.map((r) => ({
 			id: V.all(r),
 			kind: "op" as const,
-			label: "All 8 tokens",
-			detail: "16 copies",
+			label: "moe_align_block_size",
+			detail: "my experts' copies",
 			tray: [TRAY_COLS, 4] as [number, number],
 			from: [V.gather],
 		})),
@@ -403,7 +403,7 @@ function vllmFlow(): Flow {
 		...ranks.map((r) => ({
 			id: V.partial(r),
 			kind: "op" as const,
-			label: "Partial output",
+			label: "moe_sum",
 			detail: "8 tokens",
 			tray: [TRAY_COLS, 2] as [number, number],
 			from: [V.experts(r)],
@@ -499,14 +499,14 @@ function vllmFlow(): Flow {
 		{
 			line: 0,
 			head: "Each rank serves its own requests",
-			body: `vLLM runs data-parallel attention: each of the ${EP} ranks holds different requests, here ${TOKENS_PER_RANK} tokens each. With --enable-expert-parallel, the MoE layers of all ${EP} ranks form one EP group of size TP × DP = ${EP}, each holding ${LOCAL} experts. Hover over a node to see its tensor.`,
+			body: `vLLM runs data-parallel attention: each of the ${EP} ranks holds different requests, here ${TOKENS_PER_RANK} tokens each. With --enable-expert-parallel, the MoE layers of all ${EP} ranks form one EP group of size TP × DP = ${EP}, each holding ${LOCAL} experts. Hover over a node for its equation, or an edge for the tensor on it.`,
 			active: ranks.map(V.tok),
 			places: atTokens,
 		},
 		{
 			line: 1,
 			head: "Route locally",
-			body: `Each rank runs the router on its own tokens only. Rank 0's t0 picks experts ${fmt(ROUTING[0])}, t1 picks ${fmt(ROUTING[1])}. Chip colours are the ranks that hold those experts.`,
+			body: `Each rank runs the router on its own tokens only. Rank 0's t0 picks experts ${fmt(ROUTING[0])}, t1 picks ${fmt(ROUTING[1])}.`,
 			active: ranks.map(V.router),
 			places: atRouter,
 		},
@@ -514,14 +514,14 @@ function vllmFlow(): Flow {
 			line: 2,
 			head: "All-gather everyone's tokens",
 			body: `Instead of sending each copy to its expert, the default backend sends every token to every rank: an all-gather of the hidden states with their top-k ids and weights. Each rank receives ${gathered} rows from the others and now holds all ${TOKENS} tokens, ${COPIES.length} copies.`,
-			active: [V.gather, ...ranks.map(V.all)],
+			active: [V.gather],
 			places: atAll,
 		},
 		{
 			line: 3,
 			head: "Keep only my experts' copies",
-			body: `moe_align_block_size sorts the copies by expert and pads each expert's group to the kernel's block size. expert_map turns the other ranks' experts into -1, so their copies (dimmed) are skipped. Rank ${busy} keeps ${load[busy]} copies, rank ${quiet} only ${load[quiet]}.`,
-			active: ranks.map(V.experts),
+			body: `moe_align_block_size sorts the copies by expert and pads each expert's group to the kernel's block size. expert_map turns the other ranks' experts into -1, so their copies are skipped. Rank ${busy} keeps ${load[busy]} copies, rank ${quiet} only ${load[quiet]}.`,
+			active: ranks.map(V.all),
 			places: atExperts,
 		},
 		{
@@ -648,7 +648,6 @@ const G = {
 	tok: (r: number) => `g-tok${r}`,
 	router: (r: number) => `g-router${r}`,
 	experts: (r: number) => `g-exp${r}`,
-	partial: (r: number) => `g-partial${r}`,
 	ar: "g-allreduce",
 	out: (r: number) => `g-out${r}`,
 };
@@ -678,19 +677,11 @@ function sglangFlow(): Flow {
 			tray: [TRAY_COLS, LOCAL] as [number, number],
 			from: [G.router(r)],
 		})),
-		...ranks.map((r) => ({
-			id: G.partial(r),
-			kind: "op" as const,
-			label: "Partial output",
-			detail: "8 tokens",
-			tray: [TRAY_COLS, 2] as [number, number],
-			from: [G.experts(r)],
-		})),
 		{
 			id: G.ar,
 			kind: "other",
 			label: "All-reduce",
-			from: ranks.map(G.partial),
+			from: ranks.map(G.experts),
 		},
 		...ranks.map((r) => ({
 			id: G.out(r),
@@ -720,7 +711,7 @@ function sglangFlow(): Flow {
 	const atPartial = placeAll((r, c) =>
 		c.dest === r
 			? {
-					node: G.partial(r),
+					node: G.experts(r),
 					...tokSlot(c.t, TRAY_COLS),
 					state: "on",
 					nudge: c.k * 1.5,
@@ -747,7 +738,7 @@ function sglangFlow(): Flow {
 		{
 			line: 0,
 			head: "Every rank already has every token",
-			body: `With --tp ${EP} --ep ${EP}, attention is tensor-parallel: it ends with an all-reduce, so all ${EP} ranks hold the same ${TOKENS} tokens when the MoE layer starts. There is nothing to dispatch. Hover over a node to see its tensor.`,
+			body: `With --tp ${EP} --ep ${EP}, attention is tensor-parallel: it ends with an all-reduce, so all ${EP} ranks hold the same ${TOKENS} tokens when the MoE layer starts. There is nothing to dispatch. Hover over a node for its equation, or an edge for the tensor on it.`,
 			active: ranks.map(G.tok),
 			places: atTokens,
 		},
@@ -761,14 +752,14 @@ function sglangFlow(): Flow {
 		{
 			line: 2,
 			head: "Top-k on every rank",
-			body: `Each token becomes ${TOP_K} copies, ${COPIES.length} in all, on every rank. Chip colours are the ranks that hold the experts.`,
+			body: `Each token becomes ${TOP_K} copies, ${COPIES.length} in all, on every rank.`,
 			active: ranks.map(G.router),
 			places: atRouter,
 		},
 		{
 			line: 3,
 			head: "Map to local experts",
-			body: `The default dispatcher only renames experts: local_expert_mapping turns E${busy * LOCAL} and E${busy * LOCAL + 1} into 0 and 1 on rank ${busy}, and every other expert into -1. The dimmed copies are skipped. Rank ${busy} keeps ${load[busy]} copies, rank ${quiet} ${load[quiet]}.`,
+			body: `The default dispatcher only renames experts: local_expert_mapping turns E${busy * LOCAL} and E${busy * LOCAL + 1} into 0 and 1 on rank ${busy}, and every other expert into -1. Those copies are skipped. Rank ${busy} keeps ${load[busy]} copies, rank ${quiet} ${load[quiet]}.`,
 			active: ranks.map(G.experts),
 			places: atExperts,
 		},
@@ -776,7 +767,7 @@ function sglangFlow(): Flow {
 			line: 4,
 			head: "Run the local experts",
 			body: `The Triton fused MoE kernel (the same algorithm as vLLM's) computes the local copies, scales them by their gates and adds each token's rows: a partial output for all ${TOKENS} tokens.`,
-			active: ranks.map(G.partial),
+			active: ranks.map(G.experts),
 			places: atPartial,
 		},
 		{
@@ -817,7 +808,6 @@ function sglangFlow(): Flow {
 			"fused_experts output",
 			"Copies whose expert maps to -1 are never computed; the rest are grouped by expert for the Triton kernel.",
 		);
-		views[G.partial(r)] = partialView(r, `Rank ${r}'s partial output`);
 		views[G.out(r)] = {
 			title: `Rank ${r}'s output`,
 			code: "final_hidden_states",
@@ -856,10 +846,8 @@ const D = {
 	gate: (r: number) => `ds-gate${r}`,
 	buf: (r: number) => `ds-buf${r}`,
 	a2a1: "ds-a2a1",
-	recv: (r: number) => `ds-recv${r}`,
 	exp: (r: number) => `ds-exp${r}`,
 	a2a2: "ds-a2a2",
-	back: (r: number) => `ds-back${r}`,
 	out: (r: number) => `ds-out${r}`,
 };
 
@@ -927,7 +915,7 @@ function deepspeedFlow(): Flow {
 		...ranks.map((r) => ({
 			id: D.buf(r),
 			kind: "op" as const,
-			label: "Capacity buffer",
+			label: "Sparse encode",
 			detail: `[${EXPERTS} experts, ${C}, h]`,
 			tray: [TRAY_COLS, (EXPERTS * C) / TRAY_COLS] as [number, number],
 			from: [D.gate(r)],
@@ -939,20 +927,12 @@ function deepspeedFlow(): Flow {
 			from: ranks.map(D.buf),
 		},
 		...ranks.map((r) => ({
-			id: D.recv(r),
-			kind: "op" as const,
-			label: "Received",
-			detail: `[${EP} ranks, ${LOCAL}, ${C}, h]`,
-			tray: [EP * C, LOCAL] as [number, number],
-			from: [D.a2a1],
-		})),
-		...ranks.map((r) => ({
 			id: D.exp(r),
 			kind: "linear" as const,
 			label: "Experts",
 			detail: `E${r * LOCAL} / E${r * LOCAL + 1}`,
 			tray: [EP * C, LOCAL] as [number, number],
-			from: [D.recv(r)],
+			from: [D.a2a1],
 		})),
 		{
 			id: D.a2a2,
@@ -961,20 +941,12 @@ function deepspeedFlow(): Flow {
 			from: ranks.map(D.exp),
 		},
 		...ranks.map((r) => ({
-			id: D.back(r),
-			kind: "op" as const,
-			label: "Returned",
-			detail: `[${EXPERTS} experts, ${C}, h]`,
-			tray: [TRAY_COLS, (EXPERTS * C) / TRAY_COLS] as [number, number],
-			from: [D.a2a2],
-		})),
-		...ranks.map((r) => ({
 			id: D.out(r),
 			kind: "output" as const,
-			label: "Combine",
+			label: "Sparse decode",
 			detail: "2 tokens",
 			tray: [2, 1] as [number, number],
-			from: [D.back(r)],
+			from: [D.a2a2],
 		})),
 	];
 
@@ -1033,7 +1005,7 @@ function deepspeedFlow(): Flow {
 	const atBuf = byCell(inBuf, droppedAtGate);
 	const atRecv = byCell(
 		(r, e, j) => ({
-			node: D.recv(Math.floor(e / LOCAL)),
+			node: D.exp(Math.floor(e / LOCAL)),
 			...recvSlot(r, e, j),
 			state: "on",
 		}),
@@ -1048,12 +1020,12 @@ function deepspeedFlow(): Flow {
 		droppedAtGate,
 	);
 	const atBack = byCell(
-		(r, e, j) => ({ node: D.back(r), ...bufSlot(e, j), state: "on" }),
+		(r, e, j) => ({ node: D.out(r), ...bufSlot(e, j), state: "hidden" }),
 		droppedAtGate,
 	);
 	const atOut = byCell(
 		(r, e, j, isPad) => {
-			if (isPad) return hiddenAt(D.back(r), bufSlot(e, j));
+			if (isPad) return hiddenAt(D.out(r), bufSlot(e, j));
 			const c = COPIES[cells[r][e][j]];
 			return {
 				node: D.out(r),
@@ -1083,7 +1055,7 @@ function deepspeedFlow(): Flow {
 		{
 			line: 0,
 			head: "Tokens on each rank",
-			body: `The same example as before: ${EP} ranks, ${TOKENS_PER_RANK} tokens each, ${EXPERTS} experts, top-2. DeepSpeed's MoE layer follows GShard: every expert gets a fixed number of slots per rank. Hover over a node to see its tensor.`,
+			body: `The same example as before: ${EP} ranks, ${TOKENS_PER_RANK} tokens each, ${EXPERTS} experts, top-2. DeepSpeed's MoE layer follows GShard: every expert gets a fixed number of slots per rank. Hover over a node for its equation, or an edge for the tensor on it.`,
 			active: ranks.map(D.tok),
 			places: atTokens,
 		},
@@ -1097,7 +1069,7 @@ function deepspeedFlow(): Flow {
 		{
 			line: 2,
 			head: "Fill the capacity buffers",
-			body: `Each copy goes to its expert's slot in an [${EXPERTS}, ${C}, h] buffer; empty slots are zero padding (dashed). On rank 0, t1 takes expert 2's only slot with its first choice, so ${droppedTxt} is dropped (dimmed): that token keeps only its other expert. Ranks carry ${pads.join(", ")} padding rows.`,
+			body: `Each copy goes to its expert's slot in an [${EXPERTS}, ${C}, h] buffer; empty slots are zero padding. On rank 0, t1 takes expert 2's only slot with its first choice, so ${droppedTxt} is dropped: that token keeps only its other expert. Ranks carry ${pads.join(", ")} padding rows.`,
 			active: ranks.map(D.buf),
 			places: atBuf,
 		},
@@ -1105,7 +1077,7 @@ function deepspeedFlow(): Flow {
 			line: 3,
 			head: "All-to-all with equal chunks",
 			body: `Every rank sends rank j the slots of experts ${LOCAL}j and ${LOCAL}j + 1: always ${LOCAL * C} rows, padding included. Because every chunk has the same size, no counts need to be exchanged first, and the shapes are static.`,
-			active: [D.a2a1, ...ranks.map(D.recv)],
+			active: [D.a2a1],
 			places: atRecv,
 		},
 		{
@@ -1119,7 +1091,7 @@ function deepspeedFlow(): Flow {
 			line: 5,
 			head: "All-to-all back",
 			body: "The same equal exchange in reverse: every slot returns to the rank its token came from, in the same [experts, C, h] layout.",
-			active: [D.a2a2, ...ranks.map(D.back)],
+			active: [D.a2a2],
 			places: atBack,
 		},
 		{
@@ -1185,7 +1157,7 @@ function deepspeedFlow(): Flow {
 			note: "One block of C rows per expert, whether or not anyone chose it.",
 			groups: slotRows(r, (c) => `slot for E${c.expert}`),
 		};
-		views[D.recv(r)] = {
+		const received: TensorView = {
 			title: `Rank ${r} after the first all-to-all`,
 			code: "dispatched_input",
 			shape: `[${EP}, ${LOCAL}, ${C}, h]`,
@@ -1204,18 +1176,10 @@ function deepspeedFlow(): Flow {
 			})),
 		};
 		views[D.exp(r)] = {
-			...views[D.recv(r)],
+			...received,
 			title: `Rank ${r}'s experts`,
 			code: "expert_output",
 			note: "Each local expert multiplies all of its rows, padding included: a batched matrix multiply over equal-sized blocks.",
-		};
-		views[D.back(r)] = {
-			title: `Rank ${r} after the second all-to-all`,
-			code: "expert_output",
-			shape: `[${EXPERTS}, ${C}, h]`,
-			shapeWords: `${EXPERTS * C} rows, back in this rank's slot layout`,
-			note: "The expert outputs for this rank's own copies, in the slots they left from.",
-			groups: slotRows(r, (c) => `E${c.expert}(t${c.t})`),
 		};
 		views[D.out(r)] = {
 			title: `Rank ${r}'s output`,
@@ -1277,13 +1241,9 @@ const crossNode = (c: Copy) => nodeOf(c.dest) !== nodeOf(c.home);
 const K = {
 	tok: (r: number) => `dk-tok${r}`,
 	router: (r: number) => `dk-router${r}`,
-	ib: "dk-ib",
-	rdma: (r: number) => `dk-rdma${r}`,
-	nvl: "dk-nvl",
+	dispatch: "dk-dispatch",
 	exp: (r: number) => `dk-exp${r}`,
-	nvl2: "dk-nvl2",
-	fwd: (r: number) => `dk-fwd${r}`,
-	ib2: "dk-ib2",
+	combine: "dk-combine",
 	out: (r: number) => `dk-out${r}`,
 };
 
@@ -1318,23 +1278,10 @@ function deepseekFlow(): Flow {
 			from: [K.tok(r)],
 		})),
 		{
-			id: K.ib,
+			id: K.dispatch,
 			kind: "other",
-			label: "RDMA: once per token and node",
+			label: "buffer.dispatch: RDMA, then NVLink",
 			from: ranks.map(K.router),
-		},
-		...ranks.map((r) => ({
-			id: K.rdma(r),
-			kind: "op" as const,
-			label: "Arrived over RDMA",
-			tray: [TRAY_COLS, 1] as [number, number],
-			from: [K.ib],
-		})),
-		{
-			id: K.nvl,
-			kind: "other",
-			label: "NVLink: forward to the experts",
-			from: ranks.map(K.rdma),
 		},
 		...ranks.map((r) => ({
 			id: K.exp(r),
@@ -1342,27 +1289,13 @@ function deepseekFlow(): Flow {
 			label: "Experts",
 			detail: `E${r * LOCAL} / E${r * LOCAL + 1}`,
 			tray: [TRAY_COLS, LOCAL] as [number, number],
-			from: [K.nvl],
+			from: [K.dispatch],
 		})),
 		{
-			id: K.nvl2,
+			id: K.combine,
 			kind: "other",
-			label: "NVLink: back, summed per token",
+			label: "buffer.combine: NVLink, then RDMA",
 			from: ranks.map(K.exp),
-		},
-		...ranks.map((r) => ({
-			id: K.fwd(r),
-			kind: "op" as const,
-			label: "Partial sums",
-			detail: "for other nodes",
-			tray: [TRAY_COLS, 1] as [number, number],
-			from: [K.nvl2],
-		})),
-		{
-			id: K.ib2,
-			kind: "other",
-			label: "RDMA: back home",
-			from: ranks.map(K.fwd),
 		},
 		...ranks.map((r) => ({
 			id: K.out(r),
@@ -1370,21 +1303,12 @@ function deepseekFlow(): Flow {
 			label: "Output",
 			detail: "2 tokens",
 			tray: [2, 1] as [number, number],
-			from: [K.ib2],
+			from: [K.combine],
 		})),
 	];
-	/** Slot of a token arriving over RDMA at its forwarding GPU (copies of one token share it). */
-	const rdmaSlot = (c: Copy) => {
-		const at = sends.filter((s) => s.to === viaOf(c));
-		const i = at.findIndex((s) => s.copies.includes(c.id));
-		return gridSlot(i);
-	};
 	const routerSlot = (c: Copy) =>
 		gridSlot(c.id - c.home * TOKENS_PER_RANK * TOP_K);
 	const outSlot = (c: Copy) => ({ col: c.t % TOKENS_PER_RANK, row: 0 });
-	const stack = (c: Copy) =>
-		(sends.find((s) => s.copies.includes(c.id))?.copies.indexOf(c.id) ?? 0) *
-		1.5;
 	const place = (f: (c: Copy) => ChipPlace) => COPIES.map(f);
 
 	const atTokens = place((c) => ({
@@ -1398,11 +1322,11 @@ function deepseekFlow(): Flow {
 		...routerSlot(c),
 		state: "on",
 	}));
-	const atRdma = place((c) =>
-		crossNode(c)
-			? { node: K.rdma(viaOf(c)), ...rdmaSlot(c), state: "on", nudge: stack(c) }
-			: { node: K.router(c.home), ...routerSlot(c), state: "on" },
-	);
+	const atRdma = place((c) => ({
+		node: K.router(c.home),
+		...routerSlot(c),
+		state: "on",
+	}));
 	const atExp = place((c) => ({
 		node: K.exp(c.dest),
 		...expertSlot(c.dest, c),
@@ -1410,12 +1334,7 @@ function deepseekFlow(): Flow {
 	}));
 	const atFwd = place((c) =>
 		crossNode(c)
-			? {
-					node: K.fwd(viaOf(c)),
-					...rdmaSlot(c),
-					state: "plain",
-					nudge: stack(c),
-				}
+			? { node: K.exp(c.dest), ...expertSlot(c.dest, c), state: "on" }
 			: {
 					node: K.out(c.home),
 					...outSlot(c),
@@ -1446,7 +1365,7 @@ function deepseekFlow(): Flow {
 		{
 			line: 0,
 			head: "Two nodes of two GPUs",
-			body: `The same ${EP}-rank example, now on 2 nodes: GPUs in a node talk over NVLink (160 GB/s on DeepSeek's H800s), nodes over InfiniBand RDMA (50 GB/s per GPU). Experts E0–E3 live on node 0, E4–E7 on node 1. Hover over a node to see its tensor.`,
+			body: `The same ${EP}-rank example, now on 2 nodes: GPUs in a node talk over NVLink (160 GB/s on DeepSeek's H800s), nodes over InfiniBand RDMA (50 GB/s per GPU). Experts E0–E3 live on node 0, E4–E7 on node 1. Hover over a node for its equation, or an edge for the tensor on it.`,
 			active: ranks.map(K.tok),
 			places: atTokens,
 		},
@@ -1460,15 +1379,15 @@ function deepseekFlow(): Flow {
 		{
 			line: 2,
 			head: "Dispatch, part 1: RDMA",
-			body: `Each token crosses InfiniBand once per target node, to the GPU with its own local index there. ${cross.length} copies need another node, but only ${sends.length} RDMA transfers happen: ${dedup.map((s) => `t${s.t}'s ${s.copies.length} copies for node ${nodeOf(s.to)} travel together`).join("; ")}. Copies for the home node stay put.`,
-			active: [K.ib, ...ranks.map(K.rdma)],
+			body: `buffer.dispatch is one operation, one kernel, but it moves the data in two hops. First, each token crosses InfiniBand once per target node, to the GPU with its own local index there. ${cross.length} copies need another node, but only ${sends.length} RDMA transfers happen: ${dedup.map((s) => `t${s.t}'s ${s.copies.length} copies for node ${nodeOf(s.to)} travel together`).join("; ")}. Copies for the home node stay put.`,
+			active: [K.dispatch],
 			places: atRdma,
 		},
 		{
 			line: 3,
 			head: "Dispatch, part 2: NVLink",
 			body: `Inside each node, NVLink forwards every copy to the GPU that holds its expert: ${relay.length} of the RDMA arrivals are relayed one more hop, and the home node's copies go directly. In DeepEP both parts run in one kernel, with separate warps sending over RDMA, forwarding and receiving.`,
-			active: [K.nvl, ...ranks.map(K.exp)],
+			active: [K.dispatch],
 			places: atExp,
 		},
 		{
@@ -1481,15 +1400,15 @@ function deepseekFlow(): Flow {
 		{
 			line: 5,
 			head: "Combine, part 1: NVLink",
-			body: "The results retrace the path. Within a node they go back over NVLink: straight home if the token lives on this node, otherwise to the GPU that received it over RDMA, which adds up that token's results from this node into one row.",
-			active: [K.nvl2, ...ranks.map(K.fwd)],
+			body: "buffer.combine retraces the path, again in one kernel. Within a node the results go back over NVLink: straight home if the token lives on this node, otherwise to the GPU that received it over RDMA, which adds up that token's results from this node into one row.",
+			active: [K.combine],
 			places: atFwd,
 		},
 		{
 			line: 6,
 			head: "Combine, part 2: RDMA",
 			body: `One partial sum per token and node crosses InfiniBand back home, ${sends.length} transfers again, and is added to the token's other results. Each GPU ends with its ${TOKENS_PER_RANK} tokens.`,
-			active: [K.ib2, ...ranks.map(K.out)],
+			active: [K.combine, ...ranks.map(K.out)],
 			places: atOut,
 		},
 	];
@@ -1530,52 +1449,11 @@ function deepseekFlow(): Flow {
 				},
 			],
 		};
-		const arrivals = sends.filter((s) => s.to === r);
-		views[K.rdma(r)] = {
-			title: `${gpuName(r)}: RDMA receive buffer`,
-			code: "(inside the dispatch kernel)",
-			shape: `[${arrivals.length}, h]`,
-			shapeWords: `${rowsOf(arrivals.length)}: one per (token, this node)`,
-			note: "Tokens from the other node that arrived at this GPU because it has their home GPU's local index.",
-			groups: [
-				{
-					label: "",
-					rows: arrivals.map((s) => ({
-						t: s.t,
-						rank: null,
-						note: `from GPU ${s.from}, for ${s.copies.map((id) => `E${COPIES[id].expert} (GPU ${COPIES[id].dest})`).join(" and ")}`,
-					})),
-				},
-			],
-		};
 		views[K.exp(r)] = expertsView(
 			r,
 			"recv_x → expert_output",
 			"Rows grouped by local expert (the expanded layout), each multiplied by its gate weight.",
 		);
-		const fwdRows = sends.filter((s) => s.to === r);
-		views[K.fwd(r)] = {
-			title: `${gpuName(r)}: partial sums for the other node`,
-			code: "(inside the combine kernel)",
-			shape: `[${fwdRows.length}, h]`,
-			shapeWords: `${rowsOf(fwdRows.length)}: one per token received over RDMA`,
-			note: "Results from this node for tokens that came from the other node, summed per token before crossing InfiniBand.",
-			groups: [
-				{
-					label: "",
-					rows: fwdRows.map((s) => ({
-						t: s.t,
-						rank: null,
-						note: s.copies
-							.map(
-								(id) =>
-									`${g2(COPIES[id].gate)} × E${COPIES[id].expert}(t${s.t})`,
-							)
-							.join(" + "),
-					})),
-				},
-			],
-		};
 		views[K.out(r)] = {
 			title: `${gpuName(r)}: output`,
 			code: "combined_x",
@@ -1586,45 +1464,19 @@ function deepseekFlow(): Flow {
 		};
 	}
 	const ibOut = ranks.map((r) => sends.filter((s) => s.from === r).length);
-	views[K.ib] = collectiveView(
+	views[K.dispatch] = collectiveView(
 		"Rows each GPU sends over RDMA",
-		"dispatch (RDMA part)",
+		"buffer.dispatch (RDMA hop)",
 		"rows out",
 		ibOut,
-		`${sends.length} transfers for ${cross.length} cross-node copies: a token going to two experts on the same node crosses InfiniBand once.`,
+		`${sends.length} transfers for ${cross.length} cross-node copies: a token going to two experts on the same node crosses InfiniBand once. NVLink then forwards each copy to its expert's GPU.`,
 	);
-	views[K.nvl] = collectiveView(
-		"Copies each GPU receives over NVLink",
-		"dispatch (NVLink part)",
-		"rows in",
-		ranks.map(
-			(r) =>
-				COPIES.filter(
-					(c) =>
-						c.dest === r && c.home !== r && !(crossNode(c) && viaOf(c) === r),
-				).length,
-		),
-		"Forwarded RDMA arrivals plus copies from the same node.",
-	);
-	views[K.nvl2] = collectiveView(
-		"Rows each GPU sends back over NVLink",
-		"combine (NVLink part)",
-		"rows out",
-		ranks.map(
-			(r) =>
-				COPIES.filter(
-					(c) =>
-						c.dest === r && c.home !== r && !(crossNode(c) && viaOf(c) === r),
-				).length,
-		),
-		"The mirror image of the NVLink dispatch.",
-	);
-	views[K.ib2] = collectiveView(
+	views[K.combine] = collectiveView(
 		"Rows each GPU sends back over RDMA",
-		"combine (RDMA part)",
+		"buffer.combine (RDMA hop)",
 		"rows out",
 		ranks.map((r) => sends.filter((s) => s.to === r).length),
-		"One partial sum per token and node.",
+		"One partial sum per token and node, after NVLink has summed this node's results.",
 	);
 	return {
 		nodes,

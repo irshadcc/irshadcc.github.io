@@ -50,15 +50,20 @@ export const TOPK_W: number[][][] = [
 const range = (n: number) => [...Array(n).keys()];
 /** W1 of expert e: [2I, H], rows 0..I-1 are the gate projection, rows I..2I-1 the up projection. */
 export const W1: number[][][] = range(EXPERTS).map((e) =>
-	range(2 * I).map((r) => range(H).map((c) => (((2 * e + 3 * r + 3 * c + 1) % 5) - 2) * 0.5)),
+	range(2 * I).map((r) =>
+		range(H).map((c) => (((2 * e + 3 * r + 3 * c + 1) % 5) - 2) * 0.5),
+	),
 );
 /** W2 of expert e: [H, I]. */
 export const W2: number[][][] = range(EXPERTS).map((e) =>
-	range(H).map((r) => range(I).map((c) => (((e + 3 * r + 2 * c + 2) % 5) - 2) * 0.5)),
+	range(H).map((r) =>
+		range(I).map((c) => (((e + 3 * r + 2 * c + 2) % 5) - 2) * 0.5),
+	),
 );
 
 const silu = (v: number) => v / (1 + Math.exp(-v));
-const matvec = (m: number[][], v: number[]) => m.map((row) => row.reduce((a, w, j) => a + w * v[j], 0));
+const matvec = (m: number[][], v: number[]) =>
+	m.map((row) => row.reduce((a, w, j) => a + w * v[j], 0));
 
 /** One token copy as the kernel sees it. */
 export interface CopyRef {
@@ -72,7 +77,13 @@ export interface CopyRef {
 
 const copiesOf = (rank: number): CopyRef[] =>
 	range(TOKENS).flatMap((token) =>
-		range(TOPK).map((k) => ({ rank, token, k, expert: TOPK_IDX[rank][token][k], tokenTopk: token * TOPK + k })),
+		range(TOPK).map((k) => ({
+			rank,
+			token,
+			k,
+			expert: TOPK_IDX[rank][token][k],
+			tokenTopk: token * TOPK + k,
+		})),
 	);
 
 /** Reference MoE output: y[rank][token] = sum_k w * W2 (silu(gate) * up). */
@@ -83,7 +94,9 @@ export function reference(): number[][][] {
 			for (let k = 0; k < TOPK; k++) {
 				const e = TOPK_IDX[r][t][k];
 				const z = matvec(W1[e], X[r][t]);
-				const act = range(I).map((i) => silu(z[i]) * z[I + i] * TOPK_W[r][t][k]);
+				const act = range(I).map(
+					(i) => silu(z[i]) * z[I + i] * TOPK_W[r][t][k],
+				);
 				const out = matvec(W2[e], act);
 				for (let j = 0; j < H; j++) y[j] += out[j];
 			}
@@ -112,7 +125,9 @@ export interface Simulation {
 }
 
 export function simulate(): Simulation {
-	const counts = range(RANKS).map((r) => range(EXPERTS).map((e) => copiesOf(r).filter((c) => c.expert === e).length));
+	const counts = range(RANKS).map((r) =>
+		range(EXPERTS).map((e) => copiesOf(r).filter((c) => c.expert === e).length),
+	);
 	// Slots are claimed in token-topk order (the second read_topk_idx pass).
 	const srcIdx = range(RANKS).map((d) =>
 		range(LOCAL).map((le) =>
@@ -123,7 +138,9 @@ export function simulate(): Simulation {
 			),
 		),
 	);
-	const recvCount = range(RANKS).map((d) => range(RANKS).map((s) => range(LOCAL).map((le) => srcIdx[d][le][s].length)));
+	const recvCount = range(RANKS).map((d) =>
+		range(RANKS).map((s) => range(LOCAL).map((le) => srcIdx[d][le][s].length)),
+	);
 	// Pull order within an expert: round-robin over source ranks ("min-peeling").
 	const l1Rows = range(RANKS).map((d) =>
 		range(LOCAL).flatMap((le) => {
@@ -135,28 +152,50 @@ export function simulate(): Simulation {
 					if (tt === undefined) continue;
 					const token = Math.floor(tt / TOPK);
 					const k = tt % TOPK;
-					rows.push({ rank: s, token, k, expert: d * LOCAL + le, tokenTopk: tt });
+					rows.push({
+						rank: s,
+						token,
+						k,
+						expert: d * LOCAL + le,
+						tokenTopk: tt,
+					});
 				}
 			while (rows.length % BLOCK_M !== 0) rows.push(null);
 			return rows;
 		}),
 	);
-	const acc1 = l1Rows.map((rows) => rows.map((c) => (c ? matvec(W1[c.expert], X[c.rank][c.token]) : null)));
+	const acc1 = l1Rows.map((rows) =>
+		rows.map((c) => (c ? matvec(W1[c.expert], X[c.rank][c.token]) : null)),
+	);
 	const act = l1Rows.map((rows, d) =>
 		rows.map((c, i) => {
 			const z = acc1[d][i];
 			if (!c || !z) return null;
-			return range(I).map((j) => silu(z[j]) * z[I + j] * TOPK_W[c.rank][c.token][c.k]);
+			return range(I).map(
+				(j) => silu(z[j]) * z[I + j] * TOPK_W[c.rank][c.token][c.k],
+			);
 		}),
 	);
-	const acc2 = l1Rows.map((rows, d) => rows.map((c, i) => (c && act[d][i] ? matvec(W2[c.expert], act[d][i] as number[]) : null)));
-	const combine = range(RANKS).map(() => range(TOPK).map(() => range(TOKENS).map(() => new Array<number>(H).fill(0))));
+	const acc2 = l1Rows.map((rows, d) =>
+		rows.map((c, i) =>
+			c && act[d][i] ? matvec(W2[c.expert], act[d][i] as number[]) : null,
+		),
+	);
+	const combine = range(RANKS).map(() =>
+		range(TOPK).map(() =>
+			range(TOKENS).map(() => new Array<number>(H).fill(0)),
+		),
+	);
 	l1Rows.forEach((rows, d) => {
 		rows.forEach((c, i) => {
 			if (c) combine[c.rank][c.k][c.token] = acc2[d][i] as number[];
 		});
 	});
-	const y = combine.map((cb) => range(TOKENS).map((t) => range(H).map((j) => cb.reduce((a, slot) => a + slot[t][j], 0))));
+	const y = combine.map((cb) =>
+		range(TOKENS).map((t) =>
+			range(H).map((j) => cb.reduce((a, slot) => a + slot[t][j], 0)),
+		),
+	);
 	return { counts, srcIdx, recvCount, l1Rows, acc1, act, acc2, combine, y };
 }
 
@@ -169,7 +208,12 @@ export interface TensorCard {
 	/** Where it lives, e.g. "rank 0 · symmetric buffer". */
 	where: string;
 	cols?: string[];
-	rows: { label: string; cells: string[]; tone?: number | null; dim?: boolean }[];
+	rows: {
+		label: string;
+		cells: string[];
+		tone?: number | null;
+		dim?: boolean;
+	}[];
 }
 
 export interface MkStep {
@@ -185,7 +229,12 @@ const f2 = (v: number) => (Math.abs(v) < 0.005 ? "0.00" : v.toFixed(2));
 const vec = (v: number[]) => v.map(f2);
 const f3 = (v: number) => (v < 0 ? `(${v.toFixed(3)})` : v.toFixed(3));
 /** A number for inline arithmetic: negatives in parentheses. */
-const sgn = (v: number) => (v < 0 ? `(${Number.isInteger(v) ? v : f2(v)})` : Number.isInteger(v) ? String(v) : f2(v));
+const sgn = (v: number) =>
+	v < 0
+		? `(${Number.isInteger(v) ? v : f2(v)})`
+		: Number.isInteger(v)
+			? String(v)
+			: f2(v);
 const tokName = (rank: number, token: number) => `t${rank * TOKENS + token}`;
 const copyName = (c: CopyRef) => `${tokName(c.rank, c.token)}·k${c.k}`;
 /** Tone = the rank that holds the row's expert, as in the other MoE figures. */
@@ -217,7 +266,10 @@ export function buildSteps(): MkStep[] {
 		shape: `[${TOKENS}, ${H}]`,
 		where: `rank ${r} · symmetric buffer`,
 		cols: range(H).map((j) => `h${j}`),
-		rows: range(TOKENS).map((t) => ({ label: tokName(r, t), cells: vec(X[r][t]) })),
+		rows: range(TOKENS).map((t) => ({
+			label: tokName(r, t),
+			cells: vec(X[r][t]),
+		})),
 	});
 	const topkCard = (r: number): TensorCard => ({
 		name: "topk_idx, topk_weights",
@@ -226,7 +278,9 @@ export function buildSteps(): MkStep[] {
 		cols: range(TOPK).map((k) => `k${k}`),
 		rows: range(TOKENS).map((t) => ({
 			label: tokName(r, t),
-			cells: range(TOPK).map((k) => `E${TOPK_IDX[r][t][k]} · ${TOPK_W[r][t][k]}`),
+			cells: range(TOPK).map(
+				(k) => `E${TOPK_IDX[r][t][k]} · ${TOPK_W[r][t][k]}`,
+			),
 		})),
 	});
 	const countCard = (r: number, name: string, where: string): TensorCard => ({
@@ -247,7 +301,9 @@ export function buildSteps(): MkStep[] {
 				tone: s === 0 ? null : 1,
 				cells: [0, 1].map((slot) => {
 					const v = S.srcIdx[d][le][s][slot];
-					return v === undefined ? "·" : `${v} (${tokName(s, Math.floor(v / TOPK))}·k${v % TOPK})`;
+					return v === undefined
+						? "·"
+						: `${v} (${tokName(s, Math.floor(v / TOPK))}·k${v % TOPK})`;
 				}),
 			})),
 		),
@@ -257,29 +313,50 @@ export function buildSteps(): MkStep[] {
 		shape: `[${RANKS} sources, ${LOCAL} experts]`,
 		where: `rank ${d} · symmetric buffer (written by peers)`,
 		cols: range(LOCAL).map((le) => `E${d * LOCAL + le}`),
-		rows: range(RANKS).map((s) => ({ label: `from rank ${s}`, cells: S.recvCount[d][s].map(String) })),
+		rows: range(RANKS).map((s) => ({
+			label: `from rank ${s}`,
+			cells: S.recvCount[d][s].map(String),
+		})),
 	});
-	const l1Card = (d: number, rows = S.l1Rows[d], name = "l1_token_buffer (ring)"): TensorCard => ({
+	const l1Card = (
+		d: number,
+		rows = S.l1Rows[d],
+		name = "l1_token_buffer (ring)",
+	): TensorCard => ({
 		name,
 		shape: `[${rows.length}, ${H}]`,
 		where: `rank ${d} · symmetric buffer`,
 		cols: range(H).map((j) => `h${j}`),
 		rows: rows.map((c, i) => ({
-			label: c ? `E${c.expert} ← ${copyName(c)}` : `E${S.l1Rows[d][Math.floor(i / BLOCK_M) * BLOCK_M]?.expert ?? ""} pad`,
+			label: c
+				? `E${c.expert} ← ${copyName(c)}`
+				: `E${S.l1Rows[d][Math.floor(i / BLOCK_M) * BLOCK_M]?.expert ?? ""} pad`,
 			tone: c ? c.rank : null,
 			dim: !c,
 			cells: c ? vec(X[c.rank][c.token]) : range(H).map(() => "0"),
 		})),
 	});
 	const blockLabel = (c: CopyRef | null) => (c ? copyName(c) : "pad");
-	const matCard = (name: string, m: number[][], rowNames: string[], colNames: string[], where: string): TensorCard => ({
+	const matCard = (
+		name: string,
+		m: number[][],
+		rowNames: string[],
+		colNames: string[],
+		where: string,
+	): TensorCard => ({
 		name,
 		shape: `[${m.length}, ${m[0].length}]`,
 		where,
 		cols: colNames,
 		rows: m.map((row, i) => ({ label: rowNames[i], cells: vec(row) })),
 	});
-	const rowsCard = (name: string, vals: (number[] | null)[], cols: string[], where: string, rows = blockRows): TensorCard => ({
+	const rowsCard = (
+		name: string,
+		vals: (number[] | null)[],
+		cols: string[],
+		where: string,
+		rows = blockRows,
+	): TensorCard => ({
 		name,
 		shape: `[${BLOCK_M}, ${cols.length}]`,
 		where,
@@ -291,8 +368,12 @@ export function buildSteps(): MkStep[] {
 			cells: vals[i] ? vec(vals[i] as number[]) : cols.map(() => "—"),
 		})),
 	});
-	const gateUp = [...range(I).map((i) => `gate${i}`), ...range(I).map((i) => `up${i}`)];
-	const weightsCol = (rows: (CopyRef | null)[]) => rows.map((c) => (c ? [TOPK_W[c.rank][c.token][c.k]] : null));
+	const gateUp = [
+		...range(I).map((i) => `gate${i}`),
+		...range(I).map((i) => `up${i}`),
+	];
+	const weightsCol = (rows: (CopyRef | null)[]) =>
+		rows.map((c) => (c ? [TOPK_W[c.rank][c.token][c.k]] : null));
 	const combineCard = (r: number): TensorCard => ({
 		name: "combine_token_buffer",
 		shape: `[${TOPK}, ${TOKENS}, ${H}]`,
@@ -301,12 +382,20 @@ export function buildSteps(): MkStep[] {
 		rows: range(TOPK).flatMap((k) =>
 			range(TOKENS).map((t) => {
 				const e = TOPK_IDX[r][t][k];
-				return { label: `k${k} · ${tokName(r, t)} ← E${e}`, tone: toneOf(e), cells: vec(S.combine[r][k][t]) };
+				return {
+					label: `k${k} · ${tokName(r, t)} ← E${e}`,
+					tone: toneOf(e),
+					cells: vec(S.combine[r][k][t]),
+				};
 			}),
 		),
 	});
 	const ref = reference();
-	const maxErr = Math.max(...S.y.flatMap((ry, r) => ry.flatMap((row, t) => row.map((v, j) => Math.abs(v - ref[r][t][j])))));
+	const maxErr = Math.max(
+		...S.y.flatMap((ry, r) =>
+			ry.flatMap((row, t) => row.map((v, j) => Math.abs(v - ref[r][t][j]))),
+		),
+	);
 
 	const e0Rows = blockRows.filter((c): c is CopyRef => c !== null);
 	const l1Block = blockRows.map((c) => (c ? X[c.rank][c.token] : null));
@@ -337,7 +426,10 @@ export function buildSteps(): MkStep[] {
 					where: "rank 0 · symmetric buffer / shared memory",
 					cols: range(EXPERTS).map((e) => `E${e}`),
 					rows: [
-						{ label: "counter after", cells: S.counts[0].map((n) => (n ? `2³²+${n}` : "0")) },
+						{
+							label: "counter after",
+							cells: S.counts[0].map((n) => (n ? `2³²+${n}` : "0")),
+						},
 						{ label: "first slot", cells: S.counts[0].map(() => "0") },
 					],
 				},
@@ -356,7 +448,10 @@ export function buildSteps(): MkStep[] {
 			head: "Publish the per-expert counts",
 			body: `After a grid-wide barrier, SM 0 of every rank writes its count for each expert into the expert's rank, and an NVLink barrier waits until all ranks have. Rank 0 now knows it will receive ${S.recvCount[0].map((row, s) => `${row.join(" and ")} copies for E0 and E1 from rank ${s}`).join(", ")}.`,
 			op: "remote stores, then NVLink barrier",
-			inputs: [countCard(0, "expert_send_count (low 32 bits)", "rank 0"), countCard(1, "expert_send_count (low 32 bits)", "rank 1")],
+			inputs: [
+				countCard(0, "expert_send_count (low 32 bits)", "rank 0"),
+				countCard(1, "expert_send_count (low 32 bits)", "rank 1"),
+			],
 			outputs: [recvCard(0)],
 		},
 		{
@@ -366,7 +461,9 @@ export function buildSteps(): MkStep[] {
 				.slice(0, BLOCK_M)
 				.filter(Boolean)
 				.map((c) => copyName(c as CopyRef))
-				.join(", ")}), and each expert's rows fill a block of ${BLOCK_M}, padded. When a block is full, l1_full_count tells the GEMM warps.`,
+				.join(
+					", ",
+				)}), and each expert's rows fill a block of ${BLOCK_M}, padded. When a block is full, l1_full_count tells the GEMM warps.`,
 			op: "TMA pull, round-robin over source ranks",
 			inputs: [xCard(0), xCard(1)],
 			outputs: [l1Card(0)],
@@ -377,10 +474,23 @@ export function buildSteps(): MkStep[] {
 			body: `The MMA warp multiplies E0's block of tokens by E0's W1, the gate and up projections stacked, accumulating in tensor memory. Check one entry, ${copyName(e0Rows[0])}'s gate0: ${X[e0Rows[0].rank][e0Rows[0].token].map((v, j) => `${sgn(v)} × ${sgn(W1[e0][0][j])}`).join(" + ")} = ${f2(acc1Block[0]?.[0] ?? 0)}. The padding row is never stored.`,
 			op: "acc = tokens × W1ᵀ (tensor cores)",
 			inputs: [
-				rowsCard("token tile (from the L1 ring)", l1Block, range(H).map((j) => `h${j}`), "rank 0 · shared memory"),
-				matCard("W1 of E0", W1[e0], gateUp, range(H).map((j) => `h${j}`), "rank 0 · HBM → shared memory"),
+				rowsCard(
+					"token tile (from the L1 ring)",
+					l1Block,
+					range(H).map((j) => `h${j}`),
+					"rank 0 · shared memory",
+				),
+				matCard(
+					"W1 of E0",
+					W1[e0],
+					gateUp,
+					range(H).map((j) => `h${j}`),
+					"rank 0 · HBM → shared memory",
+				),
 			],
-			outputs: [rowsCard("accumulator", acc1Block, gateUp, "rank 0 · tensor memory")],
+			outputs: [
+				rowsCard("accumulator", acc1Block, gateUp, "rank 0 · tensor memory"),
+			],
 		},
 		{
 			line: 8,
@@ -389,9 +499,21 @@ export function buildSteps(): MkStep[] {
 			op: "silu(gate) · up · weight",
 			inputs: [
 				rowsCard("accumulator", acc1Block, gateUp, "rank 0 · tensor memory"),
-				rowsCard("l1_topk_weights", weightsCol(blockRows), ["w"], "rank 0 · symmetric buffer"),
+				rowsCard(
+					"l1_topk_weights",
+					weightsCol(blockRows),
+					["w"],
+					"rank 0 · symmetric buffer",
+				),
 			],
-			outputs: [rowsCard("l2_token_buffer (ring)", actBlock, range(I).map((i) => `i${i}`), "rank 0 · symmetric buffer")],
+			outputs: [
+				rowsCard(
+					"l2_token_buffer (ring)",
+					actBlock,
+					range(I).map((i) => `i${i}`),
+					"rank 0 · symmetric buffer",
+				),
+			],
 		},
 		{
 			line: 9,
@@ -399,23 +521,48 @@ export function buildSteps(): MkStep[] {
 			body: "As soon as the bits for the K blocks it needs are set in l2_full_mask, a second-GEMM task multiplies the block by E0's W2, again into tensor memory.",
 			op: "acc = act × W2ᵀ (tensor cores)",
 			inputs: [
-				rowsCard("L2 tile", actBlock, range(I).map((i) => `i${i}`), "rank 0 · shared memory"),
-				matCard("W2 of E0", W2[e0], range(H).map((j) => `h${j}`), range(I).map((i) => `i${i}`), "rank 0 · HBM → shared memory"),
+				rowsCard(
+					"L2 tile",
+					actBlock,
+					range(I).map((i) => `i${i}`),
+					"rank 0 · shared memory",
+				),
+				matCard(
+					"W2 of E0",
+					W2[e0],
+					range(H).map((j) => `h${j}`),
+					range(I).map((i) => `i${i}`),
+					"rank 0 · HBM → shared memory",
+				),
 			],
-			outputs: [rowsCard("accumulator", acc2Block, range(H).map((j) => `h${j}`), "rank 0 · tensor memory")],
+			outputs: [
+				rowsCard(
+					"accumulator",
+					acc2Block,
+					range(H).map((j) => `h${j}`),
+					"rank 0 · tensor memory",
+				),
+			],
 		},
 		{
 			line: 10,
 			head: "Epilogue 2: write each row home",
 			body: `Each output row goes straight to the rank its token came from, into that rank's combine buffer at [k][token]. ${e0Rows.map((c) => `${copyName(c)} → rank ${c.rank}, slot k${c.k}`).join("; ")}. Rank 0's E1 block and rank 1's E2 and E3 blocks do the same, so rank 0's buffer fills with rows computed on both ranks.`,
 			op: "16-byte remote stores via sym_buffer.map",
-			inputs: [rowsCard("accumulator", acc2Block, range(H).map((j) => `h${j}`), "rank 0 · tensor memory")],
+			inputs: [
+				rowsCard(
+					"accumulator",
+					acc2Block,
+					range(H).map((j) => `h${j}`),
+					"rank 0 · tensor memory",
+				),
+			],
 			outputs: [combineCard(0)],
 		},
 		{
 			line: 12,
 			head: "Combine: add each token's top-k rows",
-			body: `When every rank holding one of a token's experts has signalled combine_ready, the epilogue warps load the token's ${TOPK} rows from local memory and add them in FP32. Check one entry: y[t0][h0] = ${f3(S.combine[0][0][0][0])} + ${f3(S.combine[0][1][0][0])} = ${S.y[0][0][0].toFixed(3)}. Against a plain PyTorch-style MoE on the same inputs, the largest difference is ${maxErr.toExponential(1)}.`,
+			body: `When every rank holding one of a token's experts has signalled combine_ready, the epilogue warps load the token's ${TOPK} rows from local memory and add them in FP32. Check one entry: y[t0][h0] = ${f3(S.combine[0][0][0][0])} + ${f3(S.combine[0][1][0][0])} = ${S.y[0][0][0].toFixed(3)}. ${maxErr === 0 ? "This matches a plain PyTorch MoE on the same inputs exactly." : `Against a plain PyTorch MoE on the same inputs, the largest difference is ${maxErr.toExponential(1)}.`}`,
 			op: "sum over k, FP32 → BF16",
 			inputs: [combineCard(0)],
 			outputs: [
@@ -424,7 +571,10 @@ export function buildSteps(): MkStep[] {
 					shape: `[${TOKENS}, ${H}]`,
 					where: "rank 0 · output",
 					cols: range(H).map((j) => `h${j}`),
-					rows: range(TOKENS).map((t) => ({ label: tokName(0, t), cells: vec(S.y[0][t]) })),
+					rows: range(TOKENS).map((t) => ({
+						label: tokName(0, t),
+						cells: vec(S.y[0][t]),
+					})),
 				},
 			],
 		},

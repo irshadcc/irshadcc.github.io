@@ -1,16 +1,20 @@
 ---
 import Layout from "../../layouts/Layout.astro";
 import EplbPlacement from "../../utils/distributed/EplbPlacement.astro";
+import MegaKernelSteps from "../../utils/distributed/MegaKernelSteps.astro";
 import MoeDispatch from "../../utils/distributed/MoeDispatch.astro";
 import MoeDispatchSteps from "../../utils/distributed/MoeDispatchSteps.astro";
 import MoeEpSteps from "../../utils/distributed/MoeEpSteps.astro";
 import MoeRouters from "../../utils/distributed/MoeRouters.astro";
 import ZeroMemory from "../../utils/distributed/ZeroMemory.astro";
+import ModuleGraph from "../../utils/distributed/graph/ModuleGraph.astro";
+import type { ModuleSpec } from "../../utils/distributed/graph/moduleGraph";
+import megatronMoe from "../../utils/distributed/graph/megatronMoe.json";
 ---
 
 <Layout title="ZeRO and MoE demo">
 	<h1>ZeRO and MoE demo</h1>
-	<p>Figures from <code>zero.ts</code>, <code>moe.ts</code>, <code>moeRouting.ts</code>, <code>epDispatch.ts</code>, <code>epFlows.ts</code> and <code>eplb.ts</code>.</p>
+	<p>Figures from <code>zero.ts</code>, <code>moe.ts</code>, <code>moeRouting.ts</code>, <code>epDispatch.ts</code>, <code>epFlows.ts</code>, <code>megaKernel.ts</code> and <code>eplb.ts</code>.</p>
 
 	<h2>EplbPlacement</h2>
 	<EplbPlacement />
@@ -53,4 +57,11 @@ import ZeroMemory from "../../utils/distributed/ZeroMemory.astro";
 
 	<h2>MoeEpSteps, DeepSeek-V3's two-hop dispatch</h2>
 	<MoeEpSteps flow="deepseek" />
+
+	<h2>ModuleGraph: a Megatron-style MoE layer with expert parallelism</h2>
+	<p>The forward pass of <code>MegatronMoELayer</code> as one EP rank runs it, with its three all-to-alls (orange): the split counts, the dispatch and the combine. Values are rank 0's from a run with EP = 2 (gloo, 2 processes): 4 tokens per rank, hidden size 4, 4 experts (2 per rank), top-2. Hover over an edge for its tensor (rows tinted by expert), a node for its equation.</p>
+	<ModuleGraph spec={megatronMoe as ModuleSpec} wide />
+
+	<h2>MegaKernelSteps</h2>
+	<MegaKernelSteps title="Mega MoE, one line at a time" />
 </Layout>

@@ -1,0 +1,378 @@
+---
+// A distributed computation drawn from a ParallelGraphSpec (parallelGraph.ts): JSON with a
+// parallel_config, operations (nodes: PyTorch operators, collectives, inputs/outputs) and tensors
+// (edges). Draw.io-style boxes coloured by operation type, a large icon at the left, each
+// per-rank box's (DP, TP, PP, EP) coordinates, right-angled edges, and a dashed line under the
+// inputs. Hovering an edge shows its tensor as a matrix with axis titles and its shape; hovering
+// a node shows its equation. Nodes are .node[data-id] in the SVG, so a figure around it can
+// highlight them (MoeEpSteps does, step by step).
+// Usage in .mdx:
+//   import spec from "../../utils/distributed/graphs/moeExample.json";
+//   <ParallelGraph spec={spec} />
+import katex from "katex";
+import NeuralNetworkGraph from "../neuralnetwork/NeuralNetworkGraph.astro";
+import { type ParallelGraphSpec, edgeKey, specToGraph } from "./parallelGraph";
+
+interface Props {
+	spec: ParallelGraphSpec;
+	/** Extend into the margin-note column on wide screens. */
+	wide?: boolean;
+	/** Vertical gap between rows, in px. */
+	rankSep?: number;
+}
+
+const { spec, wide = false, rankSep = 56 } = Astro.props;
+const g = specToGraph(spec);
+const inputs = Object.entries(spec.operations)
+	.filter(([, op]) => op.type === "input")
+	.map(([id]) => id);
+const tex = (l: string) =>
+	katex.renderToString(l, {
+		displayMode: true,
+		throwOnError: false,
+		output: "html",
+	});
+const isZero = (v: string) => /^-?0(\.0+)?$/.test(v);
+---
+
+<div class:list={["pg", { wide }]} data-inputs={inputs.join(" ")}>
+	<NeuralNetworkGraph graph={g} legend={false} keepOutputOrder rankSep={rankSep} look="diagram" />
+	{
+		Object.entries(spec.operations)
+			.filter(([, op]) => op.equation)
+			.map(([id, op]) => (
+				<div class="ep-card eq" data-node={id} hidden>
+					<p class="card-title">{op.equation?.title}</p>
+					{op.equation?.latex.map((l) => <div class="katex-line" set:html={tex(l)} />)}
+					{op.equation?.note && <p class="card-note">{op.equation.note}</p>}
+				</div>
+			))
+	}
+	{
+		Object.values(spec.tensors).map((t) => (
+			<div class="ep-card mx-card" data-edge={edgeKey(t)} hidden>
+				<p class="card-title">
+					<code>{t.name}</code>
+				</p>
+				{t.values.length > 0 ? (
+					<table class="mx">
+						<tbody>
+							<tr>
+								<td colspan="2" />
+								<th class="ax-col" colspan={t.col_labels.length}>
+									{t.axes[1]}
+								</th>
+							</tr>
+							<tr>
+								<td colspan="2" />
+								{t.col_labels.map((c) => (
+									<th class="idx-col">{c}</th>
+								))}
+							</tr>
+							{t.values.map((row, i) => (
+								<tr class={t.row_ranks?.[i] == null ? "" : `d${t.row_ranks[i]}`}>
+									{i === 0 && (
+										<th class="ax-row" rowspan={t.values.length}>
+											<span>{t.axes[0]}</span>
+										</th>
+									)}
+									<th class="idx-row">{t.row_labels[i]}</th>
+									{row.map((v, j) => (
+										<td class:list={{ first: j === 0, nz: !isZero(v) }}>{v}</td>
+									))}
+								</tr>
+							))}
+						</tbody>
+					</table>
+				) : (
+					<p class="empty">(empty)</p>
+				)}
+				<p class="shape-line">
+					<span class="sym">{t.symbolic_shape}</span> = <span class="concrete">({t.shape.join(", ")})</span>
+				</p>
+				{t.note && <p class="card-note">{t.note}</p>}
+			</div>
+		))
+	}
+</div>
+
+<script>
+	const SVG = "http://www.w3.org/2000/svg";
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".pg")) {
+		const svg = fig.querySelector<SVGSVGElement>("svg");
+		if (!svg) continue;
+		const nodes = new Map<string, SVGGElement>();
+		for (const n of svg.querySelectorAll<SVGGElement>(".node")) nodes.set(n.dataset.id ?? "", n);
+		// A dashed line under the inputs, across the whole graph: the MoE layer starts below it.
+		const bodies = [...nodes].map(([id, n]) => ({ id, b: n.querySelector<SVGRectElement>("rect.body")?.getBBox() }));
+		const inputIds = new Set((fig.dataset.inputs ?? "").split(" "));
+		const inputs = bodies.filter((x) => inputIds.has(x.id) && x.b);
+		if (inputs.length) {
+			const bottom = Math.max(...inputs.map((x) => (x.b?.y ?? 0) + (x.b?.height ?? 0)));
+			const below = bodies.filter((x) => x.b && x.b.y > bottom).map((x) => x.b?.y ?? 0);
+			const vb = svg.viewBox.baseVal;
+			const y = below.length ? (bottom + Math.min(...below)) / 2 : bottom + 10;
+			const sep = document.createElementNS(SVG, "line");
+			sep.setAttribute("class", "ep-sep");
+			sep.setAttribute("x1", String(vb.x));
+			sep.setAttribute("x2", String(vb.x + vb.width));
+			sep.setAttribute("y1", String(y));
+			sep.setAttribute("y2", String(y));
+			svg.querySelector(".edge")?.before(sep);
+		}
+
+		// Node cards: the equation each node computes. They replace the graph's plain tooltips.
+		const graph = fig;
+		const cards = new Map<string, HTMLElement>();
+		for (const c of fig.querySelectorAll<HTMLElement>(".ep-card[data-node]")) cards.set(c.dataset.node ?? "", c);
+		const showCard = (id: string | null, n?: SVGGElement) => {
+			for (const c of cards.values()) c.hidden = true;
+			const card = id ? cards.get(id) : undefined;
+			if (!card || !n || !graph) return;
+			card.hidden = false;
+			const g = graph.getBoundingClientRect();
+			const b = n.getBoundingClientRect();
+			// Below the node, kept inside the figure; above it if there's no room below.
+			const left = Math.min(Math.max(0, b.left - g.left + b.width / 2 - card.offsetWidth / 2), g.width - card.offsetWidth);
+			const below = b.bottom - g.top + 6;
+			const top = below + card.offsetHeight > g.height ? b.top - g.top - card.offsetHeight - 6 : below;
+			card.style.left = `${Math.max(0, left)}px`;
+			card.style.top = `${Math.max(0, top)}px`;
+		};
+		// Edge cards: the tensor on each edge, shown next to the pointer.
+		const edgeCards = new Map<string, HTMLElement>();
+		for (const c of fig.querySelectorAll<HTMLElement>("[data-edge]")) edgeCards.set(c.dataset.edge ?? "", c);
+		const hideEdgeCards = () => {
+			for (const c of edgeCards.values()) c.hidden = true;
+		};
+		for (const e of svg.querySelectorAll<SVGGElement>(".edge")) {
+			const k = `${e.dataset.from}->${e.dataset.to}`;
+			const card = edgeCards.get(k);
+			const path = e.querySelector("path");
+			if (!card || !path || !graph) continue;
+			// The drawn stroke is too thin to hover; add a wide invisible one on top.
+			const hit = document.createElementNS(SVG, "path");
+			hit.setAttribute("d", path.getAttribute("d") ?? "");
+			hit.setAttribute("class", "ep-hit");
+			e.append(hit);
+			const place = (ev: PointerEvent) => {
+				const g = graph.getBoundingClientRect();
+				const x = ev.clientX - g.left;
+				const y = ev.clientY - g.top;
+				const left = Math.min(Math.max(0, x + 14), g.width - card.offsetWidth);
+				const top = y + 14 + card.offsetHeight > g.height ? Math.max(0, y - card.offsetHeight - 14) : y + 14;
+				card.style.left = `${left}px`;
+				card.style.top = `${top}px`;
+			};
+			hit.addEventListener("pointerenter", (ev) => {
+				showCard(null);
+				hideEdgeCards();
+				card.hidden = false;
+				e.classList.add("ep-hot");
+				place(ev);
+			});
+			hit.addEventListener("pointermove", place);
+			hit.addEventListener("pointerleave", () => {
+				card.hidden = true;
+				e.classList.remove("ep-hot");
+			});
+		}
+
+		for (const [id, n] of nodes) {
+			n.querySelector("title")?.remove();
+			n.addEventListener("pointerenter", () => showCard(id, n));
+			n.addEventListener("focus", () => showCard(id, n));
+			n.addEventListener("pointerleave", () => showCard(null));
+			n.addEventListener("blur", () => showCard(null));
+		}
+	}
+</script>
+
+<style>
+	.pg {
+		/* One colour per rank (row_ranks tints). */
+		--d0: #2a78d6;
+		--d1: #eb6834;
+		--d2: #1baf7a;
+		--d3: #eda100;
+		--d4: #e87ba4;
+		--d5: #008300;
+		--d6: #4a3aa7;
+		--d7: #e34948;
+		position: relative;
+		font-family: var(--sans);
+	}
+	@media (prefers-color-scheme: dark) {
+		.pg {
+			--d0: #3987e5;
+			--d1: #d95926;
+			--d2: #199e70;
+			--d3: #c98500;
+			--d4: #d55181;
+			--d5: #2ea043;
+			--d6: #9085e9;
+			--d7: #e66767;
+		}
+	}
+	.pg :global(.d0) {
+		--c: var(--d0);
+	}
+	.pg :global(.d1) {
+		--c: var(--d1);
+	}
+	.pg :global(.d2) {
+		--c: var(--d2);
+	}
+	.pg :global(.d3) {
+		--c: var(--d3);
+	}
+	.pg :global(.d4) {
+		--c: var(--d4);
+	}
+	.pg :global(.d5) {
+		--c: var(--d5);
+	}
+	.pg :global(.d6) {
+		--c: var(--d6);
+	}
+	.pg :global(.d7) {
+		--c: var(--d7);
+	}
+	.pg :global(.nn-graph) {
+		margin: 0.3rem 0 0;
+	}
+	.ep-card {
+		position: absolute;
+		z-index: 5;
+		width: max-content;
+		max-width: min(28rem, 100%);
+		padding: 0.5rem 0.65rem;
+		border: 1px solid var(--faint);
+		border-radius: 8px;
+		background: var(--bg);
+		box-shadow: 0 6px 20px rgb(0 0 0 / 0.18);
+		font-size: 0.72rem;
+		pointer-events: none;
+	}
+	.ep-card[hidden] {
+		display: none;
+	}
+	.card-title {
+		margin: 0;
+		font-size: 0.8rem;
+		font-weight: 700;
+	}
+	.card-note {
+		margin: 0.35rem 0 0;
+		color: var(--muted);
+		line-height: 1.4;
+	}
+	.eq .katex-line {
+		margin: 0.15rem 0;
+		overflow-x: auto;
+		font-size: 0.85rem;
+	}
+	.eq .katex-line :global(.katex-display) {
+		margin: 0.25rem 0;
+	}
+	/* The tensor on an edge, drawn as a matrix with axis titles. */
+	.mx {
+		width: auto;
+		margin: 0.2rem 0 0;
+		border-collapse: collapse;
+		font-family: var(--mono);
+		font-size: 0.68rem;
+	}
+	.mx th,
+	.mx td {
+		padding: 0.08rem 0.35rem;
+		border: 0;
+		white-space: nowrap;
+		text-align: right;
+	}
+	.mx .ax-col {
+		font-family: var(--sans);
+		font-weight: 600;
+		color: var(--muted);
+		text-align: center;
+	}
+	.mx .idx-col {
+		font-weight: 400;
+		color: var(--muted);
+		text-align: right;
+		border-bottom: 1px solid var(--muted);
+	}
+	.mx .ax-row {
+		padding: 0 0.2rem 0 0;
+		vertical-align: middle;
+	}
+	.mx .ax-row span {
+		display: inline-block;
+		writing-mode: vertical-rl;
+		transform: rotate(180deg);
+		font-family: var(--sans);
+		font-weight: 600;
+		color: var(--muted);
+	}
+	.mx .idx-row {
+		font-weight: 400;
+		color: var(--muted);
+		text-align: right;
+	}
+	.mx td.first {
+		border-left: 1px solid var(--muted);
+	}
+	.mx td {
+		color: var(--muted);
+	}
+	.mx td.nz {
+		color: var(--text);
+	}
+	.mx tr[class^="d"] td {
+		background: color-mix(in srgb, var(--c) 12%, transparent);
+	}
+	.mx-card .shape-line {
+		margin: 0.35rem 0 0;
+		text-align: center;
+		font-family: var(--mono);
+		font-size: 0.68rem;
+	}
+	.mx-card .sym {
+		color: var(--text);
+	}
+	.mx-card .concrete {
+		color: var(--muted);
+	}
+	.mx-card .empty {
+		margin: 0.3rem 0;
+		color: var(--muted);
+		font-family: var(--mono);
+		font-size: 0.7rem;
+	}
+	.pg :global(.ep-hit) {
+		fill: none;
+		stroke: transparent;
+		stroke-width: 12;
+		pointer-events: stroke;
+		cursor: help;
+	}
+	.pg :global(.edge.ep-hot path:not(.ep-hit)) {
+		stroke: var(--accent);
+		stroke-width: 2.2;
+		stroke-opacity: 1;
+	}
+
+	.pg :global(.ep-sep) {
+		stroke: var(--muted);
+		stroke-width: 1;
+		stroke-dasharray: 4 4;
+		opacity: 0.7;
+	}
+	/* On wide screens a `wide` graph also takes the margin-note column. */
+	@media (min-width: 1081px) {
+		.pg.wide {
+			width: calc(100% + var(--gap) + var(--note));
+		}
+	}
+</style>

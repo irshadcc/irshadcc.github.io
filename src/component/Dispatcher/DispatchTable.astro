@@ -9,8 +9,11 @@
 // Usage in .mdx:
 //   <DispatchTable />
 //   <DispatchTable step={7} highlight={["AutogradCPU", "CPU"]} />
-import { drawTable } from "./dispatcherDraw";
-import { addTableSteps, tableRows } from "./dispatcherFigures";
+import { drawTable } from "../../utils/dispatcher/dispatcherDraw";
+import {
+	addTableSteps,
+	tableRows,
+} from "../../utils/dispatcher/dispatcherFigures";
 
 interface Props {
 	step?: number;
@@ -64,8 +67,8 @@ const legend = [
 </figure>
 
 <script>
-	import { drawTable } from "./dispatcherDraw";
-	import { addTableSteps, tableRows } from "./dispatcherFigures";
+	import { drawTable } from "../../utils/dispatcher/dispatcherDraw";
+	import { addTableSteps, tableRows } from "../../utils/dispatcher/dispatcherFigures";
 
 	const steps = addTableSteps();
 	const rows = tableRows();

@@ -11,6 +11,7 @@
 //
 //   g.node("linear", "FC", { from: c, formula: "y = Wx + b", weights: { W: w, b: bias } });
 
+import type { NNIconName } from "./nnIcons";
 /** What a node does; picks its colour and its legend entry. */
 export type NodeKind =
 	| "input"
@@ -52,6 +53,8 @@ export interface GraphNode {
 	weights?: NodeWeights;
 	/** Empty space reserved below the text, for figures that draw on top of the graph. */
 	tray?: { width: number; height: number };
+	/** An icon drawn left of the label (a key of NN_ICONS in nnIcons.ts). */
+	icon?: NNIconName;
 }
 
 export interface GraphEdge {
@@ -76,6 +79,7 @@ export interface NodeOptions {
 	formula?: string;
 	weights?: NodeWeights;
 	tray?: { width: number; height: number };
+	icon?: NNIconName;
 	/** Explicit id; defaults to an auto-generated one. Ids must be unique. */
 	id?: string;
 }
@@ -94,7 +98,7 @@ export class NNGraph {
 				`NNGraph: node "${label}" is in unknown group "${opts.group}"`,
 			);
 		}
-		const { detail, shape, group, formula, weights, tray } = opts;
+		const { detail, shape, group, formula, weights, tray, icon } = opts;
 		this.nodes.push({
 			id,
 			kind,
@@ -105,6 +109,7 @@ export class NNGraph {
 			formula,
 			weights,
 			tray,
+			icon,
 		});
 		for (const from of [opts.from ?? []].flat()) this.edge(from, id);
 		return id;

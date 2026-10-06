@@ -1,0 +1,98 @@
+{
+	"parallel_config": { "dp_size": 2, "tp_size": 1, "pp_size": 1, "ep_size": 2 },
+	"operations": {
+		"input": {
+			"type": "input",
+			"label": "Input",
+			"rank": 0,
+			"icon": "tokens",
+			"equation": { "title": "Input tokens", "latex": ["X \\in \\mathbb{R}^{2 \\times 4}"], "note": "Rank 0's two tokens, hidden size 4." }
+		},
+		"routing": {
+			"type": "operator",
+			"label": "Routing",
+			"rank": 0,
+			"icon": "network",
+			"equation": {
+				"title": "Router: softmax, top-1",
+				"latex": ["p_t = \\operatorname{softmax}(W_r\\, x_t)", "\\text{routing\\_map}[t, e] = \\mathbb{1}[e = \\arg\\max_j p_{t,j}]"]
+			}
+		},
+		"alltoall": {
+			"type": "collective",
+			"label": "AllToAll",
+			"ranks": [0, 1],
+			"icon": "ring",
+			"equation": { "title": "All-to-all: dispatch", "latex": ["\\text{rank } i \\text{ sends its rows for experts on rank } j \\text{ to rank } j"] }
+		},
+		"experts01": {
+			"type": "operator",
+			"label": "Expert 0,1",
+			"rank": 0,
+			"icon": "network",
+			"equation": { "title": "Experts 0 and 1", "latex": ["y_t = W_2^{(e)}\\, \\operatorname{SwiGLU}(W_1^{(e)} x_t)"] }
+		},
+		"experts23": {
+			"type": "operator",
+			"label": "Expert 2,3",
+			"rank": 1,
+			"icon": "network",
+			"equation": { "title": "Experts 2 and 3", "latex": ["y_t = W_2^{(e)}\\, \\operatorname{SwiGLU}(W_1^{(e)} x_t)"] }
+		}
+	},
+	"tensors": {
+		"hidden_states": {
+			"from": "input",
+			"to": "routing",
+			"name": "hidden_states",
+			"symbolic_shape": "(batch_size·seq_len, hidden)",
+			"shape": [2, 4],
+			"axes": ["Tokens", "hidden"],
+			"row_labels": ["0", "1"],
+			"col_labels": ["0", "1", "2", "3"],
+			"values": [
+				["-1.00", "0.00", "1.00", "-1.50"],
+				["0.50", "1.50", "-1.00", "0.00"]
+			]
+		},
+		"routing_map": {
+			"from": "routing",
+			"to": "alltoall",
+			"name": "routing_map",
+			"symbolic_shape": "(batch_size·seq_len, num_experts)",
+			"shape": [2, 4],
+			"axes": ["Tokens", "Expert"],
+			"row_labels": ["0", "1"],
+			"col_labels": ["0", "1", "2", "3"],
+			"values": [
+				["0", "1", "0", "0"],
+				["0", "0", "1", "0"]
+			],
+			"note": "Token 0 picked expert 1 (rank 0), token 1 picked expert 2 (rank 1)."
+		},
+		"tokens_for_rank0": {
+			"from": "alltoall",
+			"to": "experts01",
+			"name": "global_input_tokens",
+			"symbolic_shape": "(tokens for local experts, hidden)",
+			"shape": [1, 4],
+			"axes": ["Tokens", "hidden"],
+			"row_labels": ["t0→E1"],
+			"col_labels": ["0", "1", "2", "3"],
+			"values": [["-1.00", "0.00", "1.00", "-1.50"]],
+			"row_ranks": [0]
+		},
+		"tokens_for_rank1": {
+			"from": "alltoall",
+			"to": "experts23",
+			"name": "global_input_tokens",
+			"symbolic_shape": "(tokens for local experts, hidden)",
+			"shape": [1, 4],
+			"axes": ["Tokens", "hidden"],
+			"row_labels": ["t1→E2"],
+			"col_labels": ["0", "1", "2", "3"],
+			"values": [["0.50", "1.50", "-1.00", "0.00"]],
+			"row_ranks": [1]
+		}
+	}
+}

@@ -1,0 +1,496 @@
+---
+// Step-through of DeepGEMM's Mega MoE kernel on a tiny example (data and logic in megaKernel.ts:
+// 2 ranks, 4 experts, top-2, 2 tokens per rank, hidden size 4). Top: the kernel's key lines, with
+// the one each step executes highlighted. Below: what that line does to the data, the tensors it
+// reads, the operation, and the tensors it writes, with their values. Rows are tinted by the
+// rank they came from.
+// Usage in .mdx:
+//   <MegaKernelSteps />
+//   <MegaKernelSteps title="Mega MoE, one line at a time" />
+import { CODE, type TensorCard, buildSteps } from "./megaKernel";
+
+interface Props {
+	title?: string;
+}
+
+const { title } = Astro.props;
+const steps = buildSteps();
+---
+
+<figure class="mk">
+	{title && <figcaption class="title">{title}</figcaption>}
+	<pre class="code" aria-label="Mega MoE kernel, key lines"><code>{CODE.map((l, i) => <span class:list={["ln", { cmt: l.trimStart().startsWith("//") }]} data-line={i}>{l}{"\n"}</span>)}</code></pre>
+
+	<div class="stage-wrap">
+		{
+			steps.map((s, i) => (
+				<div class="stage" data-i={i} hidden={i !== 0}>
+					<div class="side inputs">
+						<p class="side-label">reads</p>
+						{s.inputs.map((t: TensorCard) => (
+							<div class="tensor">
+								<p class="t-head">
+									<code>{t.name}</code> <span class="t-shape">{t.shape}</span>
+								</p>
+								<p class="t-where">{t.where}</p>
+								<table>
+									{t.cols && (
+										<thead>
+											<tr>
+												<th />
+												{t.cols.map((c) => (
+													<th>{c}</th>
+												))}
+											</tr>
+										</thead>
+									)}
+									<tbody>
+										{t.rows.map((r) => (
+											<tr class:list={[r.tone === 1 ? "tone1" : r.tone === 0 ? "tone0" : "", { dim: r.dim }]}>
+												<th>{r.label}</th>
+												{r.cells.map((c) => (
+													<td>{c}</td>
+												))}
+											</tr>
+										))}
+									</tbody>
+								</table>
+							</div>
+						))}
+					</div>
+					<div class="op">
+						<span class="op-arrow" aria-hidden="true" />
+						<span class="op-text">{s.op}</span>
+					</div>
+					<div class="side outputs">
+						<p class="side-label">writes</p>
+						{s.outputs.map((t: TensorCard) => (
+							<div class="tensor out">
+								<p class="t-head">
+									<code>{t.name}</code> <span class="t-shape">{t.shape}</span>
+								</p>
+								<p class="t-where">{t.where}</p>
+								<table>
+									{t.cols && (
+										<thead>
+											<tr>
+												<th />
+												{t.cols.map((c) => (
+													<th>{c}</th>
+												))}
+											</tr>
+										</thead>
+									)}
+									<tbody>
+										{t.rows.map((r) => (
+											<tr class:list={[r.tone === 1 ? "tone1" : r.tone === 0 ? "tone0" : "", { dim: r.dim }]}>
+												<th>{r.label}</th>
+												{r.cells.map((c) => (
+													<td>{c}</td>
+												))}
+											</tr>
+										))}
+									</tbody>
+								</table>
+							</div>
+						))}
+					</div>
+				</div>
+			))
+		}
+	</div>
+
+	<div class="controls">
+		<div class="buttons">
+			<button type="button" data-act="first" aria-label="First step">
+				<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 3v10M13 3 6 8l7 5z"></path></svg>
+			</button>
+			<button type="button" data-act="prev" aria-label="Previous step">
+				<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M11 3 4 8l7 5z"></path></svg>
+			</button>
+			<button type="button" data-act="play" class="play" aria-label="Play">
+				<svg class="i-play" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5v11L13.5 8z"></path></svg>
+				<svg class="i-pause" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 3h3v10H4zM9 3h3v10H9z"></path></svg>
+			</button>
+			<button type="button" data-act="next" aria-label="Next step">
+				<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 3l7 5-7 5z"></path></svg>
+			</button>
+		</div>
+		<div class="timeline" role="group" aria-label="Steps">
+			{steps.map((s, i) => <button type="button" class="seg" data-i={i} aria-label={s.head} title={s.head} />)}
+		</div>
+		<span class="counter"></span>
+	</div>
+	<div class="narration" aria-live="polite">
+		<p class="head"></p>
+		<p class="body"></p>
+	</div>
+	<div class="store" hidden>
+		{steps.map((s) => <span data-head={s.head} data-line={s.line}>{s.body}</span>)}
+	</div>
+	<p class="legend">
+		<span class="key tone0">rank 0</span>
+		<span class="key tone1">rank 1</span>
+		<span>rows are tinted by the rank they came from; values in FP32, rounded to 2 decimals</span>
+	</p>
+</figure>
+
+<script>
+	for (const fig of document.querySelectorAll<HTMLElement>(".mk")) {
+		const stages = [...fig.querySelectorAll<HTMLElement>(".stage")];
+		const lines = [...fig.querySelectorAll<HTMLElement>(".code .ln")];
+		const segs = [...fig.querySelectorAll<HTMLButtonElement>(".seg")];
+		const store = [...fig.querySelectorAll<HTMLElement>(".store span")];
+		const head = fig.querySelector(".narration .head");
+		const body = fig.querySelector(".narration .body");
+		const counter = fig.querySelector(".counter");
+		const play = fig.querySelector<HTMLButtonElement>("[data-act=play]");
+		const last = stages.length - 1;
+		let at = 0;
+		let timer: number | undefined;
+		const go = (i: number) => {
+			at = Math.min(Math.max(0, i), last);
+			stages.forEach((s, k) => {
+				s.hidden = k !== at;
+			});
+			const line = Number(store[at]?.dataset.line ?? -1);
+			lines.forEach((l, k) => {
+				l.classList.toggle("on", k === line);
+			});
+			segs.forEach((b, k) => {
+				b.classList.toggle("done", k <= at);
+				b.setAttribute("aria-current", String(k === at));
+			});
+			if (head) head.textContent = store[at]?.dataset.head ?? "";
+			if (body) body.textContent = store[at]?.textContent ?? "";
+			if (counter) counter.textContent = `${at + 1} / ${last + 1}`;
+		};
+		const stop = () => {
+			if (timer !== undefined) clearInterval(timer);
+			timer = undefined;
+			play?.classList.remove("playing");
+			play?.setAttribute("aria-label", "Play");
+		};
+		const start = () => {
+			if (at >= last) go(0);
+			play?.classList.add("playing");
+			play?.setAttribute("aria-label", "Pause");
+			timer = window.setInterval(() => {
+				if (at >= last) stop();
+				else go(at + 1);
+			}, 3500);
+		};
+		for (const b of fig.querySelectorAll<HTMLButtonElement>("[data-act]"))
+			b.addEventListener("click", () => {
+				const act = b.dataset.act;
+				if (act === "play") return timer === undefined ? start() : stop();
+				stop();
+				if (act === "first") go(0);
+				if (act === "prev") go(at - 1);
+				if (act === "next") go(at + 1);
+			});
+		for (const b of segs)
+			b.addEventListener("click", () => {
+				stop();
+				go(Number(b.dataset.i));
+			});
+		fig.addEventListener("keydown", (e) => {
+			if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+			e.preventDefault();
+			stop();
+			go(at + (e.key === "ArrowRight" ? 1 : -1));
+		});
+		go(0);
+	}
+</script>
+
+<style>
+	.mk {
+		--t0: #2a78d6;
+		--t1: #eb6834;
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+	}
+	@media (prefers-color-scheme: dark) {
+		.mk {
+			--t0: #3987e5;
+			--t1: #d95926;
+		}
+	}
+	.title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.5rem;
+	}
+	.code {
+		margin: 0;
+		padding: 0.55rem 0;
+		overflow-x: auto;
+		font-size: 0.7rem;
+		line-height: 1.55;
+		border: 1px solid var(--faint);
+		border-radius: 8px 8px 0 0;
+		background: var(--surface);
+	}
+	.code code {
+		display: block;
+		min-width: max-content;
+	}
+	.ln {
+		display: block;
+		padding: 0 0.8rem;
+		border-left: 3px solid transparent;
+		color: var(--muted);
+		transition: background 200ms ease;
+	}
+	.ln.cmt {
+		font-style: italic;
+		opacity: 0.75;
+	}
+	.ln.on {
+		border-left-color: var(--accent);
+		background: color-mix(in srgb, var(--accent) 16%, transparent);
+		color: var(--text);
+	}
+	.stage-wrap {
+		border: 1px solid var(--faint);
+		border-top: 0;
+		border-radius: 0 0 8px 8px;
+		padding: 0.7rem;
+		min-height: 13rem;
+	}
+	.stage {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+		gap: 0.6rem;
+		align-items: center;
+	}
+	.stage[hidden] {
+		display: none;
+	}
+	.side {
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+		min-width: 0;
+	}
+	.side-label {
+		margin: 0;
+		font-size: 0.66rem;
+		font-weight: 600;
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+		color: var(--muted);
+	}
+	.tensor {
+		padding: 0.4rem 0.5rem;
+		border: 1px solid var(--faint);
+		border-radius: 6px;
+		background: var(--bg);
+		overflow-x: auto;
+	}
+	.tensor.out {
+		border-color: color-mix(in srgb, var(--accent) 55%, var(--faint));
+	}
+	.t-head {
+		margin: 0;
+		font-size: 0.74rem;
+		font-weight: 600;
+	}
+	.t-head code {
+		font-size: 0.72rem;
+	}
+	.t-shape {
+		font-family: var(--mono);
+		font-size: 0.68rem;
+		color: var(--muted);
+		font-weight: 400;
+	}
+	.t-where {
+		margin: 0 0 0.25rem;
+		font-size: 0.66rem;
+		color: var(--muted);
+	}
+	.tensor table {
+		width: auto;
+		margin: 0;
+		border-collapse: separate;
+		border-spacing: 1px;
+		font-family: var(--mono);
+		font-size: 0.66rem;
+	}
+	.tensor th,
+	.tensor td {
+		padding: 0.08rem 0.35rem;
+		border: 0;
+		white-space: nowrap;
+		text-align: right;
+	}
+	.tensor thead th {
+		font-family: var(--sans);
+		font-weight: 600;
+		color: var(--muted);
+		text-align: center;
+	}
+	.tensor tbody th {
+		font-family: var(--sans);
+		font-weight: 500;
+		color: var(--muted);
+		text-align: left;
+	}
+	.tensor td {
+		border-radius: 2px;
+		background: color-mix(in srgb, var(--faint) 35%, transparent);
+	}
+	.tone0 td {
+		background: color-mix(in srgb, var(--t0) 16%, transparent);
+	}
+	.tone1 td {
+		background: color-mix(in srgb, var(--t1) 18%, transparent);
+	}
+	tr.dim td,
+	tr.dim th {
+		opacity: 0.4;
+	}
+	.op {
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		gap: 0.3rem;
+		max-width: 8.5rem;
+		text-align: center;
+	}
+	.op-arrow {
+		width: 3rem;
+		height: 0.9rem;
+		background: var(--accent);
+		clip-path: polygon(0 35%, 70% 35%, 70% 0, 100% 50%, 70% 100%, 70% 65%, 0 65%);
+	}
+	.op-text {
+		font-family: var(--mono);
+		font-size: 0.66rem;
+		color: var(--text);
+	}
+	@media (max-width: 720px) {
+		.stage {
+			grid-template-columns: minmax(0, 1fr);
+		}
+		.op {
+			max-width: none;
+			flex-direction: row;
+			justify-content: center;
+		}
+		.op-arrow {
+			width: 0.9rem;
+			height: 1.6rem;
+			clip-path: polygon(35% 0, 65% 0, 65% 70%, 100% 70%, 50% 100%, 0 70%, 35% 70%);
+		}
+	}
+	.legend {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.3rem 0.8rem;
+		margin: 0.3rem 0 0;
+		font-size: 0.68rem;
+		color: var(--muted);
+	}
+	.key {
+		padding: 0 0.35rem;
+		border-radius: 3px;
+		font-family: var(--mono);
+	}
+	.key.tone0 {
+		background: color-mix(in srgb, var(--t0) 22%, transparent);
+	}
+	.key.tone1 {
+		background: color-mix(in srgb, var(--t1) 24%, transparent);
+	}
+
+	.controls {
+		display: flex;
+		align-items: center;
+		gap: 0.75rem;
+		margin-top: 0.5rem;
+	}
+	.buttons {
+		display: flex;
+		gap: 0.3rem;
+	}
+	.buttons button {
+		display: grid;
+		place-items: center;
+		width: 2rem;
+		height: 2rem;
+		padding: 0;
+		border: 1px solid var(--faint);
+		border-radius: 8px;
+		background: var(--bg);
+		color: var(--text);
+		cursor: pointer;
+		transition: border-color 150ms ease;
+	}
+	.buttons button:hover {
+		border-color: var(--accent);
+	}
+	.buttons svg {
+		width: 0.8rem;
+		height: 0.8rem;
+		fill: currentColor;
+		stroke: currentColor;
+		stroke-width: 1.2;
+		stroke-linejoin: round;
+	}
+	.buttons .play {
+		width: 2.6rem;
+		background: var(--accent);
+		border-color: var(--accent);
+		color: var(--bg);
+	}
+	.play .i-pause,
+	.play.playing .i-play {
+		display: none;
+	}
+	.play.playing .i-pause {
+		display: block;
+	}
+	.timeline {
+		flex: 1;
+		display: flex;
+		gap: 3px;
+	}
+	.seg {
+		flex: 1;
+		height: 0.55rem;
+		padding: 0;
+		border: 0;
+		border-radius: 3px;
+		background: var(--faint);
+		cursor: pointer;
+	}
+	.seg.done {
+		background: var(--accent);
+	}
+	.seg[aria-current="true"] {
+		outline: 2px solid var(--text);
+		outline-offset: 1px;
+	}
+	.counter {
+		font-family: var(--mono);
+		font-size: 0.75rem;
+		color: var(--muted);
+		min-width: 3.2rem;
+		text-align: right;
+	}
+	.narration {
+		margin-top: 0.5rem;
+		font-size: 0.8rem;
+		min-height: 5.5rem;
+	}
+	.narration p {
+		margin: 0.15rem 0;
+	}
+	.narration .head {
+		font-weight: 600;
+	}
+</style>

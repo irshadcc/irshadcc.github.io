@@ -18,9 +18,11 @@ export interface PlacedNode extends GraphNode {
 	/** Drawn as a circle: a 1–2 character op such as "+". */
 	circle: boolean;
 	/** Text lines with their baselines, stacked around the centre (above the tray, if any). */
-	lines: { cls: LineClass; text: string; y: number }[];
+	lines: { cls: LineClass; text: string; y: number; x?: number }[];
 	/** The node's tray (see GraphNode.tray): top-left corner and size. */
 	trayBox?: { x: number; y: number; w: number; h: number };
+	/** Top-left corner and size of the icon (see GraphNode.icon). */
+	iconAt?: { x: number; y: number; size: number };
 }
 
 export interface PlacedEdge extends GraphEdge {
@@ -53,7 +55,21 @@ const LINE: Record<LineClass, number> = { label: 16, detail: 14, shape: 14 };
 const CHAR: Record<LineClass, number> = { label: 7.3, detail: 6.1, shape: 6.4 };
 const CIRCLE = 30;
 const GROUP_PAD = { side: 8, top: 20, bottom: 8 };
-const TRAY_PAD = 8;
+const TRAY_PAD = 5;
+/** Icon size and the gap between icon and label, in px. */
+export const ICON_SIZE = 15;
+const ICON_GAP = 5;
+/** The "diagram" look: a large icon at the left, the text centred in the rest of the box. */
+const DIAGRAM = {
+	icon: 28,
+	pad: 8,
+	gap: 8,
+	minH: 48,
+	char: { label: 6.6, detail: 5.0, shape: 5.4 },
+};
+
+/** How nodes are sized and edges routed: see NeuralNetworkGraph's `look` prop. */
+export type Look = "flat" | "glass" | "diagram";
 
 const isCircle = (n: GraphNode) => n.kind === "op" && [...n.label].length <= 2;
 
@@ -67,17 +83,37 @@ function textLines(n: GraphNode) {
 	).filter((l): l is { cls: LineClass; text: string } => !!l.text);
 }
 
-function size(n: GraphNode) {
+/** Width of the text block of a "diagram" node. */
+function diagramTextW(n: GraphNode) {
+	return Math.max(
+		...textLines(n).map((l) => [...l.text].length * DIAGRAM.char[l.cls]),
+	);
+}
+
+function size(n: GraphNode, look: Look) {
 	if (isCircle(n)) return { width: CIRCLE, height: CIRCLE };
+	if (look === "diagram") {
+		const iconW = n.icon ? DIAGRAM.icon + DIAGRAM.gap : 0;
+		const height = textLines(n).reduce((h, l) => h + LINE[l.cls], 20);
+		return {
+			width: Math.round(
+				Math.max(90, 2 * DIAGRAM.pad + iconW + diagramTextW(n) + 4),
+			),
+			height: Math.max(DIAGRAM.minH, height),
+		};
+	}
 	const ls = textLines(n);
 	const width = Math.max(
 		72,
 		...ls.map((l) => [...l.text].length * CHAR[l.cls] + 24),
 	);
 	const height = ls.reduce((h, l) => h + LINE[l.cls], 14);
-	if (!n.tray) return { width: Math.round(width), height };
+	const labelW =
+		[...n.label].length * CHAR.label + 24 + (n.icon ? ICON_SIZE + ICON_GAP : 0);
+	const textW = Math.max(width, labelW);
+	if (!n.tray) return { width: Math.round(textW), height };
 	return {
-		width: Math.round(Math.max(width, n.tray.width + 2 * TRAY_PAD)),
+		width: Math.round(Math.max(textW, n.tray.width + 2 * TRAY_PAD)),
 		height: height + n.tray.height + TRAY_PAD,
 	};
 }
@@ -87,6 +123,8 @@ export interface LayoutOptions {
 	keepOutputOrder?: boolean;
 	/** Gap between ranks (rows, for top-to-bottom flows); more room lets fan-out edges arrive from above. */
 	rankSep?: number;
+	/** "diagram" also routes edges at right angles between rows (top-to-bottom flows). */
+	look?: Look;
 }
 
 export function layoutGraph(
@@ -108,7 +146,7 @@ export function layoutGraph(
 	g.setDefaultEdgeLabel(() => ({}));
 	for (const grp of graph.groups) g.setNode(grp.id, { width: 0, height: 0 });
 	for (const n of graph.nodes) {
-		g.setNode(n.id, size(n));
+		g.setNode(n.id, size(n, options.look ?? "flat"));
 		if (n.group) g.setParent(n.id, n.group);
 	}
 	// Edge labels get no room in the layout (reserving it bends the edge around a phantom box);
@@ -143,6 +181,30 @@ export function layoutGraph(
 			w: n.tray.width,
 			h: n.tray.height,
 		};
+		const lines = stack(n, y - trayH / 2);
+		// The icon sits left of the label; the label shifts right by half the icon's room.
+		let iconAt: PlacedNode["iconAt"];
+		if (options.look === "diagram" && !isCircle(n)) {
+			// Icon at the left edge, the text centred in the space to its right.
+			const left = x - b.width / 2 + DIAGRAM.pad;
+			const textLeft = n.icon ? left + DIAGRAM.icon + DIAGRAM.gap : left;
+			const textX = (textLeft + x + b.width / 2 - DIAGRAM.pad) / 2;
+			for (const l of lines) l.x = textX;
+			if (n.icon)
+				iconAt = { x: left, y: y - DIAGRAM.icon / 2, size: DIAGRAM.icon };
+		} else if (n.icon && !isCircle(n)) {
+			const shift = (ICON_SIZE + ICON_GAP) / 2;
+			const labelW = [...n.label].length * CHAR.label * 0.93;
+			const label = lines.find((l) => l.cls === "label");
+			if (label) {
+				label.x = x + shift;
+				iconAt = {
+					x: x + shift - labelW / 2 - ICON_GAP - ICON_SIZE,
+					y: label.y - ICON_SIZE + 3,
+					size: ICON_SIZE,
+				};
+			}
+		}
 		return {
 			...n,
 			x,
@@ -150,19 +212,30 @@ export function layoutGraph(
 			w: b.width,
 			h: b.height,
 			circle: isCircle(n),
-			lines: stack(n, y - trayH / 2),
+			lines,
 			trayBox,
+			iconAt,
 		};
 	});
 
 	const vertical = direction === "TB" || direction === "BT";
-	const edges = graph.edges.map((e, i) =>
-		placeEdge(
+	const byId = new Map(nodes.map((n) => [n.id, n]));
+	const edges = graph.edges.map((e, i) => {
+		const placed = placeEdge(
 			e,
 			g.edge({ v: e.from, w: e.to, name: `e${i}` }).points ?? [],
 			vertical,
-		),
-	);
+		);
+		const [a, b] = [byId.get(e.from), byId.get(e.to)];
+		if (options.look !== "diagram" || direction !== "TB" || !a || !b)
+			return placed;
+		// Right angles: down from the source, along a bus halfway between the rows, down into the
+		// target. Edges that fan out from (or into) one node share their bus.
+		const sy = a.y + a.h / 2;
+		const ty = b.y - b.h / 2;
+		const mid = Math.round((sy + ty) / 2);
+		return { ...placed, d: `M${a.x},${sy}V${mid}H${b.x}V${ty}` };
+	});
 
 	// The extent: dagre's size, widened for the group label padding added above.
 	const gl = g.graph();

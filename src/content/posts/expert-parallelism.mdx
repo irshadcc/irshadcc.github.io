@@ -12,6 +12,7 @@ import MoeRouters from "../../utils/distributed/MoeRouters.astro";
 import MoeEpSteps from "../../utils/distributed/MoeEpSteps.astro";
 import EplbPlacement from "../../utils/distributed/EplbPlacement.astro";
 import BoxDiagram from "../../utils/payments/BoxDiagram.astro";
+import MegaKernelSteps from "../../utils/distributed/MegaKernelSteps.astro";
 import { megaMoeEdges, megaMoeGrid, megaMoeNodes } from "../../utils/distributed/megaMoeFigures";
 import LineChart from "../../utils/charts/LineChart.astro";
 import { BALANCE_SIM, STEPS } from "../../utils/distributed/moeBalanceSim";
@@ -507,11 +508,11 @@ bookkeeping around the two all-to-alls: counting the copies, sorting them so tha
 destination's chunk is contiguous, and undoing both sorts on the way back.
 
 The figure runs it on a scaled-down configuration: EP = 4, 8 experts (2 per rank, so rank $r$
-holds experts $2r$ and $2r + 1$), top-2 routing and 8 tokens, 2 per rank. Each chip is one token
-copy, labelled with its token, and coloured by the rank that holds its expert. Step through it and
-watch the colours: before the dispatch every rank holds a mix, after it each rank holds only its
-own colour, and the combine sends every chip home. Hover over any node to see the tensor it holds:
-its name in the code, its shape, and what each row is.
+holds experts $2r$ and $2r + 1$), top-2 routing and 8 tokens, 2 per rank. Each step highlights
+the nodes it runs and the line of code behind them. Hover over an edge to see the tensor flowing
+along it, as a matrix with its shape, and over a node to see the equation it computes. Compare the
+edge into "All-to-all: dispatch" with the edge out of it: before the dispatch each rank holds
+copies for every rank's experts, after it only copies for its own.
 
 <MoeEpSteps flow="megatron" title="One MoE layer in Megatron-LM: EP = 4, 8 experts, top-2, 8 tokens" />
 
@@ -531,8 +532,8 @@ A few things to look for:
   rows together.
 - **The busiest rank sets the pace.** Rank 1, which holds the popular experts 2 and 3, receives 8
   of the 16 copies; rank 3 receives 2. The grouped GEMM on rank 1 does four times the work of rank
-  3's, and the combine can't finish until rank 1 is done. Hover over "All-to-all: dispatch" to
-  see the whole send matrix.
+  3's, and the combine can't finish until rank 1 is done. Hover over an edge leaving "Count copies,
+  all-gather counts" to see the whole table of counts.
 
 The routing comes from a seeded PyTorch run, with experts 2 and 3 made more likely. I checked
 every buffer in the figure against the same algorithm run on 4 processes with `torch.distributed`
@@ -883,6 +884,22 @@ The walkthrough below follows the BF16 version,
 which is easier to read than FP8×FP4 because it has no scale factors. The excerpts are trimmed,
 with `...` where code is left out.
 
+First, the whole kernel on numbers small enough to follow by hand: 2 ranks, 4 experts (E0 and E1 on
+rank 0, E2 and E3 on rank 1), top-2 routing, 2 tokens per rank, a hidden size of 4, an expert width
+of 2 and token blocks of 4 rows. Each step runs one line of the kernel, shown at the top, and below
+it what that line reads, the operation, and what it writes, from rank 0's point of view. Rows that
+came from rank 1 are tinted orange.
+
+<MegaKernelSteps title="Mega MoE, one line at a time: 2 ranks, 4 experts, top-2, 2 tokens per rank" />
+
+The last step checks the result: rank 0's output equals a plain MoE layer's on the same inputs,
+exactly, since the example computes in FP32 throughout.<Sidenote>The real kernel rounds to BF16
+when it stores the first GEMM's activations and the second GEMM's outputs, and the weights here
+are small multiples of 0.5 chosen to give readable numbers. The example's data path, the slot
+order within an expert and the padding of blocks follow the kernel's code; the values were
+computed by a script and checked against PyTorch.</Sidenote> The sections below go through the
+same lines in the real code.
+
 #### One persistent kernel, six warp roles
 
 The kernel is launched once per layer with one CTA per SM, in clusters of two SMs, and every CTA
@@ -1179,8 +1196,8 @@ copies routed to its own experts, which gives it a partial output for every toke
 **reduce-scatter** adds the partial outputs and hands each rank back the rows of its own tokens.
 
 The figure runs it on the same example as Megatron's: EP = 4, 8 experts, top-2, 8 tokens, 2 per
-rank, with the same routing. Each rank now keeps a copy of every chip; the dimmed ones are copies
-it holds but skips because their expert lives elsewhere.
+rank, with the same routing. After the all-gather every rank holds every token, but it only runs
+the copies whose expert it owns; hover over the edge into a fused MoE kernel to see which.
 
 <MoeEpSteps flow="vllm" title="vLLM's default EP path: EP = 4, 8 experts, top-2, 8 tokens" />
 

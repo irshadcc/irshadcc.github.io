@@ -1,0 +1,1697 @@
+{
+	"name": "",
+	"type": "module",
+	"class": "MegatronMoELayer",
+	"inputs": {
+		"hidden_states": {
+			"name": "hidden_states",
+			"symbolic_shape": "(batch_size, seq_len, hidden)",
+			"shape": [2, 2, 4],
+			"axes": ["(batch, seq)", "hidden"],
+			"row_labels": ["b0·s0", "b0·s1", "b1·s0", "b1·s1"],
+			"col_labels": ["0", "1", "2", "3"],
+			"values": [
+				["-1.40", "-1.70", "0.60", "0.80"],
+				["0.60", "-1.60", "-0.30", "1.90"],
+				["0.80", "-0.60", "-0.20", "0.20"],
+				["1.40", "1.60", "0.90", "-0.80"]
+			],
+			"note": "Rank 0's tokens t0–t3 (rank 1 holds t4–t7)."
+		}
+	},
+	"operations": {
+		"view": {
+			"type": "op",
+			"op": "Tensor.view",
+			"label": "view(-1, hidden)",
+			"inputs": {
+				"input": "hidden_states"
+			},
+			"outputs": {
+				"out": {
+					"name": "flat_hidden",
+					"symbolic_shape": "(total_tokens, hidden)",
+					"shape": [4, 4],
+					"axes": ["Tokens", "hidden"],
+					"row_labels": ["t0", "t1", "t2", "t3"],
+					"col_labels": ["0", "1", "2", "3"],
+					"values": [
+						["-1.40", "-1.70", "0.60", "0.80"],
+						["0.60", "-1.60", "-0.30", "1.90"],
+						["0.80", "-0.60", "-0.20", "0.20"],
+						["1.40", "1.60", "0.90", "-0.80"]
+					]
+				}
+			},
+			"equation": {
+				"title": "Flatten the tokens",
+				"latex": ["X_{\\text{flat}} = X.\\text{view}(-1, h)"],
+				"note": "total_tokens = 4 on this rank."
+			}
+		},
+		"router": {
+			"type": "module",
+			"class": "TopKRouter",
+			"inputs": {
+				"hidden_states": "view.out"
+			},
+			"operations": {
+				"gate": {
+					"type": "module",
+					"class": "Linear",
+					"inputs": {
+						"input": "hidden_states"
+					},
+					"outputs": {
+						"out": {
+							"name": "logits",
+							"symbolic_shape": "(total_tokens, num_experts)",
+							"shape": [4, 4],
+							"axes": ["Tokens", "Expert"],
+							"row_labels": ["t0", "t1", "t2", "t3"],
+							"col_labels": ["0", "1", "2", "3"],
+							"values": [
+								["-0.99", "0.35", "-0.33", "1.12"],
+								["-1.01", "0.43", "-0.38", "0.34"],
+								["-0.16", "-0.15", "-0.10", "-0.14"],
+								["0.35", "-0.38", "0.09", "-1.40"]
+							]
+						}
+					},
+					"equation": {
+						"title": "Router logits",
+						"latex": [
+							"\\text{logits} = X W_g^{\\top}, \\quad W_g \\in \\mathbb{R}^{E \\times h}"
+						],
+						"note": "Every rank holds the same router weights."
+					}
+				},
+				"softmax": {
+					"type": "op",
+					"op": "F.softmax",
+					"label": "softmax",
+					"inputs": {
+						"input": "gate.out"
+					},
+					"outputs": {
+						"out": {
+							"name": "probs",
+							"symbolic_shape": "(total_tokens, num_experts)",
+							"shape": [4, 4],
+							"axes": ["Tokens", "Expert"],
+							"row_labels": ["t0", "t1", "t2", "t3"],
+							"col_labels": ["0", "1", "2", "3"],
+							"values": [
+								["0.07", "0.25", "0.13", "0.55"],
+								["0.09", "0.38", "0.17", "0.35"],
+								["0.25", "0.25", "0.26", "0.25"],
+								["0.41", "0.20", "0.32", "0.07"]
+							]
+						}
+					},
+					"equation": {
+						"title": "Router probabilities",
+						"latex": [
+							"p_{t,e} = \\frac{\\exp(\\text{logits}_{t,e})}{\\sum_{j} \\exp(\\text{logits}_{t,j})}"
+						]
+					}
+				},
+				"topk": {
+					"type": "op",
+					"op": "torch.topk",
+					"label": "topk",
+					"inputs": {
+						"input": "softmax.out"
+					},
+					"outputs": {
+						"values": {
+							"name": "topk_weights",
+							"symbolic_shape": "(total_tokens, top_k)",
+							"shape": [4, 2],
+							"axes": ["Tokens", "k"],
+							"row_labels": ["t0", "t1", "t2", "t3"],
+							"col_labels": ["0", "1"],
+							"values": [
+								["0.55", "0.25"],
+								["0.38", "0.35"],
+								["0.26", "0.25"],
+								["0.41", "0.32"]
+							],
+							"note": "The two largest probabilities, before renormalizing."
+						},
+						"indices": {
+							"name": "topk_indices",
+							"symbolic_shape": "(total_tokens, top_k)",
+							"shape": [4, 2],
+							"axes": ["Tokens", "k"],
+							"row_labels": ["t0", "t1", "t2", "t3"],
+							"col_labels": ["0", "1"],
+							"values": [["3", "1"], ["1", "3"], ["2", "3"], ["0", "2"]],
+							"note": "Experts 0 and 1 live on rank 0, experts 2 and 3 on rank 1."
+						}
+					},
+					"equation": {
+						"title": "Top-k selection",
+						"latex": [
+							"\\text{topk\\_weights}_t,\\ \\text{topk\\_indices}_t = \\operatorname{top}_{2}(p_t)"
+						]
+					}
+				},
+				"div": {
+					"type": "op",
+					"op": "torch.div",
+					"label": "div (renormalize)",
+					"inputs": {
+						"input": "topk.values"
+					},
+					"outputs": {
+						"out": {
+							"name": "topk_weights",
+							"symbolic_shape": "(total_tokens, top_k)",
+							"shape": [4, 2],
+							"axes": ["Tokens", "k"],
+							"row_labels": ["t0", "t1", "t2", "t3"],
+							"col_labels": ["0", "1"],
+							"values": [
+								["0.68", "0.32"],
+								["0.52", "0.48"],
+								["0.51", "0.49"],
+								["0.56", "0.44"]
+							],
+							"note": "Each row sums to 1."
+						}
+					},
+					"equation": {
+						"title": "Renormalize the top-k weights",
+						"latex": [
+							"g_{t,k} = \\frac{w_{t,k}}{\\max\\left(\\sum_{k'} w_{t,k'},\\ 10^{-6}\\right)}"
+						],
+						"note": "norm_topk_prob=True."
+					}
+				},
+				"aux": {
+					"type": "op",
+					"op": "one_hot, sum, mean, mul, sum",
+					"label": "aux loss",
+					"inputs": {
+						"probs": "softmax.out",
+						"topk_indices": "topk.indices"
+					},
+					"outputs": {
+						"out": {
+							"name": "aux_loss",
+							"symbolic_shape": "()",
+							"shape": [],
+							"axes": ["", ""],
+							"row_labels": [""],
+							"col_labels": ["value"],
+							"values": [["0.0105"]]
+						}
+					},
+					"equation": {
+						"title": "Switch Transformer load-balancing loss",
+						"latex": [
+							"f_e = \\frac{c_e}{T K}, \\qquad P_e = \\frac{1}{T} \\sum_t p_{t,e}",
+							"\\mathcal{L}_{\\text{aux}} = \\alpha \\, E \\sum_{e} f_e P_e"
+						],
+						"note": "Over this rank's 4 tokens only. α = 0.01, E = 4: 𝓛_aux = 0.0105 on rank 0."
+					}
+				}
+			},
+			"outputs": {
+				"topk_weights": "div.out",
+				"topk_indices": "topk.indices",
+				"aux_loss": "aux.out"
+			}
+		},
+		"expand": {
+			"type": "op",
+			"op": "Tensor.expand, Tensor.reshape",
+			"label": "expand + reshape",
+			"inputs": {
+				"input": "view.out"
+			},
+			"outputs": {
+				"out": {
+					"name": "expanded_tokens",
+					"symbolic_shape": "(total_tokens·top_k, hidden)",
+					"shape": [8, 4],
+					"axes": ["Copies", "hidden"],
+					"row_labels": [
+						"t0→E3",
+						"t0→E1",
+						"t1→E1",
+						"t1→E3",
+						"t2→E2",
+						"t2→E3",
+						"t3→E0",
+						"t3→E2"
+					],
+					"col_labels": ["0", "1", "2", "3"],
+					"values": [
+						["-1.40", "-1.70", "0.60", "0.80"],
+						["-1.40", "-1.70", "0.60", "0.80"],
+						["0.60", "-1.60", "-0.30", "1.90"],
+						["0.60", "-1.60", "-0.30", "1.90"],
+						["0.80", "-0.60", "-0.20", "0.20"],
+						["0.80", "-0.60", "-0.20", "0.20"],
+						["1.40", "1.60", "0.90", "-0.80"],
+						["1.40", "1.60", "0.90", "-0.80"]
+					],
+					"row_tones": [3, 1, 1, 3, 2, 3, 0, 2]
+				}
+			},
+			"equation": {
+				"title": "Replicate each token top_k times",
+				"latex": ["\\text{expanded}[tK + k, :] = X[t, :]"]
+			}
+		},
+		"sort": {
+			"type": "op",
+			"op": "Tensor.view, torch.sort",
+			"label": "view(-1) + sort",
+			"inputs": {
+				"input": "router.topk_indices"
+			},
+			"outputs": {
+				"values": {
+					"name": "sorted_expert_indices",
+					"symbolic_shape": "(total_tokens·top_k)",
+					"shape": [8],
+					"axes": ["", "Position"],
+					"row_labels": [""],
+					"col_labels": ["0", "1", "2", "3", "4", "5", "6", "7"],
+					"values": [["0", "1", "1", "2", "2", "3", "3", "3"]]
+				},
+				"indices": {
+					"name": "global_reorder_indices",
+					"symbolic_shape": "(total_tokens·top_k)",
+					"shape": [8],
+					"axes": ["", "Position"],
+					"row_labels": [""],
+					"col_labels": ["0", "1", "2", "3", "4", "5", "6", "7"],
+					"values": [["6", "1", "2", "4", "7", "0", "3", "5"]],
+					"note": "Row i of permuted_tokens is row global_reorder_indices[i] of expanded_tokens."
+				}
+			},
+			"equation": {
+				"title": "Sort the copies by global expert",
+				"latex": [
+					"\\text{sorted},\\ \\text{reorder} = \\operatorname{sort}(\\text{topk\\_indices.view}(-1))"
+				],
+				"note": "Experts are numbered so that each EP rank's experts are contiguous: sorting by expert also groups the copies by destination rank."
+			}
+		},
+		"index": {
+			"type": "op",
+			"op": "Tensor.__getitem__",
+			"label": "index (gather)",
+			"inputs": {
+				"input": "expand.out",
+				"index": "sort.indices"
+			},
+			"outputs": {
+				"out": {
+					"name": "permuted_tokens",
+					"symbolic_shape": "(total_tokens·top_k, hidden)",
+					"shape": [8, 4],
+					"axes": ["Copies", "hidden"],
+					"row_labels": [
+						"t3→E0",
+						"t0→E1",
+						"t1→E1",
+						"t2→E2",
+						"t3→E2",
+						"t0→E3",
+						"t1→E3",
+						"t2→E3"
+					],
+					"col_labels": ["0", "1", "2", "3"],
+					"values": [
+						["1.40", "1.60", "0.90", "-0.80"],
+						["-1.40", "-1.70", "0.60", "0.80"],
+						["0.60", "-1.60", "-0.30", "1.90"],
+						["0.80", "-0.60", "-0.20", "0.20"],
+						["1.40", "1.60", "0.90", "-0.80"],
+						["-1.40", "-1.70", "0.60", "0.80"],
+						["0.60", "-1.60", "-0.30", "1.90"],
+						["0.80", "-0.60", "-0.20", "0.20"]
+					],
+					"row_tones": [0, 1, 1, 2, 2, 3, 3, 3],
+					"note": "The first 3 rows are for rank 0's experts, the last 5 for rank 1's."
+				}
+			},
+			"equation": {
+				"title": "Permute",
+				"latex": [
+					"\\text{permuted}[i, :] = \\text{expanded}[\\text{reorder}[i], :]"
+				]
+			}
+		},
+		"bincount": {
+			"type": "op",
+			"op": "torch.bincount",
+			"label": "bincount",
+			"inputs": {
+				"input": "sort.values"
+			},
+			"outputs": {
+				"out": {
+					"name": "tokens_per_expert",
+					"symbolic_shape": "(num_experts)",
+					"shape": [4],
+					"axes": ["", "Expert"],
+					"row_labels": [""],
+					"col_labels": ["0", "1", "2", "3"],
+					"values": [["1", "2", "2", "3"]]
+				}
+			},
+			"equation": {
+				"title": "Copies per global expert",
+				"latex": [
+					"c_e = \\left|\\{ i : \\text{sorted\\_expert\\_indices}[i] = e \\}\\right|"
+				]
+			}
+		},
+		"counts": {
+			"type": "op",
+			"op": "Tensor.view, Tensor.sum, tolist",
+			"label": "view(ep_size, local) + sum",
+			"inputs": {
+				"input": "bincount.out"
+			},
+			"outputs": {
+				"counts": {
+					"name": "input_counts_per_expert",
+					"symbolic_shape": "(ep_size, num_local_experts)",
+					"shape": [2, 2],
+					"axes": ["Destination rank", "Local expert"],
+					"row_labels": ["0", "1"],
+					"col_labels": ["0", "1"],
+					"values": [["1", "2"], ["2", "3"]],
+					"note": "Row r: how many copies this rank sends to each of rank r's experts."
+				},
+				"splits": {
+					"name": "input_split_sizes",
+					"symbolic_shape": "(ep_size)",
+					"shape": [2],
+					"axes": ["", "Destination rank"],
+					"row_labels": [""],
+					"col_labels": ["0", "1"],
+					"values": [["3", "5"]],
+					"note": "Rows sent to each rank: the row sums."
+				}
+			},
+			"equation": {
+				"title": "Copies per destination rank",
+				"latex": ["\\text{input\\_split\\_sizes}[r] = \\sum_{j} c_{rL + j}"],
+				"note": "L = num_local_experts = 2."
+			}
+		},
+		"a2a_counts": {
+			"type": "op",
+			"op": "dist.all_to_all_single",
+			"label": "all_to_all_single (counts)",
+			"inputs": {
+				"input": "counts.counts"
+			},
+			"outputs": {
+				"out": {
+					"name": "output_counts_per_expert",
+					"symbolic_shape": "(ep_size, num_local_experts)",
+					"shape": [2, 2],
+					"axes": ["Source rank", "Local expert"],
+					"row_labels": ["0", "1"],
+					"col_labels": ["0", "1"],
+					"values": [["1", "2"], ["2", "3"]],
+					"note": "Row s: how many copies rank s sends to each of this rank's experts. Rank 1 sends 5."
+				}
+			},
+			"equation": {
+				"title": "Exchange the counts",
+				"latex": [
+					"\\text{output\\_counts}[s, :] = \\text{input\\_counts}_s[\\text{rank}, :]"
+				],
+				"note": "Row r of every rank's count table goes to rank r: each rank learns how many rows it will receive."
+			},
+			"kind": "collective"
+		},
+		"out_splits": {
+			"type": "op",
+			"op": "Tensor.sum, tolist",
+			"label": "sum(dim=-1)",
+			"inputs": {
+				"input": "a2a_counts.out"
+			},
+			"outputs": {
+				"out": {
+					"name": "output_split_sizes",
+					"symbolic_shape": "(ep_size)",
+					"shape": [2],
+					"axes": ["", "Source rank"],
+					"row_labels": [""],
+					"col_labels": ["0", "1"],
+					"values": [["3", "5"]],
+					"note": "Rows received from each rank."
+				}
+			},
+			"equation": {
+				"title": "Rows per source rank",
+				"latex": [
+					"\\text{output\\_split\\_sizes}[s] = \\sum_{j} \\text{output\\_counts}[s, j]"
+				]
+			}
+		},
+		"dispatch": {
+			"type": "function",
+			"function": "_AllToAll.apply",
+			"inputs": {
+				"input_tensor": "index.out",
+				"output_split_sizes": "out_splits.out",
+				"input_split_sizes": "counts.splits"
+			},
+			"operations": {
+				"total": {
+					"type": "op",
+					"op": "builtins.sum",
+					"label": "sum(output_split_sizes)",
+					"inputs": {
+						"input": "output_split_sizes"
+					},
+					"outputs": {
+						"out": {
+							"name": "total_out",
+							"symbolic_shape": "()",
+							"shape": [],
+							"axes": ["", ""],
+							"row_labels": [""],
+							"col_labels": ["value"],
+							"values": [["8"]]
+						}
+					},
+					"equation": {
+						"title": "Rows this rank will receive",
+						"latex": [
+							"\\text{total\\_out} = \\sum_s \\text{output\\_split\\_sizes}[s]"
+						]
+					}
+				},
+				"empty": {
+					"type": "op",
+					"op": "torch.empty",
+					"label": "empty",
+					"inputs": {
+						"size": "total.out"
+					},
+					"outputs": {
+						"out": {
+							"name": "output_tensor",
+							"symbolic_shape": "(total_out, hidden)",
+							"shape": [8, 4],
+							"note": "Uninitialized: all_to_all_single writes every row."
+						}
+					},
+					"equation": {
+						"title": "Allocate the receive buffer",
+						"latex": [
+							"\\text{output\\_tensor} \\in \\mathbb{R}^{\\text{total\\_out} \\times h}"
+						]
+					}
+				},
+				"a2a": {
+					"type": "op",
+					"op": "dist.all_to_all_single",
+					"label": "all_to_all_single",
+					"inputs": {
+						"output": "empty.out",
+						"input": "input_tensor",
+						"output_split_sizes": "output_split_sizes",
+						"input_split_sizes": "input_split_sizes"
+					},
+					"outputs": {
+						"out": {
+							"name": "dispatched_tokens",
+							"symbolic_shape": "(sum(output_split_sizes), hidden)",
+							"shape": [8, 4],
+							"axes": ["Copies", "hidden"],
+							"row_labels": [
+								"t3→E0",
+								"t0→E1",
+								"t1→E1",
+								"t6→E0",
+								"t7→E0",
+								"t4→E1",
+								"t5→E1",
+								"t6→E1"
+							],
+							"col_labels": ["0", "1", "2", "3"],
+							"values": [
+								["1.40", "1.60", "0.90", "-0.80"],
+								["-1.40", "-1.70", "0.60", "0.80"],
+								["0.60", "-1.60", "-0.30", "1.90"],
+								["-0.10", "0.80", "-0.30", "0.10"],
+								["0.50", "2.30", "-1.50", "-1.60"],
+								["-0.60", "0.00", "-0.50", "0.20"],
+								["0.40", "0.10", "0.60", "0.40"],
+								["-0.10", "0.80", "-0.30", "0.10"]
+							],
+							"row_tones": [0, 1, 1, 0, 0, 1, 1, 1],
+							"note": "Grouped by source rank: 3 rows from rank 0 itself, then 5 from rank 1."
+						}
+					},
+					"equation": {
+						"title": "All-to-all: dispatch",
+						"latex": [
+							"\\text{rank } i \\text{ sends permuted}_i[\\text{chunk } j] \\text{ to rank } j"
+						],
+						"note": "Uneven chunks, sized by the splits. Rank 0 sends [3, 5] and receives [3, 5]."
+					},
+					"kind": "collective"
+				}
+			},
+			"outputs": {
+				"out": "a2a.out"
+			}
+		},
+		"local_ids": {
+			"type": "op",
+			"op": "list.extend, torch.tensor",
+			"label": "local expert ids (loop)",
+			"inputs": {
+				"input": "a2a_counts.out"
+			},
+			"outputs": {
+				"out": {
+					"name": "local_expert_ids",
+					"symbolic_shape": "(sum(output_split_sizes))",
+					"shape": [8],
+					"axes": ["", "Received row"],
+					"row_labels": [""],
+					"col_labels": ["0", "1", "2", "3", "4", "5", "6", "7"],
+					"values": [["0", "1", "1", "0", "0", "1", "1", "1"]]
+				}
+			},
+			"equation": {
+				"title": "Local expert of each received row",
+				"latex": [
+					"\\text{ids} = [\\, j \\text{ repeated output\\_counts}[s, j] \\text{ times, for } s, j \\,]"
+				],
+				"note": "Rebuilt from the counts alone: the rows arrive in (source rank, local expert) order."
+			}
+		},
+		"sort_local": {
+			"type": "op",
+			"op": "torch.sort",
+			"label": "sort",
+			"inputs": {
+				"input": "local_ids.out"
+			},
+			"outputs": {
+				"values": {
+					"name": "sorted_local_ids",
+					"symbolic_shape": "(rows)",
+					"shape": [8],
+					"axes": ["", "Position"],
+					"row_labels": [""],
+					"col_labels": ["0", "1", "2", "3", "4", "5", "6", "7"],
+					"values": [["0", "0", "0", "1", "1", "1", "1", "1"]]
+				},
+				"indices": {
+					"name": "local_reorder_indices",
+					"symbolic_shape": "(rows)",
+					"shape": [8],
+					"axes": ["", "Position"],
+					"row_labels": [""],
+					"col_labels": ["0", "1", "2", "3", "4", "5", "6", "7"],
+					"values": [["0", "3", "4", "1", "2", "5", "6", "7"]]
+				}
+			},
+			"equation": {
+				"title": "Sort the received rows by local expert",
+				"latex": [
+					"\\text{sorted},\\ \\text{local\\_reorder} = \\operatorname{sort}(\\text{local\\_expert\\_ids})"
+				]
+			}
+		},
+		"index_local": {
+			"type": "op",
+			"op": "Tensor.__getitem__",
+			"label": "index (gather)",
+			"inputs": {
+				"input": "dispatch.out",
+				"index": "sort_local.indices"
+			},
+			"outputs": {
+				"out": {
+					"name": "tokens_for_local_experts",
+					"symbolic_shape": "(rows, hidden)",
+					"shape": [8, 4],
+					"axes": ["Copies", "hidden"],
+					"row_labels": [
+						"t3→E0",
+						"t6→E0",
+						"t7→E0",
+						"t0→E1",
+						"t1→E1",
+						"t4→E1",
+						"t5→E1",
+						"t6→E1"
+					],
+					"col_labels": ["0", "1", "2", "3"],
+					"values": [
+						["1.40", "1.60", "0.90", "-0.80"],
+						["-0.10", "0.80", "-0.30", "0.10"],
+						["0.50", "2.30", "-1.50", "-1.60"],
+						["-1.40", "-1.70", "0.60", "0.80"],
+						["0.60", "-1.60", "-0.30", "1.90"],
+						["-0.60", "0.00", "-0.50", "0.20"],
+						["0.40", "0.10", "0.60", "0.40"],
+						["-0.10", "0.80", "-0.30", "0.10"]
+					],
+					"row_tones": [0, 0, 0, 1, 1, 1, 1, 1],
+					"note": "Local expert 0's rows first, then local expert 1's."
+				}
+			},
+			"equation": {
+				"title": "Group by local expert",
+				"latex": [
+					"\\text{tokens}[i, :] = \\text{dispatched}[\\text{local\\_reorder}[i], :]"
+				]
+			}
+		},
+		"bincount_local": {
+			"type": "op",
+			"op": "torch.bincount",
+			"label": "bincount",
+			"inputs": {
+				"input": "sort_local.values"
+			},
+			"outputs": {
+				"out": {
+					"name": "local_tokens_per_expert",
+					"symbolic_shape": "(num_local_experts)",
+					"shape": [2],
+					"axes": ["", "Local expert"],
+					"row_labels": [""],
+					"col_labels": ["0", "1"],
+					"values": [["3", "5"]]
+				}
+			},
+			"equation": {
+				"title": "Rows per local expert",
+				"latex": [
+					"c_j = \\left|\\{ i : \\text{sorted\\_local\\_ids}[i] = j \\}\\right|"
+				]
+			}
+		},
+		"split": {
+			"type": "op",
+			"op": "Tensor.__getitem__ (loop)",
+			"label": "slice per expert",
+			"inputs": {
+				"tokens": "index_local.out",
+				"counts": "bincount_local.out"
+			},
+			"outputs": {
+				"e0": {
+					"name": "inp",
+					"symbolic_shape": "(local_tokens_per_expert[j], hidden)",
+					"shape": [3, 4],
+					"axes": ["Copies", "hidden"],
+					"row_labels": ["t3→E0", "t6→E0", "t7→E0"],
+					"col_labels": ["0", "1", "2", "3"],
+					"values": [
+						["1.40", "1.60", "0.90", "-0.80"],
+						["-0.10", "0.80", "-0.30", "0.10"],
+						["0.50", "2.30", "-1.50", "-1.60"]
+					],
+					"row_tones": [0, 0, 0],
+					"note": "tokens_for_local_experts[0:3]"
+				},
+				"e1": {
+					"name": "inp",
+					"symbolic_shape": "(local_tokens_per_expert[j], hidden)",
+					"shape": [5, 4],
+					"axes": ["Copies", "hidden"],
+					"row_labels": ["t0→E1", "t1→E1", "t4→E1", "t5→E1", "t6→E1"],
+					"col_labels": ["0", "1", "2", "3"],
+					"values": [
+						["-1.40", "-1.70", "0.60", "0.80"],
+						["0.60", "-1.60", "-0.30", "1.90"],
+						["-0.60", "0.00", "-0.50", "0.20"],
+						["0.40", "0.10", "0.60", "0.40"],
+						["-0.10", "0.80", "-0.30", "0.10"]
+					],
+					"row_tones": [1, 1, 1, 1, 1],
+					"note": "tokens_for_local_experts[3:8]"
+				}
+			},
+			"equation": {
+				"title": "Slice each local expert's rows",
+				"latex": ["\\text{inp}_j = \\text{tokens}[o_j : o_j + c_j]"],
+				"note": "The loop over local_tokens_per_expert.tolist()."
+			}
+		},
+		"local_experts": {
+			"type": "module",
+			"class": "ModuleList",
+			"inputs": {
+				"x0": "split.e0",
+				"x1": "split.e1"
+			},
+			"operations": {
+				"0": {
+					"type": "module",
+					"class": "SwiGLUMLP",
+					"inputs": {
+						"x": "x0"
+					},
+					"operations": {
+						"w1": {
+							"type": "module",
+							"class": "Linear",
+							"inputs": {
+								"input": "x"
+							},
+							"outputs": {
+								"out": {
+									"name": "w1(x)",
+									"symbolic_shape": "(rows, ffn_hidden)",
+									"shape": [3, 8],
+									"axes": ["Copies", "ffn"],
+									"row_labels": ["t3→E0", "t6→E0", "t7→E0"],
+									"col_labels": ["0", "1", "2", "3", "4", "5", "6", "7"],
+									"values": [
+										[
+											"0.07",
+											"-0.06",
+											"-0.16",
+											"-0.19",
+											"-0.10",
+											"-0.33",
+											"-0.04",
+											"0.57"
+										],
+										[
+											"0.10",
+											"0.13",
+											"0.13",
+											"-0.39",
+											"-0.42",
+											"0.35",
+											"-0.09",
+											"0.04"
+										],
+										[
+											"0.65",
+											"0.48",
+											"0.40",
+											"-0.46",
+											"-0.17",
+											"1.63",
+											"-0.30",
+											"0.31"
+										]
+									],
+									"row_tones": [0, 0, 0]
+								}
+							},
+							"equation": {
+								"title": "Local expert 0: gate projection",
+								"latex": [
+									"a = x W_1^{\\top}, \\quad W_1 \\in \\mathbb{R}^{f \\times h}"
+								],
+								"note": "h = 4 → f = 8."
+							}
+						},
+						"w2": {
+							"type": "module",
+							"class": "Linear",
+							"inputs": {
+								"input": "x"
+							},
+							"outputs": {
+								"out": {
+									"name": "w2(x)",
+									"symbolic_shape": "(rows, ffn_hidden)",
+									"shape": [3, 8],
+									"axes": ["Copies", "ffn"],
+									"row_labels": ["t3→E0", "t6→E0", "t7→E0"],
+									"col_labels": ["0", "1", "2", "3", "4", "5", "6", "7"],
+									"values": [
+										[
+											"0.92",
+											"-0.23",
+											"-1.38",
+											"1.56",
+											"0.21",
+											"0.99",
+											"-0.42",
+											"0.16"
+										],
+										[
+											"0.30",
+											"0.15",
+											"-0.31",
+											"-0.12",
+											"-0.23",
+											"0.19",
+											"0.11",
+											"-0.20"
+										],
+										[
+											"-0.18",
+											"0.24",
+											"-1.80",
+											"0.63",
+											"-1.40",
+											"1.66",
+											"-1.01",
+											"0.39"
+										]
+									],
+									"row_tones": [0, 0, 0]
+								}
+							},
+							"equation": {
+								"title": "Local expert 0: up projection",
+								"latex": [
+									"b = x W_2^{\\top}, \\quad W_2 \\in \\mathbb{R}^{f \\times h}"
+								]
+							}
+						},
+						"silu": {
+							"type": "op",
+							"op": "F.silu",
+							"label": "silu",
+							"inputs": {
+								"input": "w1.out"
+							},
+							"outputs": {
+								"out": {
+									"name": "silu(w1(x))",
+									"symbolic_shape": "(rows, ffn_hidden)",
+									"shape": [3, 8],
+									"axes": ["Copies", "ffn"],
+									"row_labels": ["t3→E0", "t6→E0", "t7→E0"],
+									"col_labels": ["0", "1", "2", "3", "4", "5", "6", "7"],
+									"values": [
+										[
+											"0.04",
+											"-0.03",
+											"-0.07",
+											"-0.09",
+											"-0.05",
+											"-0.14",
+											"-0.02",
+											"0.37"
+										],
+										[
+											"0.05",
+											"0.07",
+											"0.07",
+											"-0.16",
+											"-0.17",
+											"0.20",
+											"-0.04",
+											"0.02"
+										],
+										[
+											"0.42",
+											"0.30",
+											"0.24",
+											"-0.18",
+											"-0.08",
+											"1.37",
+											"-0.13",
+											"0.18"
+										]
+									],
+									"row_tones": [0, 0, 0]
+								}
+							},
+							"equation": {
+								"title": "Swish",
+								"latex": ["\\operatorname{silu}(a) = a \\, \\sigma(a)"]
+							}
+						},
+						"mul": {
+							"type": "op",
+							"op": "torch.mul",
+							"label": "mul",
+							"inputs": {
+								"input": "silu.out",
+								"other": "w2.out"
+							},
+							"outputs": {
+								"out": {
+									"name": "silu(w1(x)) * w2(x)",
+									"symbolic_shape": "(rows, ffn_hidden)",
+									"shape": [3, 8],
+									"axes": ["Copies", "ffn"],
+									"row_labels": ["t3→E0", "t6→E0", "t7→E0"],
+									"col_labels": ["0", "1", "2", "3", "4", "5", "6", "7"],
+									"values": [
+										[
+											"0.03",
+											"0.01",
+											"0.10",
+											"-0.14",
+											"-0.01",
+											"-0.14",
+											"0.01",
+											"0.06"
+										],
+										[
+											"0.02",
+											"0.01",
+											"-0.02",
+											"0.02",
+											"0.04",
+											"0.04",
+											"0.00",
+											"0.00"
+										],
+										[
+											"-0.08",
+											"0.07",
+											"-0.42",
+											"-0.11",
+											"0.11",
+											"2.27",
+											"0.13",
+											"0.07"
+										]
+									],
+									"row_tones": [0, 0, 0]
+								}
+							},
+							"equation": {
+								"title": "Gated product",
+								"latex": ["u = \\operatorname{silu}(a) \\odot b"]
+							}
+						},
+						"w3": {
+							"type": "module",
+							"class": "Linear",
+							"inputs": {
+								"input": "mul.out"
+							},
+							"outputs": {
+								"out": {
+									"name": "expert output",
+									"symbolic_shape": "(rows, hidden)",
+									"shape": [3, 4],
+									"axes": ["Copies", "hidden"],
+									"row_labels": ["t3→E0", "t6→E0", "t7→E0"],
+									"col_labels": ["0", "1", "2", "3"],
+									"values": [
+										["-0.03", "0.00", "0.02", "0.03"],
+										["0.01", "-0.01", "-0.02", "-0.01"],
+										["0.12", "-0.01", "-0.37", "-0.12"]
+									],
+									"row_tones": [0, 0, 0]
+								}
+							},
+							"equation": {
+								"title": "Local expert 0: down projection",
+								"latex": [
+									"y = u W_3^{\\top}, \\quad W_3 \\in \\mathbb{R}^{h \\times f}"
+								],
+								"note": "f = 8 → h = 4."
+							}
+						}
+					},
+					"outputs": {
+						"out": "w3.out"
+					}
+				},
+				"1": {
+					"type": "module",
+					"class": "SwiGLUMLP",
+					"inputs": {
+						"x": "x1"
+					},
+					"operations": {
+						"w1": {
+							"type": "module",
+							"class": "Linear",
+							"inputs": {
+								"input": "x"
+							},
+							"outputs": {
+								"out": {
+									"name": "w1(x)",
+									"symbolic_shape": "(rows, ffn_hidden)",
+									"shape": [5, 8],
+									"axes": ["Copies", "ffn"],
+									"row_labels": ["t0→E1", "t1→E1", "t4→E1", "t5→E1", "t6→E1"],
+									"col_labels": ["0", "1", "2", "3", "4", "5", "6", "7"],
+									"values": [
+										[
+											"-0.36",
+											"0.05",
+											"-0.34",
+											"0.98",
+											"-1.20",
+											"-0.94",
+											"0.10",
+											"0.85"
+										],
+										[
+											"0.66",
+											"-0.48",
+											"-0.33",
+											"-0.27",
+											"0.09",
+											"-0.36",
+											"-0.73",
+											"-0.59"
+										],
+										[
+											"0.13",
+											"0.36",
+											"-0.07",
+											"0.10",
+											"-0.10",
+											"0.06",
+											"-0.28",
+											"0.05"
+										],
+										[
+											"0.14",
+											"-0.09",
+											"0.00",
+											"0.07",
+											"0.08",
+											"-0.16",
+											"0.03",
+											"-0.02"
+										],
+										[
+											"0.30",
+											"0.44",
+											"0.05",
+											"-0.07",
+											"0.30",
+											"0.28",
+											"-0.28",
+											"-0.13"
+										]
+									],
+									"row_tones": [1, 1, 1, 1, 1]
+								}
+							},
+							"equation": {
+								"title": "Local expert 1: gate projection",
+								"latex": [
+									"a = x W_1^{\\top}, \\quad W_1 \\in \\mathbb{R}^{f \\times h}"
+								],
+								"note": "h = 4 → f = 8."
+							}
+						},
+						"w2": {
+							"type": "module",
+							"class": "Linear",
+							"inputs": {
+								"input": "x"
+							},
+							"outputs": {
+								"out": {
+									"name": "w2(x)",
+									"symbolic_shape": "(rows, ffn_hidden)",
+									"shape": [5, 8],
+									"axes": ["Copies", "ffn"],
+									"row_labels": ["t0→E1", "t1→E1", "t4→E1", "t5→E1", "t6→E1"],
+									"col_labels": ["0", "1", "2", "3", "4", "5", "6", "7"],
+									"values": [
+										[
+											"0.17",
+											"0.36",
+											"0.10",
+											"0.43",
+											"-1.19",
+											"0.83",
+											"0.79",
+											"-0.86"
+										],
+										[
+											"-0.69",
+											"-0.24",
+											"1.16",
+											"1.26",
+											"-0.76",
+											"0.49",
+											"0.65",
+											"-1.79"
+										],
+										[
+											"0.18",
+											"0.11",
+											"-0.23",
+											"-0.41",
+											"-0.40",
+											"0.17",
+											"-0.13",
+											"-0.21"
+										],
+										[
+											"-0.30",
+											"-0.12",
+											"0.33",
+											"0.42",
+											"0.31",
+											"0.06",
+											"0.31",
+											"0.04"
+										],
+										[
+											"0.03",
+											"-0.04",
+											"-0.20",
+											"-0.48",
+											"0.19",
+											"-0.05",
+											"-0.23",
+											"0.25"
+										]
+									],
+									"row_tones": [1, 1, 1, 1, 1]
+								}
+							},
+							"equation": {
+								"title": "Local expert 1: up projection",
+								"latex": [
+									"b = x W_2^{\\top}, \\quad W_2 \\in \\mathbb{R}^{f \\times h}"
+								]
+							}
+						},
+						"silu": {
+							"type": "op",
+							"op": "F.silu",
+							"label": "silu",
+							"inputs": {
+								"input": "w1.out"
+							},
+							"outputs": {
+								"out": {
+									"name": "silu(w1(x))",
+									"symbolic_shape": "(rows, ffn_hidden)",
+									"shape": [5, 8],
+									"axes": ["Copies", "ffn"],
+									"row_labels": ["t0→E1", "t1→E1", "t4→E1", "t5→E1", "t6→E1"],
+									"col_labels": ["0", "1", "2", "3", "4", "5", "6", "7"],
+									"values": [
+										[
+											"-0.15",
+											"0.03",
+											"-0.14",
+											"0.71",
+											"-0.28",
+											"-0.26",
+											"0.05",
+											"0.60"
+										],
+										[
+											"0.44",
+											"-0.18",
+											"-0.14",
+											"-0.12",
+											"0.05",
+											"-0.15",
+											"-0.24",
+											"-0.21"
+										],
+										[
+											"0.07",
+											"0.21",
+											"-0.03",
+											"0.06",
+											"-0.05",
+											"0.03",
+											"-0.12",
+											"0.03"
+										],
+										[
+											"0.07",
+											"-0.05",
+											"0.00",
+											"0.03",
+											"0.04",
+											"-0.07",
+											"0.02",
+											"-0.01"
+										],
+										[
+											"0.17",
+											"0.27",
+											"0.03",
+											"-0.03",
+											"0.17",
+											"0.16",
+											"-0.12",
+											"-0.06"
+										]
+									],
+									"row_tones": [1, 1, 1, 1, 1]
+								}
+							},
+							"equation": {
+								"title": "Swish",
+								"latex": ["\\operatorname{silu}(a) = a \\, \\sigma(a)"]
+							}
+						},
+						"mul": {
+							"type": "op",
+							"op": "torch.mul",
+							"label": "mul",
+							"inputs": {
+								"input": "silu.out",
+								"other": "w2.out"
+							},
+							"outputs": {
+								"out": {
+									"name": "silu(w1(x)) * w2(x)",
+									"symbolic_shape": "(rows, ffn_hidden)",
+									"shape": [5, 8],
+									"axes": ["Copies", "ffn"],
+									"row_labels": ["t0→E1", "t1→E1", "t4→E1", "t5→E1", "t6→E1"],
+									"col_labels": ["0", "1", "2", "3", "4", "5", "6", "7"],
+									"values": [
+										[
+											"-0.02",
+											"0.01",
+											"-0.01",
+											"0.31",
+											"0.33",
+											"-0.22",
+											"0.04",
+											"-0.52"
+										],
+										[
+											"-0.30",
+											"0.04",
+											"-0.16",
+											"-0.15",
+											"-0.04",
+											"-0.07",
+											"-0.16",
+											"0.38"
+										],
+										[
+											"0.01",
+											"0.02",
+											"0.01",
+											"-0.02",
+											"0.02",
+											"0.01",
+											"0.02",
+											"-0.01"
+										],
+										[
+											"-0.02",
+											"0.01",
+											"0.00",
+											"0.01",
+											"0.01",
+											"0.00",
+											"0.00",
+											"0.00"
+										],
+										[
+											"0.00",
+											"-0.01",
+											"-0.01",
+											"0.02",
+											"0.03",
+											"-0.01",
+											"0.03",
+											"-0.02"
+										]
+									],
+									"row_tones": [1, 1, 1, 1, 1]
+								}
+							},
+							"equation": {
+								"title": "Gated product",
+								"latex": ["u = \\operatorname{silu}(a) \\odot b"]
+							}
+						},
+						"w3": {
+							"type": "module",
+							"class": "Linear",
+							"inputs": {
+								"input": "mul.out"
+							},
+							"outputs": {
+								"out": {
+									"name": "expert output",
+									"symbolic_shape": "(rows, hidden)",
+									"shape": [5, 4],
+									"axes": ["Copies", "hidden"],
+									"row_labels": ["t0→E1", "t1→E1", "t4→E1", "t5→E1", "t6→E1"],
+									"col_labels": ["0", "1", "2", "3"],
+									"values": [
+										["-0.06", "0.06", "-0.02", "-0.10"],
+										["0.17", "-0.21", "-0.20", "0.22"],
+										["0.00", "0.00", "0.00", "0.01"],
+										["0.00", "-0.01", "-0.01", "0.01"],
+										["0.00", "0.00", "0.01", "0.00"]
+									],
+									"row_tones": [1, 1, 1, 1, 1]
+								}
+							},
+							"equation": {
+								"title": "Local expert 1: down projection",
+								"latex": [
+									"y = u W_3^{\\top}, \\quad W_3 \\in \\mathbb{R}^{h \\times f}"
+								],
+								"note": "f = 8 → h = 4."
+							}
+						}
+					},
+					"outputs": {
+						"out": "w3.out"
+					}
+				}
+			},
+			"outputs": {
+				"y0": "0.out",
+				"y1": "1.out"
+			},
+			"layout": {
+				"order": ["0", "1"]
+			}
+		},
+		"assign": {
+			"type": "op",
+			"op": "Tensor.__setitem__ (loop)",
+			"label": "slice assign",
+			"inputs": {
+				"y0": "local_experts.y0",
+				"y1": "local_experts.y1"
+			},
+			"outputs": {
+				"out": {
+					"name": "local_expert_outputs",
+					"symbolic_shape": "(rows, hidden)",
+					"shape": [8, 4],
+					"axes": ["Copies", "hidden"],
+					"row_labels": [
+						"t3→E0",
+						"t6→E0",
+						"t7→E0",
+						"t0→E1",
+						"t1→E1",
+						"t4→E1",
+						"t5→E1",
+						"t6→E1"
+					],
+					"col_labels": ["0", "1", "2", "3"],
+					"values": [
+						["-0.03", "0.00", "0.02", "0.03"],
+						["0.01", "-0.01", "-0.02", "-0.01"],
+						["0.12", "-0.01", "-0.37", "-0.12"],
+						["-0.06", "0.06", "-0.02", "-0.10"],
+						["0.17", "-0.21", "-0.20", "0.22"],
+						["0.00", "0.00", "0.00", "0.01"],
+						["0.00", "-0.01", "-0.01", "0.01"],
+						["0.00", "0.00", "0.01", "0.00"]
+					],
+					"row_tones": [0, 0, 0, 1, 1, 1, 1, 1]
+				}
+			},
+			"equation": {
+				"title": "Write each expert's rows back",
+				"latex": [
+					"\\text{out}[o_j : o_j + c_j] = \\text{expert}_j(\\text{inp}_j)"
+				]
+			}
+		},
+		"restore": {
+			"type": "op",
+			"op": "Tensor.__setitem__",
+			"label": "index_put (restore)",
+			"inputs": {
+				"values": "assign.out",
+				"indices": "sort_local.indices"
+			},
+			"outputs": {
+				"out": {
+					"name": "unpermuted_local_outputs",
+					"symbolic_shape": "(rows, hidden)",
+					"shape": [8, 4],
+					"axes": ["Copies", "hidden"],
+					"row_labels": [
+						"t3→E0",
+						"t0→E1",
+						"t1→E1",
+						"t6→E0",
+						"t7→E0",
+						"t4→E1",
+						"t5→E1",
+						"t6→E1"
+					],
+					"col_labels": ["0", "1", "2", "3"],
+					"values": [
+						["-0.03", "0.00", "0.02", "0.03"],
+						["-0.06", "0.06", "-0.02", "-0.10"],
+						["0.17", "-0.21", "-0.20", "0.22"],
+						["0.01", "-0.01", "-0.02", "-0.01"],
+						["0.12", "-0.01", "-0.37", "-0.12"],
+						["0.00", "0.00", "0.00", "0.01"],
+						["0.00", "-0.01", "-0.01", "0.01"],
+						["0.00", "0.00", "0.01", "0.00"]
+					],
+					"row_tones": [0, 1, 1, 0, 0, 1, 1, 1],
+					"note": "Back in the order the rows arrived, grouped by source rank."
+				}
+			},
+			"equation": {
+				"title": "Undo the local sort",
+				"latex": [
+					"\\text{restored}[\\text{local\\_reorder}[i], :] = \\text{out}[i, :]"
+				]
+			}
+		},
+		"combine": {
+			"type": "function",
+			"function": "_AllToAll.apply",
+			"inputs": {
+				"input_tensor": "restore.out",
+				"output_split_sizes": "counts.splits",
+				"input_split_sizes": "out_splits.out"
+			},
+			"operations": {
+				"total": {
+					"type": "op",
+					"op": "builtins.sum",
+					"label": "sum(output_split_sizes)",
+					"inputs": {
+						"input": "output_split_sizes"
+					},
+					"outputs": {
+						"out": {
+							"name": "total_out",
+							"symbolic_shape": "()",
+							"shape": [],
+							"axes": ["", ""],
+							"row_labels": [""],
+							"col_labels": ["value"],
+							"values": [["8"]]
+						}
+					},
+					"equation": {
+						"title": "Rows this rank will receive",
+						"latex": [
+							"\\text{total\\_out} = \\sum_s \\text{output\\_split\\_sizes}[s]"
+						]
+					}
+				},
+				"empty": {
+					"type": "op",
+					"op": "torch.empty",
+					"label": "empty",
+					"inputs": {
+						"size": "total.out"
+					},
+					"outputs": {
+						"out": {
+							"name": "output_tensor",
+							"symbolic_shape": "(total_out, hidden)",
+							"shape": [8, 4],
+							"note": "Uninitialized: all_to_all_single writes every row."
+						}
+					},
+					"equation": {
+						"title": "Allocate the receive buffer",
+						"latex": [
+							"\\text{output\\_tensor} \\in \\mathbb{R}^{\\text{total\\_out} \\times h}"
+						]
+					}
+				},
+				"a2a": {
+					"type": "op",
+					"op": "dist.all_to_all_single",
+					"label": "all_to_all_single",
+					"inputs": {
+						"output": "empty.out",
+						"input": "input_tensor",
+						"output_split_sizes": "output_split_sizes",
+						"input_split_sizes": "input_split_sizes"
+					},
+					"outputs": {
+						"out": {
+							"name": "returned_tokens",
+							"symbolic_shape": "(total_tokens·top_k, hidden)",
+							"shape": [8, 4],
+							"axes": ["Copies", "hidden"],
+							"row_labels": [
+								"t3→E0",
+								"t0→E1",
+								"t1→E1",
+								"t2→E2",
+								"t3→E2",
+								"t0→E3",
+								"t1→E3",
+								"t2→E3"
+							],
+							"col_labels": ["0", "1", "2", "3"],
+							"values": [
+								["-0.03", "0.00", "0.02", "0.03"],
+								["-0.06", "0.06", "-0.02", "-0.10"],
+								["0.17", "-0.21", "-0.20", "0.22"],
+								["0.00", "0.00", "-0.12", "0.06"],
+								["0.02", "-0.02", "-0.04", "-0.01"],
+								["-0.22", "0.24", "-0.39", "0.02"],
+								["-0.05", "-0.01", "0.02", "-0.10"],
+								["-0.01", "0.00", "0.03", "-0.03"]
+							],
+							"row_tones": [0, 1, 1, 2, 2, 3, 3, 3],
+							"note": "Every copy this rank sent, back in the order it sent them."
+						}
+					},
+					"equation": {
+						"title": "All-to-all: combine",
+						"latex": [
+							"\\text{rank } j \\text{ returns each row of chunk}_{i \\to j} \\text{ to rank } i"
+						],
+						"note": "The dispatch with the splits swapped."
+					},
+					"kind": "collective"
+				}
+			},
+			"outputs": {
+				"out": "a2a.out"
+			}
+		},
+		"unpermute": {
+			"type": "op",
+			"op": "Tensor.__setitem__",
+			"label": "index_put (unpermute)",
+			"inputs": {
+				"values": "combine.out",
+				"indices": "sort.indices"
+			},
+			"outputs": {
+				"out": {
+					"name": "unpermuted_tokens",
+					"symbolic_shape": "(total_tokens, top_k, hidden)",
+					"shape": [4, 2, 4],
+					"axes": ["(Token, k)", "hidden"],
+					"row_labels": [
+						"t0→E3",
+						"t0→E1",
+						"t1→E1",
+						"t1→E3",
+						"t2→E2",
+						"t2→E3",
+						"t3→E0",
+						"t3→E2"
+					],
+					"col_labels": ["0", "1", "2", "3"],
+					"values": [
+						["-0.22", "0.24", "-0.39", "0.02"],
+						["-0.06", "0.06", "-0.02", "-0.10"],
+						["0.17", "-0.21", "-0.20", "0.22"],
+						["-0.05", "-0.01", "0.02", "-0.10"],
+						["0.00", "0.00", "-0.12", "0.06"],
+						["-0.01", "0.00", "0.03", "-0.03"],
+						["-0.03", "0.00", "0.02", "0.03"],
+						["0.02", "-0.02", "-0.04", "-0.01"]
+					],
+					"row_tones": [3, 1, 1, 3, 2, 3, 0, 2]
+				}
+			},
+			"equation": {
+				"title": "Invert the global permutation",
+				"latex": [
+					"\\text{unpermuted}[\\text{reorder}[i], :] = \\text{returned}[i, :]"
+				],
+				"note": "Then view(T, top_k, h): row tK + k is copy k of token t."
+			}
+		},
+		"wsum": {
+			"type": "op",
+			"op": "torch.mul, Tensor.sum",
+			"label": "mul + sum(dim=1)",
+			"inputs": {
+				"input": "unpermute.out",
+				"weights": "router.topk_weights"
+			},
+			"outputs": {
+				"out": {
+					"name": "combined_output",
+					"symbolic_shape": "(total_tokens, hidden)",
+					"shape": [4, 4],
+					"axes": ["Tokens", "hidden"],
+					"row_labels": ["t0", "t1", "t2", "t3"],
+					"col_labels": ["0", "1", "2", "3"],
+					"values": [
+						["-0.17", "0.18", "-0.27", "-0.02"],
+						["0.07", "-0.11", "-0.09", "0.07"],
+						["0.00", "0.00", "-0.05", "0.02"],
+						["0.00", "-0.01", "-0.01", "0.01"]
+					]
+				}
+			},
+			"equation": {
+				"title": "Weighted combination",
+				"latex": ["y_t = \\sum_{k} g_{t,k} \\, \\text{unpermuted}[t, k, :]"]
+			}
+		},
+		"view2": {
+			"type": "op",
+			"op": "Tensor.view",
+			"label": "view(orig_shape)",
+			"inputs": {
+				"input": "wsum.out"
+			},
+			"outputs": {
+				"out": {
+					"name": "output",
+					"symbolic_shape": "(batch_size, seq_len, hidden)",
+					"shape": [2, 2, 4],
+					"axes": ["(batch, seq)", "hidden"],
+					"row_labels": ["b0·s0", "b0·s1", "b1·s0", "b1·s1"],
+					"col_labels": ["0", "1", "2", "3"],
+					"values": [
+						["-0.17", "0.18", "-0.27", "-0.02"],
+						["0.07", "-0.11", "-0.09", "0.07"],
+						["0.00", "0.00", "-0.05", "0.02"],
+						["0.00", "-0.01", "-0.01", "0.01"]
+					],
+					"note": "Checked against layer(hidden_states) and against all four experts applied directly."
+				}
+			},
+			"equation": {
+				"title": "Restore the shape",
+				"latex": ["Y = y.\\text{view}(B, S, h)"]
+			}
+		}
+	},
+	"outputs": {
+		"output": "view2.out",
+		"aux_loss": "router.aux_loss"
+	}
+}

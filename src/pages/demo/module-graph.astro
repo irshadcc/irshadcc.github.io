@@ -1,0 +1,81 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import ModuleGraph from "../../utils/distributed/graph/ModuleGraph.astro";
+import megatronMoe from "../../utils/distributed/graph/megatronMoe.json";
+import type { ModuleSpec } from "../../utils/distributed/graph/moduleGraph";
+
+// A residual MLP block, written by hand: a submodule, leaf Linear modules, and a tensor (x) that
+// enters the submodule and is also read outside it. Shapes only, no values.
+const t = (name: string, shape: number[], symbolic_shape: string) => ({
+	name,
+	shape,
+	symbolic_shape,
+});
+const block: ModuleSpec = {
+	name: "",
+	type: "module",
+	class: "ResidualBlock",
+	inputs: { x: t("x", [8, 16], "(tokens, hidden)") },
+	operations: {
+		add: {
+			type: "op",
+			op: "torch.add",
+			label: "add (residual)",
+			inputs: { input: "x", other: "mlp.out" },
+			outputs: { out: t("y", [8, 16], "(tokens, hidden)") },
+			equation: {
+				title: "Residual",
+				latex: ["y = x + \\operatorname{MLP}(\\operatorname{LN}(x))"],
+			},
+		},
+		norm: {
+			type: "module",
+			class: "LayerNorm",
+			inputs: { input: "x" },
+			outputs: { out: t("normed", [8, 16], "(tokens, hidden)") },
+		},
+		mlp: {
+			type: "module",
+			class: "MLP",
+			inputs: { h: "norm.out" },
+			operations: {
+				fc1: {
+					type: "module",
+					class: "Linear",
+					inputs: { input: "h" },
+					outputs: { out: t("fc1(h)", [8, 64], "(tokens, 4·hidden)") },
+				},
+				gelu: {
+					type: "op",
+					op: "F.gelu",
+					inputs: { input: "fc1.out" },
+					outputs: { out: t("gelu", [8, 64], "(tokens, 4·hidden)") },
+				},
+				fc2: {
+					type: "module",
+					class: "Linear",
+					inputs: { input: "gelu.out" },
+					outputs: { out: t("fc2", [8, 16], "(tokens, hidden)") },
+				},
+			},
+			outputs: { out: "fc2.out" },
+		},
+	},
+	outputs: { y: "add.out" },
+};
+---
+
+<Layout title="ModuleGraph demo">
+	<h1>ModuleGraph demo</h1>
+	<p>
+		<code>ModuleGraph</code> draws a PyTorch module from nested JSON (<code>utils/distributed/graph/moduleGraph.ts</code>): ops and
+		leaf modules as nodes, modules as nested boxes, tensors as edges. Hover over an edge for its tensor, a node for its equation.
+	</p>
+
+	<h2>A residual MLP block (shapes only)</h2>
+	<ModuleGraph spec={block} title="ResidualBlock.forward" />
+
+	<h2>A Megatron-style MoE layer with expert parallelism</h2>
+	<p>One EP rank's forward pass, collectives in orange; values are rank 0's from an EP = 2 run.</p>
+	<ModuleGraph spec={megatronMoe as ModuleSpec} wide />
+</Layout>
