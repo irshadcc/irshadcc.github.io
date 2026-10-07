@@ -390,7 +390,9 @@ export function moduleLabel(
 ): string {
 	const name = path.replace(/:/g, ".");
 	if (info?.function !== undefined)
-		return info.function ? `${name}: ${info.function}()` : `${name}()`;
+		return info.function
+			? `${name ? `${name}: ` : ""}${info.function}()`
+			: `${name}()`;
 	if (!path) return info?.class ?? "";
 	return info?.class ? `${name}: ${info.class}` : name;
 }

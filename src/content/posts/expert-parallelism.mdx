@@ -9,11 +9,11 @@ import Sidenote from "../../components/Sidenote.astro";
 import MarginNote from "../../components/MarginNote.astro";
 import MoeDispatchSteps from "../../utils/distributed/MoeDispatchSteps.astro";
 import MoeRouters from "../../utils/distributed/MoeRouters.astro";
-import MoeEpSteps from "../../utils/distributed/MoeEpSteps.astro";
 import EplbPlacement from "../../utils/distributed/EplbPlacement.astro";
-import BoxDiagram from "../../utils/payments/BoxDiagram.astro";
+import ModuleGraph from "../../utils/distributed/graph/ModuleGraph.astro";
+import { epModuleSpec } from "../../utils/distributed/epModules";
 import MegaKernelSteps from "../../utils/distributed/MegaKernelSteps.astro";
-import { megaMoeEdges, megaMoeGrid, megaMoeNodes } from "../../utils/distributed/megaMoeFigures";
+import { megaMoeSpec } from "../../utils/distributed/megaMoeModule";
 import LineChart from "../../utils/charts/LineChart.astro";
 import { BALANCE_SIM, STEPS } from "../../utils/distributed/moeBalanceSim";
 
@@ -507,42 +507,69 @@ Megatron-LM's `MoELayer.forward` runs the three steps through a **token dispatch
 bookkeeping around the two all-to-alls: counting the copies, sorting them so that each
 destination's chunk is contiguous, and undoing both sorts on the way back.
 
-The figure runs it on a scaled-down configuration: EP = 4, 8 experts (2 per rank, so rank $r$
-holds experts $2r$ and $2r + 1$), top-2 routing and 8 tokens, 2 per rank. Each step highlights
-the nodes it runs and the line of code behind them. Hover over an edge to see the tensor flowing
-along it, as a matrix with its shape, and over a node to see the equation it computes. Compare the
-edge into "All-to-all: dispatch" with the edge out of it: before the dispatch each rank holds
-copies for every rank's experts, after it only copies for its own.
+In condensed form, for tensor parallelism of 1 and no token dropping, with the shapes of the
+example below in the comments:
 
-<MoeEpSteps flow="megatron" title="One MoE layer in Megatron-LM: EP = 4, 8 experts, top-2, 8 tokens" />
+```python
+def forward(self, hidden_states):  # [2 tokens, hidden] on each of the 4 EP ranks
+    probs, routing_map = self.router(hidden_states)  # top-2 of 8 experts
+    num_local_tokens_per_expert = routing_map.sum(dim=0)  # [8]
+    input_splits = num_local_tokens_per_expert.reshape(ep_size, num_local_experts).sum(axis=1)
+    num_global_tokens_per_expert = all_gather(num_local_tokens_per_expert, group=ep_group)
+    output_splits = num_global_tokens_per_local_expert.sum(axis=-1)
+    tokens, probs, mapping = permute(hidden_states, routing_map, probs)
+    tokens = all_to_all(ep_group, tokens, output_splits, input_splits)
+    probs = all_to_all(ep_group, probs, output_splits, input_splits)
+    tokens = sort_chunks_by_idxs(tokens, num_global_tokens_per_local_expert, sort_input_by_local_experts)
+    out = self.experts(tokens, tokens_per_expert, probs)  # grouped GEMM, probs scale the activation
+    out = sort_chunks_by_idxs(out, num_global_tokens_per_local_expert.T, restore_output_by_local_experts)
+    out = all_to_all(ep_group, out, input_splits, output_splits)
+    return unpermute(out, mapping, restore_shape)  # scatter-add each token's 2 copies
+```
 
-A few things to look for:
+The figure draws this layer as PyTorch runs it on one rank, on a scaled-down configuration: EP =
+4, 8 experts (2 per rank, so rank $r$ holds experts $2r$ and $2r + 1$), top-2 routing and 8
+tokens, 2 per rank. It shows rank 1. Every op and leaf module is a card, every module a box around
+its cards, and every tensor a wire from the op that made it to each op that reads it. The dashed
+boxes are the dispatcher's methods, in the order `MoELayer` calls them, and the orange cards are
+communication. Hover over a wire to see its tensor as a matrix with its shape, and over a card to
+see the equation it computes.
 
-- **The counts move first.** Steps 3 to 6 move no tokens. The ranks exchange how many copies they
-  will send each other with an all-gather of the per-expert counts, because `all_to_all` needs the
-  split sizes on the CPU to size its buffers. That copy to the host is a synchronization point.
-  Megatron starts it on a side stream and, depending on the MoE and parallel settings, waits for
-  it as late as it can, at the latest just before the dispatch all-to-all.
+<ModuleGraph spec={epModuleSpec("megatron")} wide title="One MoE layer in Megatron-LM, rank 1: EP = 4, 8 experts, top-2, 8 tokens" />
+
+Compare the wire into "all-to-all tokens" with the wire out of it. Before the exchange, rank 1
+holds its own 4 copies, one for each rank's experts, so `input_splits` is $[1, 1, 1, 1]$. After
+it, rank 1 holds the 8 copies for its own experts 2 and 3, from every rank: `output_splits` is
+$[3, 1, 2, 2]$. Check one: rank 0's tokens t0 and t1 chose experts $\{1, 2\}$ and $\{2, 3\}$, so
+rank 0 sends rank 1 three copies. A few more things to look for:
+
+- **The counts move first.** The four cards before `permute` move no tokens. The ranks exchange
+  how many copies they will send each other with an all-gather of the per-expert counts, because
+  `all_to_all` needs the split sizes on the CPU to size its buffers. That copy to the host is a
+  synchronization point. Megatron starts it on a side stream and, depending on the MoE and
+  parallel settings, waits for it as late as it can, at the latest just before the dispatch
+  all-to-all.
 - **Two sorts on each side.** `permute` sorts the local copies by expert, so the chunk for each
   rank is contiguous. After the exchange, the received rows are ordered by sender, then by expert,
-  and `sort_chunks_by_idxs` regroups them by local expert for the grouped GEMM. On the way back,
-  the same two sorts run in reverse.
+  and `sort_chunks_by_idxs` regroups them by local expert for the grouped GEMM: four rows for E2,
+  then four for E3. On the way back, the same two sorts run in reverse.
 - **The gates travel with the tokens.** The gate weights go through their own all-to-all, and
-  the experts multiply them into the activation. `unpermute` then only has to add each token's
-  rows together.
+  the experts multiply them into the activation ("SwiGLU × probs"). `unpermute` then only has to
+  add each token's rows together.
 - **The busiest rank sets the pace.** Rank 1, which holds the popular experts 2 and 3, receives 8
   of the 16 copies; rank 3 receives 2. The grouped GEMM on rank 1 does four times the work of rank
-  3's, and the combine can't finish until rank 1 is done. Hover over an edge leaving "Count copies,
-  all-gather counts" to see the whole table of counts.
+  3's, and the combine can't finish until rank 1 is done. Hover over the wire out of "all-gather
+  counts" to see the whole table of counts.
 
 The routing comes from a seeded PyTorch run, with experts 2 and 3 made more likely. I checked
 every buffer in the figure against the same algorithm run on 4 processes with `torch.distributed`
 (gloo), where each rank's output also matched a single-device reference exactly.<Sidenote>The code
-under the figure is condensed from [`moe_layer.py`](https://github.com/NVIDIA/Megatron-LM/blob/ef8cd10b8e34a94c9ad7452e7851f58337f353a0/megatron/core/transformer/moe/moe_layer.py)
-and [`token_dispatcher.py`](https://github.com/NVIDIA/Megatron-LM/blob/ef8cd10b8e34a94c9ad7452e7851f58337f353a0/megatron/core/transformer/moe/token_dispatcher.py)
-for tensor parallelism of 1 and no token dropping. With TP > 1, the counts are all-gathered over
-the TP × EP group, and the received tokens are all-gathered over TP before the experts and
-reduce-scattered after them.</Sidenote>
+above is condensed from [`moe_layer.py`](https://github.com/NVIDIA/Megatron-LM/blob/ef8cd10b8e34a94c9ad7452e7851f58337f353a0/megatron/core/transformer/moe/moe_layer.py)
+and [`token_dispatcher.py`](https://github.com/NVIDIA/Megatron-LM/blob/ef8cd10b8e34a94c9ad7452e7851f58337f353a0/megatron/core/transformer/moe/token_dispatcher.py),
+where the steps are split over `dispatch_preprocess`, `token_dispatch`, `dispatch_postprocess`
+and their three `combine_` counterparts. With TP > 1, the counts are all-gathered over the TP × EP
+group, and the received tokens are all-gathered over TP before the experts and reduce-scattered
+after them.</Sidenote>
 
 ### Megatron Core at scale
 
@@ -652,12 +679,27 @@ and at least `min_capacity`. The tokens are scattered into an `[E, C, h]` buffer
 fills are zero padding, and copies past an expert's capacity are dropped. Because every buffer has
 the same shape, both all-to-alls send equal chunks, and no counts have to be exchanged first.
 
-The figure runs it on the same example. With a capacity factor of 1, each expert gets
+Condensed from `MOELayer.forward` and `top2gating`:
+
+```python
+def forward(self, x):  # x: [2, h] tokens on each of the 4 EP ranks
+    l_aux, C, E, indices, locations, gates, _ = self.gate(x)  # top-2; C = ceil(2 S / E × cf) = 1
+    dispatched = _sparse_encode(x, _route_slots(indices, locations, E, C), E, C)  # [E, C, h]
+    dispatched = _AllToAll.apply(self.ep_group, dispatched)  # equal chunks, no counts needed
+    expert_output = self.experts(dispatched.reshape(ep_size, num_local_experts, -1, h))
+    expert_output = _AllToAll.apply(self.ep_group, expert_output)
+    return _sparse_decode(expert_output.view(E * C, h), slots, gates, S)  # gather, weight, sum
+```
+
+The figure draws it on rank 0 of the same example. With a capacity factor of 1, each expert gets
 $C = \lceil 2 \times 2/8 \rceil = 1$ slot per rank. The `min_capacity` default of 4 is set to 0
 here; it exists so that small batches don't drop everything, and on 2 tokens per rank it would
-make the buffers mostly padding.
+make the buffers mostly padding. Hover over the wire out of "scatter into [E, C, h]": rank 0's
+8 slots hold `t0` in E1 and `t1` in E2 and E3, and the other 5 are zero padding. The wire out of
+the first all-to-all holds the 8 rows rank 0's experts receive, one slot from each rank for each
+expert, and only 3 of them are tokens: `t2` for E0, `t0` and `t6` for E1.
 
-<MoeEpSteps flow="deepspeed" title="DeepSpeed's MoE layer: EP = 4, 8 experts, top-2, capacity 1" />
+<ModuleGraph spec={epModuleSpec("deepspeed")} wide title="DeepSpeed's MoE layer, rank 0: EP = 4, 8 experts, top-2, capacity 1" />
 
 Every rank sends 6 rows in each all-to-all (2 to each of the 3 others) whatever the routing,
 against 5 to 10 for Megatron's dropless dispatch, and most of those rows are padding: each rank's
@@ -760,12 +802,26 @@ nodes its EP group spans. The router scores each node by the sum of its best $K_
 expert affinities, keeps the best 4 nodes and picks the top 8 experts among them. A token then
 crosses InfiniBand at most 4 times, once per target node, to the GPU with the same local index as
 its own; NVLink forwards it from there to every GPU on that node that holds one of its experts.
-The figure runs this on the example, as 2 nodes of 2 GPUs:
+In code, with DeepEP:
 
-<MoeEpSteps flow="deepseek" title="DeepSeek-V3's two-hop dispatch: 2 nodes × 2 GPUs, 8 experts, top-2" />
+```python
+topk_idx, topk_weights = gate(x)  # x: [2, h] per GPU; node-limited: experts on at most M nodes
+event = buffer.dispatch(x, topk_idx=topk_idx, topk_weights=topk_weights, num_experts=E, ...)
+recv_x, _, recv_topk_weights, handle = event.current_stream_wait()  # expanded layout
+expert_output = grouped_gemm(recv_x) * recv_topk_weights  # the experts apply the gates
+event = buffer.combine(expert_output, handle)
+combined_x, _ = event.current_stream_wait()
+```
+
+The figure runs this on the example as 2 nodes of 2 GPUs, and draws node 0's GPU 1, which holds
+experts 2 and 3. `buffer.dispatch` and `buffer.combine` are drawn as two hops each, although
+DeepEP runs both hops in one kernel. Hover over the wire out of "NVLink: forward to expert GPUs":
+each of the 8 copies is labelled with how it got there.
+
+<ModuleGraph spec={epModuleSpec("deepseek")} wide title="DeepSeek-V3's two-hop dispatch, node 0 · GPU 1: 2 nodes × 2 GPUs, 8 experts, top-2" />
 
 Seven copies need the other node but only six transfers cross InfiniBand: `t6` sends one row to
-node 0 that serves both its experts there. The saving grows with the number of experts per node a
+node 0, which lands on this GPU and serves both its experts there, E1 on GPU 0 and E3 here. The saving grows with the number of experts per node a
 token uses: the report notes that with IB and NVLink fully overlapped, a token can reach about 3.2
 experts per node at no extra cost, so DeepSeek-V3 could use up to 13 experts per token ($4 \times
 3.2$) for the communication cost of 8. The combine is the mirror image, and it sums on the way:
@@ -873,9 +929,23 @@ more tokens per rank than the buffer was sized for, and vLLM with
 `--moe-backend flashinfer_moe_ep_mega_deep_gemm`, through FlashInfer's MoE-EP wrapper and the
 `passthrough` all-to-all backend.
 
-The figure follows one token copy through it. Click a box to read what happens there:
+The figure draws one launch as a graph, in the same style as
+[Megatron's layer above](#megatron-lms-moe-layer), on the example the next section steps
+through: 2 ranks, 4 experts (rank 0 holds experts 0 and 1), top-2, 2 tokens per rank, hidden size
+4 and expert width 2. It shows rank 0, which is both a source rank (it owns tokens t0 and t1) and an
+expert rank. The orange cards are where data crosses NVLink, and there are only three: publishing
+the counts, pulling the token rows, and writing the results home. The dashed boxes inside the
+kernel are the dispatch warps and the two GEMMs, each of which stages tiles in shared memory and accumulates in
+tensor memory. Hover over a wire to see its tensor, and over a card to see what it computes.
 
-<BoxDiagram nodes={megaMoeNodes} edges={megaMoeEdges} grid={megaMoeGrid} selected="l1" title="One token copy through Mega MoE: dispatch, two GEMMs, combine" />
+<ModuleGraph spec={megaMoeSpec} wide title="One launch of Mega MoE on rank 0: dispatch, two GEMMs, combine" />
+
+Follow the wire out of "pull token rows". The L1 ring holds the three copies for expert 0, one
+of them pulled from rank 1 (t2), then a padding row to fill the block of 4, then expert 1's two
+copies, one from each rank, and two more padding rows. The padding goes through both GEMMs, but "write rows home" skips it, so
+only real rows cross NVLink. The wire into "sum top-k" is rank 0's combine buffer: the rows for
+experts 0 and 1 were written by rank 0's own epilogue, the row for expert 3 (t0's second choice)
+by rank 1's. Check one: t0 chose experts 0 and 3, so its output is the sum of those two rows.
 
 ### Inside the kernel
 
@@ -1197,9 +1267,27 @@ copies routed to its own experts, which gives it a partial output for every toke
 
 The figure runs it on the same example as Megatron's: EP = 4, 8 experts, top-2, 8 tokens, 2 per
 rank, with the same routing. After the all-gather every rank holds every token, but it only runs
-the copies whose expert it owns; hover over the edge into a fused MoE kernel to see which.
+the copies whose expert it owns. Condensed, with the example's shapes:
 
-<MoeEpSteps flow="vllm" title="vLLM's default EP path: EP = 4, 8 experts, top-2, 8 tokens" />
+```python
+def forward(x, router_logits):  # x: [2, h] on each of 4 DP ranks; the EP group is all 4
+    topk_weights, topk_ids = select_experts(x, router_logits)  # top-2 of 8, for my tokens only
+    x, topk_weights, topk_ids = all_gatherv([x, topk_weights, topk_ids], group=ep_group)  # [8, h]
+    sorted_ids, expert_ids, _ = moe_align_block_size(topk_ids, BLOCK_M, 8, expert_map)
+    cache1 = fused_moe_kernel(x, w1, sorted_ids, expert_ids)  # reads rows of x by index
+    cache2 = silu_and_mul(cache1)
+    cache3 = fused_moe_kernel(cache2, w2, sorted_ids, expert_ids, topk_weights)  # gate applied
+    out = moe_sum(cache3)  # [8, h]: add each token's top-2 rows
+    return reduce_scatterv(out, group=ep_group)  # [2, h]: sum over ranks, keep my rows
+```
+
+The figure draws rank 1, which holds experts 2 and 3. Hover over the wire out of
+`moe_align_block_size`: `sorted_token_ids` lists only the 8 copies for rank 1's experts, as flat
+indices $t \cdot 2 + k$, one block per expert. The other ranks' copies are never counted, so the
+kernels skip their rows of `intermediate_cache1`, and their rows of `intermediate_cache3` stay
+zero.
+
+<ModuleGraph spec={epModuleSpec("vllm")} wide title="vLLM's default EP path, rank 1: EP = 4, 8 experts, top-2, 8 tokens" />
 
 Compare the traffic. Megatron's all-to-all moves only the copies that leave a rank, so how much
 each rank sends depends on the routing: 5, 10, 5 and 6 rows (dispatch and combine together) in
@@ -1291,7 +1379,20 @@ ranks already hold the same batch when the MoE layer starts. There is nothing to
 Each rank runs its local experts on the whole batch, and the partial outputs are added by an
 all-reduce over the TP group, exactly the all-reduce a tensor-parallel MLP would end with.
 
-<MoeEpSteps flow="sglang" title="SGLang's default EP path: EP = 4, 8 experts, top-2, 8 tokens" />
+```python
+def forward_normal(self, hidden_states):  # [8, h], the same on all 4 ranks (TP attention)
+    router_logits = self.gate(hidden_states)  # [8, 8]: every rank routes every token
+    topk_output = self.topk(hidden_states, router_logits)  # top-2 of 8 experts
+    topk_ids = self.local_expert_mapping[topk_output.topk_ids]  # StandardDispatcher: -1 = not mine
+    out = self.experts(hidden_states, topk_ids, topk_weights)  # Triton fused MoE, sums the top-2
+    return tensor_model_parallel_all_reduce(out)  # add the partial outputs of all ranks
+```
+
+The figure draws rank 1. The only orange card is the all-reduce at the end; the wire into it
+holds rank 1's partial output, which is zero for `t2`, the one token that chose none of experts 2
+and 3.
+
+<ModuleGraph spec={epModuleSpec("sglang")} wide title="SGLang's default EP path, rank 1: EP = 4, 8 experts, top-2, 8 tokens" />
 
 Here every rank routes all 8 tokens, the same work four times, which is cheap next to the experts.
 A ring all-reduce of the `[8, h]` output sends $2(N-1)/N \times 8 = 12$ rows per rank, the same as
