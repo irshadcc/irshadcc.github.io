@@ -123,7 +123,7 @@ const boxCards = Object.entries(graph.modules)
 	<div class="mg-cards">
 		{
 			nodeCards.map(({ n, ins, outs, syms, weights }) => (
-				<div class="mg-card eq" data-node={n.id} hidden>
+				<div class="mg-card eq" data-node={n.id} data-kind={n.kind} hidden>
 					<p class="card-title">{n.equation?.title ?? <code>{n.label}</code>}</p>
 					{n.equation?.latex.map((l) => <div class="katex-line" set:html={tex(l)} />)}
 					{n.equation?.note && <p class="card-note">{n.equation.note}</p>}
@@ -425,11 +425,11 @@ const boxCards = Object.entries(graph.modules)
 		--mg-lit: var(--accent);
 		--mg-grid: color-mix(in oklch, var(--muted) 20%, transparent);
 		--mg-shadow: rgb(40 36 20 / 0.07);
-		/* Icon colours: ops, leaf modules, collectives, sparkles. */
-		--mg-fn: #7c5cd6;
-		--mg-hex: #b04fc4;
-		--mg-x: #c27a12;
-		--mg-spark: #4a7fe0;
+		/* Icon colours: ops (teal), leaf modules and weights (indigo), collectives (orange), sparkles. */
+		--mg-fn: #12827f;
+		--mg-hex: #5157c4;
+		--mg-x: #c9631c;
+		--mg-spark: #5157c4;
 		/* Row tints (row_tones 0–7). */
 		--t0: #2a78d6;
 		--t1: #eb6834;
@@ -446,10 +446,10 @@ const boxCards = Object.entries(graph.modules)
 	@media (prefers-color-scheme: dark) {
 		.mg {
 			--mg-shadow: rgb(0 0 0 / 0.35);
-			--mg-fn: #9d86f0;
-			--mg-hex: #d083e0;
-			--mg-x: #e3a04a;
-			--mg-spark: #6d9cf5;
+			--mg-fn: #4cbdb6;
+			--mg-hex: #8f94f2;
+			--mg-x: #ec8b4c;
+			--mg-spark: #8f94f2;
 			--t0: #3987e5;
 			--t1: #d95926;
 			--t2: #199e70;
@@ -561,10 +561,10 @@ const boxCards = Object.entries(graph.modules)
 	.mg-canvas :global(.mg-flow) {
 		display: none;
 		fill: none;
-		stroke: var(--mg-card);
-		stroke-width: 1.4;
+		stroke: color-mix(in oklch, var(--mg-lit) 35%, var(--mg-card));
+		stroke-width: 3.2;
 		stroke-linecap: round;
-		stroke-dasharray: 2 9;
+		stroke-dasharray: 0 16;
 		pointer-events: none;
 	}
 	.mg-canvas :global(.mg-hit) {
@@ -581,7 +581,7 @@ const boxCards = Object.entries(graph.modules)
 	}
 	.mg-canvas :global(.mg-edge.lit .mg-flow) {
 		display: inline;
-		animation: mg-flow 0.9s linear infinite;
+		animation: mg-flow 0.8s linear infinite;
 	}
 	.mg-canvas :global(.mg-edge.lit .mg-arrow) {
 		fill: var(--mg-lit);
@@ -589,7 +589,7 @@ const boxCards = Object.entries(graph.modules)
 	}
 	@keyframes mg-flow {
 		from {
-			stroke-dashoffset: 11;
+			stroke-dashoffset: 16;
 		}
 		to {
 			stroke-dashoffset: 0;
@@ -645,7 +645,8 @@ const boxCards = Object.entries(graph.modules)
 	.mg-canvas :global(.mg-node:hover .mg-cardbox),
 	.mg-canvas :global(.mg-node.near .mg-cardbox) {
 		stroke: var(--k);
-		filter: drop-shadow(0 2px 3px var(--mg-shadow)) drop-shadow(0 8px 18px var(--mg-shadow));
+		filter: drop-shadow(0 0 5px color-mix(in oklch, var(--k) 40%, transparent))
+			drop-shadow(0 8px 18px var(--mg-shadow));
 	}
 	.mg-canvas :global(.mg-node:focus-visible .mg-cardbox) {
 		stroke: var(--mg-lit);
@@ -730,17 +731,29 @@ const boxCards = Object.entries(graph.modules)
 
 	/* Hover cards: a node's equation, an edge's tensor. */
 	.mg-card {
+		--kc: var(--accent);
 		position: absolute;
 		z-index: 5;
 		width: max-content;
 		max-width: min(30rem, 100%);
 		padding: 0.5rem 0.65rem;
 		border: 1px solid var(--faint);
+		border-top: 2px solid var(--kc);
 		border-radius: 8px;
 		background: var(--bg);
 		box-shadow: 0 6px 20px rgb(0 0 0 / 0.18);
 		font-size: 0.72rem;
 		pointer-events: none;
+	}
+	/* The top edge takes the node's kind colour; wires and boxes keep the accent. */
+	.mg-card[data-kind="op"] {
+		--kc: var(--mg-fn);
+	}
+	.mg-card[data-kind="module"] {
+		--kc: var(--mg-hex);
+	}
+	.mg-card[data-kind="collective"] {
+		--kc: var(--mg-x);
 	}
 	/* A pinned card takes the pointer, so its text can be selected. */
 	.mg-card.pinned {
