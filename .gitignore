@@ -6,6 +6,8 @@ dist/
 
 # dependencies
 node_modules/
+# pyc
+**/*.pyc
 
 # logs
 npm-debug.log*

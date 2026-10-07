@@ -423,6 +423,8 @@ const boxCards = Object.entries(graph.modules)
 		--mg-text: var(--text);
 		--mg-muted: var(--muted);
 		--mg-lit: var(--accent);
+		--mg-grid: color-mix(in oklch, var(--muted) 20%, transparent);
+		--mg-shadow: rgb(40 36 20 / 0.07);
 		/* Icon colours: ops, leaf modules, collectives, sparkles. */
 		--mg-fn: #7c5cd6;
 		--mg-hex: #b04fc4;
@@ -443,6 +445,7 @@ const boxCards = Object.entries(graph.modules)
 	}
 	@media (prefers-color-scheme: dark) {
 		.mg {
+			--mg-shadow: rgb(0 0 0 / 0.35);
 			--mg-fn: #9d86f0;
 			--mg-hex: #d083e0;
 			--mg-x: #e3a04a;
@@ -468,42 +471,58 @@ const boxCards = Object.entries(graph.modules)
 		font-weight: 600;
 		text-align: center;
 	}
+	/* The drawing sits on a framed panel with a faint dot grid. */
 	.mg-canvas {
 		position: relative;
 		overflow-x: auto;
+		padding: 1.25rem 1rem;
+		border: 1px solid var(--faint);
+		border-radius: 14px;
+		background:
+			radial-gradient(circle, var(--mg-grid) 1px, transparent 1.3px) 0 0 / 18px 18px,
+			var(--bg);
 	}
 	.mg-canvas :global(svg) {
 		display: block;
 		max-width: 100%;
 		height: auto;
 		margin: 0 auto;
+		overflow: visible;
 		font-family: var(--mono);
 	}
 
-	/* Module boxes. */
+	/* Module boxes: tinted more the deeper they nest; function calls dashed. */
 	.mg-canvas :global(.mg-box) {
-		fill: color-mix(in oklch, var(--surface) 45%, transparent);
-		stroke: var(--mg-border);
+		fill: color-mix(in oklch, var(--mg-hex) 3%, color-mix(in oklch, var(--surface) 55%, transparent));
+		stroke: color-mix(in oklch, var(--mg-hex) 22%, var(--mg-border));
 		stroke-width: 1.1;
 	}
 	.mg-canvas :global(.mg-box[data-depth="0"]) {
-		fill: transparent;
+		fill: color-mix(in oklch, var(--surface) 30%, transparent);
+	}
+	.mg-canvas :global(.mg-box[data-depth="2"]),
+	.mg-canvas :global(.mg-box[data-depth="3"]) {
+		fill: color-mix(in oklch, var(--mg-hex) 5%, var(--surface));
 	}
 	.mg-canvas :global(.mg-box.dashed) {
-		fill: transparent;
-		stroke: var(--mg-line);
+		fill: color-mix(in oklch, var(--mg-fn) 3%, transparent);
+		stroke: color-mix(in oklch, var(--mg-fn) 45%, var(--mg-border));
 		stroke-dasharray: 5 4;
+		stroke-linecap: round;
+	}
+	.mg-canvas :global(.mg-chip) {
+		fill: var(--mg-card);
+		stroke: color-mix(in oklch, var(--mg-hex) 25%, var(--mg-border));
+		stroke-width: 1;
+	}
+	.mg-canvas :global(.mg-chip.fn) {
+		stroke: color-mix(in oklch, var(--mg-fn) 40%, var(--mg-border));
 	}
 	.mg-canvas :global(.mg-box-t) {
 		font-size: 11px;
 		fill: var(--mg-muted);
-		stroke: var(--bg);
-		stroke-width: 4px;
-		stroke-linejoin: round;
-		paint-order: stroke;
 		pointer-events: none;
 	}
-
 	.mg-canvas :global(.mg-box-t.has-card) {
 		fill: var(--mg-text);
 		text-decoration: underline dotted;
@@ -514,16 +533,39 @@ const boxCards = Object.entries(graph.modules)
 		outline: none;
 	}
 
-	/* Wires. */
+	/* Wires: rounded corners, dots where bundles split or join, a flow along lit wires. */
 	.mg-canvas :global(.mg-wire) {
 		fill: none;
 		stroke: var(--mg-line);
-		stroke-width: 1.1;
+		stroke-width: 1.25;
+		stroke-linejoin: round;
 		transition: stroke 0.15s;
 	}
 	.mg-canvas :global(.mg-arrow) {
 		fill: var(--mg-line);
+		stroke: var(--mg-line);
+		stroke-width: 1;
+		stroke-linejoin: round;
 		transition: fill 0.15s;
+	}
+	.mg-canvas :global(.mg-junction) {
+		fill: var(--mg-line);
+		stroke: var(--bg);
+		stroke-width: 1.5;
+		pointer-events: none;
+		transition: opacity 0.15s;
+	}
+	.mg-canvas:global(.focused) :global(.mg-junction) {
+		opacity: 0.3;
+	}
+	.mg-canvas :global(.mg-flow) {
+		display: none;
+		fill: none;
+		stroke: var(--mg-card);
+		stroke-width: 1.4;
+		stroke-linecap: round;
+		stroke-dasharray: 2 9;
+		pointer-events: none;
 	}
 	.mg-canvas :global(.mg-hit) {
 		fill: none;
@@ -534,32 +576,76 @@ const boxCards = Object.entries(graph.modules)
 	}
 	.mg-canvas :global(.mg-edge.lit .mg-wire) {
 		stroke: var(--mg-lit);
-		stroke-width: 1.6;
+		stroke-width: 2.4;
+		filter: drop-shadow(0 0 3px color-mix(in oklch, var(--mg-lit) 45%, transparent));
+	}
+	.mg-canvas :global(.mg-edge.lit .mg-flow) {
+		display: inline;
+		animation: mg-flow 0.9s linear infinite;
 	}
 	.mg-canvas :global(.mg-edge.lit .mg-arrow) {
 		fill: var(--mg-lit);
+		stroke: var(--mg-lit);
+	}
+	@keyframes mg-flow {
+		from {
+			stroke-dashoffset: 11;
+		}
+		to {
+			stroke-dashoffset: 0;
+		}
+	}
+	@media (prefers-reduced-motion: reduce) {
+		.mg-canvas :global(.mg-edge.lit .mg-flow) {
+			display: none;
+		}
 	}
 
-	/* Cards. */
+	/* Cards: a colour per kind (ops, leaf modules, collectives, inputs and outputs). */
 	.mg-canvas :global(.mg-node) {
+		--k: var(--mg-fn);
 		cursor: pointer;
 		outline: none;
 	}
+	.mg-canvas :global(.mg-node.k-module) {
+		--k: var(--mg-hex);
+	}
+	.mg-canvas :global(.mg-node.k-collective) {
+		--k: var(--mg-x);
+	}
+	.mg-canvas :global(.mg-node.k-input),
+	.mg-canvas :global(.mg-node.k-output) {
+		--k: var(--accent);
+	}
 	.mg-canvas :global(.mg-cardbox) {
-		fill: var(--mg-card);
-		stroke: var(--mg-border);
+		fill: color-mix(in oklch, var(--k) 4%, var(--mg-card));
+		stroke: color-mix(in oklch, var(--k) 28%, var(--mg-border));
 		stroke-width: 1.1;
+		filter: drop-shadow(0 1px 1.5px var(--mg-shadow)) drop-shadow(0 4px 10px var(--mg-shadow));
+		transition:
+			stroke 0.15s,
+			filter 0.15s;
+	}
+	.mg-canvas :global(.mg-bar) {
+		fill: var(--k);
+		opacity: 0.85;
+	}
+	.mg-canvas :global(.mg-tile) {
+		fill: color-mix(in oklch, var(--k) 13%, var(--mg-card));
 	}
 	.mg-canvas :global(.mg-t) {
 		font-size: 13px;
+		font-weight: 500;
 		fill: var(--mg-text);
 	}
 	.mg-canvas :global(.mg-s) {
 		font-size: 11px;
 		fill: var(--mg-muted);
 	}
+	.mg-canvas :global(.mg-node:hover .mg-cardbox),
 	.mg-canvas :global(.mg-node.near .mg-cardbox) {
-		stroke: var(--mg-lit);
+		stroke: var(--k);
+		filter: drop-shadow(0 2px 3px var(--mg-shadow)) drop-shadow(0 8px 18px var(--mg-shadow));
 	}
 	.mg-canvas :global(.mg-node:focus-visible .mg-cardbox) {
 		stroke: var(--mg-lit);
@@ -571,7 +657,7 @@ const boxCards = Object.entries(graph.modules)
 	}
 	.mg-canvas:global(.focused) :global(.mg-node:not(.near)),
 	.mg-canvas:global(.focused) :global(.mg-edge:not(.lit)) {
-		opacity: 0.35;
+		opacity: 0.3;
 	}
 
 	/* Collapse / expand buttons. */
