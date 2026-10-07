@@ -6,7 +6,8 @@
 // as possible above or below what they connect to. An edge that skips rows gets a lane (a
 // dummy cell) in every row it crosses; an edge that leaves or enters a box gets a lane down to
 // the box's bottom (from its top) and a port there, so every edge is routed through free space
-// and each box is exactly as big as its contents.
+// and each box is exactly as big as its contents. Lanes are bundled: edges into one node share a
+// trunk that the others join, and the remaining edges from one source share one until they branch.
 import { type LoweredGraph, type Node, moduleLabel } from "./moduleGraph";
 
 /** The invisible outermost box: the root's input nodes, the root box, its output nodes. */
@@ -79,6 +80,8 @@ export interface PlacedBlock extends Rect {
 	label: string;
 	dashed: boolean;
 	depth: number;
+	/** The module lists weights: its label opens a hover card. */
+	card: boolean;
 }
 export interface PlacedEdge {
 	index: number;
@@ -120,8 +123,8 @@ interface BoxLayout {
 	rows: Cell[][];
 	rowTop: number[];
 	rowH: number[];
-	/** Lanes by key: `i|a|b|src` inside, `in|b|src` from the top, `out|a|src` to the bottom. */
-	chains: Map<string, Cell[]>;
+	/** Each edge's lane cells by key: `i|src|to` inside, `in|src|to` from the top, `out|src` to the bottom. */
+	routes: Map<string, Cell[]>;
 	/** Port x (box coordinates) on the top edge, per edge: key `targetNode|src`. */
 	inPort: Map<string, number>;
 	/** Port x on the bottom edge, one per producing node. */
@@ -189,7 +192,7 @@ export function layoutModule(g: LoweredGraph): Layout {
 		};
 
 		// Classify every edge by where it runs relative to this box.
-		type Inner = { a: string; b: string; src: string };
+		type Inner = { a: string; b: string; src: string; to: string };
 		const inner: Inner[] = [];
 		const incoming: { b: string; src: string; to: string }[] = [];
 		const outgoing: { a: string; src: string }[] = [];
@@ -197,7 +200,7 @@ export function layoutModule(g: LoweredGraph): Layout {
 			const a = itemOf(box, e.from);
 			const b = itemOf(box, e.to);
 			if (a !== undefined && b !== undefined && a !== b)
-				inner.push({ a, b, src: e.from });
+				inner.push({ a, b, src: e.from, to: e.to });
 			else if (a !== undefined && b === undefined)
 				outgoing.push({ a, src: e.from });
 			else if (a === undefined && b !== undefined)
@@ -260,37 +263,93 @@ export function layoutModule(g: LoweredGraph): Layout {
 			u.succs.push(v);
 			v.preds.push(u);
 		};
-		const chains = new Map<string, Cell[]>();
-		const lane = (key: string, from: number, to: number) => {
+		// Lanes: an edge that skips rows runs down a column of dummy cells, one per row it crosses.
+		// Lanes are shared so that wires bundle instead of running side by side: the edges into
+		// one node join one trunk (each enters it in the gap above its first row, |__ __|), and
+		// the other edges from one source share the source's trunk, each leaving it in the gap
+		// above its target. `routes` holds each edge's slice of a trunk, by key: `i|src|to`
+		// inside the box, `in|src|to` from its top edge, `out|src` to its bottom edge.
+		const routes = new Map<string, Cell[]>();
+		const trunk = (key: string, from: number, to: number) => {
 			const out: Cell[] = [];
 			for (let r = from; r <= to; r++)
 				out.push(addCell(`${key}#${r}`, true, r, 0, 0));
 			for (let k = 1; k < out.length; k++) link(out[k - 1], out[k]);
-			chains.set(key, out);
 			return out;
 		};
-		for (const { a, b, src } of inner) {
-			const key = `i|${a}|${b}|${src}`;
-			if (chains.has(key)) continue;
-			const ca = cells.get(a) as Cell;
-			const cb = cells.get(b) as Cell;
-			const ds = lane(key, ca.rank + 1, cb.rank - 1);
-			const path = [ca, ...ds, cb];
-			for (let k = 1; k < path.length; k++) link(path[k - 1], path[k]);
+		type Route = {
+			key: string;
+			src: string;
+			to?: string;
+			a?: string;
+			b?: string;
+			/** The rows its lane crosses; empty when lo > hi. */
+			lo: number;
+			hi: number;
+		};
+		const routeOf = new Map<string, Route>();
+		const rankOf = (id: string) => rank.get(id) ?? 0;
+		for (const { a, b, src, to } of inner) {
+			const key = `i|${src}|${to}`;
+			if (!routeOf.has(key))
+				routeOf.set(key, {
+					key,
+					src,
+					to,
+					a,
+					b,
+					lo: rankOf(a) + 1,
+					hi: rankOf(b) - 1,
+				});
 		}
-		for (const { b, src } of incoming) {
-			const key = `in|${b}|${src}`;
-			if (chains.has(key)) continue;
-			const cb = cells.get(b) as Cell;
-			const ds = lane(key, 0, cb.rank - 1);
-			if (ds.length) link(ds[ds.length - 1], cb);
+		for (const { b, src, to } of incoming) {
+			const key = `in|${src}|${to}`;
+			if (!routeOf.has(key))
+				routeOf.set(key, { key, src, to, b, lo: 0, hi: rankOf(b) - 1 });
 		}
 		for (const { a, src } of outgoing) {
-			const key = `out|${a}|${src}`;
-			if (chains.has(key)) continue;
-			const ca = cells.get(a) as Cell;
-			const ds = lane(key, ca.rank + 1, maxRank);
-			if (ds.length) link(ca, ds[0]);
+			const key = `out|${src}`;
+			if (!routeOf.has(key))
+				routeOf.set(key, { key, src, a, lo: rankOf(a) + 1, hi: maxRank });
+		}
+		const groups = (rs: Route[], by: (r: Route) => string) => {
+			const m = new Map<string, Route[]>();
+			for (const r of rs) m.set(by(r), [...(m.get(by(r)) ?? []), r]);
+			return m;
+		};
+		const lanes = [...routeOf.values()].filter((r) => r.lo <= r.hi);
+		const merged = new Set<Route>();
+		for (const [to, rs] of groups(
+			lanes.filter((r) => r.to !== undefined),
+			(r) => r.to as string,
+		)) {
+			if (rs.length < 2) continue;
+			const lo = Math.min(...rs.map((r) => r.lo));
+			const t = trunk(`fi|${to}`, lo, rs[0].hi);
+			for (const r of rs) {
+				routes.set(r.key, t.slice(r.lo - lo));
+				merged.add(r);
+			}
+		}
+		for (const [src, rs] of groups(
+			lanes.filter((r) => !merged.has(r)),
+			(r) => r.src,
+		)) {
+			const lo = Math.min(...rs.map((r) => r.lo));
+			const t = trunk(`fo|${src}`, lo, Math.max(...rs.map((r) => r.hi)));
+			for (const r of rs) routes.set(r.key, t.slice(r.lo - lo, r.hi - lo + 1));
+		}
+		// Ordering links: the source item to its route's first cell, the last cell to the target.
+		for (const r of routeOf.values()) {
+			const cs = routes.get(r.key) ?? [];
+			const ca = r.a === undefined ? undefined : cells.get(r.a);
+			const cb = r.b === undefined ? undefined : cells.get(r.b);
+			if (!cs.length) {
+				if (ca && cb) link(ca, cb);
+				continue;
+			}
+			if (ca) link(ca, cs[0]);
+			if (cb) link(cs[cs.length - 1], cb);
 		}
 
 		orderRows(
@@ -327,7 +386,7 @@ export function layoutModule(g: LoweredGraph): Layout {
 			rows,
 			rowTop,
 			rowH,
-			chains,
+			routes,
 			inPort: new Map(),
 			outPort: new Map(),
 		};
@@ -335,7 +394,7 @@ export function layoutModule(g: LoweredGraph): Layout {
 		// Ports: where each edge crosses the top edge (straight down its lane, or straight into
 		// the item below), and each tensor the bottom edge.
 		for (const { b, src, to } of incoming) {
-			const ds = chains.get(`in|${b}|${src}`) ?? [];
+			const ds = routes.get(`in|${src}|${to}`) ?? [];
 			layout.inPort.set(
 				`${to}|${src}`,
 				ds.length ? ds[0].x : entryX(cells.get(b) as Cell, src, to),
@@ -343,7 +402,7 @@ export function layoutModule(g: LoweredGraph): Layout {
 		}
 		for (const { a, src } of outgoing) {
 			if (layout.outPort.has(src)) continue;
-			const ds = chains.get(`out|${a}|${src}`) ?? [];
+			const ds = routes.get(`out|${src}`) ?? [];
 			layout.outPort.set(
 				src,
 				ds.length ? ds[ds.length - 1].x : exitX(cells.get(a) as Cell, src),
@@ -405,7 +464,7 @@ export function layoutModule(g: LoweredGraph): Layout {
 	const laneWays = (box: string, key: string): Way[] => {
 		const l = boxes.get(box) as BoxLayout;
 		const at = abs.get(box) as Rect;
-		return (l.chains.get(key) ?? []).map((c) => ({
+		return (l.routes.get(key) ?? []).map((c) => ({
 			x: at.x + c.x,
 			top: at.y + l.rowTop[c.rank],
 			bottom: at.y + l.rowTop[c.rank] + l.rowH[c.rank],
@@ -420,18 +479,13 @@ export function layoutModule(g: LoweredGraph): Layout {
 		const ways: Way[] = [];
 		for (const b of up) {
 			if (b === lca) break;
-			ways.push(...laneWays(b, `out|${itemOf(b, e.from)}|${e.from}`));
+			ways.push(...laneWays(b, `out|${e.from}`));
 			const at = abs.get(b) as Rect;
 			const x =
 				at.x + ((boxes.get(b) as BoxLayout).outPort.get(e.from) ?? at.w / 2);
 			ways.push({ x, top: at.y + at.h, bottom: band(b).bottom });
 		}
-		ways.push(
-			...laneWays(
-				lca,
-				`i|${itemOf(lca, e.from)}|${itemOf(lca, e.to)}|${e.from}`,
-			),
-		);
+		ways.push(...laneWays(lca, `i|${e.from}|${e.to}`));
 		const down = ancestors(e.to);
 		for (const b of down.slice(0, down.indexOf(lca)).reverse()) {
 			const at = abs.get(b) as Rect;
@@ -441,7 +495,7 @@ export function layoutModule(g: LoweredGraph): Layout {
 				top: band(b).top,
 				bottom: at.y,
 			});
-			ways.push(...laneWays(b, `in|${itemOf(b, e.to)}|${e.from}`));
+			ways.push(...laneWays(b, `in|${e.from}|${e.to}`));
 		}
 		ways.push({ x: t.x + t.w / 2, top: band(e.to).top, bottom: t.y });
 		// The last waypoint ends on the target's top edge; stop short of it for the arrowhead.
@@ -474,6 +528,7 @@ export function layoutModule(g: LoweredGraph): Layout {
 			id,
 			label: labelOf(id),
 			dashed: g.modules[id]?.function !== undefined,
+			card: g.modules[id]?.weights !== undefined,
 			...(abs.get(id) as Rect),
 			depth: depthOf(id),
 		}))

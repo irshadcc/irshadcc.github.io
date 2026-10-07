@@ -4,8 +4,12 @@
 // calls in dashed boxes), and every tensor a thin right-angled wire with an arrowhead, from the
 // op that produced it to each op that reads it. Cards carry an icon (an op, a leaf module, a
 // collective, an input or an output), a monospace title and the PyTorch call as a muted subtitle.
-// Hovering a card lights its wires and neighbours and shows its equation; hovering a wire shows
-// its tensor as a matrix with axis titles and shape. Every box has a − button that collapses it
+// Hovering a card lights its wires and neighbours and shows its equation, its input and output
+// shapes and its weights (if the spec lists any: a value histogram, the singular values and the
+// numerical, effective and stable ranks, which show rank collapse); hovering a wire shows its
+// tensor as a matrix with axis titles and shape; hovering the label of a box with weights shows
+// them. The names in symbolic shapes are explained from the root's `symbols`. Clicking a card,
+// wire or box label pins its hover card (a second click, a click elsewhere or Escape unpins it). Every box has a − button that collapses it
 // into one card, which gets a + button to expand it again; `collapsed` lists the boxes (dotted
 // names, "" for the root) that start collapsed. The input is a nested JSON module
 // (moduleGraph.ts describes the format), lowered to a flat graph that moduleLayout.ts lays out
@@ -15,9 +19,17 @@
 //   import spec from "../../utils/distributed/graph/megatronMoe.json";
 //   <ModuleGraph spec={spec} wide collapsed={["local_experts.1"]} />
 import katex from "katex";
-import { type ModuleSpec, collapse, lower } from "./moduleGraph";
+import {
+	type ModuleSpec,
+	type TensorValue,
+	type WeightSpec,
+	collapse,
+	lower,
+	moduleLabel,
+} from "./moduleGraph";
 import { layoutModule } from "./moduleLayout";
 import { renderSvg } from "./moduleRender";
+import { weightHtml, weightStats } from "./weightStats";
 
 interface Props {
 	spec: ModuleSpec;
@@ -36,16 +48,22 @@ for (const c of collapsed)
 			`ModuleGraph: collapsed "${c}" is not a module or function with operations`,
 		);
 const svg = renderSvg(layoutModule(collapse(graph, collapsed)), title);
-// What the browser needs to redraw after a toggle: the graph without equations or tensor values.
+// What the browser needs to redraw after a toggle: the graph without equations, tensor values or
+// weights (a module keeps an empty `weights` as the mark that its label has a card).
 const clientGraph = {
-	nodes: graph.nodes.map(({ equation, ...n }) => n),
+	nodes: graph.nodes.map(({ equation, outputs, weights, ...n }) => n),
 	edges: graph.edges.map((e) => ({
 		from: e.from,
 		to: e.to,
 		index: e.index,
 		tensor: { name: e.tensor.name, shape: [] },
 	})),
-	modules: graph.modules,
+	modules: Object.fromEntries(
+		Object.entries(graph.modules).map(([k, m]) => [
+			k,
+			{ ...m, weights: m.weights ? {} : undefined },
+		]),
+	),
 };
 const data = JSON.stringify({ graph: clientGraph, collapsed, title }).replace(
 	/</g,
@@ -58,6 +76,41 @@ const tex = (l: string) =>
 		output: "html",
 	});
 const isZero = (v: string) => /^-?0(\.0+)?$/.test(v);
+const symbols = spec.symbols ?? {};
+/** The names in these shapes that `symbols` explains, in order of first use. */
+const usedSymbols = (ts: TensorValue[]) =>
+	[
+		...new Set(
+			ts.flatMap((t) => t.symbolic_shape?.match(/[A-Za-z_]\w*/g) ?? []),
+		),
+	].filter((w) => Object.hasOwn(symbols, w));
+const weightsHtml = (ws?: Record<string, WeightSpec>) =>
+	Object.entries(ws ?? {})
+		.map(([k, w]) => weightHtml(k, weightStats(w)))
+		.join("");
+const unique = <T extends { name: string }>(ts: T[]) =>
+	ts.filter((t, i) => ts.findIndex((u) => u.name === t.name) === i);
+/** A card per node: its equation, the tensors it reads and writes, its weights. */
+const nodeCards = graph.nodes.map((n) => {
+	const ins = unique(
+		graph.edges.filter((e) => e.to === n.id).map((e) => e.tensor),
+	);
+	const outs = unique(n.outputs ?? []);
+	return {
+		n,
+		ins,
+		outs,
+		syms: usedSymbols([...ins, ...outs]),
+		weights: weightsHtml(n.weights),
+	};
+});
+const boxCards = Object.entries(graph.modules)
+	.filter(([, m]) => m.weights)
+	.map(([id, m]) => ({
+		id,
+		label: moduleLabel(id, m),
+		weights: weightsHtml(m.weights),
+	}));
 ---
 
 <figure class:list={["mg", { wide }]}>
@@ -65,16 +118,50 @@ const isZero = (v: string) => /^-?0(\.0+)?$/.test(v);
 	<div class="mg-canvas">
 		<div class="mg-svg" set:html={svg} />
 		<script is:inline type="application/json" class="mg-data" set:html={data} />
+	</div>
+	<!-- Hover cards sit outside the scrolling canvas, so a tall card is not clipped by it. -->
+	<div class="mg-cards">
 		{
-			graph.nodes
-				.filter((n) => n.equation)
-				.map((n) => (
-					<div class="mg-card eq" data-node={n.id} hidden>
-						<p class="card-title">{n.equation?.title}</p>
-						{n.equation?.latex.map((l) => <div class="katex-line" set:html={tex(l)} />)}
-						{n.equation?.note && <p class="card-note">{n.equation.note}</p>}
-					</div>
-				))
+			nodeCards.map(({ n, ins, outs, syms, weights }) => (
+				<div class="mg-card eq" data-node={n.id} hidden>
+					<p class="card-title">{n.equation?.title ?? <code>{n.label}</code>}</p>
+					{n.equation?.latex.map((l) => <div class="katex-line" set:html={tex(l)} />)}
+					{n.equation?.note && <p class="card-note">{n.equation.note}</p>}
+					{ins.length + outs.length > 0 && (
+						<table class="io">
+							<tbody>
+								{[...ins.map((t) => ["in", t] as const), ...outs.map((t) => ["out", t] as const)].map(([dir, t]) => (
+									<tr>
+										<th>{dir}</th>
+										<td><code>{t.name}</code></td>
+										<td class="sym">{t.symbolic_shape}</td>
+										<td class="concrete">({t.shape.join(", ")})</td>
+									</tr>
+								))}
+							</tbody>
+						</table>
+					)}
+					{syms.length > 0 && (
+						<dl class="syms">
+							{syms.map((w) => (
+								<>
+									<dt>{w}</dt>
+									<dd>{symbols[w]}</dd>
+								</>
+							))}
+						</dl>
+					)}
+					{weights && <Fragment set:html={weights} />}
+				</div>
+			))
+		}
+		{
+			boxCards.map((b) => (
+				<div class="mg-card eq" data-module={b.id} hidden>
+					<p class="card-title"><code>{b.label}</code></p>
+					<Fragment set:html={b.weights} />
+				</div>
+			))
 		}
 		{
 			graph.edges.map((e) => {
@@ -121,6 +208,16 @@ const isZero = (v: string) => /^-?0(\.0+)?$/.test(v);
 							{t.symbolic_shape && <span class="sym">{t.symbolic_shape} = </span>}
 							<span class="concrete">({t.shape.join(", ")})</span>
 						</p>
+						{usedSymbols([t]).length > 0 && (
+							<dl class="syms">
+								{usedSymbols([t]).map((w) => (
+									<>
+										<dt>{w}</dt>
+										<dd>{symbols[w]}</dd>
+									</>
+								))}
+							</dl>
+						)}
 						{t.note && <p class="card-note">{t.note}</p>}
 					</div>
 				);
@@ -145,18 +242,40 @@ const isZero = (v: string) => /^-?0(\.0+)?$/.test(v);
 		const hideCards = () => {
 			for (const c of cards) c.hidden = true;
 		};
-		/** Keeps a card inside the canvas: at (x, y), or above `above` if there's no room below. */
+		/**
+		 * Places a card (figure coordinates) at (x, y), within the figure's width; above `above`
+		 * instead when it would run past the bottom of the window and fits above.
+		 */
 		const put = (card: HTMLElement, x: number, y: number, above: number) => {
-			const box = canvas.getBoundingClientRect();
-			const left = Math.min(Math.max(0, x), Math.max(0, canvas.scrollWidth - card.offsetWidth));
-			const top = y + card.offsetHeight > box.height && above - card.offsetHeight > 0 ? above - card.offsetHeight : y;
+			const box = fig.getBoundingClientRect();
+			const h = card.offsetHeight;
+			const left = Math.min(Math.max(0, x), Math.max(0, fig.clientWidth - card.offsetWidth));
+			const top = box.top + y + h > window.innerHeight && box.top + above - h > 0 ? above - h : y;
 			card.style.left = `${left}px`;
-			card.style.top = `${Math.max(0, top)}px`;
+			card.style.top = `${top}px`;
 		};
 		const local = (r: DOMRect) => {
-			const box = canvas.getBoundingClientRect();
-			return { x: r.left - box.left + canvas.scrollLeft, y: r.top - box.top, w: r.width, h: r.height };
+			const box = fig.getBoundingClientRect();
+			return { x: r.left - box.left, y: r.top - box.top, w: r.width, h: r.height };
 		};
+		/**
+		 * A clicked node, wire or box label pins its card: hovering then changes nothing until the
+		 * same element is clicked again, the reader clicks elsewhere, or presses Escape.
+		 */
+		let pinned: Element | null = null;
+		let clear = () => {};
+		const unpin = () => {
+			pinned = null;
+			for (const c of cards) c.classList.remove("pinned");
+			clear();
+		};
+		document.addEventListener("click", (ev) => {
+			const t = ev.target as Element | null;
+			if (pinned && !(t && fig.contains(t) && t.closest(".mg-node, .mg-hit, .mg-box-hit, .mg-card"))) unpin();
+		});
+		document.addEventListener("keydown", (ev) => {
+			if (pinned && ev.key === "Escape") unpin();
+		});
 
 		/** Hover behaviour for the current drawing (it is replaced on every toggle). */
 		const bind = () => {
@@ -179,9 +298,37 @@ const isZero = (v: string) => /^-?0(\.0+)?$/.test(v);
 				hideCards();
 				light([]);
 			};
+			clear = reset;
+			/** Hover shows (and leaving hides) a card unless one is pinned; a click pins or unpins. */
+			const pinnable = (el: Element, card: HTMLElement | null, show: (ev?: Event) => void) => {
+				el.addEventListener("pointerenter", (ev) => {
+					if (!pinned) show(ev);
+				});
+				el.addEventListener("pointerleave", () => {
+					if (!pinned) reset();
+				});
+				const click = (ev?: Event) => {
+					if (pinned === el) return unpin();
+					unpin();
+					show(ev);
+					pinned = el;
+					card?.classList.add("pinned");
+				};
+				el.addEventListener("click", click);
+				el.addEventListener("keydown", (ev) => {
+					const k = (ev as KeyboardEvent).key;
+					if (k === "Enter" || k === " ") {
+						ev.preventDefault();
+						click();
+					}
+				});
+			};
 			for (const n of nodes) {
 				const id = n.dataset.id ?? "";
-				const card = fig.querySelector<HTMLElement>(`.mg-card[data-node="${CSS.escape(id)}"]`);
+				// A collapsed box's card shows the module's weights, if it lists any.
+				const card = fig.querySelector<HTMLElement>(
+					n.classList.contains("collapsed") ? `.mg-card[data-module="${CSS.escape(id)}"]` : `.mg-card[data-node="${CSS.escape(id)}"]`,
+				);
 				const show = () => {
 					reset();
 					light(
@@ -193,28 +340,50 @@ const isZero = (v: string) => /^-?0(\.0+)?$/.test(v);
 					const b = local(n.getBoundingClientRect());
 					put(card, b.x + b.w / 2 - card.offsetWidth / 2, b.y + b.h + 8, b.y - 8);
 				};
-				n.addEventListener("pointerenter", show);
-				n.addEventListener("focus", show);
-				n.addEventListener("pointerleave", reset);
-				n.addEventListener("blur", reset);
+				pinnable(n, card, show);
+				n.addEventListener("focus", () => {
+					if (!pinned) show();
+				});
+				n.addEventListener("blur", () => {
+					if (!pinned) reset();
+				});
 			}
 			for (const e of edges) {
 				const card = fig.querySelector<HTMLElement>(`.mg-card[data-edge="${e.dataset.i}"]`);
 				const hit = e.querySelector(".mg-hit");
 				if (!card || !hit) continue;
-				const move = (ev: Event) => {
-					const p = ev as PointerEvent;
-					const box = canvas.getBoundingClientRect();
-					put(card, p.clientX - box.left + canvas.scrollLeft + 14, p.clientY - box.top + 14, p.clientY - box.top - 14);
+				const move = (ev?: Event) => {
+					const p = ev as PointerEvent | undefined;
+					const box = fig.getBoundingClientRect();
+					if (!p) return put(card, 0, local(hit.getBoundingClientRect()).y, 0);
+					put(card, p.clientX - box.left + 14, p.clientY - box.top + 14, p.clientY - box.top - 14);
 				};
-				hit.addEventListener("pointerenter", (ev) => {
+				pinnable(hit, card, (ev) => {
 					reset();
 					light([e]);
 					card.hidden = false;
 					move(ev);
 				});
-				hit.addEventListener("pointermove", move);
-				hit.addEventListener("pointerleave", reset);
+				hit.addEventListener("pointermove", (ev) => {
+					if (!pinned) move(ev);
+				});
+			}
+			for (const hit of svg.querySelectorAll<SVGRectElement>(".mg-box-hit")) {
+				const card = fig.querySelector<HTMLElement>(`.mg-card[data-module="${CSS.escape(hit.dataset.box ?? "")}"]`);
+				if (!card) continue;
+				const show = () => {
+					reset();
+					card.hidden = false;
+					const b = local(hit.getBoundingClientRect());
+					put(card, b.x, b.y + b.h + 6, b.y - 6);
+				};
+				pinnable(hit, card, show);
+				hit.addEventListener("focus", () => {
+					if (!pinned) show();
+				});
+				hit.addEventListener("blur", () => {
+					if (!pinned) reset();
+				});
 			}
 			for (const t of svg.querySelectorAll<SVGGElement>(".mg-toggle")) {
 				const box = t.dataset.box ?? "";
@@ -234,6 +403,8 @@ const isZero = (v: string) => /^-?0(\.0+)?$/.test(v);
 		};
 		/** Lay out and draw the graph again, then give the toggled box's button the focus back. */
 		const redraw = (focus: string) => {
+			pinned = null;
+			for (const c of cards) c.classList.remove("pinned");
 			hideCards();
 			canvas.classList.remove("focused");
 			holder.innerHTML = renderSvg(layoutModule(collapse(data.graph, collapsed)), data.title);
@@ -266,6 +437,7 @@ const isZero = (v: string) => /^-?0(\.0+)?$/.test(v);
 		--t5: #008300;
 		--t6: #4a3aa7;
 		--t7: #e34948;
+		position: relative;
 		margin: 1.75rem 0;
 		font-family: var(--sans);
 	}
@@ -332,6 +504,16 @@ const isZero = (v: string) => /^-?0(\.0+)?$/.test(v);
 		pointer-events: none;
 	}
 
+	.mg-canvas :global(.mg-box-t.has-card) {
+		fill: var(--mg-text);
+		text-decoration: underline dotted;
+	}
+	.mg-canvas :global(.mg-box-hit) {
+		fill: transparent;
+		cursor: pointer;
+		outline: none;
+	}
+
 	/* Wires. */
 	.mg-canvas :global(.mg-wire) {
 		fill: none;
@@ -348,7 +530,7 @@ const isZero = (v: string) => /^-?0(\.0+)?$/.test(v);
 		stroke: transparent;
 		stroke-width: 12;
 		pointer-events: stroke;
-		cursor: help;
+		cursor: pointer;
 	}
 	.mg-canvas :global(.mg-edge.lit .mg-wire) {
 		stroke: var(--mg-lit);
@@ -360,7 +542,7 @@ const isZero = (v: string) => /^-?0(\.0+)?$/.test(v);
 
 	/* Cards. */
 	.mg-canvas :global(.mg-node) {
-		cursor: default;
+		cursor: pointer;
 		outline: none;
 	}
 	.mg-canvas :global(.mg-cardbox) {
@@ -474,6 +656,11 @@ const isZero = (v: string) => /^-?0(\.0+)?$/.test(v);
 		font-size: 0.72rem;
 		pointer-events: none;
 	}
+	/* A pinned card takes the pointer, so its text can be selected. */
+	.mg-card.pinned {
+		border-color: var(--accent);
+		pointer-events: auto;
+	}
 	.mg-card[hidden] {
 		display: none;
 	}
@@ -561,6 +748,138 @@ const isZero = (v: string) => /^-?0(\.0+)?$/.test(v);
 		text-align: center;
 		font-family: var(--mono);
 		font-size: 0.68rem;
+	}
+	/* A node's tensors, the meaning of shape names, weights. */
+	.io {
+		width: auto;
+		margin: 0.4rem 0 0;
+		border-collapse: collapse;
+		font-size: 0.68rem;
+	}
+	.io th,
+	.io td {
+		padding: 0.05rem 0.4rem 0.05rem 0;
+		border: 0;
+		white-space: nowrap;
+		text-align: left;
+	}
+	.io th {
+		font-weight: 400;
+		color: var(--muted);
+	}
+	.io .sym {
+		font-family: var(--mono);
+	}
+	.io .concrete {
+		font-family: var(--mono);
+		color: var(--muted);
+	}
+	.syms {
+		display: grid;
+		grid-template-columns: max-content 1fr;
+		gap: 0.1rem 0.6rem;
+		margin: 0.4rem 0 0;
+		padding-top: 0.35rem;
+		border-top: 1px solid var(--faint);
+		font-size: 0.68rem;
+		line-height: 1.35;
+	}
+	.syms dt {
+		font-family: var(--mono);
+	}
+	.syms dd {
+		margin: 0;
+		color: var(--muted);
+	}
+	.mg-card :global(.wt) {
+		margin-top: 0.5rem;
+		padding-top: 0.4rem;
+		border-top: 1px solid var(--faint);
+	}
+	.mg-card :global(.wt-head) {
+		margin: 0;
+		font-size: 0.72rem;
+	}
+	.mg-card :global(.wt-head span) {
+		font-family: var(--mono);
+		color: var(--muted);
+	}
+	.mg-card :global(.wt-plots) {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.75rem;
+		margin-top: 0.3rem;
+	}
+	.mg-card :global(.wt-plots figure) {
+		margin: 0;
+	}
+	.mg-card :global(.wt-plots svg) {
+		display: block;
+		overflow: visible;
+		font-family: var(--mono);
+		font-size: 8px;
+	}
+	.mg-card :global(.wt-plots figcaption) {
+		margin-top: 0.1rem;
+		color: var(--muted);
+		font-size: 0.64rem;
+	}
+	.mg-card :global(.wt-bar) {
+		fill: var(--mg-spark);
+	}
+	.mg-card :global(.wt-bar.low) {
+		fill: color-mix(in oklch, var(--muted) 45%, var(--bg));
+	}
+	.mg-card :global(.wt-axis) {
+		stroke: var(--muted);
+		stroke-width: 0.8;
+	}
+	.mg-card :global(.wt-zero) {
+		stroke: var(--text);
+		stroke-width: 0.8;
+		stroke-dasharray: 2 2;
+	}
+	.mg-card :global(svg text) {
+		fill: var(--muted);
+	}
+	.mg-card :global(.wt-stats) {
+		width: auto;
+		margin: 0.35rem 0 0;
+		border-collapse: collapse;
+		font-size: 0.68rem;
+	}
+	.mg-card :global(.wt-stats th),
+	.mg-card :global(.wt-stats td) {
+		padding: 0.05rem 0.5rem 0.05rem 0;
+		border: 0;
+		white-space: nowrap;
+		text-align: left;
+	}
+	.mg-card :global(.wt-stats th) {
+		font-weight: 400;
+		color: var(--muted);
+	}
+	.mg-card :global(.wt-stats td) {
+		font-family: var(--mono);
+	}
+	.mg-card :global(.wt-meter) {
+		display: inline-block;
+		width: 4.5rem;
+		height: 0.4rem;
+		border-radius: 2px;
+		background: var(--surface);
+		vertical-align: middle;
+	}
+	.mg-card :global(.wt-meter span) {
+		display: block;
+		height: 100%;
+		border-radius: 2px;
+		background: var(--mg-spark);
+	}
+	.mg-card :global(.wt-warn) {
+		margin: 0.35rem 0 0;
+		color: var(--mg-x);
+		font-weight: 600;
 	}
 	.mx-card .sym {
 		color: var(--text);

@@ -2,6 +2,22 @@
 	"name": "",
 	"type": "module",
 	"class": "MegatronMoELayer",
+	"symbols": {
+		"batch_size": "sequences in the batch, B (2 here)",
+		"seq_len": "tokens per sequence, S (2 here)",
+		"hidden": "model width h (4 here)",
+		"total_tokens": "tokens on this rank: batch_size · seq_len, T (4 here)",
+		"num_experts": "experts in the layer across all ranks, E (4 here)",
+		"top_k": "experts each token is sent to, K (2 here)",
+		"ep_size": "expert-parallel ranks (2 here)",
+		"num_local_experts": "experts held by this rank: num_experts / ep_size (2 here)",
+		"output_split_sizes": "rows this rank receives from each rank in the all-to-all",
+		"total_out": "rows this rank receives: sum(output_split_sizes)",
+		"rows": "token copies in the tensor: all copies this rank received or, inside an expert, that expert's share",
+		"local_tokens_per_expert": "token copies for each of this rank's experts; [j] is local expert j's count",
+		"j": "index of a local expert",
+		"ffn_hidden": "inner width of an expert's MLP, f (8 here)"
+	},
 	"inputs": {
 		"hidden_states": {
 			"name": "hidden_states",

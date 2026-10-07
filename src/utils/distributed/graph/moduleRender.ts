@@ -2,7 +2,13 @@
 // wires with arrowheads, box labels, cards, and the collapse / expand buttons. Pure, so
 // ModuleGraph.astro uses it at build time and again in the browser after a box is toggled.
 import { iconSvg } from "./icons";
-import { CARD, type Layout, type PlacedNode, TOGGLE } from "./moduleLayout";
+import {
+	CARD,
+	type Layout,
+	type PlacedBlock,
+	type PlacedNode,
+	TOGGLE,
+} from "./moduleLayout";
 
 const MARGIN = 2;
 const f = (v: number) => (Math.round(v * 10) / 10).toString();
@@ -49,6 +55,14 @@ function card(n: PlacedNode): string {
 	return `<g class="mg-node k-${n.kind}${n.collapsed ? " collapsed" : ""}" data-id="${esc(n.id)}" tabindex="0"><rect class="mg-cardbox" x="${f(n.x)}" y="${f(n.y)}" width="${f(n.w)}" height="${f(n.h)}" rx="6"/>${icon}<text class="mg-t" x="${f(tx)}" y="${f(ty)}">${esc(n.label)}</text>${sub}</g>${button}`;
 }
 
+/** A box's label; a box with weights gets a hover target over it, as wide as the text. */
+function boxLabel(b: PlacedBlock): string {
+	const text = `<text class="mg-box-t${b.card ? " has-card" : ""}" x="${f(b.x + 10)}" y="${f(b.y + 18)}">${esc(b.label)}</text>`;
+	if (!b.card) return text;
+	const w = Math.min([...b.label].length * 6.6 + 12, b.w - TOGGLE - 14);
+	return `<rect class="mg-box-hit" data-box="${esc(b.id)}" tabindex="0" x="${f(b.x + 4)}" y="${f(b.y + 4)}" width="${f(w)}" height="22"/>${text}`;
+}
+
 export function renderSvg(layout: Layout, title?: string): string {
 	const W = layout.width + 2 * MARGIN;
 	const H = layout.height + 2 * MARGIN;
@@ -69,7 +83,7 @@ export function renderSvg(layout: Layout, title?: string): string {
 	const labels = layout.blocks
 		.map(
 			(b) =>
-				`<text class="mg-box-t" x="${f(b.x + 10)}" y="${f(b.y + 18)}">${esc(b.label)}</text>${toggle(b.id, b.id || b.label, true, b.x + b.w - TOGGLE - 6, b.y + 6)}`,
+				`${boxLabel(b)}${toggle(b.id, b.id || b.label, true, b.x + b.w - TOGGLE - 6, b.y + 6)}`,
 		)
 		.join("");
 	return `<svg viewBox="${-MARGIN} ${-MARGIN} ${W} ${H}" width="${W}" height="${H}" style="min-width:${Math.round(W * 0.75)}px" role="img" aria-label="${esc(title ?? "Module dataflow graph")}">${boxes}<g class="mg-edges">${wires}</g>${labels}${layout.nodes.map(card).join("")}</svg>`;

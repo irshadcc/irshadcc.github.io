@@ -1,20 +1,65 @@
 ---
 import Layout from "../../layouts/Layout.astro";
 import ModuleGraph from "../../utils/distributed/graph/ModuleGraph.astro";
+import ffn from "../../utils/distributed/graph/ffnRankExample.json";
 import megatronMoe from "../../utils/distributed/graph/megatronMoe.json";
-import type { ModuleSpec } from "../../utils/distributed/graph/moduleGraph";
+import type {
+	ModuleSpec,
+	WeightSpec,
+} from "../../utils/distributed/graph/moduleGraph";
+
+// The FFN section uses one FFN (8 → 32 → 8, ReLU, no biases) before and after a torch run: the
+// teacher y = A x has rank 2, and AdamW with weight decay 0.1 drives both weights to about two
+// strong directions. Its weights are the run's, rounded to 4 decimals; the component computes
+// the histograms, singular values and ranks from them.
 
 // A residual MLP block, written by hand: a submodule, leaf Linear modules, and a tensor (x) that
-// enters the submodule and is also read outside it. Shapes only, no values.
+// enters the submodule and is also read outside it. Shapes and weights, no tensor values.
 const t = (name: string, shape: number[], symbolic_shape: string) => ({
 	name,
 	shape,
 	symbolic_shape,
 });
+// Weights from a seeded generator: fc1 as at initialization (Gaussian, std 1/√in, full rank), fc2
+// collapsed to rank 2 plus small noise, which the hover card's ranks and spectrum show.
+let seed = 7;
+const uniform = () => {
+	seed = (seed + 0x6d2b79f5) | 0;
+	let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+	t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+	return ((t ^ (t >>> 14)) >>> 0) / 2 ** 32;
+};
+const gauss = () =>
+	Math.sqrt(-2 * Math.log(1 - uniform())) * Math.cos(2 * Math.PI * uniform());
+const matrix = (m: number, n: number, f: (i: number, j: number) => number) =>
+	Array.from({ length: m }, (_, i) =>
+		Array.from({ length: n }, (_, j) => Number(f(i, j).toFixed(4))),
+	);
+const fc1Weight: WeightSpec = {
+	shape: [64, 16],
+	values: matrix(64, 16, () => gauss() / 4),
+	note: "As initialized: std 1/√16.",
+};
+const [u, v] = [matrix(16, 2, gauss), matrix(2, 64, gauss)];
+const fc2Weight: WeightSpec = {
+	shape: [16, 64],
+	values: matrix(
+		16,
+		64,
+		(i, j) => (u[i][0] * v[0][j] + u[i][1] * v[1][j]) / 8 + 0.002 * gauss(),
+	),
+	rank_tol: 0.05,
+	note: "Collapsed: rank 2 plus noise of std 0.002. rank_tol = 0.05 counts only σ above 5% of σ₁.",
+};
+
 const block: ModuleSpec = {
 	name: "",
 	type: "module",
 	class: "ResidualBlock",
+	symbols: {
+		tokens: "rows of the batch: batch size · sequence length",
+		hidden: "the model width; 16 here",
+	},
 	inputs: { x: t("x", [8, 16], "(tokens, hidden)") },
 	operations: {
 		add: {
@@ -44,6 +89,7 @@ const block: ModuleSpec = {
 					class: "Linear",
 					inputs: { input: "h" },
 					outputs: { out: t("fc1(h)", [8, 64], "(tokens, 4·hidden)") },
+					weights: { weight: fc1Weight },
 				},
 				gelu: {
 					type: "op",
@@ -56,9 +102,12 @@ const block: ModuleSpec = {
 					class: "Linear",
 					inputs: { input: "gelu.out" },
 					outputs: { out: t("fc2", [8, 16], "(tokens, hidden)") },
+					weights: { weight: fc2Weight },
 				},
 			},
 			outputs: { out: "fc2.out" },
+			// A module's weights are its named_parameters().
+			weights: { "fc1.weight": fc1Weight, "fc2.weight": fc2Weight },
 		},
 	},
 	outputs: { y: "add.out" },
@@ -69,11 +118,43 @@ const block: ModuleSpec = {
 	<h1>ModuleGraph demo</h1>
 	<p>
 		<code>ModuleGraph</code> draws a PyTorch module from nested JSON (<code>utils/distributed/graph/moduleGraph.ts</code>): ops and
-		leaf modules as nodes, modules as nested boxes, tensors as edges. Hover over an edge for its tensor, a node for its equation.
+		leaf modules as nodes, modules as nested boxes, tensors as edges. Hover over an edge for its tensor, a node for its equation,
+		shapes and weights, and a box's dotted label for its weights. Click any of them to keep its card open; click again,
+		click elsewhere or press Escape to close it. The names in shapes are explained from the spec's
+		<code>symbols</code>.
 	</p>
 
-	<h2>A residual MLP block (shapes only)</h2>
+	<h2>A residual MLP block (shapes and weights)</h2>
+	<p>
+		<code>fc1</code> and <code>fc2</code> list weights: hover <code>fc2</code> to see a collapsed one (rank 2 of 16), or
+		<code>mlp: MLP</code> for both.
+	</p>
 	<ModuleGraph spec={block} title="ResidualBlock.forward" />
+
+	<h2>An FFN's weights before and after training</h2>
+	<p>
+		A two-layer feed-forward network, <code>fc2(relu(fc1(x)))</code> with widths 8 → 32 → 8 and no biases, trained on
+		<code>y = A x</code> where <code>A</code> has rank 2 (512 random inputs, AdamW, lr 0.01, weight decay 0.1, 3000 steps,
+		final MSE 1.4 × 10⁻⁶). Hover over <code>fc1</code> or <code>fc2</code> for one weight, or over the dotted
+		<code>FFN</code> label for both. The weights come from a torch run, rounded to 4 decimals.
+	</p>
+
+	<h3>At initialization</h3>
+	<p>
+		PyTorch's default uniform initialization: the histogram is flat, and the singular values fall slowly. The effective
+		rank is close to the maximum of 8, so every direction is in use.
+	</p>
+	<ModuleGraph spec={ffn.init as ModuleSpec} title="FFN at initialization" />
+
+	<h3>After training</h3>
+	<p>
+		The map to learn needs only two directions, and weight decay shrinks the rest. Two singular values stay large and a
+		third is about 14% of σ₁ in <code>fc1</code>, 23% in <code>fc2</code> (the ReLU needs a little extra to represent a
+		linear map); the rest fall below 8%. The effective rank drops from about 7.7 to about 3. The numerical rank still
+		reads 8 of 8, because no singular value is exactly zero. Rank collapse shows in the effective and stable ranks
+		and the spectrum, not in the exact rank.
+	</p>
+	<ModuleGraph spec={ffn.trained as ModuleSpec} title="FFN after training" />
 
 	<h2>A Megatron-style MoE layer with expert parallelism</h2>
 	<p>One EP rank's forward pass, collectives in orange; values are rank 0's from an EP = 2 run.</p>

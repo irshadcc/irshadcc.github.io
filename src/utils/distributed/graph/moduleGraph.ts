@@ -29,6 +29,11 @@
 // in `function`, e.g. { "type": "function", "function": "_AllToAll.apply", ... }. It is drawn as
 // a dashed box labelled "key: _AllToAll.apply()"; without operations it is a single node.
 //
+// The root may define `symbols`, the meaning of each name used in a symbolic shape, e.g.
+// { "total_tokens": "tokens on this rank: batch_size · seq_len" }; hover cards explain the names
+// their shapes use. Any op or module may list `weights`, its parameters (WeightSpec): hovering
+// its card (or a module box's label) shows their value histogram, singular values and ranks.
+//
 // The listing order of operations carries no meaning: an operation depends on what its inputs
 // reference, and nothing else. The optional `layout.order` lists child names left to right for
 // independent branches. A module with operations is drawn as a box; one without (a leaf, such
@@ -54,6 +59,24 @@ export interface TensorValue {
 	note?: string;
 }
 
+/**
+ * A parameter of an op or module. Give `values` and the component computes the rest at build
+ * time; or give `singular_values` and/or `histogram` (e.g. from a large layer) without values.
+ */
+export interface WeightSpec {
+	/** The parameter's shape, e.g. [out_features, in_features]. */
+	shape: number[];
+	/** The parameter as a matrix, one array per row; flatten a higher-rank weight to (shape[0], rest). */
+	values?: number[][];
+	/** Singular values (any order), when `values` is not given. */
+	singular_values?: number[];
+	/** A histogram of the values, when `values` is not given: n + 1 bin edges, n counts. */
+	histogram?: { edges: number[]; counts: number[] };
+	/** Numerical rank counts σ > rank_tol · σ₁; default max(m, n) · ε of float32. */
+	rank_tol?: number;
+	note?: string;
+}
+
 export interface Equation {
 	title: string;
 	/** LaTeX, one display line each. */
@@ -73,6 +96,8 @@ interface Common {
 	icon?: Icon;
 	/** Shown when the node is hovered. */
 	equation?: Equation;
+	/** Parameters, by name ("weight", "bias"), shown when the node or box is hovered. */
+	weights?: Record<string, WeightSpec>;
 }
 
 export interface OpSpec extends Common {
@@ -100,6 +125,8 @@ export interface ModuleSpec extends Common {
 	/** Module with operations: references in its own scope. Leaf module: tensor values. */
 	outputs: Record<string, Ref | TensorValue>;
 	layout?: { order?: string[] };
+	/** Root only: what each name in a symbolic shape means, e.g. { "hidden": "model width h" }. */
+	symbols?: Record<string, string>;
 }
 
 export type NodeKind = "input" | "output" | "op" | "collective" | "module";
@@ -118,6 +145,9 @@ export interface Node {
 	equation?: Equation;
 	/** A collapsed module or function (see collapse): its id is the module's dotted name. */
 	collapsed?: boolean;
+	/** The tensors it produces (for an output node, none). */
+	outputs?: (TensorValue & { name: string })[];
+	weights?: Record<string, WeightSpec>;
 }
 
 /** A tensor from the node that produced it to one node that reads it. */
@@ -136,6 +166,7 @@ export interface ModuleInfo {
 	function?: string;
 	/** Child ids (dotted) to keep left to right. */
 	order: string[];
+	weights?: Record<string, WeightSpec>;
 }
 
 export interface LoweredGraph {
@@ -185,6 +216,8 @@ export function lower(root: ModuleSpec): LoweredGraph {
 		...t,
 		name: t.name ?? key,
 	});
+	const outputsOf = (outs: Record<string, Ref | TensorValue>) =>
+		Object.entries(outs).flatMap(([k, v]) => (isRef(v) ? [] : [named(v, k)]));
 
 	/** The node (and tensor) a reference in a scope points to. */
 	const resolve = (scope: Scope, ref: Ref): Producer | undefined => {
@@ -277,6 +310,7 @@ export function lower(root: ModuleSpec): LoweredGraph {
 					? (scope.spec.function ?? "")
 					: undefined,
 			order: (scope.spec.layout?.order ?? []).map((k) => join(scope.path, k)),
+			weights: scope.spec.weights,
 		};
 		for (const [key, child] of Object.entries(scope.spec.operations ?? {})) {
 			if (key.includes("."))
@@ -294,6 +328,8 @@ export function lower(root: ModuleSpec): LoweredGraph {
 					subtitle: child.op,
 					icon: iconOf(id, child.icon, collective ? "exchange" : "fn"),
 					equation: child.equation,
+					outputs: outputsOf(child.outputs),
+					weights: child.weights,
 				});
 				connect(scope, id, child.inputs ?? {});
 			} else if (isLeaf(child)) {
@@ -306,6 +342,8 @@ export function lower(root: ModuleSpec): LoweredGraph {
 					subtitle: fn ? child.function : child.class,
 					icon: iconOf(id, child.icon, fn ? "fn" : "hexagon"),
 					equation: child.equation,
+					outputs: outputsOf(child.outputs),
+					weights: child.weights,
 				});
 				connect(scope, id, child.inputs ?? {});
 			} else walk({ path: id, spec: child, parent: scope });
@@ -321,6 +359,7 @@ export function lower(root: ModuleSpec): LoweredGraph {
 			module: null,
 			subtitle: isRef(v) ? "input" : `input (${v.shape.join(", ")})`,
 			icon: "file",
+			outputs: isRef(v) ? [] : [named(v, k)],
 		});
 	walk(rootScope);
 	for (const [k, v] of Object.entries(root.outputs)) {
