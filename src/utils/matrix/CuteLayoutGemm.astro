@@ -1,0 +1,1393 @@
+---
+// One thread through the two stages of a CuTe GEMM mainloop, on one CTA tile.
+//   1. Copy, global -> shared:
+//        Tensor gA   = local_tile(mA, cta_tiler, make_coord(blockIdx.x, blockIdx.y, _), Step<_1, X,_1>{});
+//        Tensor tAgA = local_partition(gA, tA, threadIdx.x);   // (THR_M,THR_K,k)
+//        Tensor tAsA = local_partition(sA, tA, threadIdx.x);   // (THR_M,THR_K)
+//        copy(tAgA(_,_,k_tile), tAsA);                          // and the same for B (blockIdx.y)
+//      Three columns: global memory (the whole matrix cut into CTA tiles; the block's strip green,
+//      the current k tile coloured by owning thread), the tile in shared memory, and the
+//      registers a plain copy moves each element through. An A tile / B tile switch picks the operand.
+//   2. MMA, shared -> registers:
+//        ThrMMA thr_mma = mma.get_slice(threadIdx.x);
+//        Tensor tCsA = thr_mma.partition_A(sA);  Tensor tCsB = thr_mma.partition_B(sB);
+//        Tensor tCgC = thr_mma.partition_C(gC);  Tensor tCrC = thr_mma.make_fragment_C(tCgC);
+//        gemm(mma, tCsA(_,_,k_block), tCsB(_,_,k_block), tCrC);
+//      sB on top (K × N), sA on the left (M × K), C in the middle coloured by owning thread; the
+//      dashed band is the current k_block. Right: the thread's A and B values and accumulators.
+// The CTA shape, threadIdx and the sA / sB layouts are shared by both stages. The thread's
+// elements are filled and numbered with their index in its partition; hover one to find it in
+// the other columns, hover a C cell for the A and B rows it sums, click a cell to switch thread.
+// Under each stage a table gives every variable's CuTe line, layout (+ the offset CuTe adds to the
+// pointer) and meaning. Layouts are typed as CuTe prints them, "shape:stride", or "shape" for
+// compact column-major. Logic and checks: cuteLayoutGemm.ts; TiledMMA: CuteMma.ts.
+// Usage in .mdx:
+//   <CuteLayoutGemm cta="(16,16,4)" aThr="(8,4)" mmaThr="(8,4)" block={[1, 0]} thread={5} />
+//   <CuteLayoutGemm stages="mma" atom="SM80_16x8x8_F32F16F16F32_TN" mmaThr="(2,1)" cta="(32,16,8)" ... />
+interface Props {
+	/** Which stages to draw. */
+	stages?: "both" | "copy" | "mma";
+	/** Operand the copy stage shows first. */
+	operand?: "A" | "B";
+	/** mA, the (M,K) matrix in global memory. */
+	aMatrix?: string;
+	/** sA, one (BM,BK) tile in shared memory. */
+	aSmem?: string;
+	/** tA, the thread layout for copying A. */
+	aThr?: string;
+	/** mB, the (N,K) matrix in global memory. */
+	bMatrix?: string;
+	bSmem?: string;
+	bThr?: string;
+	/** cta_tiler (BM,BN,BK). */
+	cta?: string;
+	/** (blockIdx.x, blockIdx.y). */
+	block?: [number, number];
+	thread?: number;
+	kTile?: number;
+	atom?: "UniversalFMA" | "SM80_16x8x8_F32F16F16F32_TN";
+	/** AtomLayoutMNK passed to make_tiled_mma. */
+	mmaThr?: string;
+	/** The block's (BM,BN) tile of C in global memory, with mC's strides. */
+	gC?: string;
+	kBlock?: number;
+}
+
+const {
+	stages = "both",
+	operand = "A",
+	aMatrix = "(32,16):(1,32)",
+	aSmem = "(16,4)",
+	aThr = "(8,4)",
+	bMatrix = "(32,16):(1,32)",
+	bSmem = "(16,4)",
+	bThr = "(8,4)",
+	cta = "(16,16,4)",
+	block = [0, 0],
+	thread = 0,
+	kTile = 0,
+	atom = "UniversalFMA",
+	mmaThr = "(8,4)",
+	gC = "(16,16):(1,32)",
+	kBlock = 0,
+} = Astro.props;
+
+const split = (layout: string) => {
+	const [shape, stride = ""] = layout.split(":");
+	return { shape, stride };
+};
+const config = {
+	operand,
+	A: { ...split(aMatrix), smem: aSmem, thr: aThr },
+	B: { ...split(bMatrix), smem: bSmem, thr: bThr },
+	cta,
+	bx: block[0],
+	by: block[1],
+	tx: thread,
+	k: kTile,
+	atom,
+	mmaThr,
+	gC,
+	kb: kBlock,
+};
+const showCopy = stages !== "mma";
+const showMma = stages !== "copy";
+---
+
+<figure class="cl-gemm" data-config={JSON.stringify(config)}>
+	<div class="cl-shared">
+		<label class="cl-field">CTA shape <input data-key="cta" title="cta_tiler (BM,BN,BK)" aria-label="CTA shape" /></label>
+		<span class="cl-field">
+			threadIdx =
+			<input type="number" min="0" data-key="tx" aria-label="threadIdx.x" />
+			<input type="number" value="0" disabled title="The kernel uses threadIdx.x only" aria-label="threadIdx.y" />
+			<input type="number" value="0" disabled title="The kernel uses threadIdx.x only" aria-label="threadIdx.z" />
+		</span>
+		<label class="cl-field">sA <input data-key="sA" aria-label="sA layout" /></label>
+		<label class="cl-field">sB <input data-key="sB" aria-label="sB layout" /></label>
+	</div>
+	<p class="cl-warn" role="status" hidden></p>
+
+	<section class="cl-section" hidden={!showCopy}>
+		<h4 class="cl-title">1 · Copy a k tile from global to shared memory</h4>
+		<div class="cl-tabs" role="tablist" aria-label="Operand">
+			<button type="button" role="tab" data-op="A">A tile</button>
+			<button type="button" role="tab" data-op="B">B tile</button>
+		</div>
+		<div class="cl-stage cl-three">
+			<div class="cl-col">
+				<div class="cl-art"><svg class="lp-gmem" role="img" aria-label="Global memory"></svg></div>
+				<p class="cl-caption">Global memory <span data-name="m"></span></p>
+				<label class="cl-k">k_tile <input type="range" data-key="k" min="0" max="0" value="0" /> <output data-out="k"></output></label>
+				<div class="cl-form">
+					<span class="cl-flabel">Matrix layout</span>
+					<span class="cl-boxes">
+						<input data-key="shape" title="Shape, e.g. (32,16)" aria-label="Matrix shape" />
+						<span class="cl-sep">:</span>
+						<input data-key="stride" title="Stride, e.g. (1,32); empty for compact column-major" aria-label="Matrix stride" />
+					</span>
+					<span class="cl-flabel">blockIdx =</span>
+					<span class="cl-boxes">
+						<input type="number" min="0" data-key="bx" aria-label="blockIdx.x" />
+						<input type="number" min="0" data-key="by" aria-label="blockIdx.y" />
+						<input type="number" value="0" disabled title="The kernel does not use blockIdx.z" aria-label="blockIdx.z" />
+					</span>
+				</div>
+			</div>
+			<div class="cl-col">
+				<div class="cl-art cl-scroll"><table class="cl-grid lp-smem"></table></div>
+				<p class="cl-caption">Tile in shared memory <span data-name="s"></span></p>
+				<div class="cl-form">
+					<span class="cl-flabel" data-name="t-label">tA layout</span>
+					<span class="cl-boxes"><input data-key="thr" aria-label="Copy thread layout" /></span>
+				</div>
+			</div>
+			<div class="cl-col">
+				<div class="cl-art cl-scroll"><table class="cl-grid lp-regs"></table></div>
+				<p class="cl-caption">Registers <span data-name="r"></span></p>
+			</div>
+		</div>
+		<p class="cl-error lp-error" role="status" hidden></p>
+		<div class="cl-scroll"><table class="cl-vars lp-vars"><thead><tr><th>Variable</th><th>CuTe</th><th>Layout</th><th>Meaning here</th></tr></thead><tbody></tbody></table></div>
+	</section>
+
+	<section class="cl-section" hidden={!showMma}>
+		<h4 class="cl-title">2 · Multiply the tiles in shared memory into registers</h4>
+		<div class="cl-stage cl-two">
+			<div class="cl-col">
+				<div class="cl-art"><svg class="mp-svg" role="img" aria-label="Tiles of A, B and C"></svg></div>
+				<p class="cl-caption">sA × sB → C tile</p>
+				<div class="cl-eq" data-name="eq" aria-live="polite"></div>
+				<p class="cl-note" data-name="mnote" hidden></p>
+				<label class="cl-k">k_block <input type="range" data-key="kb" min="0" max="0" value="0" /> <output data-out="kb"></output></label>
+				<div class="cl-form">
+					<span class="cl-flabel">MMA atom</span>
+					<span class="cl-boxes">
+						<select data-key="atom" aria-label="MMA atom">
+							<option value="UniversalFMA">UniversalFMA</option>
+							<option value="SM80_16x8x8_F32F16F16F32_TN">SM80_16x8x8_F32F16F16F32_TN</option>
+						</select>
+					</span>
+					<span class="cl-flabel">Thread layout</span>
+					<span class="cl-boxes"><input data-key="mmaThr" title="AtomLayoutMNK, e.g. (16,16)" aria-label="MMA thread layout" /></span>
+					<span class="cl-flabel">gC</span>
+					<span class="cl-boxes"><input data-key="gC" title="The block's (BM,BN) tile of C, with mC's strides" aria-label="gC layout" /></span>
+				</div>
+			</div>
+			<div class="cl-col">
+				<div class="mp-regs"></div>
+				<p class="cl-caption">Registers <span data-name="mr"></span></p>
+			</div>
+		</div>
+		<p class="cl-error mp-error" role="status" hidden></p>
+		<div class="cl-scroll"><table class="cl-vars mp-vars"><thead><tr><th>Variable</th><th>CuTe</th><th>Layout</th><th>Meaning here</th></tr></thead><tbody></tbody></table></div>
+	</section>
+</figure>
+
+<script>
+	import { type CuteLayout, formatTuple } from "./CuteLayout";
+	import {
+		ATOMS,
+		type CopyView,
+		copyView,
+		type MmaElement,
+		type MmaView,
+		mmaView,
+		NAMES,
+		type Operand,
+		parseIntTuple,
+		parseLayout,
+	} from "./cuteLayoutGemm";
+
+	interface OperandState {
+		shape: string;
+		stride: string;
+		smem: string;
+		thr: string;
+	}
+	interface State {
+		operand: Operand;
+		A: OperandState;
+		B: OperandState;
+		cta: string;
+		bx: number;
+		by: number;
+		tx: number;
+		k: number;
+		atom: string;
+		mmaThr: string;
+		gC: string;
+		kb: number;
+	}
+
+	const SVG = "http://www.w3.org/2000/svg";
+	// Golden-angle steps keep neighbouring threads visually distinct (as in Matrix2D).
+	const hueOf = (t: number) => ((25 + t * 137.508) % 360).toFixed(1);
+
+	function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls?: string, text?: string) {
+		const e = document.createElement(tag);
+		if (cls) e.className = cls;
+		if (text !== undefined) e.textContent = text;
+		return e;
+	}
+	function svgEl(tag: string, attrs: Record<string, string | number>, text?: string) {
+		const e = document.createElementNS(SVG, tag);
+		for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+		if (text !== undefined) e.textContent = text;
+		return e;
+	}
+	const pair = (c: [number, number]) => `(${c[0]},${c[1]})`;
+	const placed = (p: { layout: CuteLayout; offset: number }) =>
+		p.offset ? `${p.layout} + ${p.offset}` : `${p.layout}`;
+	const list = (xs: string[]) => (xs.length > 6 ? `${xs.slice(0, 6).join(", ")}, …` : xs.join(", "));
+
+	/** Fill a variables table from [name, code, layout, meaning] rows. */
+	function fillVars(body: HTMLElement, rows: [string, string, string, string][]) {
+		body.replaceChildren(
+			...rows.map(([name, code, layout, meaning]) => {
+				const tr = el("tr");
+				const n = el("td");
+				n.append(el("code", undefined, name));
+				const c = el("td");
+				c.append(el("code", undefined, code));
+				const l = el("td", "cl-layout");
+				l.append(el("code", undefined, layout));
+				tr.append(n, c, l, el("td", undefined, meaning));
+				return tr;
+			}),
+		);
+	}
+
+	function setup(fig: HTMLElement) {
+		const st: State = JSON.parse(fig.dataset.config ?? "{}");
+		const $ = <T extends Element>(sel: string) => fig.querySelector<T>(sel);
+		const field = (key: string) => $<HTMLInputElement | HTMLSelectElement>(`[data-key=${key}]`);
+		const setText = (sel: string, text: string) => {
+			const e = $<HTMLElement>(sel);
+			if (e) e.textContent = text;
+		};
+		const showError = (sel: string, msg?: string) => {
+			const e = $<HTMLElement>(sel);
+			if (!e) return;
+			e.hidden = !msg;
+			e.textContent = msg ?? "";
+		};
+		const copyOn = !$<HTMLElement>(".cl-section:nth-of-type(1)")?.hidden;
+		const mmaOn = !$<HTMLElement>(".cl-section:nth-of-type(2)")?.hidden;
+
+		function fillInputs() {
+			const op = st[st.operand];
+			const values: Record<string, string | number> = {
+				shape: op.shape,
+				stride: op.stride,
+				thr: op.thr,
+				sA: st.A.smem,
+				sB: st.B.smem,
+				cta: st.cta,
+				bx: st.bx,
+				by: st.by,
+				tx: st.tx,
+				k: st.k,
+				atom: st.atom,
+				mmaThr: st.mmaThr,
+				gC: st.gC,
+				kb: st.kb,
+			};
+			for (const [key, value] of Object.entries(values)) {
+				const f = field(key);
+				if (f) f.value = String(value);
+			}
+			for (const tab of fig.querySelectorAll<HTMLButtonElement>("[data-op]")) {
+				tab.setAttribute("aria-selected", String(tab.dataset.op === st.operand));
+			}
+			const n = NAMES[st.operand];
+			setText("[data-name=m]", `(${n.m})`);
+			setText("[data-name=s]", `(${n.s})`);
+			setText("[data-name=r]", `(${n.ts} elements)`);
+			setText("[data-name=t-label]", `${n.t} layout`);
+		}
+
+		function readInputs() {
+			const op = st[st.operand];
+			const val = (key: string, fallback: string) => field(key)?.value ?? fallback;
+			op.shape = val("shape", op.shape);
+			op.stride = val("stride", op.stride);
+			op.thr = val("thr", op.thr);
+			st.A.smem = val("sA", st.A.smem);
+			st.B.smem = val("sB", st.B.smem);
+			st.cta = val("cta", st.cta);
+			st.atom = val("atom", st.atom);
+			st.mmaThr = val("mmaThr", st.mmaThr);
+			st.gC = val("gC", st.gC);
+			for (const key of ["bx", "by", "tx", "k", "kb"] as const) {
+				const v = Number(field(key)?.value);
+				if (Number.isInteger(v)) st[key] = v;
+			}
+		}
+
+		/** Parse one input, outlining it in red if it does not parse. */
+		function parse<T>(keys: string[], f: () => T): T {
+			try {
+				return f();
+			} catch (e) {
+				for (const key of keys) field(key)?.classList.add("invalid");
+				throw e;
+			}
+		}
+		const parseCta = () =>
+			parse(["cta"], () => {
+				const t = parseIntTuple(st.cta);
+				if (!Array.isArray(t) || t.length !== 3 || t.some((x) => typeof x !== "number")) {
+					throw new Error("CTA shape must be (BM,BN,BK)");
+				}
+				return t as [number, number, number];
+			});
+
+		/** Thread counts of each stage, to clamp threadIdx.x and warn when they differ. */
+		function threadCounts(): { name: string; n: number }[] {
+			const counts: { name: string; n: number }[] = [];
+			const tryCount = (name: string, f: () => number) => {
+				try {
+					counts.push({ name, n: f() });
+				} catch {
+					// reported by the stage itself
+				}
+			};
+			if (copyOn) {
+				tryCount("tA", () => parseLayout(st.A.thr).size);
+				tryCount("tB", () => parseLayout(st.B.thr).size);
+			}
+			if (mmaOn) {
+				tryCount("the MMA", () => {
+					const cta = parseIntTuple(st.cta) as [number, number, number];
+					return mmaView({
+						atom: ATOMS[st.atom] ?? ATOMS.UniversalFMA,
+						thr: parseLayout(st.mmaThr),
+						cta,
+						sA: parseLayout(st.A.smem),
+						sB: parseLayout(st.B.smem),
+						gC: parseLayout(st.gC),
+						thread: 0,
+						kBlock: 0,
+					}).mma.size;
+				});
+			}
+			return counts;
+		}
+
+		function render() {
+			for (const f of fig.querySelectorAll(".invalid")) f.classList.remove("invalid");
+			const counts = threadCounts();
+			if (counts.length) {
+				st.tx = Math.min(Math.max(0, st.tx), Math.max(...counts.map((c) => c.n)) - 1);
+				field("tx")?.setAttribute("max", String(Math.max(...counts.map((c) => c.n)) - 1));
+			}
+			const distinct = new Set(counts.map((c) => c.n));
+			showError(
+				".cl-warn",
+				distinct.size > 1
+					? `The thread layouts disagree: ${counts.map((c) => `${c.name} has ${c.n} threads`).join(", ")}. A kernel launches one block size for all of them.`
+					: undefined,
+			);
+			if (copyOn) renderCopy();
+			if (mmaOn) renderMma();
+			fillInputs();
+		}
+
+		// ---------- Stage 1: copy, global -> shared ----------
+
+		function renderCopy() {
+			const op = st[st.operand];
+			let view: CopyView;
+			let matrix: CuteLayout;
+			let smem: CuteLayout;
+			let thr: CuteLayout;
+			let cta: [number, number, number];
+			const key = st.operand === "A" ? "bx" : "by";
+			try {
+				matrix = parse(["shape", "stride"], () =>
+					parseLayout(op.stride.trim() ? `${op.shape}:${op.stride}` : op.shape),
+				);
+				smem = parse([st.operand === "A" ? "sA" : "sB"], () => parseLayout(op.smem));
+				thr = parse(["thr"], () => parseLayout(op.thr));
+				cta = parseCta();
+				// Keep the indices in range for the current shapes.
+				const tile0 = st.operand === "A" ? cta[0] : cta[1];
+				const blocks = Math.max(1, Math.floor(matrix.mode(0).size / tile0));
+				const kTiles = Math.max(1, Math.floor((matrix.rank > 1 ? matrix.mode(1).size : 1) / cta[2]));
+				st[key] = Math.min(Math.max(0, st[key]), blocks - 1);
+				st.k = Math.min(Math.max(0, st.k), kTiles - 1);
+				field("k")?.setAttribute("max", String(kTiles - 1));
+				view = copyView({
+					operand: st.operand,
+					matrix,
+					cta,
+					block: st[key],
+					smem,
+					thr,
+					thread: st.tx,
+					kTile: st.k,
+				});
+			} catch (e) {
+				showError(".lp-error", (e as Error).message);
+				return;
+			}
+			showError(".lp-error");
+			setText("[data-out=k]", `${st.k} of ${view.tiles[1]}`);
+			drawGlobal(view, matrix, st[key]);
+			drawSmem(view, smem);
+			drawCopyRegs(view);
+			drawCopyVars(view, { matrix, smem, thr, cta, blk: st[key] });
+		}
+
+		function drawGlobal(view: CopyView, matrix: CuteLayout, blk: number) {
+			const svg = $<SVGSVGElement>(".lp-gmem");
+			if (!svg) return;
+			const rows = matrix.mode(0).size;
+			const cols = matrix.mode(1).size;
+			const cs = Math.max(4, Math.min(20, Math.floor(Math.min(380 / cols, 420 / rows))));
+			const left = 34;
+			const top = 18;
+			const [b0, b1] = view.tile;
+			const mine = new Map(view.elements.map((e) => [`${e.global[0]},${e.global[1]}`, e.index]));
+			svg.replaceChildren();
+			svg.setAttribute("viewBox", `0 0 ${left + cols * cs + 2} ${top + rows * cs + 2}`);
+			svg.setAttribute("width", String(left + cols * cs + 2));
+			const g = svgEl("g", { transform: `translate(${left},${top})` });
+			for (let r = 0; r < rows; r++) {
+				for (let c = 0; c < cols; c++) {
+					const inStrip = Math.floor(r / b0) === blk;
+					const inTile = inStrip && Math.floor(c / b1) === st.k;
+					const cell = svgEl("rect", { x: c * cs, y: r * cs, width: cs, height: cs, class: "lp-cell" });
+					let tip = `${NAMES[st.operand].m}(${r},${c}) at offset ${matrix.offset(r, c)}`;
+					if (inStrip) cell.classList.add("lp-strip");
+					if (inTile) {
+						const owner = view.owners.cells[r - blk * b0][c - st.k * b1];
+						cell.classList.add("lp-tile");
+						cell.style.setProperty("--hue", hueOf(owner.thread));
+						tip += `, thread ${owner.thread} (click to select)`;
+						cell.addEventListener("click", () => selectThread(owner.thread));
+					}
+					const i = mine.get(`${r},${c}`);
+					if (i !== undefined) {
+						cell.classList.add("lp-mine");
+						cell.dataset.hl = `g${i}`;
+						tip += `, element ${i} of ${NAMES[st.operand].tg}`;
+					}
+					cell.append(svgEl("title", {}, tip));
+					g.append(cell);
+				}
+			}
+			// CTA tile boundaries, then outlines for the strip gA and the current k tile.
+			for (let r = 0; r <= rows; r += b0) g.append(svgEl("line", { x1: 0, y1: r * cs, x2: cols * cs, y2: r * cs, class: "lp-tline" }));
+			for (let c = 0; c <= cols; c += b1) g.append(svgEl("line", { x1: c * cs, y1: 0, x2: c * cs, y2: rows * cs, class: "lp-tline" }));
+			g.append(svgEl("rect", { x: 0, y: blk * b0 * cs, width: cols * cs, height: b0 * cs, class: "lp-outline" }));
+			g.append(svgEl("rect", { x: st.k * b1 * cs, y: blk * b0 * cs, width: b1 * cs, height: b0 * cs, class: "lp-outline lp-cur" }));
+			const axis = st.operand === "A" ? "x" : "y";
+			for (let t = 0; t < view.tiles[0]; t++) {
+				g.append(svgEl("text", { x: -4, y: (t + 0.5) * b0 * cs, class: "cl-axis", "text-anchor": "end", "dominant-baseline": "middle" }, `${axis}=${t}`));
+			}
+			for (let t = 0; t < view.tiles[1]; t++) {
+				g.append(svgEl("text", { x: (t + 0.5) * b1 * cs, y: -5, class: "cl-axis", "text-anchor": "middle" }, `k=${t}`));
+			}
+			svg.append(g);
+		}
+
+		function drawSmem(view: CopyView, smem: CuteLayout) {
+			const table = $<HTMLTableElement>(".lp-smem");
+			if (!table) return;
+			const rowMode = smem.mode(0);
+			const colMode = smem.mode(1);
+			const mine = new Map(view.elements.map((e) => [`${e.smem[0]},${e.smem[1]}`, e.index]));
+			const head = el("tr");
+			head.append(el("th"));
+			for (let j = 0; j < view.tile[1]; j++) head.append(el("th", undefined, formatTuple(colMode.coord(j))));
+			const body = el("tbody");
+			for (let r = 0; r < view.tile[0]; r++) {
+				const tr = el("tr");
+				tr.append(el("th", undefined, formatTuple(rowMode.coord(r))));
+				for (let c = 0; c < view.tile[1]; c++) {
+					const owner = view.owners.cells[r][c];
+					const td = el("td");
+					td.style.setProperty("--hue", hueOf(owner.thread));
+					td.title = `${NAMES[st.operand].s}(${r},${c}) at offset ${owner.offset}, thread ${owner.thread} (click to select)`;
+					td.append(el("span", "cl-value", String(owner.offset)), el("span", "cl-label", `T${owner.thread}`));
+					const i = mine.get(`${r},${c}`);
+					if (i !== undefined) {
+						td.classList.add("cl-mine");
+						td.dataset.hl = `g${i}`;
+						td.append(el("span", "cl-index", String(i)));
+					}
+					td.addEventListener("click", () => selectThread(owner.thread));
+					tr.append(td);
+				}
+				body.append(tr);
+			}
+			const thead = el("thead");
+			thead.append(head);
+			table.replaceChildren(thead, body);
+		}
+
+		function drawCopyRegs(view: CopyView) {
+			const table = $<HTMLTableElement>(".lp-regs");
+			if (!table) return;
+			// One register per element, laid out in the partition's shape (index i = column-major).
+			const shape = view.ts.layout;
+			const rows = shape.mode(0).size;
+			const cols = shape.rank > 1 ? shape.size / rows : 1;
+			const n = NAMES[st.operand];
+			const body = el("tbody");
+			for (let r = 0; r < rows; r++) {
+				const tr = el("tr");
+				for (let c = 0; c < cols; c++) {
+					const e = view.elements[r + rows * c];
+					const td = el("td", "cl-mine cl-reg");
+					td.style.setProperty("--hue", hueOf(st.tx));
+					td.dataset.hl = `g${e.index}`;
+					td.title = `element ${e.index}: ${n.m}${pair(e.global)} -> ${n.s}${pair(e.smem)}`;
+					td.append(el("span", "cl-value", `r${e.index}`), el("span", "cl-label", `${n.m.slice(1)}${pair(e.global)}`));
+					tr.append(td);
+				}
+				body.append(tr);
+			}
+			table.replaceChildren(body);
+		}
+
+		function drawCopyVars(
+			view: CopyView,
+			c: { matrix: CuteLayout; smem: CuteLayout; thr: CuteLayout; cta: [number, number, number]; blk: number },
+		) {
+			const body = $<HTMLElement>(".lp-vars tbody");
+			if (!body) return;
+			const n = NAMES[st.operand];
+			const { matrix, thr } = c;
+			const [b0, b1] = view.tile;
+			const op = st.operand;
+			const r0 = c.blk * b0;
+			const coord = thr.flatCoord(st.tx);
+			const perK = view.elements.length;
+			const kStride = view.tg.layout.mode(2).stride;
+			fillVars(body, [
+				[
+					n.m,
+					`make_tensor(make_gmem_ptr(${op}), select<${op === "A" ? "0,2" : "1,2"}>(shape_MNK), d${op})`,
+					`${matrix}`,
+					`All of ${op} in global memory, ${matrix.mode(0).size}×${matrix.mode(1).size} (${n.dim}×K).`,
+				],
+				[
+					"cta_tiler",
+					"make_shape(bM, bN, bK)",
+					`(${c.cta.join(",")})`,
+					`Each block computes a ${c.cta[0]}×${c.cta[1]} tile of C, stepping along K ${c.cta[2]} at a time.`,
+				],
+				[
+					n.g,
+					`local_tile(${n.m}, cta_tiler, make_coord(blockIdx.x, blockIdx.y, _), ${n.step})`,
+					placed(view.g),
+					`The rows ${r0}–${r0 + b0 - 1} of ${op} that the block with ${n.blk} = ${c.blk} needs (green), as ${view.tiles[1]} k tiles of ${b0}×${b1}. The offset ${view.g.offset} is where row ${r0} starts.`,
+				],
+				[n.s, `make_tensor(make_smem_ptr(smem${op}), ${n.s}_layout)`, `${c.smem}`, `The shared buffer that holds one k tile, ${b0}×${b1}.`],
+				[
+					n.t,
+					"thread layout",
+					`${thr}`,
+					`${thr.size} threads over the ${b0}×${b1} tile; thread ${st.tx} sits at (${coord.join(",")}), so it takes every ${thr.mode(0).size}th row${thr.rank > 1 ? ` and every ${thr.mode(1).size}th column` : ""} from there.`,
+				],
+				[
+					n.tg,
+					`local_partition(${n.g}, ${n.t}, threadIdx.x)`,
+					placed(view.tg),
+					`Thread ${st.tx}'s elements of ${n.g}: ${perK} per k tile, and the last mode steps to the next k tile (stride ${formatTuple(kStride)}).`,
+				],
+				[
+					n.ts,
+					`local_partition(${n.s}, ${n.t}, threadIdx.x)`,
+					placed(view.ts),
+					`Where the same ${perK} elements go in shared memory: offsets ${list(view.elements.map((e) => String(e.smemOffset)))}.`,
+				],
+				[
+					`${n.tg}(_,_,k_tile)`,
+					`copy(${n.tg}(_,_,k_tile), ${n.ts})`,
+					placed(view.tgk),
+					`At k_tile = ${st.k}, element i goes ${list(view.elements.map((e) => `${n.m}${pair(e.global)} → ${n.s}${pair(e.smem)}`))}. A plain copy loads each into a register, then stores it.`,
+				],
+			]);
+		}
+
+		// ---------- Stage 2: MMA, shared -> registers ----------
+
+		// The last MMA inputs and view, for the hover equations.
+		let mmaInputs: Parameters<typeof mmaView>[0] | undefined;
+		let mmaCurrent: MmaView | undefined;
+
+		function renderMma() {
+			let view: MmaView;
+			let cta: [number, number, number];
+			const atom = ATOMS[st.atom] ?? ATOMS.UniversalFMA;
+			try {
+				const thr = parse(["mmaThr"], () => parseLayout(st.mmaThr));
+				cta = parseCta();
+				const sA = parse(["sA"], () => parseLayout(st.A.smem));
+				const sB = parse(["sB"], () => parseLayout(st.B.smem));
+				const gC = parse(["gC"], () => parseLayout(st.gC));
+				const inputs = { atom, thr, cta, sA, sB, gC, thread: 0, kBlock: 0 };
+				const probe = mmaView(inputs);
+				st.kb = Math.min(Math.max(0, st.kb), probe.kBlocks - 1);
+				field("kb")?.setAttribute("max", String(probe.kBlocks - 1));
+				mmaInputs = { ...inputs, kBlock: st.kb };
+				view = mmaView({ ...mmaInputs, thread: st.tx });
+				mmaCurrent = view;
+			} catch (e) {
+				showError(".mp-error", (e as Error).message);
+				return;
+			}
+			showError(".mp-error");
+			setText("[data-out=kb]", `${st.kb} of ${view.kBlocks}`);
+			drawMmaTiles(view, cta);
+			drawMmaRegs(view);
+			drawMmaVars(view, cta);
+			drawMmaNote(view);
+			resetEquation();
+		}
+
+		/** Columns [k0, k1) of the tile that the current k_block covers. */
+		function kRange(view: MmaView): [number, number] {
+			const permK = view.mma.permutationMNK[2] as number;
+			return [st.kb * permK, (st.kb + 1) * permK];
+		}
+
+		function drawMmaTiles(view: MmaView, cta: [number, number, number]) {
+			const svg = $<SVGSVGElement>(".mp-svg");
+			if (!svg) return;
+			const [bm, bn, bk] = cta;
+			const cs = Math.max(6, Math.min(22, Math.floor(Math.min(400 / (bk + bn), 420 / (bk + bm)))));
+			const gap = 10;
+			const ax = 4;
+			const ay = 4 + bk * cs + gap;
+			const bx = 4 + bk * cs + gap;
+			const by = 4;
+			const [k0, k1] = kRange(view);
+			fig.dataset.k0 = String(k0);
+			fig.dataset.k1 = String(k1);
+			const showText = cs >= 16;
+			const w = bx + bn * cs + 4;
+			const h = ay + bm * cs + 4;
+			svg.replaceChildren();
+			svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+			svg.setAttribute("width", String(w));
+
+			const cell = (x: number, y: number, cls: string, hue: number | undefined, tip: string, label?: string) => {
+				const g = svgEl("g", { class: cls });
+				if (hue !== undefined) g.setAttribute("style", `--hue: ${hueOf(hue)}`);
+				g.append(svgEl("rect", { x, y, width: cs, height: cs }));
+				if (label !== undefined && showText) {
+					g.append(svgEl("text", { x: x + cs / 2, y: y + cs / 2 + 0.5, "text-anchor": "middle", "dominant-baseline": "middle" }, label));
+				}
+				g.append(svgEl("title", {}, tip));
+				svg.append(g);
+				return g;
+			};
+			const index = (els: MmaElement[]) => new Map(els.map((e) => [`${e.coord[0]},${e.coord[1]}`, e]));
+			const myA = index(view.a);
+			const myB = index(view.b);
+			const myC = index(view.c);
+			const operand = (mine: Map<string, MmaElement>, name: string, prefix: string, r: number, k: number, x: number, y: number) => {
+				const e = mine.get(`${r},${k}`);
+				const now = e && e.mode[2] === st.kb;
+				const g = cell(
+					x,
+					y,
+					`mp-cell${e ? (now ? " mp-mine" : " mp-later") : ""}`,
+					e ? st.tx : undefined,
+					`${name}(${r},${k})${e ? `: tC${name} element ${e.index}, k_block ${e.mode[2]}` : ""}`,
+					now ? String(e.index) : undefined,
+				);
+				g.dataset.k = String(k);
+				if (e) g.dataset.hl = `${prefix}${e.index}`;
+				return g;
+			};
+			// sA: (m, k), drawn M down and K across.
+			for (let m = 0; m < bm; m++) {
+				for (let k = 0; k < bk; k++) operand(myA, "sA", "a", m, k, ax + k * cs, ay + m * cs).dataset.m = String(m);
+			}
+			// sB: (n, k), drawn K down and N across so that its columns line up with C's.
+			for (let n = 0; n < bn; n++) {
+				for (let k = 0; k < bk; k++) operand(myB, "sB", "b", n, k, bx + n * cs, by + k * cs).dataset.n = String(n);
+			}
+			// C: coloured by owning thread.
+			for (let m = 0; m < bm; m++) {
+				for (let n = 0; n < bn; n++) {
+					const owner = view.cOwner[m][n];
+					const e = myC.get(`${m},${n}`);
+					const g = cell(
+						bx + n * cs,
+						ay + m * cs,
+						`mp-cell mp-c${e ? " mp-mine" : ""}`,
+						owner,
+						`C(${m},${n}): thread ${owner}${e ? `, tCgC element ${e.index}` : ""} (click to select)`,
+						e ? String(e.index) : undefined,
+					);
+					g.dataset.cm = String(m);
+					g.dataset.cn = String(n);
+					if (e) g.dataset.hl = `c${e.index}`;
+					g.addEventListener("click", () => selectThread(owner));
+				}
+			}
+			svg.append(svgEl("rect", { x: ax + k0 * cs, y: ay, width: (k1 - k0) * cs, height: bm * cs, class: "mp-band" }));
+			svg.append(svgEl("rect", { x: bx, y: by + k0 * cs, width: bn * cs, height: (k1 - k0) * cs, class: "mp-band" }));
+			svg.append(svgEl("text", { x: ax + (bk * cs) / 2, y: ay - 3, class: "cl-axis", "text-anchor": "middle" }, "sA"));
+			svg.append(svgEl("text", { x: bx - 3, y: by + (bk * cs) / 2, class: "cl-axis", "text-anchor": "end", "dominant-baseline": "middle" }, "sB"));
+		}
+
+		function regTable(title: string, els: MmaElement[], rows: number, label: (e: MmaElement) => string, prefix: string) {
+			const wrap = el("div", "mp-regblock");
+			wrap.append(el("p", "mp-regtitle", title));
+			const table = el("table", "cl-grid");
+			const cols = Math.ceil(els.length / rows);
+			for (let r = 0; r < rows; r++) {
+				const tr = el("tr");
+				for (let c = 0; c < cols; c++) {
+					const e = els[r + rows * c];
+					if (!e) continue;
+					const td = el("td", "cl-mine cl-reg");
+					td.style.setProperty("--hue", hueOf(st.tx));
+					td.dataset.hl = `${prefix}${e.index}`;
+					if (prefix === "c") {
+						td.dataset.cm = String(e.coord[0]);
+						td.dataset.cn = String(e.coord[1]);
+					}
+					td.title = `element ${e.index}, mode coordinate (${e.mode.join(",")})`;
+					td.append(el("span", "cl-value", String(e.index)), el("span", "cl-label", label(e)));
+					tr.append(td);
+				}
+				table.append(tr);
+			}
+			wrap.append(table);
+			return wrap;
+		}
+
+		/** The hint shown under the MMA picture until a C element is hovered. */
+		function resetEquation() {
+			const box = $<HTMLElement>("[data-name=eq]");
+			box?.replaceChildren(el("span", "cl-eqhint", "Hover a C element to see how gemm() computes it in this k_block."));
+		}
+
+		/**
+		 * C(m,n) += sum of A(m,k)·B(n,k) over the current k_block, each factor labelled with the
+		 * thread and partition index of the register that holds it.
+		 */
+		function showEquation(m: number, n: number) {
+			const box = $<HTMLElement>("[data-name=eq]");
+			if (!box || !mmaCurrent || !mmaInputs) return;
+			const owner = mmaCurrent.cOwner[m]?.[n];
+			if (owner === undefined) return;
+			const view = owner === st.tx ? mmaCurrent : mmaView({ ...mmaInputs, thread: owner });
+			const eq = view.equations.find((e) => e.coord[0] === m && e.coord[1] === n);
+			if (!eq) return;
+			const atom = mmaInputs.atom;
+			const reg = (r: { thread: number; index: number }, name: string) =>
+				el("span", r.thread === owner ? "cl-own" : undefined, `T${r.thread}:${name}(${r.index})`);
+			const terms = el("div", "cl-terms");
+			terms.append(el("span", "cl-eqlhs", `T${owner}:tCrC(${eq.index}) = C(${m},${n}) +=`));
+			eq.terms.forEach((t, j) => {
+				if (j > 0) terms.append(el("span", "cl-plus", "+"));
+				const chip = el("span", "cl-term");
+				chip.style.setProperty("--hue", hueOf(owner));
+				const src = el("span", "cl-src");
+				src.append(reg(t.a, "tCsA"), document.createTextNode(" · "), reg(t.b, "tCsB"));
+				chip.append(el("span", "cl-math", `A(${m},${t.k})·B(${n},${t.k})`), src);
+				terms.append(chip);
+			});
+			const how =
+				atom.threads === 1
+					? `One fused multiply-add per term, all from thread ${owner}'s own registers.`
+					: `Bold factors are in thread ${owner}'s own registers; the others come from the named lanes of the same ${atom.name}, which the ${atom.threads} lanes issue together.`;
+			box.replaceChildren(terms, el("span", "cl-eqhint", how));
+		}
+
+		/**
+		 * For an atom run by several lanes, say where the lane's operands and outputs differ: the
+		 * instruction exchanges values across the lanes, so they need not line up.
+		 */
+		function drawMmaNote(view: MmaView) {
+			const atom = ATOMS[st.atom] ?? ATOMS.UniversalFMA;
+			const note = $<HTMLElement>("[data-name=mnote]");
+			if (!note) return;
+			const uniq = (xs: number[]) => [...new Set(xs)].sort((a, b) => a - b);
+			const same = (a: number[], b: number[]) => a.join() === b.join();
+			const aRows = uniq(view.a.map((e) => e.coord[0]));
+			const bCols = uniq(view.b.map((e) => e.coord[0]));
+			const cRows = uniq(view.c.map((e) => e.coord[0]));
+			const cCols = uniq(view.c.map((e) => e.coord[1]));
+			const parts: string[] = [];
+			if (!same(aRows, cRows)) parts.push(`A from rows ${aRows.join(", ")} but owns C rows ${cRows.join(", ")}`);
+			if (!same(bCols, cCols)) parts.push(`B from columns ${bCols.join(", ")} but owns C columns ${cCols.join(", ")}`);
+			note.hidden = atom.threads === 1 || parts.length === 0;
+			note.textContent = `Lane ${view.vmnk[0]} loads ${parts.join(", and ")}. That is not a mistake: the ${atom.threads} lanes of one ${atom.name} issue it together and the hardware exchanges A and B values between them, so a lane's operands need not line up with its outputs (PTX fragment tables for mma.m16n8k8). With UniversalFMA they always do.`;
+		}
+
+		function drawMmaRegs(view: MmaView) {
+			const regs = $<HTMLElement>(".mp-regs");
+			if (!regs) return;
+			const nowA = view.a.filter((e) => e.mode[2] === st.kb);
+			const nowB = view.b.filter((e) => e.mode[2] === st.kb);
+			const frag = view.tCrC;
+			regs.replaceChildren(
+				regTable(`tCsA(_,_,${st.kb})`, nowA, nowA.length, (e) => `A${pair(e.coord)}`, "a"),
+				regTable(`tCsB(_,_,${st.kb})`, nowB, 1, (e) => `B${pair(e.coord)}`, "b"),
+				regTable("tCrC", view.c, frag.mode(0).size * frag.mode(1).size, (e) => `C${pair(e.coord)}`, "c"),
+			);
+			setText("[data-name=mr]", `(thread ${st.tx})`);
+		}
+
+		function drawMmaVars(view: MmaView, cta: [number, number, number]) {
+			const body = $<HTMLElement>(".mp-vars tbody");
+			if (!body) return;
+			const atom = ATOMS[st.atom] ?? ATOMS.UniversalFMA;
+			const [am, an, ak] = atom.shapeMNK;
+			const perm = view.mma.permutationMNK as number[];
+			const vmnk = view.vmnk;
+			const grid = `${view.mma.thrLayoutVMNK.mode(1).size}×${view.mma.thrLayoutVMNK.mode(2).size}`;
+			const vA = view.tCsA.layout.mode(0).size;
+			const vC = view.tCgC.layout.mode(0).size;
+			const atomsM = view.tCsA.layout.mode(1).size;
+			const [k0, k1] = kRange(view);
+			const fma = atom.threads === 1;
+			const nowA = view.a.filter((e) => e.mode[2] === st.kb).length;
+			const nowB = view.b.filter((e) => e.mode[2] === st.kb).length;
+			fillVars(body, [
+				[
+					"mma",
+					`make_tiled_mma(${atom.name}{}, Layout<${st.mmaThr}>{})`,
+					`${view.mma.thrLayoutVMNK}`,
+					`${view.mma.size} threads. One ${atom.name} is ${am}×${an}×${ak} on ${atom.threads} thread${atom.threads > 1 ? "s" : ""}; the thread layout repeats it so one step covers ${perm[0]}×${perm[1]}×${perm[2]} of the ${cta[0]}×${cta[1]}×${cta[2]} CTA tile. The layout maps (ThrV,ThrM,ThrN,ThrK) to a thread index.`,
+				],
+				[
+					"thr_mma",
+					"mma.get_slice(threadIdx.x)",
+					`(${vmnk.join(",")})`,
+					fma
+						? `Thread ${st.tx} is atom (${vmnk[1]},${vmnk[2]}) in the ${grid} grid of threads.`
+						: `Thread ${st.tx} is lane ${vmnk[0]} of the atom at (${vmnk[1]},${vmnk[2]}) in the ${grid} grid of atoms.`,
+				],
+				[
+					"tCsA",
+					"thr_mma.partition_A(sA)",
+					placed(view.tCsA),
+					`(MMA,MMA_M,MMA_K): ${vA} A value${vA > 1 ? "s" : ""} per atom, ${atomsM} atom${atomsM > 1 ? "s" : ""} along M, ${view.kBlocks} k blocks. Rows ${list([...new Set(view.a.map((e) => String(e.coord[0])))])} of sA.`,
+				],
+				[
+					"tCsB",
+					"thr_mma.partition_B(sB)",
+					placed(view.tCsB),
+					`(MMA,MMA_N,MMA_K): rows ${list([...new Set(view.b.map((e) => String(e.coord[0])))])} of sB, i.e. columns of C.`,
+				],
+				[
+					"tCgC",
+					"thr_mma.partition_C(gC)",
+					placed(view.tCgC),
+					`(MMA,MMA_M,MMA_N): the ${view.c.length} elements of C this thread owns and writes back, ${vC} per atom.`,
+				],
+				[
+					"tCrC",
+					"thr_mma.make_fragment_C(tCgC)",
+					`${view.tCrC}`,
+					`Same shape as tCgC, but compact: ${view.c.length} accumulator registers, cleared before the k loop.`,
+				],
+				[
+					`gemm(…, k_block=${st.kb})`,
+					"gemm(mma, tCsA(_,_,k_block), tCsB(_,_,k_block), tCrC)",
+					`k ∈ [${k0}, ${k1})`,
+					fma
+						? `Each of the thread's C(m,n) += A(m,k)·B(n,k) for k = ${k0}${k1 - k0 > 1 ? `…${k1 - 1}` : ""}: an outer product of its ${nowA} A values and ${nowB} B values.`
+						: `The ${atom.threads} threads of each atom issue one ${atom.name} together; this thread supplies the A and B values shown and receives ${vC} of the results per atom. Each C(m,n) still sums A(m,k)·B(n,k) over the whole k block, using values held by other lanes.`,
+				],
+			]);
+		}
+
+		function selectThread(t: number) {
+			if (t === st.tx) return;
+			st.tx = t;
+			render();
+		}
+
+		// Hover: an element lights up everywhere it appears; a C cell also lights the A row and
+		// B row it sums over in the current k_block.
+		fig.addEventListener("mouseover", (ev) => {
+			for (const e of fig.querySelectorAll(".cl-hl")) e.classList.remove("cl-hl");
+			const target = (ev.target as Element).closest<HTMLElement | SVGElement>("[data-hl], [data-cm]");
+			if (!target) return;
+			const hl = target.dataset.hl;
+			if (hl) for (const e of fig.querySelectorAll(`[data-hl="${hl}"]`)) e.classList.add("cl-hl");
+			const { cm, cn } = target.dataset;
+			if (cm === undefined) return;
+			showEquation(Number(cm), Number(cn));
+			const k0 = Number(fig.dataset.k0);
+			const k1 = Number(fig.dataset.k1);
+			for (const e of fig.querySelectorAll<SVGElement>("[data-m], [data-n]")) {
+				const k = Number(e.dataset.k);
+				if (k >= k0 && k < k1 && (e.dataset.m === cm || e.dataset.n === cn)) e.classList.add("cl-hl");
+			}
+		});
+		for (const f of fig.querySelectorAll<HTMLInputElement | HTMLSelectElement>("[data-key]")) {
+			f.addEventListener(f.type === "range" ? "input" : "change", () => {
+				readInputs();
+				render();
+			});
+		}
+		for (const tab of fig.querySelectorAll<HTMLButtonElement>("[data-op]")) {
+			tab.addEventListener("click", () => {
+				readInputs();
+				st.operand = tab.dataset.op === "B" ? "B" : "A";
+				fillInputs();
+				render();
+			});
+		}
+		fillInputs();
+		render();
+	}
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".cl-gemm")) setup(fig);
+</script>
+
+<style is:global>
+	/* Global because the figure is built by the script; every rule is scoped by .cl-gemm. */
+	.cl-gemm {
+		--green: oklch(0.78 0.1 145);
+		margin: 2rem 0;
+		font-family: var(--sans);
+	}
+	@media (min-width: 1081px) {
+		.cl-gemm {
+			width: calc(100% + var(--gap) + var(--note));
+		}
+	}
+	.cl-gemm [hidden] {
+		display: none !important;
+	}
+
+	/* ---------- Inputs ---------- */
+	.cl-gemm .cl-shared {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.5rem 1.2rem;
+		padding: 0.6rem 0.8rem;
+		border: 1px solid var(--faint);
+		border-radius: 10px;
+		background: color-mix(in oklch, var(--surface) 50%, var(--bg));
+	}
+	.cl-gemm .cl-field {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.35rem;
+		font-size: 0.75rem;
+		color: var(--muted);
+	}
+	.cl-gemm input,
+	.cl-gemm select {
+		width: 7rem;
+		font: 0.75rem var(--mono);
+		padding: 0.25rem 0.4rem;
+		border: 1px solid var(--faint);
+		border-radius: 5px;
+		background: var(--surface);
+		color: var(--text);
+	}
+	.cl-gemm select {
+		width: auto;
+		max-width: 15rem;
+	}
+	.cl-gemm input[type="number"] {
+		width: 3.4rem;
+	}
+	.cl-gemm input[type="range"] {
+		width: 8rem;
+		padding: 0;
+		border: none;
+		background: none;
+		accent-color: var(--accent);
+	}
+	.cl-gemm input:disabled {
+		opacity: 0.5;
+	}
+	.cl-gemm .invalid {
+		border-color: #c8443f !important;
+	}
+	.cl-gemm .cl-form {
+		display: grid;
+		grid-template-columns: auto auto;
+		gap: 0.45rem 0.6rem;
+		align-items: center;
+	}
+	.cl-gemm .cl-flabel {
+		font-size: 0.75rem;
+		color: var(--muted);
+		text-align: right;
+		white-space: nowrap;
+	}
+	.cl-gemm .cl-boxes {
+		display: flex;
+		align-items: center;
+		gap: 0.3rem;
+	}
+	.cl-gemm .cl-sep {
+		color: var(--muted);
+		font-family: var(--mono);
+	}
+	.cl-gemm .cl-k {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		font: 0.75rem var(--mono);
+		color: var(--muted);
+		margin-bottom: 0.8rem;
+	}
+	.cl-gemm .cl-error,
+	.cl-gemm .cl-warn {
+		text-align: center;
+		font-size: 0.78rem;
+		color: #c8443f;
+	}
+	.cl-gemm .cl-warn {
+		color: #b7791f;
+	}
+
+	/* ---------- Stages ---------- */
+	.cl-gemm .cl-section {
+		margin-top: 1.6rem;
+	}
+	.cl-gemm .cl-title {
+		margin: 0 0 0.8rem;
+		text-align: center;
+		font-size: 0.9rem;
+		font-weight: 600;
+		color: var(--text);
+	}
+	.cl-gemm .cl-tabs {
+		display: flex;
+		justify-content: center;
+		gap: 0.4rem;
+		margin-bottom: 1rem;
+	}
+	.cl-gemm .cl-tabs button {
+		font: 600 0.8rem var(--sans);
+		padding: 0.3rem 0.9rem;
+		border: 1px solid var(--faint);
+		border-radius: 999px;
+		background: var(--surface);
+		color: var(--muted);
+		cursor: pointer;
+	}
+	.cl-gemm .cl-tabs button[aria-selected="true"] {
+		border-color: var(--accent);
+		background: var(--accent-soft);
+		color: var(--accent);
+	}
+	.cl-gemm .cl-stage {
+		display: grid;
+	}
+	.cl-gemm .cl-three {
+		grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr) minmax(0, 0.6fr);
+	}
+	.cl-gemm .cl-two {
+		grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr);
+	}
+	.cl-gemm .cl-col {
+		min-width: 0;
+		padding: 0 1rem;
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+	}
+	.cl-gemm .cl-col + .cl-col {
+		border-left: 1.5px dashed var(--faint);
+	}
+	@media (max-width: 760px) {
+		.cl-gemm .cl-three,
+		.cl-gemm .cl-two {
+			grid-template-columns: minmax(0, 1fr);
+		}
+		.cl-gemm .cl-col + .cl-col {
+			border-left: none;
+			border-top: 1.5px dashed var(--faint);
+			margin-top: 1rem;
+			padding-top: 1rem;
+		}
+	}
+	.cl-gemm .cl-art {
+		min-height: 8rem;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		max-width: 100%;
+	}
+	.cl-gemm .cl-scroll {
+		overflow-x: auto;
+		max-width: 100%;
+	}
+	.cl-gemm .cl-caption {
+		margin: 0.5rem 0 0.8rem;
+		font-size: 0.8rem;
+		font-weight: 600;
+		color: var(--text);
+		text-align: center;
+	}
+	.cl-gemm .cl-caption span {
+		font: 400 0.75rem var(--mono);
+		color: var(--muted);
+	}
+	.cl-gemm svg {
+		display: block;
+		max-width: 100%;
+		height: auto;
+	}
+	.cl-gemm .cl-note {
+		max-width: 30rem;
+		margin: -0.4rem auto 0.8rem;
+		font-size: 0.75rem;
+		line-height: 1.45;
+		color: var(--muted);
+		text-align: center;
+	}
+	.cl-gemm .cl-axis {
+		font: 9px var(--mono);
+		fill: var(--muted);
+	}
+
+	/* ---------- Global memory (copy stage) ---------- */
+	.cl-gemm .lp-cell {
+		fill: var(--surface);
+		stroke: var(--faint);
+		stroke-width: 0.5;
+	}
+	.cl-gemm .lp-cell.lp-strip {
+		fill: color-mix(in oklch, var(--green) 30%, var(--bg));
+	}
+	.cl-gemm .lp-cell.lp-tile {
+		fill: color-mix(in oklch, oklch(0.72 0.15 var(--hue)) 30%, var(--bg));
+		cursor: pointer;
+	}
+	.cl-gemm .lp-cell.lp-mine {
+		fill: color-mix(in oklch, oklch(0.72 0.15 var(--hue)) 85%, var(--bg));
+		stroke: var(--text);
+		stroke-width: 1;
+	}
+	.cl-gemm .lp-cell.cl-hl {
+		stroke: var(--accent);
+		stroke-width: 2.5;
+	}
+	.cl-gemm .lp-tline {
+		stroke: var(--muted);
+		stroke-width: 1;
+	}
+	.cl-gemm .lp-outline {
+		fill: none;
+		stroke: color-mix(in oklch, var(--green) 70%, var(--text));
+		stroke-width: 2;
+		pointer-events: none;
+	}
+	.cl-gemm .lp-outline.lp-cur {
+		stroke: var(--accent);
+		stroke-dasharray: 4 2;
+	}
+
+	/* ---------- Tiles of A, B and C (MMA stage) ---------- */
+	.cl-gemm .mp-cell rect {
+		fill: var(--surface);
+		stroke: var(--faint);
+		stroke-width: 0.6;
+	}
+	.cl-gemm .mp-cell.mp-c rect {
+		fill: color-mix(in oklch, oklch(0.72 0.15 var(--hue)) 22%, var(--bg));
+		cursor: pointer;
+	}
+	.cl-gemm .mp-cell.mp-later rect {
+		fill: color-mix(in oklch, oklch(0.72 0.15 var(--hue)) 30%, var(--bg));
+	}
+	.cl-gemm .mp-cell.mp-mine rect {
+		fill: color-mix(in oklch, oklch(0.72 0.15 var(--hue)) 80%, var(--bg));
+		stroke: var(--text);
+		stroke-width: 1;
+	}
+	.cl-gemm .mp-cell.cl-hl rect {
+		stroke: var(--accent);
+		stroke-width: 2.5;
+	}
+	.cl-gemm .mp-cell text {
+		font: 600 9px var(--mono);
+		fill: var(--text);
+		pointer-events: none;
+	}
+	.cl-gemm .mp-band {
+		fill: none;
+		stroke: var(--accent);
+		stroke-width: 1.5;
+		stroke-dasharray: 4 2;
+		pointer-events: none;
+	}
+	.cl-gemm .mp-regs {
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		gap: 0.6rem;
+		max-width: 100%;
+		overflow-x: auto;
+	}
+	.cl-gemm .mp-regtitle {
+		margin: 0 0 0.2rem;
+		text-align: center;
+		font: 0.72rem var(--mono);
+		color: var(--muted);
+	}
+
+	/* ---------- Cell tables (shared tile, registers) ---------- */
+	.cl-gemm .cl-grid {
+		border-collapse: separate;
+		border-spacing: 2px;
+		margin: 0 auto;
+		width: auto;
+		font-family: var(--mono);
+	}
+	.cl-gemm .cl-grid th,
+	.cl-gemm .cl-grid td {
+		min-width: 2.2rem;
+		height: 2rem;
+		padding: 0.1rem 0.2rem;
+		text-align: center;
+		line-height: 1.05;
+	}
+	.cl-gemm .cl-grid th {
+		white-space: nowrap;
+		color: var(--muted);
+		font-size: 0.6rem;
+		font-weight: normal;
+		border: none;
+		background: none;
+	}
+	.cl-gemm .cl-grid td {
+		--tint: oklch(0.72 0.15 var(--hue));
+		position: relative;
+		border: 1px solid color-mix(in oklch, var(--tint) 30%, var(--bg));
+		border-radius: 5px;
+		background: color-mix(in oklch, var(--tint) 12%, var(--bg));
+		color: var(--muted);
+		font-size: 0.7rem;
+		cursor: pointer;
+	}
+	.cl-gemm .cl-grid td.cl-mine {
+		border: 1.5px solid color-mix(in oklch, var(--tint) 80%, var(--text));
+		background: color-mix(in oklch, var(--tint) 45%, var(--bg));
+		color: var(--text);
+	}
+	.cl-gemm .cl-grid td.cl-hl {
+		outline: 2px solid var(--accent);
+		outline-offset: 1px;
+	}
+	.cl-gemm .cl-grid td.cl-reg {
+		min-width: 4.4rem;
+		cursor: default;
+	}
+	.cl-gemm .cl-value,
+	.cl-gemm .cl-label {
+		display: block;
+	}
+	.cl-gemm .cl-label {
+		font-size: 0.55rem;
+		color: color-mix(in oklch, var(--tint) 40%, var(--muted));
+	}
+	.cl-gemm td.cl-mine .cl-label {
+		color: var(--text);
+	}
+	.cl-gemm .cl-index {
+		position: absolute;
+		top: 1px;
+		right: 3px;
+		font-size: 0.5rem;
+		font-weight: 700;
+		color: var(--text);
+	}
+
+	/* ---------- Hover equation ---------- */
+	.cl-gemm .cl-eq {
+		max-width: 34rem;
+		min-height: 4.2rem;
+		margin: -0.3rem auto 0.8rem;
+		padding: 0.4rem 0.6rem;
+		border: 1px dashed var(--faint);
+		border-radius: 8px;
+	}
+	.cl-gemm .cl-eqlhs {
+		font: 600 0.72rem var(--mono);
+		color: var(--text);
+	}
+	.cl-gemm .cl-eqhint {
+		display: block;
+		margin-top: 0.3rem;
+		font-size: 0.72rem;
+		color: var(--muted);
+		text-align: center;
+	}
+	.cl-gemm .cl-terms {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 0.3rem;
+	}
+	.cl-gemm .cl-plus {
+		color: var(--muted);
+		font-size: 0.75rem;
+	}
+	.cl-gemm .cl-term {
+		--tint: oklch(0.72 0.15 var(--hue));
+		display: inline-flex;
+		flex-direction: column;
+		align-items: center;
+		padding: 0.15rem 0.4rem;
+		border: 1px solid color-mix(in oklch, var(--tint) 45%, var(--bg));
+		border-radius: 5px;
+		background: color-mix(in oklch, var(--tint) 12%, var(--bg));
+		font-family: var(--mono);
+		line-height: 1.25;
+	}
+	.cl-gemm .cl-math {
+		font-size: 0.7rem;
+		color: var(--text);
+	}
+	.cl-gemm .cl-src {
+		font-size: 0.58rem;
+		color: var(--muted);
+	}
+	.cl-gemm .cl-own {
+		font-weight: 700;
+		color: var(--text);
+	}
+
+	/* ---------- Variable tables ---------- */
+	.cl-gemm .cl-vars {
+		width: 100%;
+		margin-top: 1.2rem;
+		border-collapse: collapse;
+		font-size: 0.78rem;
+	}
+	.cl-gemm .cl-vars th {
+		text-align: left;
+		font-weight: 600;
+		color: var(--muted);
+		border-bottom: 1px solid var(--faint);
+		padding: 0.35rem 0.5rem;
+	}
+	.cl-gemm .cl-vars td {
+		vertical-align: top;
+		padding: 0.4rem 0.5rem;
+		border-bottom: 1px solid var(--faint);
+		color: var(--text);
+	}
+	.cl-gemm .cl-vars code {
+		font-size: 0.72rem;
+		word-break: break-word;
+	}
+	.cl-gemm .cl-vars .cl-layout code {
+		white-space: nowrap;
+	}
+</style>

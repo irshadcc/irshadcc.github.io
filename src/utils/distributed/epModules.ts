@@ -1,3 +1,19 @@
+// One expert-parallel MoE layer as each framework's code runs it on one rank, as ModuleGraph specs
+// for the expert-parallelism post. All five use the shared example of epDispatch.ts (EP = 4, 8
+// experts, 2 per rank, top-2, 8 tokens, 2 per rank, the same routing) and the numbers of
+// epNumeric.ts (hidden size 4, SwiGLU experts of width 2), so every tensor on a wire holds real
+// values, and the outputs match the single-device MoE (YS). Each spec follows the condensed code
+// the post shows for that framework; rows are tinted by the rank that holds their expert.
+//   megatron  – rank 1: MoEAlltoAllTokenDispatcher (dispatch_preprocess, token_dispatch, ...).
+//   deepspeed – rank 0: MOELayer with capacity 1, where t0's second choice is dropped.
+//   deepseek  – rank 1 (node 0, GPU 1): DeepEP's two hops, where t6 arrives once for two experts.
+//   vllm      – rank 1: all-gather, fused MoE on local experts, reduce-scatter.
+//   sglang    – rank 1: no dispatch, fused MoE on local experts, all-reduce.
+import type {
+	Equation,
+	ModuleSpec,
+	TensorValue,
+} from "../../component/ModuleGraph/moduleGraph";
 import {
 	COPIES,
 	type Copy,
@@ -27,18 +43,6 @@ import {
 	probsRow,
 	routingMapRow,
 } from "./epNumeric";
-// One expert-parallel MoE layer as each framework's code runs it on one rank, as ModuleGraph specs
-// for the expert-parallelism post. All five use the shared example of epDispatch.ts (EP = 4, 8
-// experts, 2 per rank, top-2, 8 tokens, 2 per rank, the same routing) and the numbers of
-// epNumeric.ts (hidden size 4, SwiGLU experts of width 2), so every tensor on a wire holds real
-// values, and the outputs match the single-device MoE (YS). Each spec follows the condensed code
-// the post shows for that framework; rows are tinted by the rank that holds their expert.
-//   megatron  – rank 1: MoEAlltoAllTokenDispatcher (dispatch_preprocess, token_dispatch, ...).
-//   deepspeed – rank 0: MOELayer with capacity 1, where t0's second choice is dropped.
-//   deepseek  – rank 1 (node 0, GPU 1): DeepEP's two hops, where t6 arrives once for two experts.
-//   vllm      – rank 1: all-gather, fused MoE on local experts, reduce-scatter.
-//   sglang    – rank 1: no dispatch, fused MoE on local experts, all-reduce.
-import type { Equation, ModuleSpec, TensorValue } from "./graph/moduleGraph";
 
 export type EpModuleFlow =
 	| "megatron"

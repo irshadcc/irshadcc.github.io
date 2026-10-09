@@ -1,12 +1,12 @@
 ---
 import Layout from "../../layouts/Layout.astro";
-import ModuleGraph from "../../utils/distributed/graph/ModuleGraph.astro";
-import ffn from "../../utils/distributed/graph/ffnRankExample.json";
-import megatronMoe from "../../utils/distributed/graph/megatronMoe.json";
+import ModuleGraph from "../../component/ModuleGraph/ModuleGraph.astro";
+import ffn from "../../component/ModuleGraph/ffnRankExample.json";
+import megatronMoe from "../../component/ModuleGraph/megatronMoe.json";
 import type {
 	ModuleSpec,
 	WeightSpec,
-} from "../../utils/distributed/graph/moduleGraph";
+} from "../../component/ModuleGraph/moduleGraph";
 
 // The FFN section uses one FFN (8 → 32 → 8, ReLU, no biases) before and after a torch run: the
 // teacher y = A x has rank 2, and AdamW with weight decay 0.1 drives both weights to about two
@@ -117,7 +117,7 @@ const block: ModuleSpec = {
 <Layout title="ModuleGraph demo">
 	<h1>ModuleGraph demo</h1>
 	<p>
-		<code>ModuleGraph</code> draws a PyTorch module from nested JSON (<code>utils/distributed/graph/moduleGraph.ts</code>): ops and
+		<code>ModuleGraph</code> draws a PyTorch module from nested JSON (<code>component/ModuleGraph/moduleGraph.ts</code>): ops and
 		leaf modules as nodes, modules as nested boxes, tensors as edges. Hover over an edge for its tensor, a node for its equation,
 		shapes and weights, and a box's dotted label for its weights. Click any of them to keep its card open; click again,
 		click elsewhere or press Escape to close it. The names in shapes are explained from the spec's

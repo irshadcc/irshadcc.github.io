@@ -4,7 +4,10 @@
 // BLOCK_M = 4). Rank 0 is both a source rank (it owns tokens t0, t1) and an expert rank (it holds
 // experts 0 and 1). Every value comes from megaKernel.ts's simulate(), in FP32 like
 // MegaKernelSteps, so the two figures agree.
-import type { ModuleSpec, TensorValue } from "./graph/moduleGraph";
+import type {
+	ModuleSpec,
+	TensorValue,
+} from "../../component/ModuleGraph/moduleGraph";
 import {
 	EXPERTS,
 	H,
