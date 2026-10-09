@@ -1,7 +1,7 @@
 ---
 import Layout from "../../layouts/Layout.astro";
 import GpuGemmDataflow from "../../utils/gpu/GpuGemmDataflow.astro";
-import { CuteLayout } from "../../utils/matrix/CuteLayout";
+import { CuteLayout } from "../../component/Cute/CuteLayout";
 
 // Column-major B (16×32) in global memory, kept K-major in shared memory.
 const gBColMajor = new CuteLayout([16, 32], [1, 16]);

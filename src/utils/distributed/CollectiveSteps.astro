@@ -9,14 +9,14 @@
 // (solid), and adds the step's cost to a running alpha-beta total.
 //
 // Pass `ranks` to label the columns with global ranks, e.g. one data-parallel group of a
-// LogicalDistributedTopology, and `network` (see network.ts; rank r runs on GPU r) to draw each
+// LogicalDistributedTopology, and `network` (see component/ProcessGroup/network.ts; rank r runs on GPU r) to draw each
 // message by the link it crosses, since a synchronous step takes as long as its slowest message.
 // Usage in .mdx:
 //   <CollectiveSteps op="all-reduce" n={4} />
 //   <CollectiveSteps op="all-reduce" ranks={[0, 4, 8, 12]} network={{ gpusPerServer: 8, serversPerPod: 2, spinesPerPod: 2 }} />
 import katex from "katex";
 import { type CollectiveOp, buildSchedule } from "./collectives";
-import { ClusterNetwork, type HopClass, type NetworkShape } from "./network";
+import { ClusterNetwork, type HopClass, type NetworkShape } from "../../component/ProcessGroup/network";
 
 interface Props {
 	op: CollectiveOp;

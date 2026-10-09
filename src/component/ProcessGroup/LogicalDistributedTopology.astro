@@ -1,7 +1,7 @@
 ---
 // A parallel training job laid out by its parallel coordinates rather than by host.
-// Inspired by MegaScale's performance heat-map (Figure 7, arXiv:2402.15627), which draws ranks
-// inside their hosts, so TP, DP and PP groups scatter and need dashed connectors. Here:
+// A per-host heat map draws ranks inside their hosts, so TP, DP and PP groups scatter and need
+// dashed connectors. Here:
 //
 //   columns = pipeline stages (PP), left to right in the direction activations flow
 //   rows    = data-parallel replicas (DP)
@@ -14,8 +14,7 @@
 // column. An expert-parallel group (EP, carved out of CP × DP; see parallelism.ts) is a run of
 // consecutive squares down one column, drawn as a capsule. Distribution strips along the top (per stage) and right (per
 // replica) show every rank's value and mark the slowest, since synchronous training runs at
-// the pace of its slowest rank. A toggle recolours squares by idle time: how long each rank
-// waits for the slowest one per step.
+// the pace of its slowest rank.
 //
 // With `network` (see network.ts; rank r runs on GPU r), cells name their hosts and each
 // group's link is labelled with the switches its traffic crosses.
@@ -23,9 +22,9 @@
 //   <LogicalDistributedTopology parallel={{ tp: 4, dp: 3, pp: 4 }} values={times} unit="s"
 //     network={{ gpusPerServer: 4, serversPerPod: 3, spinesPerPod: 4 }} />
 //   <LogicalDistributedTopology parallel={{ tp: 2, cp: 2, dp: 4, pp: 2, ep: 4 }} />
-import { type ColorScaleSpec, colorScale } from "../colors/colorScales";
+import { type ColorScaleSpec, colorScale } from "./colorScales";
 import { ClusterNetwork, type HopClass, type NetworkShape } from "./network";
-import { type Axis, DIM_NAMES, DIMS, type Degrees, type Dim, ParallelLayout } from "./parallelism";
+import { type Axis, DIMS, DIM_NAMES, type Degrees, type Dim, ParallelLayout } from "./parallelism";
 
 interface Props {
 	/** Parallel degrees; cp and ep default to 1, and ep must divide cp × dp. */
@@ -39,8 +38,6 @@ interface Props {
 	values?: number[] | Record<number, number>;
 	/** Colour scale for the values (see colorScales.ts). */
 	colors?: ColorScaleSpec;
-	/** Colour scale for idle time. */
-	idleColors?: ColorScaleSpec;
 	domain?: [number, number];
 	unit?: string;
 	valueLabel?: string;
@@ -57,8 +54,7 @@ const {
 	parallel,
 	order = ["tp", "cp", "dp", "pp"],
 	values,
-	colors = "paper",
-	idleColors = "blues",
+	colors = "pinkRed",
 	domain: domainProp,
 	unit = "",
 	valueLabel = "time",
@@ -74,7 +70,7 @@ const { tp: T, cp: C, dp: D, pp: P } = layout.degrees;
 const active = DIMS.filter((d) => layout.degrees[d] > 1);
 const net = network ? new ClusterNetwork(network) : undefined;
 
-// ---- Values: compute time, and idle time relative to the slowest rank.
+// ---- Values: e.g. compute time per rank.
 const valueOf = (rank: number): number | undefined => {
 	const v = Array.isArray(values) ? values[rank] : values?.[rank];
 	return typeof v === "number" && Number.isFinite(v) ? v : undefined;
@@ -86,9 +82,6 @@ const valueDomain: [number, number] = domainProp ?? [Math.min(...known), Math.ma
 const scale = hasValues ? colorScale(colors, valueDomain) : undefined;
 const maxV = hasValues ? Math.max(...known) : 0;
 const slowest = vals.indexOf(maxV);
-const idleOf = (r: number) => (vals[r] === undefined ? undefined : maxV - (vals[r] as number));
-const maxIdle = hasValues ? Math.max(...known.map((v) => maxV - v)) : 0;
-const idleScale = hasValues ? colorScale(idleColors, [0, maxIdle || 1]) : undefined;
 const fmt = (v: number) => (Number.isInteger(v) ? `${v}` : Number(v.toPrecision(3)).toString());
 const withUnit = (v: number) => (unit ? `${fmt(v)} ${unit}` : fmt(v));
 
@@ -127,7 +120,6 @@ const squares = Array.from({ length: N }, (_, rank) => {
 	const x = cellX(c.pp) + PAD + (c.tp % tpCols) * S;
 	const y = blockY(c.dp, c.cp) + Math.floor(c.tp / tpCols) * S;
 	const v = vals[rank];
-	const idle = idleOf(rank);
 	return {
 		rank,
 		c,
@@ -137,8 +129,6 @@ const squares = Array.from({ length: N }, (_, rank) => {
 		cy: y + S / 2,
 		fill: v !== undefined && scale ? scale.color(v) : undefined,
 		ink: v !== undefined && scale ? scale.text(v) : undefined,
-		idleFill: idle !== undefined && idleScale ? idleScale.color(idle) : undefined,
-		idleInk: idle !== undefined && idleScale ? idleScale.text(idle) : undefined,
 	};
 });
 
@@ -209,23 +199,43 @@ const replicaStrips = hasValues
 	? Array.from({ length: D }, (_, d) => ({ d, ...strip(squares.filter((s) => s.c.dp === d).map((s) => s.rank)) }))
 	: [];
 
-// ---- Text: per-rank description (info line) and the bottleneck summary.
+// ---- Text: per-rank description (info panel).
+// Each rank gets a heading and one labelled row per fact, e.g.
+//   Rank 20 · stage 1, replica 2, TP shard 0 · host 5
+//   Time        2.1 s
+//   TP peers    21, 22, 23 · over NVLink
+//   Pipeline    rank 8 (previous stage), rank 32 (next stage) · 5 switches away
+const HOP_PHRASE: Record<HopClass, string> = {
+	nvlink: "over NVLink",
+	tor: "1 switch away",
+	spine: "3 switches away",
+	core: "5 switches away",
+};
+const PEER_LABEL: Record<Dim, string> = {
+	tp: "TP peers",
+	cp: "CP peers",
+	ep: "EP peers",
+	dp: "DP peers",
+	pp: "Pipeline",
+};
 const info = squares.map((s) => {
 	const r = s.rank;
-	const parts = [`Rank ${r}: stage ${s.c.pp}, replica ${s.c.dp}${C > 1 ? `, CP chunk ${s.c.cp}` : ""}, TP shard ${s.c.tp}`];
+	const where = [`stage ${s.c.pp}`, `replica ${s.c.dp}`, ...(C > 1 ? [`CP chunk ${s.c.cp}`] : []), `TP shard ${s.c.tp}`];
 	const host = serverOf(r);
-	if (host !== undefined) parts[0] += `, host ${host}`;
+	const head = `Rank ${r} · ${where.join(", ")}${host !== undefined ? ` · host ${host}` : ""}`;
+	const rows: [string, string][] = [];
 	const v = vals[r];
 	if (v !== undefined) {
-		parts.push(r === slowest ? `${withUnit(v)}, the slowest rank` : `${withUnit(v)}, idles ${withUnit(maxV - v)} waiting for rank ${slowest}`);
+		const label = valueLabel.charAt(0).toUpperCase() + valueLabel.slice(1);
+		rows.push([label, r === slowest ? `${withUnit(v)}, the slowest rank` : withUnit(v)]);
 	}
 	for (const dim of active) {
 		const g = layout.groupOf(dim, r);
 		const i = g.indexOf(r);
 		const peers = dim === "pp" ? [g[i - 1], g[i + 1]].filter((p) => p !== undefined) : g.filter((p) => p !== r);
-		const name = (p: number) => (dim === "pp" ? `${p < r ? "←" : "→"} ${p}` : `${p}`);
+		const name = (p: number) => (dim === "pp" ? `rank ${p} (${p < r ? "previous" : "next"} stage)` : `${p}`);
 		if (!net) {
-			parts.push(`${dim.toUpperCase()}: ${peers.map(name).join(", ")}`);
+			rows.push([PEER_LABEL[dim], peers.map(name).join(", ")]);
 			continue;
 		}
 		const byHop = new Map<HopClass, number[]>();
@@ -233,18 +243,12 @@ const info = squares.map((s) => {
 			const h = hopOf(r, p) as HopClass;
 			byHop.set(h, [...(byHop.get(h) ?? []), p]);
 		}
-		parts.push(`${dim.toUpperCase()}: ${[...byHop].map(([h, ps]) => `${ps.map(name).join(", ")} (${HOP_SHORT[h]})`).join("; ")}`);
+		rows.push([PEER_LABEL[dim], [...byHop].map(([h, ps]) => `${ps.map(name).join(", ")} · ${HOP_PHRASE[h]}`).join("; ")]);
 	}
-	return parts.join(" · ");
+	return { head, rows };
 });
-const sorted = [...known].sort((a, b) => a - b);
-const median = sorted[Math.floor(sorted.length / 2)];
-const idleHeavy = known.filter((v) => (maxV - v) / maxV > 0.1).length;
-const summary = hasValues
-	? `Slowest rank ${slowest} (stage ${squares[slowest].c.pp}, replica ${squares[slowest].c.dp}) takes ${withUnit(maxV)}. ` +
-		`Synchronous training waits for it every step: the median rank (${withUnit(median)}) idles ${withUnit(maxV - median)} ` +
-		`(${Math.round(((maxV - median) / maxV) * 100)}%), and ${idleHeavy} of ${N} ranks idle more than 10%.`
-	: "";
+const infoTitle = info.map(({ head, rows }) => [head, ...rows.map(([k, t]) => `${k}: ${t}`)].join("\n"));
+const infoLines = Math.max(1, ...info.map((t) => 1 + t.rows.length));
 
 const hash = [...JSON.stringify(Astro.props)].reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7).toString(36);
 const arrowId = `lg-arrow-${hash}`;
@@ -270,25 +274,12 @@ const commStyle = DIMS.filter((d) => commColors[d])
 		}
 	</div>
 	{
-		hasValues && scale && idleScale && (
+		hasValues && scale && (
 			<div class="legend">
-				<span class="modes" role="group" aria-label="Colour by">
-					<button type="button" data-mode="compute" aria-pressed="true">
-						{valueLabel}
-					</button>
-					<button type="button" data-mode="idle" aria-pressed="false">
-						idle time
-					</button>
-				</span>
-				<span class="key scale-compute">
-					{withUnit(valueDomain[0])}
+				<span class="key">
+					{valueLabel}: {withUnit(valueDomain[0])}
 					<span class="bar" style={`background: ${scale.gradient()}`} />
 					{withUnit(valueDomain[1])}
-				</span>
-				<span class="key scale-idle" hidden>
-					{withUnit(0)}
-					<span class="bar" style={`background: ${idleScale.gradient()}`} />
-					{withUnit(maxIdle)}
 				</span>
 			</div>
 		)
@@ -467,15 +458,12 @@ const commStyle = DIMS.filter((d) => commColors[d])
 					<g
 						class={`rank${s.rank === slowest ? " slowest" : ""}`}
 						data-rank={s.rank}
-						data-fill-compute={s.fill}
-						data-ink-compute={s.ink}
-						data-fill-idle={s.idleFill}
-						data-ink-idle={s.idleInk}
+						data-fill={s.fill}
 						tabindex="0"
 						role="button"
 						aria-label={`Rank ${s.rank}`}
 					>
-						<title>{info[s.rank]}</title>
+						<title>{infoTitle[s.rank]}</title>
 						<rect x={s.x + 1} y={s.y + 1} width={S - 2} height={S - 2} rx="3" style={s.fill && `fill: ${s.fill}`} />
 						<text x={s.cx} y={s.cy + 3.5} style={s.ink && `fill: ${s.ink}`}>
 							{s.rank}
@@ -486,21 +474,36 @@ const commStyle = DIMS.filter((d) => commColors[d])
 		</svg>
 	</div>
 
-	<p class="info" aria-live="polite">{hint}</p>
-	<div class="info-store" hidden>{info.map((t) => <span>{t}</span>)}</div>
-	{summary && <p class="summary">{summary}</p>}
+	<div class="info" aria-live="polite" style={`min-height: ${infoLines * 1.45}em`}><p class="hint">{hint}</p></div>
+	<div class="info-store" hidden>
+		{
+			info.map(({ head, rows }) => (
+				<div>
+					<p class="info-head">{head}</p>
+					{rows.length > 0 && (
+						<dl class="info-rows">
+							{rows.map(([k, t]) => (
+								<>
+									<dt>{k}</dt>
+									<dd>{t}</dd>
+								</>
+							))}
+						</dl>
+					)}
+				</div>
+			))
+		}
+	</div>
 </figure>
 
 <script>
 	// Selection highlights the rank's groups (its TP block, its CP and DP lines, its EP capsule
 	// and its horizontal pipeline), outlines each peer in the colour of the group it shares with
 	// the selection (the closest one when it shares several) and fades every rank outside them.
-	// The mode buttons swap each
-	// square's colour between the value scale and the idle-time scale.
 	for (const fig of document.querySelectorAll<HTMLElement>(".logical")) {
 		const info = fig.querySelector<HTMLElement>(".info");
-		const hint = info?.textContent ?? "";
-		const texts = [...fig.querySelectorAll<HTMLElement>(".info-store span")].map((s) => s.textContent ?? "");
+		const hint = info?.firstElementChild;
+		const texts = [...fig.querySelectorAll<HTMLElement>(".info-store > div")];
 		const ranks = [...fig.querySelectorAll<SVGGElement>(".rank")];
 		// Closest groups first: a rank in both the TP block and the DP line counts as a TP peer.
 		const closeness = ["tp", "cp", "ep", "dp", "pp"];
@@ -531,7 +534,10 @@ const commStyle = DIMS.filter((d) => commColors[d])
 				else delete el.dataset.peer;
 				el.setAttribute("aria-pressed", String(r === pinned));
 			});
-			if (info) info.textContent = sel === null ? hint : texts[sel];
+			if (info) {
+				const content = sel === null ? hint : texts[sel];
+				info.replaceChildren(...(content ? [content.cloneNode(true)] : []));
+			}
 		};
 		const toggle = (r: number) => {
 			pinned = pinned === r ? null : r;
@@ -550,18 +556,6 @@ const commStyle = DIMS.filter((d) => commColors[d])
 			});
 		});
 
-		const buttons = [...fig.querySelectorAll<HTMLButtonElement>(".modes button")];
-		const setMode = (mode: string) => {
-			for (const b of buttons) b.setAttribute("aria-pressed", String(b.dataset.mode === mode));
-			const key = mode === "idle" ? "Idle" : "Compute";
-			for (const el of ranks) {
-				el.querySelector("rect")?.style.setProperty("fill", el.dataset[`fill${key}`] ?? "");
-				el.querySelector("text")?.style.setProperty("fill", el.dataset[`ink${key}`] ?? "");
-			}
-			fig.querySelector<HTMLElement>(".scale-compute")?.toggleAttribute("hidden", mode === "idle");
-			fig.querySelector<HTMLElement>(".scale-idle")?.toggleAttribute("hidden", mode !== "idle");
-		};
-		for (const b of buttons) b.addEventListener("click", () => setMode(b.dataset.mode ?? "compute"));
 		show(pinned);
 	}
 </script>
@@ -635,32 +629,6 @@ const commStyle = DIMS.filter((d) => commColors[d])
 		height: 0.7rem;
 		border-radius: 3px;
 		border: 1px solid var(--faint);
-	}
-	.modes {
-		display: inline-flex;
-		border: 1px solid var(--faint);
-		border-radius: 6px;
-		overflow: hidden;
-	}
-	.modes button {
-		padding: 0.2rem 0.65rem;
-		font: inherit;
-		color: var(--muted);
-		background: var(--bg);
-		border: 0;
-		cursor: pointer;
-	}
-	.modes button + button {
-		border-left: 1px solid var(--faint);
-	}
-	.modes button[aria-pressed="true"] {
-		color: var(--text);
-		background: var(--surface);
-		font-weight: 600;
-	}
-	.modes button:focus-visible {
-		outline: 2px solid var(--accent);
-		outline-offset: -2px;
 	}
 	.canvas {
 		overflow-x: auto;
@@ -753,10 +721,10 @@ const commStyle = DIMS.filter((d) => commColors[d])
 		stroke-width: 2.4;
 	}
 	/* Without a value colour the selected square is white, never black, in both themes. */
-	.rank.selected:not([data-fill-compute]) rect {
+	.rank.selected:not([data-fill]) rect {
 		fill: #fff;
 	}
-	.rank.selected:not([data-fill-compute]) text {
+	.rank.selected:not([data-fill]) text {
 		fill: #1a1a1a;
 		font-weight: 700;
 	}
@@ -766,12 +734,12 @@ const commStyle = DIMS.filter((d) => commColors[d])
 		stroke: var(--group);
 		stroke-width: 2;
 	}
-	.rank[data-peer]:not([data-fill-compute]) rect {
+	.rank[data-peer]:not([data-fill]) rect {
 		fill: color-mix(in oklch, var(--group) 45%, white);
 	}
 	/* The tint is a light pastel in both themes (mixed into a dark background it reads as
 	   near-black), so its label stays dark. */
-	.rank[data-peer]:not([data-fill-compute]) text {
+	.rank[data-peer]:not([data-fill]) text {
 		fill: #1a1a1a;
 	}
 	.rank[data-peer="tp"] {
@@ -840,18 +808,33 @@ const commStyle = DIMS.filter((d) => commColors[d])
 		text-anchor: middle;
 	}
 
-	.info,
-	.summary {
+	.info {
 		margin: 0.5rem 0 0;
 		font-size: 0.8rem;
 		text-align: center;
 		color: var(--muted);
+		line-height: 1.45;
 	}
-	.info {
-		min-height: 1.4em;
+	.info p {
+		margin: 0;
 	}
-	.summary {
-		font-size: 0.78rem;
+	.info-head {
+		font-weight: 600;
+		color: var(--text);
+	}
+	.info-rows {
+		display: inline-grid;
+		grid-template-columns: auto auto;
+		column-gap: 0.75rem;
+		margin: 0;
+		text-align: left;
+	}
+	.info-rows dt {
+		color: var(--muted);
+		text-align: right;
+	}
+	.info-rows dd {
+		margin: 0;
 		color: var(--text);
 	}
 </style>

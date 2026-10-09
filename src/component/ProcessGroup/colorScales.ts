@@ -15,8 +15,8 @@ export const COLOR_SCALES = {
 	oranges: ["#fff5eb", "#fee6ce", "#fdd0a2", "#fdae6b", "#fd8d3c", "#f16913", "#d94801", "#a63603", "#7f2704"],
 	purples: ["#fcfbfd", "#efedf5", "#dadaeb", "#bcbddc", "#9e9ac8", "#807dba", "#6a51a3", "#54278f", "#3f007d"],
 	greys: ["#ffffff", "#f0f0f0", "#d9d9d9", "#bdbdbd", "#969696", "#737373", "#525252", "#252525", "#000000"],
-	// The MegaScale paper's heat-map: pale pink to red.
-	paper: ["#fbe3e3", "#f7c9c7", "#f4b0ab", "#f1968f", "#ef7c73", "#ee6357", "#ee4a3b", "#e8392a", "#d92b1d"],
+	// Pale pink to red.
+	pinkRed: ["#fbe3e3", "#f7c9c7", "#f4b0ab", "#f1968f", "#ef7c73", "#ee6357", "#ee4a3b", "#e8392a", "#d92b1d"],
 	// Perceptual multi-hue (matplotlib): even steps in lightness, readable in greyscale.
 	viridis: ["#440154", "#472d7b", "#3b528b", "#2c728e", "#21918c", "#28ae80", "#5ec962", "#addc30", "#fde725"],
 	magma: ["#000004", "#1c1044", "#4f127b", "#812581", "#b5367a", "#e55964", "#fb8761", "#fec287", "#fcfdbf"],

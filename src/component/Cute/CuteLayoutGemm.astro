@@ -19,8 +19,9 @@
 // elements are filled and numbered with their index in its partition; hover one to find it in
 // the other columns, hover a C cell for the A and B rows it sums, click a cell to switch thread.
 // Under each stage a table gives every variable's CuTe line, layout (+ the offset CuTe adds to the
-// pointer) and meaning. Layouts are typed as CuTe prints them, "shape:stride", or "shape" for
-// compact column-major. Logic and checks: cuteLayoutGemm.ts; TiledMMA: CuteMma.ts.
+// pointer) and meaning. Layout props are typed as CuTe prints them, "shape:stride", or "shape" for
+// compact column-major; in the figure every layout has a shape box and a stride box (empty stride
+// = compact column-major). Logic and checks: cuteLayoutGemm.ts; TiledMMA: CuteMma.ts.
 // Usage in .mdx:
 //   <CuteLayoutGemm cta="(16,16,4)" aThr="(8,4)" mmaThr="(8,4)" block={[1, 0]} thread={5} />
 //   <CuteLayoutGemm stages="mma" atom="SM80_16x8x8_F32F16F16F32_TN" mmaThr="(2,1)" cta="(32,16,8)" ... />
@@ -103,8 +104,8 @@ const showMma = stages !== "copy";
 			<input type="number" value="0" disabled title="The kernel uses threadIdx.x only" aria-label="threadIdx.y" />
 			<input type="number" value="0" disabled title="The kernel uses threadIdx.x only" aria-label="threadIdx.z" />
 		</span>
-		<label class="cl-field">sA <input data-key="sA" aria-label="sA layout" /></label>
-		<label class="cl-field">sB <input data-key="sB" aria-label="sB layout" /></label>
+		<span class="cl-field">sA <input data-key="sA" aria-label="sA shape" placeholder="shape" /><span class="cl-sep">:</span><input data-key="sA-stride" title="Stride; empty for compact column-major" aria-label="sA stride" placeholder="stride" /></span>
+		<span class="cl-field">sB <input data-key="sB" aria-label="sB shape" placeholder="shape" /><span class="cl-sep">:</span><input data-key="sB-stride" title="Stride; empty for compact column-major" aria-label="sB stride" placeholder="stride" /></span>
 	</div>
 	<p class="cl-warn" role="status" hidden></p>
 
@@ -139,7 +140,7 @@ const showMma = stages !== "copy";
 				<p class="cl-caption">Tile in shared memory <span data-name="s"></span></p>
 				<div class="cl-form">
 					<span class="cl-flabel" data-name="t-label">tA layout</span>
-					<span class="cl-boxes"><input data-key="thr" aria-label="Copy thread layout" /></span>
+					<span class="cl-boxes"><input data-key="thr" aria-label="Copy thread layout shape" placeholder="shape" /><span class="cl-sep">:</span><input data-key="thr-stride" title="Stride; empty for compact column-major" aria-label="Copy thread layout stride" placeholder="stride" /></span>
 				</div>
 			</div>
 			<div class="cl-col">
@@ -169,9 +170,9 @@ const showMma = stages !== "copy";
 						</select>
 					</span>
 					<span class="cl-flabel">Thread layout</span>
-					<span class="cl-boxes"><input data-key="mmaThr" title="AtomLayoutMNK, e.g. (16,16)" aria-label="MMA thread layout" /></span>
+					<span class="cl-boxes"><input data-key="mmaThr" title="AtomLayoutMNK, e.g. (16,16)" aria-label="MMA thread layout shape" placeholder="shape" /><span class="cl-sep">:</span><input data-key="mmaThr-stride" title="Stride; empty for compact column-major" aria-label="MMA thread layout stride" placeholder="stride" /></span>
 					<span class="cl-flabel">gC</span>
-					<span class="cl-boxes"><input data-key="gC" title="The block's (BM,BN) tile of C, with mC's strides" aria-label="gC layout" /></span>
+					<span class="cl-boxes"><input data-key="gC" title="The block's (BM,BN) tile of C" aria-label="gC shape" placeholder="shape" /><span class="cl-sep">:</span><input data-key="gC-stride" title="Stride; empty for compact column-major" aria-label="gC stride" placeholder="stride" /></span>
 				</div>
 			</div>
 			<div class="cl-col">
@@ -295,7 +296,13 @@ const showMma = stages !== "copy";
 			};
 			for (const [key, value] of Object.entries(values)) {
 				const f = field(key);
-				if (f) f.value = String(value);
+				const strideBox = field(`${key}-stride`);
+				if (strideBox) {
+					// A layout: shape in this box, stride in its partner.
+					const [shape, stride = ""] = String(value).split(":");
+					if (f) f.value = shape;
+					strideBox.value = stride;
+				} else if (f) f.value = String(value);
 			}
 			for (const tab of fig.querySelectorAll<HTMLButtonElement>("[data-op]")) {
 				tab.setAttribute("aria-selected", String(tab.dataset.op === st.operand));
@@ -310,15 +317,22 @@ const showMma = stages !== "copy";
 		function readInputs() {
 			const op = st[st.operand];
 			const val = (key: string, fallback: string) => field(key)?.value ?? fallback;
+			/** A layout typed as shape and stride boxes, joined back into "shape:stride". */
+			const layoutVal = (key: string, fallback: string) => {
+				const shape = field(key)?.value.trim();
+				if (shape === undefined) return fallback;
+				const stride = field(`${key}-stride`)?.value.trim() ?? "";
+				return stride ? `${shape}:${stride}` : shape;
+			};
 			op.shape = val("shape", op.shape);
 			op.stride = val("stride", op.stride);
-			op.thr = val("thr", op.thr);
-			st.A.smem = val("sA", st.A.smem);
-			st.B.smem = val("sB", st.B.smem);
+			op.thr = layoutVal("thr", op.thr);
+			st.A.smem = layoutVal("sA", st.A.smem);
+			st.B.smem = layoutVal("sB", st.B.smem);
 			st.cta = val("cta", st.cta);
 			st.atom = val("atom", st.atom);
-			st.mmaThr = val("mmaThr", st.mmaThr);
-			st.gC = val("gC", st.gC);
+			st.mmaThr = layoutVal("mmaThr", st.mmaThr);
+			st.gC = layoutVal("gC", st.gC);
 			for (const key of ["bx", "by", "tx", "k", "kb"] as const) {
 				const v = Number(field(key)?.value);
 				if (Number.isInteger(v)) st[key] = v;
@@ -330,7 +344,10 @@ const showMma = stages !== "copy";
 			try {
 				return f();
 			} catch (e) {
-				for (const key of keys) field(key)?.classList.add("invalid");
+				for (const key of keys) {
+					field(key)?.classList.add("invalid");
+					field(`${key}-stride`)?.classList.add("invalid");
+				}
 				throw e;
 			}
 		}

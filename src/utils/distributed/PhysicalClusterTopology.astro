@@ -1,7 +1,7 @@
 ---
 // The physical network of a GPU cluster: servers (hosts) of GPUs, each GPU with its own NIC,
 // wired multi-rail to ToR switches, which connect to spines, which connect to cores: the
-// three-tier CLOS network MegaScale describes (§3.4, arXiv:2402.15627). See network.ts for
+// three-tier CLOS network. See component/ProcessGroup/network.ts for
 // the wiring and routing rules.
 //
 // Selecting a GPU (hover, click, or Tab + Enter) recolours every other GPU by how far away it
@@ -10,8 +10,8 @@
 // are highlighted. With `values`, GPUs are otherwise coloured by that value (e.g. step time).
 // Usage in .mdx:
 //   <PhysicalClusterTopology servers={12} gpusPerServer={4} serversPerPod={3} spinesPerPod={4} />
-import { type ColorScaleSpec, colorScale } from "../colors/colorScales";
-import { ClusterNetwork, coreId, HOP_CLASSES, spineId, torId } from "./network";
+import { type ColorScaleSpec, colorScale } from "../../component/ProcessGroup/colorScales";
+import { ClusterNetwork, coreId, HOP_CLASSES, spineId, torId } from "../../component/ProcessGroup/network";
 
 interface Props {
 	servers: number;
@@ -44,7 +44,7 @@ const {
 	nicGbps = 200,
 	uplinkGbps = 400,
 	values,
-	colors = "paper",
+	colors = "pinkRed",
 	domain: domainProp,
 	unit = "",
 	valueLabel = "value",
@@ -295,7 +295,7 @@ const hash = [...JSON.stringify(Astro.props)].reduce((h, c) => (h * 31 + c.charC
 </figure>
 
 <script>
-	// Distance map. The class of every other GPU follows network.ts: same server -> NVLink,
+	// Distance map. The class of every other GPU follows component/ProcessGroup/network.ts: same server -> NVLink,
 	// same pod and rail -> 1 switch, same pod -> 3, otherwise 5. GPU cells are recoloured by
 	// class while a GPU is selected and restored (to their value colour) afterwards.
 	const CLASS_NAMES = ["over NVLink", "under the same ToR (1 switch)", "via a spine (3 switches)", "via the core (5 switches)"];

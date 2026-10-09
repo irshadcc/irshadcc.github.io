@@ -5,7 +5,7 @@
 // Cells sharing a label share a hue; without labels, the hue cycles with offset mod 8.
 // Usage in .mdx:
 //   <Matrix2D layout={new CuteLayout([4, [2, 2]], [2, [1, 8]])} data={{ 0: "a" }} labels={{ 0: "T0" }} />
-import { type CuteLayout, formatTuple } from "./CuteLayout";
+import { type CuteLayout, formatTuple } from "../../component/Cute/CuteLayout";
 
 interface Props {
 	layout: CuteLayout;

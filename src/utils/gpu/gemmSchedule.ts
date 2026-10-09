@@ -11,7 +11,7 @@
 // the configuration) and again in the browser whenever the reader picks another blockIdx or
 // threadIdx. Layouts are CuTe layouts (see ../matrix/CuteLayout.ts).
 
-import type { CuteLayout } from "../matrix/CuteLayout";
+import type { CuteLayout } from "../../component/Cute/CuteLayout";
 
 export const WARP = 32;
 

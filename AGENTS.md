@@ -117,7 +117,8 @@ Once a component is stable, it will be migrated to `/src/component`
 | `Matrix2D` | `src/utils/matrix/Matrix2D.astro` | Nested rank-2 layouts, with per-cell values and coloured group labels (tiles, threads) |
 | `GpuGemmDataflow` | `src/utils/gpu/GpuGemmDataflow.astro` | Step-through tiled GEMM on one SM |
 | `FeedForward`, `NeuralNetworkGraph`, `SelfAttention` | `src/utils/neuralnetwork/` | Networks, weights and attention (nodes can reserve a `tray` for overlays and take an `icon` from `nnIcons.ts`; `keepOutputOrder` and `rankSep` tune the layout; `look="glass"` gives gradient nodes with an accent bar) |
-| `LogicalDistributedTopology` | `src/utils/distributed/LogicalDistributedTopology.astro` | A training job's TP/CP/EP/DP/PP groups, with hop counts |
+| `LogicalDistributedTopology` | `src/component/ProcessGroup/LogicalDistributedTopology.astro` | A training job's TP/CP/EP/DP/PP groups, with hop counts |
+| `TopologyExplorer` | `src/component/ProcessGroup/TopologyExplorer.astro` | Interactive Megatron-style topology: reader edits the order string (drag chips), each dimension's size and on/off, GPUs per node and node count; logical view (PP × DP × CP × TP) beside a physical view of nodes in pods with ToR, spine and core switches (`network.ts`; clicking ranks selects them, and the physical view then shows only their nodes, pods and the switches on the routes between them; the table gives each dimension's farthest hop; a node view below draws the hovered rank's node from `nodeTopology.ts`: CPU sockets / NUMA, PCIe switches, GPUs with NICs and optional NVSwitch), drawn on canvases that render only what is visible (scroll, drag, zoom, full screen, go to rank, a grip under each view to resize it and a column splitter and an Equal sizes button in full screen; tested at 100,000 nodes), coloured by node or compute time with an injectable straggler and a checkbox + millisecond slider that keeps only stages, replicas and nodes slower than the threshold (`slowParts`), plus a per-dimension stride / nodes-spanned table (logic in `topologyExplorer.ts`, checked against Megatron's `RankGenerator`) |
 | `PhysicalClusterTopology` | `src/utils/distributed/PhysicalClusterTopology.astro` | Servers, switches and links of a cluster |
 | `CollectiveSteps` | `src/utils/distributed/CollectiveSteps.astro` | Step-through broadcast, reduce, reduce-scatter, all-gather, all-reduce, all-to-all with α–β cost |
 | `PipelineSchedule` | `src/utils/distributed/PipelineSchedule.astro` | Pipeline-parallel schedules as timelines |
@@ -192,3 +193,9 @@ When no component fits, build one rather than settling for a static image.
   names inside components.
 - **Headless screenshots** of a long page can come out blank when scrolled to an anchor; capture
   the full page or load it in a shifted iframe instead.
+
+## Promoting a component
+
+- The components which are experimental lives in src/utils directory. 
+- Once the component is good enough, its moved to src/component directory. 
+- All of its subcomponents

@@ -1,8 +1,8 @@
+import { CuteLayout } from "../../component/Cute/CuteLayout.ts";
 // Verified figure data for the "Tensor Layouts as Integer Set Relations" post.
 // Values are generated from the CuTe and F_2 formulas in arXiv:2511.10374 rather
 // than copied into the MDX. Run with `node --experimental-strip-types` to check.
 import type { BoxEdge, BoxNode } from "../payments/boxDiagram";
-import { CuteLayout } from "./CuteLayout.ts";
 
 const cuteLayout = new CuteLayout([4, [2, 2]], [2, [1, 8]]);
 export const cuteLayoutValues: Record<number, number> = Object.fromEntries(

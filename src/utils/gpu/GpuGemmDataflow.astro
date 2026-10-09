@@ -13,7 +13,7 @@
 // are outlined in every step. The schedule is rebuilt in the browser, see gemmSchedule.ts.
 // Usage in .mdx:
 //   <GpuGemmDataflow M={32} N={32} K={16} BM={16} BN={16} BK={8} warps={[1, 2]} />
-import { CuteLayout } from "../matrix/CuteLayout";
+import { CuteLayout } from "../../component/Cute/CuteLayout";
 import {
 	type CopyEngine,
 	type GemmLayouts,
@@ -757,7 +757,7 @@ const codeLines = kernelCode(copy).code.map((line) => {
 </figure>
 
 <script>
-	import { CuteLayout, type IntTuple } from "../matrix/CuteLayout";
+	import { CuteLayout, type IntTuple } from "../../component/Cute/CuteLayout";
 	import { buildSchedule, type GemmLayouts, type GemmShape, type Highlight, type Swizzle } from "./gemmSchedule";
 
 	type LayoutJSON = { shape: IntTuple; stride: IntTuple };

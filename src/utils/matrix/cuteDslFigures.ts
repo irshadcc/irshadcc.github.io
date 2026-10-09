@@ -2,7 +2,7 @@
 // Every layout, offset and label here was computed with pycute, CUTLASS's pure-Python layout
 // algebra, after checking it against the outputs recorded in NVIDIA's CuTe DSL notebooks.
 // Each entry is spread into a <Matrix2D>: data and labels are keyed by offset.
-import { CuteLayout, type IntTuple } from "./CuteLayout";
+import { CuteLayout, type IntTuple } from "../../component/Cute/CuteLayout";
 
 interface Figure {
 	layout: CuteLayout;

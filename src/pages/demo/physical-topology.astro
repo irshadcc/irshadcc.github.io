@@ -15,7 +15,7 @@ const temps = Array.from({ length: 48 }, (_, g) => 62 + rand() * 8 + (Math.floor
 <Layout title="PhysicalClusterTopology demo">
 	<h1>PhysicalClusterTopology demo</h1>
 	<p>
-		The three-tier network MegaScale describes (§3.4): every GPU has its own NIC, NIC <em>i</em> of every server is
+		A three-tier network: every GPU has its own NIC, NIC <em>i</em> of every server is
 		wired to ToR switch <em>i</em> of its pod ("multi-rail"), ToRs connect to every spine in the pod, and spine
 		<em>s</em> of every pod connects to core <em>s</em>. Hover or click a GPU to colour every other GPU by how many
 		switches its traffic would cross.

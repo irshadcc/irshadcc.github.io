@@ -1,4 +1,4 @@
-// A three-tier CLOS GPU cluster, after MegaScale §3.4 (arXiv:2402.15627), and how traffic
+// A three-tier CLOS GPU cluster, and how traffic
 // between two GPUs is routed through it. Shared by PhysicalClusterTopology (draws it) and
 // LogicalDistributedTopology (labels parallel groups with the hops their traffic takes).
 //
