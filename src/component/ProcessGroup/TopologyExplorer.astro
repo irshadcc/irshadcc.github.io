@@ -1,0 +1,2353 @@
+---
+// An interactive parallelism topology: the reader sets the Megatron order string, the size of
+// each parallel dimension (and turns dimensions on or off), the GPUs per node and the number of
+// nodes, and the figure redraws in the browser.
+//
+//   Logical view:  columns = pipeline stages (PP), rows = data-parallel replicas (DP), each cell
+//                  a stack of context-parallel chunks (CP), each chunk a tensor-parallel group
+//                  (TP) with one square per rank. Every dense group is a straight line here.
+//   Physical view: the same ranks inside their nodes (rank r on GPU r % gpusPerNode of node
+//                  floor(r / gpusPerNode)), wired as the three-tier network of network.ts: pods
+//                  of `nodesPerPod` nodes, each with ToR switches (one per rail) and spines, and
+//                  core switches in a band pinned to the top. Clicking ranks (in either view)
+//                  selects them; the physical view then shows only the selected ranks' nodes,
+//                  their pods and the switches on the routes between them (FocusLayout).
+//
+// Both views are canvases that draw only what is on screen, so jobs of hundreds of thousands of
+// GPUs work: each view scrolls (scrollbars, drag, trackpad), zooms (buttons, ctrl/pinch + wheel)
+// and, zoomed far out, draws one box per cell or node. A full-screen button gives both views the
+// whole window, and "Go to rank" jumps to a rank in both. A grip under each view drags its
+// height (double-click resets it); in full screen a splitter between the columns drags their width.
+//
+// Under the physical view, a node view draws the node of the hovered (or last clicked) rank:
+// CPU sockets (NUMA nodes), PCIe switches, GPUs with their NICs and the NVSwitch, with the paths
+// to the rank's peers in that node (nodeTopology.ts; an illustrative, configurable server model).
+//
+// Squares are coloured by node (to see which groups leave a node) or by compute time (to find a
+// straggler, which can be injected on one GPU or one node). A checkbox and a slider (in ms)
+// filter both views down to the stages, replicas and nodes whose slowest rank takes longer than
+// the threshold, as LogicalDistributedTopology's "slowest per stage / per replica" strips. Hovering or clicking a rank in either
+// view highlights its TP, CP, EP, DP and PP groups in both. A table lists, per dimension, the
+// group stride, how many nodes a group spans and its farthest network hop. Group logic and geometry live in
+// topologyExplorer.ts and follow Megatron-LM's RankGenerator (dense and expert generators).
+//
+// Usage in .mdx:
+//   <TopologyExplorer parallel={{ tp: 4, cp: 1, ep: 2, dp: 4, pp: 2 }} enabled={["tp", "dp", "pp", "ep"]}
+//     order={["tp", "cp", "ep", "dp", "pp"]} gpusPerNode={8} nodes={4} nodesPerPod={2} spinesPerPod={2} selected={0} />
+//   <TopologyExplorer parallel={{ tp: 8, dp: 2, pp: 2 }} gpusPerNode={8} nodes={4}
+//     straggler={{ node: 2 }} colorBy="time" controls={false} title="One slow node" />
+import { DIMS, DIM_NAMES, type Dim } from "./topologyExplorer";
+
+interface Props {
+	/** Group sizes; a missing dimension is 1. */
+	parallel: Partial<Record<Dim, number>>;
+	/** Dimensions switched on; defaults to every dimension with size > 1. */
+	enabled?: Dim[];
+	/** Megatron order, fastest-varying first; missing names are appended (default tp-cp-ep-dp-pp). */
+	order?: Dim[];
+	gpusPerNode?: number;
+	nodes?: number;
+	/** Nodes under one set of ToR switches (a pod). */
+	nodesPerPod?: number;
+	/** Spine switches per pod; also the number of core switches (one per plane). */
+	spinesPerPod?: number;
+	/** Inside each node: CPU sockets (one NUMA node each), GPUs per PCIe switch, NVSwitch on/off, NVLinks per GPU pair. */
+	cpuSockets?: number;
+	gpusPerPcieSwitch?: number;
+	nvswitch?: boolean;
+	nvlinks?: number;
+	/** A slow GPU (`rank`) or a slow node (`node`). */
+	straggler?: { rank: number } | { node: number };
+	colorBy?: "node" | "time";
+	/** Start with the slow-parts filter on, at this threshold in milliseconds. */
+	filterMs?: number;
+	/** Ranks selected initially; the physical view then focuses on them. */
+	selected?: number | number[];
+	/** Show the controls (default true). */
+	controls?: boolean;
+	title?: string;
+}
+
+const {
+	parallel,
+	enabled,
+	order = ["tp", "cp", "ep", "dp", "pp"],
+	gpusPerNode = 8,
+	nodes = 4,
+	nodesPerPod = 32,
+	spinesPerPod = 4,
+	cpuSockets = 2,
+	gpusPerPcieSwitch = 2,
+	nvswitch = true,
+	nvlinks = 18,
+	straggler,
+	filterMs,
+	colorBy = straggler || filterMs !== undefined ? "time" : "node",
+	selected,
+	controls = true,
+	title,
+} = Astro.props;
+
+const sizes = Object.fromEntries(
+	DIMS.map((d) => [d, parallel[d] ?? 1]),
+) as Record<Dim, number>;
+const on = Object.fromEntries(
+	DIMS.map((d) => [d, enabled ? enabled.includes(d) : sizes[d] > 1]),
+) as Record<Dim, boolean>;
+const fullOrder = [...order, ...DIMS.filter((d) => !order.includes(d))];
+const slow = straggler
+	? "rank" in straggler
+		? { kind: "gpu", id: straggler.rank }
+		: { kind: "node", id: straggler.node }
+	: { kind: "none", id: 0 };
+const config = {
+	sizes,
+	enabled: on,
+	order: fullOrder,
+	gpusPerNode,
+	nodes,
+	nodesPerPod,
+	spinesPerPod,
+	cpuSockets,
+	gpusPerPcieSwitch,
+	nvswitch,
+	nvlinks,
+	slow,
+	colorBy,
+	filterOn: filterMs !== undefined,
+	thresholdMs: filterMs ?? 1050,
+	selected:
+		selected === undefined
+			? []
+			: Array.isArray(selected)
+				? selected
+				: [selected],
+};
+const GPN = [1, 2, 4, 8, 16, 32, 64, 72];
+---
+
+<figure class="tx" data-config={JSON.stringify(config)}>
+	{title && <figcaption class="tx-title">{title}</figcaption>}
+	<div class="tx-controls">
+		<div class="tx-config">
+		{
+			controls && (
+				<fieldset class="tx-group tx-wide">
+					<legend>Logical topology</legend>
+					<div class="tx-row tx-order-row">
+						<span class="tx-label">Order (fastest first)</span>
+						<ol class="tx-order" aria-label="Parallelism order, fastest-varying first" />
+						<code class="tx-order-str" />
+					</div>
+					<div class="tx-row tx-dims">
+						{DIMS.map((d) => (
+							<label class={`tx-dim ${d}`} title={DIM_NAMES[d]}>
+								<input type="checkbox" data-enable={d} checked={on[d]} />
+								<span class="tx-dim-name">{d.toUpperCase()}</span>
+								<input
+									type="number"
+									min="1"
+									max="1000000"
+									value={sizes[d]}
+									data-size={d}
+									aria-label={`${DIM_NAMES[d]} size`}
+								/>
+							</label>
+						))}
+					</div>
+				</fieldset>
+			)
+		}
+		{
+			controls && (
+				<fieldset class="tx-group">
+					<legend>Physical cluster</legend>
+					<div class="tx-stack">
+						<label class="tx-field">
+							Nodes
+							<input type="number" min="1" max="10000000" value={nodes} data-nodes class="wide" />
+						</label>
+						<label class="tx-field" title="GPUs per node">
+							GPUs / node
+							<select data-gpn>
+								{GPN.map((g) => (
+									<option value={g} selected={g === gpusPerNode}>
+										{g}
+									</option>
+								))}
+							</select>
+						</label>
+						<label class="tx-field" title="Nodes under one set of ToR switches (a pod)">
+							Nodes / pod
+							<input type="number" min="1" max="1000000" value={nodesPerPod} data-pod />
+						</label>
+						<label class="tx-field" title="Spine switches per pod (also the number of core switches)">
+							Spines / pod
+							<input type="number" min="1" max="1024" value={spinesPerPod} data-spines />
+						</label>
+					</div>
+				</fieldset>
+			)
+		}
+		{
+			controls && (
+				<fieldset class="tx-group">
+					<legend>Node</legend>
+					<div class="tx-stack">
+						<label class="tx-field" title="CPU sockets, one NUMA node each">
+							CPU sockets
+							<input type="number" min="1" max="8" value={cpuSockets} data-sockets />
+						</label>
+						<label class="tx-field" title="GPUs (each with its NIC) per PCIe switch">
+							GPUs / switch
+							<input type="number" min="1" max="72" value={gpusPerPcieSwitch} data-pcie />
+						</label>
+						<label class="tx-field tx-check">
+							<input type="checkbox" data-nvswitch checked={nvswitch} />
+							NVSwitch
+						</label>
+					</div>
+				</fieldset>
+			)
+		}
+		<fieldset class="tx-group">
+			<legend>Filter</legend>
+			<div class="tx-stack">
+				<label class="tx-field" title="Colour squares by node or by compute time">
+					Colour
+					<select data-colorby>
+						<option value="node" selected={colorBy === "node"}>
+							node
+						</option>
+						<option value="time" selected={colorBy === "time"}>
+							compute time
+						</option>
+					</select>
+				</label>
+				<span class="tx-field" title="Slow down one GPU or one node">
+					Straggler
+					<select data-slow-kind aria-label="Straggler kind">
+						<option value="none" selected={slow.kind === "none"}>
+							none
+						</option>
+						<option value="gpu" selected={slow.kind === "gpu"}>
+							GPU of rank
+						</option>
+						<option value="node" selected={slow.kind === "node"}>
+							node
+						</option>
+					</select>
+				</span>
+				<label class="tx-field" title="The straggler's rank (GPU) or node number">
+					Which
+					<input type="number" min="0" value={slow.id} data-slow-id class="wide" />
+				</label>
+			</div>
+			<label class="tx-field tx-check">
+				<input type="checkbox" data-filter checked={filterMs !== undefined} />
+				Only slower than
+			</label>
+			<div class="tx-row tx-filter">
+				<input
+					type="range"
+					min="950"
+					max="1350"
+					step="1"
+					value={filterMs ?? 1050}
+					data-threshold
+					aria-label="Compute-time threshold in milliseconds"
+				/>
+				<output class="tx-threshold">{(filterMs ?? 1050).toLocaleString("en-US")} ms</output>
+			</div>
+		</fieldset>
+		</div>
+	</div>
+	<div class="tx-tools">
+		<label class="tx-field">
+			Go to rank
+			<input type="number" min="0" data-goto class="wide" />
+		</label>
+		<button type="button" class="tx-btn tx-equal" data-equal title="Equal column widths, and undo dragged heights">
+			Equal sizes
+		</button>
+		<button type="button" class="tx-btn" data-full aria-pressed="false">⛶ Full screen</button>
+	</div>
+	<p class="tx-filterinfo"></p>
+	<p class="tx-status" aria-live="polite"></p>
+	<div class="tx-legend"></div>
+	<div class="tx-views">
+		<div class="tx-view">
+			<p class="tx-view-title">Logical view: by parallel coordinates</p>
+			<div class="tx-pane tx-logical"></div>
+		</div>
+		<div
+			class="tx-split"
+			role="separator"
+			aria-orientation="vertical"
+			aria-label="Resize columns (drag, or arrow keys; double-click to reset)"
+			title="Drag to resize; double-click to reset"
+			tabindex="0"
+		>
+		</div>
+		<div class="tx-view">
+			<p class="tx-view-title">Physical view: nodes, ToR, spine and core switches</p>
+			<p class="tx-selbar"></p>
+			<div class="tx-pane tx-physical"></div>
+			<p class="tx-view-title tx-node-title">Node topology</p>
+			<div class="tx-pane tx-nodepane"></div>
+		</div>
+	</div>
+	<div class="tx-bottom">
+		<div class="tx-info" aria-live="polite"></div>
+		<div class="tx-table-wrap"><table class="tx-summary"></table></div>
+	</div>
+</figure>
+
+<script>
+	import {
+		buildTopology,
+		type Dim,
+		formatGroup,
+		GROUP_NAMES,
+		type Group,
+		HOP_NAMES,
+		FocusLayout,
+		LogicalLayout,
+		MAX_SELECTION,
+		PhysicalLayout,
+		SQ,
+		slowParts,
+		type Topology,
+		type TopologyConfig,
+		type ViewFilter,
+		timeOf,
+	} from "./topologyExplorer";
+	import { type Device, NodeLayout, NodeTopology } from "./nodeTopology";
+
+	interface State extends TopologyConfig {
+		slow: { kind: "none" | "gpu" | "node"; id: number };
+		colorBy: "node" | "time";
+		filterOn: boolean;
+		thresholdMs: number;
+		selected: number[];
+		cpuSockets: number;
+		gpusPerPcieSwitch: number;
+		nvswitch: boolean;
+		nvlinks: number;
+	}
+
+	/** Where content point (x, y) lands on screen: (ox + x·z, oy + y·z); [x0, x1] × [y0, y1] is visible. */
+	interface View {
+		z: number;
+		ox: number;
+		oy: number;
+		w: number;
+		h: number;
+		x0: number;
+		y0: number;
+		x1: number;
+		y1: number;
+	}
+	interface Scene {
+		width: number;
+		height: number;
+		/** Screen pixels kept for sticky labels on the left and top. */
+		bandLeft: number;
+		bandTop: number;
+		/** Smallest repeated box (cell or node), which sets the furthest zoom-out. */
+		minBox: number;
+		draw(ctx: CanvasRenderingContext2D, v: View): void;
+		hit(x: number, y: number): number | null;
+		pos(rank: number): { x: number; y: number };
+		/** Whether the rank is drawn (filters can hide it). */
+		shown(rank: number): boolean;
+	}
+
+	// Closest groups first: a rank in both the TP group and the DP group counts as a TP peer.
+	const CLOSENESS: Dim[] = ["tp", "cp", "ep", "dp", "pp"];
+	const TIME_DOMAIN: [number, number] = [0.95, 1.35];
+	// Browsers cap element sizes (~17M px in Firefox); larger content scrolls proportionally.
+	const MAX_SCROLL_PX = 8_000_000;
+
+	const htmlEl = <K extends keyof HTMLElementTagNameMap>(tag: K, cls = "", text = "") => {
+		const e = document.createElement(tag);
+		if (cls) e.className = cls;
+		if (text) e.textContent = text;
+		return e;
+	};
+	const hue = (node: number) => Math.round((node * 137.508 + 200) % 360);
+	const rgb = (hex: string): [number, number, number] => {
+		const h = hex.replace("#", "");
+		const n = Number.parseInt(h.length === 3 ? [...h].map((c) => c + c).join("") : h, 16);
+		return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+	};
+
+	/** A scrollable, zoomable canvas showing one Scene. */
+	class Pane {
+		readonly scroller: HTMLDivElement;
+		readonly spacer: HTMLDivElement;
+		readonly canvas: HTMLCanvasElement;
+		readonly ctx: CanvasRenderingContext2D;
+		scene: Scene | null = null;
+		z = 1;
+		zmin = 0.05;
+		readonly zmax = 3;
+		fx = 1;
+		fy = 1;
+		private frame = 0;
+		/** Height the reader dragged the view to, or null for the automatic height. */
+		userHeight: number | null = null;
+
+		constructor(
+			readonly root: HTMLElement,
+			readonly maxHeight: number,
+			readonly isFull: () => boolean,
+			onHover: (r: number | null) => void,
+			onClick: (r: number | null) => void,
+		) {
+			this.scroller = htmlEl("div", "tx-scroller");
+			this.scroller.tabIndex = 0;
+			this.spacer = htmlEl("div", "tx-spacer");
+			this.scroller.append(this.spacer);
+			this.canvas = htmlEl("canvas");
+			this.canvas.setAttribute("aria-hidden", "true");
+			this.ctx = this.canvas.getContext("2d") as CanvasRenderingContext2D;
+			const zoom = htmlEl("div", "tx-zoom");
+			const btn = (label: string, aria: string, f: () => void) => {
+				const b = htmlEl("button", "tx-btn", label);
+				b.type = "button";
+				b.setAttribute("aria-label", aria);
+				b.addEventListener("click", f);
+				return b;
+			};
+			const mid = () => [this.scroller.clientWidth / 2, this.scroller.clientHeight / 2] as const;
+			zoom.append(
+				btn("−", "Zoom out", () => this.zoomAt(this.z / 1.5, ...mid())),
+				btn("+", "Zoom in", () => this.zoomAt(this.z * 1.5, ...mid())),
+				btn("Fit", "Zoom to fit", () => this.fit()),
+			);
+			// A grip under the view drags its height; arrow keys nudge it, double-click resets it.
+			const grip = htmlEl("div", "tx-grip");
+			grip.tabIndex = 0;
+			grip.setAttribute("role", "separator");
+			grip.setAttribute("aria-orientation", "horizontal");
+			grip.setAttribute("aria-label", "Resize view (drag, or arrow keys; double-click to reset)");
+			grip.title = "Drag to resize; double-click to reset";
+			let start: { y: number; h: number } | null = null;
+			grip.addEventListener("pointerdown", (e) => {
+				start = { y: e.clientY, h: this.scroller.clientHeight };
+				grip.setPointerCapture(e.pointerId);
+				e.preventDefault();
+			});
+			grip.addEventListener("pointermove", (e) => {
+				if (start) this.setHeight(start.h + e.clientY - start.y);
+			});
+			const stop = () => {
+				start = null;
+			};
+			grip.addEventListener("pointerup", stop);
+			grip.addEventListener("pointercancel", stop);
+			grip.addEventListener("dblclick", () => {
+				this.userHeight = null;
+				this.relayout();
+			});
+			grip.addEventListener("keydown", (e) => {
+				if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
+				e.preventDefault();
+				this.setHeight(this.scroller.clientHeight + (e.key === "ArrowDown" ? 24 : -24));
+			});
+			root.replaceChildren(this.scroller, this.canvas, zoom, grip);
+
+			this.scroller.addEventListener("scroll", () => this.schedule(), { passive: true });
+			new ResizeObserver(() => this.relayout()).observe(this.scroller);
+			this.scroller.addEventListener(
+				"wheel",
+				(e) => {
+					if (!e.ctrlKey && !e.metaKey) return;
+					e.preventDefault();
+					const [mx, my] = this.local(e);
+					this.zoomAt(this.z * Math.exp(-e.deltaY * 0.004), mx, my);
+				},
+				{ passive: false },
+			);
+			this.scroller.addEventListener("keydown", (e) => {
+				if (e.key === "+" || e.key === "=") this.zoomAt(this.z * 1.5, ...mid());
+				else if (e.key === "-") this.zoomAt(this.z / 1.5, ...mid());
+			});
+			// Mouse drag pans; a press without movement is a click. Touch scrolls natively.
+			let down: { x: number; y: number; sl: number; st: number } | null = null;
+			let dragged = false;
+			this.scroller.addEventListener("pointerdown", (e) => {
+				dragged = false;
+				if (e.pointerType !== "mouse" || e.button !== 0) return;
+				down = { x: e.clientX, y: e.clientY, sl: this.scroller.scrollLeft, st: this.scroller.scrollTop };
+			});
+			this.scroller.addEventListener("pointermove", (e) => {
+				if (down && e.buttons & 1) {
+					const dx = e.clientX - down.x;
+					const dy = e.clientY - down.y;
+					if (!dragged && Math.hypot(dx, dy) > 4) {
+						dragged = true;
+						this.scroller.classList.add("dragging");
+					}
+					if (dragged) {
+						this.scroller.scrollLeft = down.sl - dx;
+						this.scroller.scrollTop = down.st - dy;
+					}
+					return;
+				}
+				if (e.pointerType === "mouse") onHover(this.hitAt(e));
+			});
+			const end = () => {
+				down = null;
+				this.scroller.classList.remove("dragging");
+			};
+			this.scroller.addEventListener("pointerup", end);
+			this.scroller.addEventListener("pointercancel", end);
+			this.scroller.addEventListener("pointerleave", () => {
+				if (!down) onHover(null);
+			});
+			this.scroller.addEventListener("click", (e) => {
+				if (!dragged) onClick(this.hitAt(e));
+				dragged = false;
+			});
+		}
+
+		private local(e: MouseEvent): [number, number] {
+			const r = this.scroller.getBoundingClientRect();
+			return [e.clientX - r.left, e.clientY - r.top];
+		}
+
+		private hitAt(e: MouseEvent): number | null {
+			if (!this.scene) return null;
+			const [mx, my] = this.local(e);
+			if (mx < this.scene.bandLeft || my < this.scene.bandTop) return null;
+			const v = this.view();
+			return this.scene.hit((mx - v.ox) / v.z, (my - v.oy) / v.z);
+		}
+
+		private centerOff() {
+			const s = this.scene as Scene;
+			return Math.max(0, (this.scroller.clientWidth - s.bandLeft - s.width * this.z) / 2);
+		}
+
+		view(): View {
+			const s = this.scene as Scene;
+			const w = this.scroller.clientWidth;
+			const h = this.scroller.clientHeight;
+			const ox = s.bandLeft + this.centerOff() - this.scroller.scrollLeft * this.fx;
+			const oy = s.bandTop - this.scroller.scrollTop * this.fy;
+			const z = this.z;
+			return { z, ox, oy, w, h, x0: -ox / z, y0: -oy / z, x1: (w - ox) / z, y1: (h - oy) / z };
+		}
+
+		/** Show a new scene, fitted to the width, or at the current zoom with `keepZoom`. */
+		setScene(scene: Scene, keepZoom = false) {
+			const had = this.scene !== null;
+			this.scene = scene;
+			const w = this.scroller.clientWidth || this.root.clientWidth || 600;
+			const h = this.isFull() ? this.scroller.clientHeight || 400 : (this.userHeight ?? this.maxHeight);
+			const fitZ = Math.min((w - scene.bandLeft - 8) / scene.width, (h - scene.bandTop - 8) / scene.height);
+			this.zmin = Math.min(1, Math.max(3 / scene.minBox, fitZ));
+			const z = keepZoom && had ? this.z : (w - scene.bandLeft - 8) / scene.width;
+			this.z = Math.min(keepZoom && had ? this.zmax : 1, Math.max(this.zmin, z));
+			this.scroller.scrollLeft = 0;
+			this.scroller.scrollTop = 0;
+			this.relayout();
+		}
+
+		/** Size the spacer (and, outside full screen, the pane) for the current zoom. */
+		setHeight(h: number) {
+			this.userHeight = Math.round(Math.min(4000, Math.max(100, h)));
+			this.relayout();
+		}
+
+		relayout() {
+			const s = this.scene;
+			if (!s) return;
+			const totalW = s.bandLeft + s.width * this.z + 8;
+			const totalH = s.bandTop + s.height * this.z + 8;
+			if (this.isFull()) {
+				// Panes share the column; a dragged one keeps its height, the others take the rest.
+				this.scroller.style.height = "";
+				this.root.style.flex = this.userHeight ? `0 0 ${this.userHeight + 8}px` : "";
+			} else {
+				this.root.style.flex = "";
+				this.scroller.style.height = `${this.userHeight ?? Math.min(Math.ceil(totalH) + 16, this.maxHeight)}px`;
+			}
+			const vw = this.scroller.clientWidth;
+			const vh = this.scroller.clientHeight;
+			const sw = Math.min(totalW, MAX_SCROLL_PX);
+			const sh = Math.min(totalH, MAX_SCROLL_PX);
+			this.spacer.style.width = `${sw}px`;
+			this.spacer.style.height = `${sh}px`;
+			this.fx = sw > vw && totalW > sw ? (totalW - vw) / (sw - vw) : 1;
+			this.fy = sh > vh && totalH > sh ? (totalH - vh) / (sh - vh) : 1;
+			this.schedule();
+		}
+
+		zoomAt(z: number, mx: number, my: number) {
+			const s = this.scene;
+			if (!s) return;
+			const v = this.view();
+			const cx = (mx - v.ox) / v.z;
+			const cy = (my - v.oy) / v.z;
+			this.z = Math.min(this.zmax, Math.max(this.zmin, z));
+			this.relayout();
+			const sx = s.bandLeft + this.centerOff() + cx * this.z - mx;
+			const sy = s.bandTop + cy * this.z - my;
+			this.scroller.scrollLeft = sx / this.fx;
+			this.scroller.scrollTop = sy / this.fy;
+			this.schedule();
+		}
+
+		fit() {
+			const s = this.scene;
+			if (!s) return;
+			const w = this.scroller.clientWidth;
+			const h = this.scroller.clientHeight;
+			this.z = Math.min(
+				this.zmax,
+				Math.max(this.zmin, Math.min((w - s.bandLeft - 8) / s.width, (h - s.bandTop - 8) / s.height)),
+			);
+			this.relayout();
+			this.scroller.scrollLeft = 0;
+			this.scroller.scrollTop = 0;
+		}
+
+		/** Scroll so content point (x, y) is in the middle, zooming in if squares are tiny. */
+		centerOn(x: number, y: number) {
+			const s = this.scene;
+			if (!s) return;
+			if (SQ * this.z < 12) {
+				this.z = Math.min(this.zmax, Math.max(this.zmin, 16 / SQ));
+				this.relayout();
+			}
+			const vw = this.scroller.clientWidth;
+			const vh = this.scroller.clientHeight;
+			const sx = s.bandLeft + this.centerOff() + x * this.z - (vw + s.bandLeft) / 2;
+			const sy = s.bandTop + y * this.z - (vh + s.bandTop) / 2;
+			this.scroller.scrollLeft = sx / this.fx;
+			this.scroller.scrollTop = sy / this.fy;
+			this.schedule();
+		}
+
+		schedule() {
+			if (this.frame) return;
+			this.frame = requestAnimationFrame(() => {
+				this.frame = 0;
+				this.draw();
+			});
+		}
+
+		draw() {
+			if (!this.scene) return;
+			const w = this.scroller.clientWidth;
+			const h = this.scroller.clientHeight;
+			const dpr = window.devicePixelRatio || 1;
+			if (this.canvas.width !== Math.round(w * dpr) || this.canvas.height !== Math.round(h * dpr)) {
+				this.canvas.width = Math.round(w * dpr);
+				this.canvas.height = Math.round(h * dpr);
+				this.canvas.style.width = `${w}px`;
+				this.canvas.style.height = `${h}px`;
+			}
+			this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+			this.ctx.clearRect(0, 0, w, h);
+			this.scene.draw(this.ctx, this.view());
+		}
+	}
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".tx")) {
+		const state: State = JSON.parse(fig.dataset.config ?? "{}");
+		const q = <T extends Element>(sel: string) => fig.querySelector<T>(sel);
+		const status = q<HTMLElement>(".tx-status");
+		const legend = q<HTMLElement>(".tx-legend");
+		const logicalRoot = q<HTMLElement>(".tx-logical");
+		const physicalRoot = q<HTMLElement>(".tx-physical");
+		const info = q<HTMLElement>(".tx-info");
+		const table = q<HTMLTableElement>(".tx-summary");
+		const orderList = q<HTMLOListElement>(".tx-order");
+		const orderStr = q<HTMLElement>(".tx-order-str");
+		const fullBtn = q<HTMLButtonElement>("[data-full]");
+		if (!status || !legend || !logicalRoot || !physicalRoot || !info || !table) continue;
+
+		let topo: Topology | null = null;
+		// Clicked ranks; the last one clicked is the focus, shown when nothing is hovered.
+		const chosen = new Set<number>(state.selected);
+		let focus: number | null = state.selected.length ? state.selected[state.selected.length - 1] : null;
+		let current: number | null = null;
+		let focusLayout: FocusLayout | null = null;
+		// Slowest time per stage / replica / node, and what the slow-parts filter keeps.
+		let parts: ReturnType<typeof slowParts> | null = null;
+		const ALL: ViewFilter = { stages: null, replicas: null, nodes: null };
+		let viewFilter: ViewFilter = ALL;
+
+		// ---- Theme colours, read from CSS so dark mode and overrides apply.
+		let th: Record<string, string> = {};
+		const readTheme = () => {
+			const cs = getComputedStyle(fig);
+			const v = (n: string) => cs.getPropertyValue(n).trim();
+			th = Object.fromEntries(
+				["tp", "cp", "ep", "dp", "pp", "text", "muted", "faint", "surface", "bg", "accent", "heat-hi", "node-s", "node-l"].map(
+					(n) => [n, v(`--${n}`)],
+				),
+			);
+			th.sans = v("--sans") || "sans-serif";
+			th.mono = v("--mono") || "monospace";
+		};
+		readTheme();
+		const heatColor = (t: number) => {
+			const a = rgb(th.bg || "#ffffff");
+			const b = rgb(th["heat-hi"] || "#d6456b");
+			const c = a.map((x, i) => Math.round(x + (b[i] - x) * t));
+			return `rgb(${c[0]}, ${c[1]}, ${c[2]})`;
+		};
+		const nodeColor = (n: number) => `hsl(${hue(n)}, ${th["node-s"]}, ${th["node-l"]})`;
+		const isSlow = (r: number) => {
+			if (!topo) return false;
+			if (state.slow.kind === "gpu") return r === state.slow.id;
+			if (state.slow.kind === "node") return topo.nodeOf(r) === state.slow.id;
+			return false;
+		};
+		const timeT = (v: number) => Math.min(1, Math.max(0, (v - TIME_DOMAIN[0]) / (TIME_DOMAIN[1] - TIME_DOMAIN[0])));
+		const fillOf = (r: number) =>
+			state.colorBy === "time" ? heatColor(timeT(timeOf(r, isSlow(r)))) : nodeColor((topo as Topology).nodeOf(r));
+		/** The group the rank shares with the selection, closest first, or null. */
+		const peerDim = (sel: number, r: number): Dim | null => {
+			const t = topo as Topology;
+			for (const d of CLOSENESS) if (t.sizes[d] > 1 && t.sameGroup(d, sel, r)) return d;
+			return null;
+		};
+
+		/** One rank's square at screen (x, y) with side s. */
+		const drawSquare = (ctx: CanvasRenderingContext2D, r: number, x: number, y: number, s: number, faded = false) => {
+			const sel = current;
+			const peer = sel !== null && r !== sel ? peerDim(sel, r) : null;
+			const picked = chosen.has(r);
+			ctx.globalAlpha = r !== sel && !peer && !picked && (sel !== null || faded) ? 0.28 : 1;
+			const inset = s >= 6 ? 1 : 0;
+			ctx.fillStyle = fillOf(r);
+			if (s >= 10) {
+				ctx.beginPath();
+				ctx.roundRect(x + inset, y + inset, s - 2 * inset, s - 2 * inset, Math.min(3, s / 8));
+				ctx.fill();
+			} else {
+				ctx.fillRect(x + inset, y + inset, s - 2 * inset, s - 2 * inset);
+			}
+			let stroke = "";
+			let lw = 0;
+			if (r === sel) [stroke, lw] = [th.text, 2.6];
+			else if (picked) [stroke, lw] = [th.text, 2];
+			else if (peer) [stroke, lw] = [th[peer], 2.2];
+			else if (isSlow(r) && s >= 6) [stroke, lw] = [th.text, 1.4];
+			else if (s >= 10) [stroke, lw] = [th.faint, 0.8];
+			if (stroke) {
+				ctx.strokeStyle = stroke;
+				ctx.lineWidth = lw;
+				ctx.strokeRect(x + inset, y + inset, s - 2 * inset, s - 2 * inset);
+			}
+			const label = String(r);
+			const fs = Math.min(s * 0.38, (s - 4) / (label.length * 0.62));
+			if (fs >= 6) {
+				ctx.fillStyle = th.text;
+				ctx.font = `${fs}px ${th.mono}`;
+				ctx.fillText(label, x + s / 2, y + s / 2 + 0.5);
+			}
+			ctx.globalAlpha = 1;
+		};
+		/**
+		 * Zoomed far out, one box per cell or node: its slowest rank's time (or its node colour), and
+		 * a ring when it holds a straggler or the selection, so a few hot boxes stand out among
+		 * thousands.
+		 */
+		const drawBox = (
+			ctx: CanvasRenderingContext2D,
+			[x, y, w, h]: number[],
+			time: number | null,
+			node: string,
+			selected: boolean,
+		) => {
+			const hot = time !== null && timeT(time) > 0.5;
+			ctx.fillStyle = time === null ? node : heatColor(timeT(time));
+			ctx.fillRect(x, y, w, h);
+			if (!hot && !selected) return;
+			ctx.strokeStyle = selected ? th.text : th["heat-hi"];
+			ctx.lineWidth = 2;
+			ctx.strokeRect(x - 3, y - 3, w + 6, h + 6);
+		};
+		/** Highest compute time among the ranks. */
+		const maxTime = (ranks: Iterable<number>) => {
+			let m = 0;
+			for (const r of ranks) m = Math.max(m, timeOf(r, isSlow(r)));
+			return m;
+		};
+
+		const logicalScene = (t: Topology, f: ViewFilter): Scene => {
+			const L = new LogicalLayout(t, f.stages, f.replicas);
+			// With compute-time colours, labels also give each stage's and replica's slowest rank.
+			const times = state.colorBy === "time" && parts ? parts : null;
+			const ms = (v: number) => `${Math.round(v * 1000).toLocaleString("en-US")} ms`;
+			const { tp: T, cp: C } = t.sizes;
+			const cellRanks = function* (d: number, p: number) {
+				for (let c = 0; c < C; c++) for (let k = 0; k < T; k++) yield t.dense.rankOf({ tp: k, cp: c, dp: d, pp: p });
+			};
+			return {
+				width: L.width,
+				height: L.height,
+				bandLeft: times ? 124 : 66,
+				bandTop: 22,
+				minBox: Math.min(L.cellW, L.cellH),
+				pos: (r) => L.pos(r),
+				hit: (x, y) => L.hit(x, y),
+				shown: (r) => L.shown(r),
+				draw(ctx, v) {
+					const { z } = v;
+					const X = (x: number) => v.ox + x * z;
+					const Y = (y: number) => v.oy + y * z;
+					const s = SQ * z;
+					const { i0, i1, j0, j1 } = L.visible(v.x0, v.y0, v.x1, v.y1);
+					ctx.textAlign = "center";
+					ctx.textBaseline = "middle";
+					// Cells.
+					ctx.fillStyle = th.surface;
+					ctx.strokeStyle = th.faint;
+					ctx.lineWidth = 1;
+					for (let j = j0; j <= j1; j++) {
+						const d = L.replicaAt(j);
+						for (let i = i0; i <= i1; i++) {
+							const p = L.stageAt(i);
+							if (s < 2) {
+								const sel = current;
+								const cell = cellRanks(d, p);
+								drawBox(
+									ctx,
+									[X(L.cellX(p)), Y(L.cellY(d)), L.cellW * z, L.cellH * z],
+									state.colorBy === "time" ? maxTime(cell) : null,
+									nodeColor(t.nodeOf(t.dense.rankOf({ dp: d, pp: p }))),
+									sel !== null && t.dense.digit(sel, "dp") === d && t.dense.digit(sel, "pp") === p,
+								);
+								continue;
+							}
+							ctx.beginPath();
+							ctx.roundRect(X(L.cellX(p)), Y(L.cellY(d)), L.cellW * z, L.cellH * z, Math.min(6, 6 * z));
+							ctx.fill();
+							if (L.cellW * z >= 12) ctx.stroke();
+						}
+					}
+					// The selection's groups, under the squares.
+					const sel = current;
+					if (sel !== null && L.shown(sel)) {
+						const at = (r: number) => {
+							const q = L.pos(r);
+							return { x: X(q.x) + s / 2, y: Y(q.y) + s / 2 };
+						};
+						/** The group's first and last ranks that are drawn (filters can hide some). */
+						const ends = (g: Group) => {
+							let a = -1;
+							let b = -1;
+							for (let k = 0; k < g.size; k++) {
+								const r = g.base + k * g.stride;
+								if (!L.shown(r)) continue;
+								if (a < 0) a = r;
+								b = r;
+							}
+							return [a, b];
+						};
+						for (const dim of t.active) {
+							const g = t.groupOf(dim, sel);
+							ctx.strokeStyle = th[dim];
+							ctx.lineWidth = 2.4;
+							ctx.setLineDash(dim === "ep" ? [4, 3] : []);
+							ctx.beginPath();
+							if (dim === "tp") {
+								const q = L.squareXY({ ...t.dense.coordOf(sel), tp: 0 });
+								ctx.roundRect(X(q.x) - 3, Y(q.y) - 3, L.tpCols * s + 6, L.blockH * z + 6, 5);
+							} else if (dim === "ep") {
+								// EP is not a straight line in general; join its ranks (capped).
+								let first = true;
+								for (let k = 0; k < Math.min(g.size, 4096); k++) {
+									const r = g.base + k * g.stride;
+									if (!L.shown(r)) continue;
+									const a = at(r);
+									if (first) ctx.moveTo(a.x, a.y);
+									else ctx.lineTo(a.x, a.y);
+									first = false;
+								}
+							} else {
+								// CP, DP and PP groups are straight lines: first rank to last.
+								const off = dim === "cp" ? -4 : dim === "dp" ? 4 : 0;
+								const [ra, rb] = ends(g);
+								const a = at(ra);
+								const b = at(rb);
+								ctx.moveTo(a.x + off, a.y);
+								ctx.lineTo(b.x + off, b.y);
+							}
+							ctx.stroke();
+						}
+						ctx.setLineDash([]);
+					}
+					// Squares.
+					if (s >= 2) {
+						for (let j = j0; j <= j1; j++) {
+							const d = L.replicaAt(j);
+							for (let i = i0; i <= i1; i++) {
+								const p = L.stageAt(i);
+								for (let c = 0; c < C; c++) {
+									for (let k = 0; k < T; k++) {
+										const r = t.dense.rankOf({ tp: k, cp: c, dp: d, pp: p });
+										const q = L.squareXY({ tp: k, cp: c, dp: d, pp: p, ep: 0 });
+										drawSquare(ctx, r, X(q.x), Y(q.y), s);
+									}
+								}
+							}
+						}
+					}
+					// Sticky labels: stages along the top, replicas down the left.
+					ctx.fillStyle = th.bg;
+					ctx.fillRect(0, 0, v.w, this.bandTop);
+					ctx.fillRect(0, 0, this.bandLeft, v.h);
+					ctx.font = `600 11px ${th.sans}`;
+					ctx.fillStyle = th.text;
+					let last = Number.NEGATIVE_INFINITY;
+					for (let i = i0; i <= i1; i++) {
+						const p = L.stageAt(i);
+						const x = X(L.cellX(p) + L.cellW / 2);
+						if (x - last < (times ? 120 : 60) || x < this.bandLeft) continue;
+						const name = `PP-${p}`;
+						ctx.fillText(times ? `${name} · ${ms(times.stage[p])}` : name, x, this.bandTop / 2 + 1);
+						last = x;
+					}
+					ctx.textAlign = "left";
+					last = Number.NEGATIVE_INFINITY;
+					for (let j = j0; j <= j1; j++) {
+						const d = L.replicaAt(j);
+						const y = Y(L.cellY(d) + L.cellH / 2);
+						if (y - last < 15 || y < this.bandTop) continue;
+						ctx.fillText(times ? `DP-${d} · ${ms(times.replica[d])}` : `DP-${d}`, 6, y);
+						last = y;
+					}
+				},
+			};
+		};
+
+		/** Every node in its pod, with the pod's spines and ToRs; cores in a band pinned to the top. */
+		const overviewScene = (t: Topology, nodes: number[] | null): Scene => {
+			const P = new PhysicalLayout(t, nodes);
+			const g = t.gpusPerNode;
+			const S = P.spinesPerPod;
+			const band = P.pods > 1 ? 40 : 0;
+			return {
+				width: P.width,
+				height: P.height,
+				bandLeft: 0,
+				bandTop: band,
+				minBox: Math.min(P.nodeW, P.nodeH),
+				pos: (r) => P.pos(r),
+				hit: (x, y) => P.hit(x, y),
+				shown: (r) => P.shown(r),
+				draw(ctx, v) {
+					const { z } = v;
+					const X = (x: number) => v.ox + x * z;
+					const Y = (y: number) => v.oy + y * z;
+					const s = SQ * z;
+					const sw = P.swW * z;
+					const sh = P.swH * z;
+					const selNode = current === null ? -1 : t.nodeOf(current);
+					ctx.textAlign = "center";
+					ctx.textBaseline = "middle";
+					for (const p of P.visiblePods(v.x0, v.y0, v.x1, v.y1)) {
+						const o = P.podXY(p);
+						drawPod(ctx, X(o.x), Y(o.y), P.podW * z, P.podH * z, z, p);
+						if (sw >= 3) {
+							for (let c = 0; c < S; c++) {
+								const q = P.spineXY(p, c);
+								drawSwitch(ctx, X(q.x), Y(q.y), sw, sh, z >= 0.55 ? `spine ${c}` : "");
+							}
+							for (let r = 0; r < g; r++) {
+								const q = P.torXY(p, r);
+								drawSwitch(ctx, X(q.x), Y(q.y), sw, sh, z >= 0.55 ? `ToR ${r}` : "");
+							}
+						}
+						for (const n of P.nodesIn(p)) {
+							const q = P.nodeXY(n);
+							const x = X(q.x);
+							const y = Y(q.y);
+							const w = P.nodeW * z;
+							const h = P.nodeH * z;
+							if (x > v.w || y > v.h || x + w < 0 || y + h < 0) continue;
+							if (s < 2) {
+								const ranks = Array.from({ length: g }, (_, i) => n * g + i);
+								drawBox(ctx, [x, y, w, h], state.colorBy === "time" ? maxTime(ranks) : null, nodeColor(n), n === selNode);
+								continue;
+							}
+							drawNode(ctx, x, y, w, h, z, n, n === selNode);
+							for (let i = 0; i < g; i++) {
+								const q2 = P.pos(n * g + i);
+								drawSquare(ctx, n * g + i, X(q2.x), Y(q2.y), s);
+							}
+						}
+					}
+					if (band) {
+						ctx.fillStyle = th.bg;
+						ctx.fillRect(0, 0, v.w, band);
+						ctx.strokeStyle = th.faint;
+						ctx.lineWidth = 1;
+						ctx.beginPath();
+						ctx.moveTo(0, band - 0.5);
+						ctx.lineTo(v.w, band - 0.5);
+						ctx.stroke();
+						const coreW = Math.min(44, v.w / S - 6);
+						for (let c = 0; c < S; c++) {
+							const cx = (v.w * (c + 0.5)) / S;
+							drawSwitch(ctx, cx - coreW / 2, 10, coreW, 20, coreW >= 30 ? `core ${c}` : "", 9);
+						}
+					}
+				},
+			};
+		};
+
+		/** Only the selected ranks' nodes and pods, and the switches and links on routes between them. */
+		const focusScene = (t: Topology, F: FocusLayout): Scene => ({
+			width: F.width,
+			height: F.height,
+			bandLeft: 0,
+			bandTop: 0,
+			minBox: F.swW,
+			pos: (r) => F.boxes.get(`gpu:${r}`) ?? { x: 0, y: 0 },
+			shown: (r) => F.boxes.has(`gpu:${r}`),
+			hit: (x, y) => F.hit(x, y),
+			draw(ctx, v) {
+				const { z } = v;
+				const X = (x: number) => v.ox + x * z;
+				const Y = (y: number) => v.oy + y * z;
+				const g = t.gpusPerNode;
+				ctx.textAlign = "center";
+				ctx.textBaseline = "middle";
+				for (const p of F.pods) {
+					const b = F.boxes.get(`pod-${p}`);
+					if (b) drawPod(ctx, X(b.x), Y(b.y), b.w * z, b.h * z, z, p);
+				}
+				for (const n of F.nodes) {
+					const b = F.boxes.get(`node-${n}`);
+					if (b) drawNode(ctx, X(b.x), Y(b.y), b.w * z, b.h * z, z, n, current !== null && t.nodeOf(current) === n);
+				}
+				// Links: from the lower box's top edge to the upper box's bottom edge.
+				ctx.lineWidth = 2;
+				for (const e of F.edges) {
+					const a = F.boxes.get(e.a);
+					const b = F.boxes.get(e.b);
+					if (!a || !b) continue;
+					const [lo, hi] = a.y > b.y ? [a, b] : [b, a];
+					ctx.strokeStyle = e.dim ? th[e.dim] : th.muted;
+					ctx.setLineDash(e.dim === "ep" ? [4, 3] : []);
+					ctx.beginPath();
+					ctx.moveTo(X(lo.x + lo.w / 2), Y(lo.y));
+					ctx.lineTo(X(hi.x + hi.w / 2), Y(hi.y + hi.h));
+					ctx.stroke();
+				}
+				// NVLink pairs: an arc under the node between the two GPUs.
+				for (const { a, b, dim } of F.nvlink) {
+					const p = F.boxes.get(`gpu:${a}`);
+					const q = F.boxes.get(`gpu:${b}`);
+					if (!p || !q) continue;
+					ctx.strokeStyle = dim ? th[dim] : th.muted;
+					ctx.setLineDash(dim === "ep" ? [4, 3] : []);
+					ctx.beginPath();
+					ctx.moveTo(X(p.x + p.w / 2), Y(p.y + p.h));
+					ctx.quadraticCurveTo(X((p.x + q.x + p.w) / 2), Y(Math.max(p.y, q.y) + p.h + 12), X(q.x + q.w / 2), Y(q.y + q.h));
+					ctx.stroke();
+				}
+				ctx.setLineDash([]);
+				for (const [id, b] of F.boxes) {
+					const [kind, a, c] = id.split("-");
+					if (kind !== "core" && kind !== "spine" && kind !== "tor") continue;
+					const label = kind === "core" ? `core ${a}` : kind === "spine" ? `spine ${c}` : `ToR ${c}`;
+					drawSwitch(ctx, X(b.x), Y(b.y), b.w * z, b.h * z, z >= 0.55 ? label : "", 9 * z);
+				}
+				for (const n of F.nodes) {
+					for (let k = 0; k < g; k++) {
+						const r = n * g + k;
+						const b = F.boxes.get(`gpu:${r}`);
+						if (b) drawSquare(ctx, r, X(b.x), Y(b.y), SQ * z, true);
+					}
+				}
+			},
+		});
+
+		const drawPod = (ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, z: number, p: number) => {
+			ctx.setLineDash([4, 3]);
+			ctx.strokeStyle = th.faint;
+			ctx.lineWidth = 1;
+			ctx.beginPath();
+			ctx.roundRect(x, y, w, h, Math.min(8, 8 * z));
+			ctx.stroke();
+			ctx.setLineDash([]);
+			if (z < 0.45) return;
+			ctx.textAlign = "left";
+			ctx.fillStyle = th.muted;
+			ctx.font = `600 ${10 * z}px ${th.sans}`;
+			ctx.fillText(`pod ${p}`, x + 8 * z, y + 10 * z);
+			ctx.textAlign = "center";
+		};
+		const drawSwitch = (
+			ctx: CanvasRenderingContext2D,
+			x: number,
+			y: number,
+			w: number,
+			h: number,
+			label: string,
+			fs = 9,
+		) => {
+			ctx.fillStyle = th.surface;
+			ctx.fillRect(x, y, w, h);
+			ctx.strokeStyle = th.muted;
+			ctx.lineWidth = 1;
+			ctx.strokeRect(x, y, w, h);
+			if (!label) return;
+			ctx.fillStyle = th.text;
+			ctx.font = `${fs}px ${th.sans}`;
+			ctx.fillText(label, x + w / 2, y + h / 2 + 0.5);
+		};
+		const drawNode = (
+			ctx: CanvasRenderingContext2D,
+			x: number,
+			y: number,
+			w: number,
+			h: number,
+			z: number,
+			n: number,
+			on: boolean,
+		) => {
+			ctx.beginPath();
+			ctx.roundRect(x, y, w, h, Math.min(6, 6 * z));
+			ctx.fillStyle = th.surface;
+			ctx.fill();
+			ctx.strokeStyle = on ? th.text : `hsl(${hue(n)}, 45%, 55%)`;
+			ctx.lineWidth = on ? 2 : 1.2;
+			ctx.stroke();
+			if (z < 0.6) return;
+			ctx.textAlign = "left";
+			ctx.fillStyle = th.muted;
+			ctx.font = `600 ${10 * z}px ${th.sans}`;
+			ctx.fillText(`node ${n}`, x + 6 * z, y + 8 * z);
+			ctx.textAlign = "center";
+		};
+
+		// ---- Node view: the inside of one node.
+		let nodeModel: NodeTopology | null = null;
+		let nodeLayout: NodeLayout | null = null;
+		let nodeShown = -1;
+		const nodeTitle = q<HTMLElement>(".tx-node-title");
+		const nodeScene = (t: Topology, NL: NodeLayout, node: number): Scene => {
+			const NT = NL.node;
+			const g = t.gpusPerNode;
+			const gpu = (i: number): Device => ({ kind: "gpu", i });
+			return {
+				width: NL.width,
+				height: NL.height,
+				bandLeft: 0,
+				bandTop: 0,
+				minBox: NL.sq,
+				pos: (r) => NL.boxes.get(`gpu:${r - node * g}`) ?? { x: 0, y: 0 },
+				shown: (r) => t.nodeOf(r) === node,
+				hit: (x, y) => {
+					const i = NL.hit(x, y);
+					return i === null ? null : node * g + i;
+				},
+				draw(ctx, v) {
+					const { z } = v;
+					const X = (x: number) => v.ox + x * z;
+					const Y = (y: number) => v.oy + y * z;
+					const box = (id: string) => NL.boxes.get(id);
+					const mid = (id: string): [number, number] => {
+						const b = box(id);
+						return b ? [X(b.x + b.w / 2), Y(b.y + b.h / 2)] : [0, 0];
+					};
+					ctx.textAlign = "center";
+					ctx.textBaseline = "middle";
+					// Wires, all vertical: NVSwitch to GPUs, GPUs and NICs to their switch, switches to CPUs.
+					ctx.strokeStyle = th.faint;
+					ctx.lineWidth = 1.4;
+					ctx.beginPath();
+					const down = (from: string, to: string, x?: number) => {
+						const a = box(from);
+						const b = box(to);
+						if (!a || !b) return;
+						const cx = x ?? a.x + a.w / 2;
+						ctx.moveTo(X(cx), Y(a.y + a.h));
+						ctx.lineTo(X(cx), Y(b.y));
+					};
+					for (let i = 0; i < g; i++) {
+						if (NT.shape.nvswitch) down("nvswitch", `gpu:${i}`, (box(`gpu:${i}`)?.x ?? 0) + NL.sq / 2);
+						down(`gpu:${i}`, `sw:${NT.switchOf(gpu(i))}`);
+						down(`nic:${i}`, `sw:${NT.switchOf(gpu(i))}`);
+					}
+					for (let k = 0; k < NT.switches; k++) down(`sw:${k}`, `cpu:${NT.socketOfSwitch(k)}`);
+					ctx.stroke();
+					// The CPU interconnect between consecutive sockets.
+					for (let s = 1; s < NT.shape.sockets; s++) {
+						const a = box(`cpu:${s - 1}`);
+						const b = box(`cpu:${s}`);
+						if (!a || !b) continue;
+						ctx.strokeStyle = th.muted;
+						ctx.lineWidth = 2;
+						ctx.beginPath();
+						ctx.moveTo(X(a.x + a.w), Y(a.y + a.h / 2));
+						ctx.lineTo(X(b.x), Y(b.y + b.h / 2));
+						ctx.stroke();
+						ctx.fillStyle = th.muted;
+						ctx.font = `${9 * z}px ${th.sans}`;
+						ctx.fillText("UPI", X((a.x + a.w + b.x) / 2), Y(a.y - 6));
+					}
+					// Paths from the selected rank to its peers in this node, coloured by shared group.
+					const sel = current;
+					let offNode = false;
+					if (sel !== null && t.nodeOf(sel) === node) {
+						const si = sel - node * g;
+						for (const dim of CLOSENESS) {
+							if (t.sizes[dim] < 2) continue;
+							const grp = t.groupOf(dim, sel);
+							for (let k = 0; k < grp.size; k++) {
+								const r = grp.base + k * grp.stride;
+								if (r === sel) continue;
+								if (t.nodeOf(r) !== node) {
+									offNode = true;
+									continue;
+								}
+								if (peerDim(sel, r) !== dim) continue;
+								const pts = NT.path(gpu(si), gpu(r - node * g)).map(mid);
+								ctx.strokeStyle = th[dim];
+								ctx.lineWidth = 2.4;
+								ctx.setLineDash(dim === "ep" ? [4, 3] : []);
+								ctx.beginPath();
+								pts.forEach(([x, y], j) => (j ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+								ctx.stroke();
+							}
+						}
+						ctx.setLineDash([]);
+					}
+					const label = (id: string, text: string, strong = false) => {
+						const b = box(id);
+						if (!b) return;
+						ctx.fillStyle = th.surface;
+						ctx.fillRect(X(b.x), Y(b.y), b.w * z, b.h * z);
+						ctx.strokeStyle = strong ? th.accent : th.muted;
+						ctx.lineWidth = strong ? 2.2 : 1;
+						ctx.strokeRect(X(b.x), Y(b.y), b.w * z, b.h * z);
+						if (z < 0.45) return;
+						ctx.fillStyle = th.text;
+						ctx.font = `${9 * z}px ${th.sans}`;
+						ctx.fillText(text, X(b.x + b.w / 2), Y(b.y + b.h / 2) + 0.5);
+					};
+					if (NT.shape.nvswitch) label("nvswitch", `NVSwitch · NV${NT.shape.nvlinks} between every GPU pair`);
+					for (let k = 0; k < NT.switches; k++) label(`sw:${k}`, `PCIe switch ${k}`);
+					for (let s = 0; s < NT.shape.sockets; s++) label(`cpu:${s}`, `CPU ${s} · NUMA ${s}`);
+					// The selected rank's NIC carries its traffic to peers on other nodes.
+					for (let i = 0; i < g; i++) {
+						label(`nic:${i}`, `NIC ${i}`, offNode && sel === node * g + i);
+						const b = box(`gpu:${i}`);
+						if (b && z >= 0.45) {
+							ctx.fillStyle = th.muted;
+							ctx.font = `${9 * z}px ${th.sans}`;
+							ctx.fillText(`GPU ${i}`, X(b.x + b.w / 2), Y(b.y - 7));
+						}
+						if (b) drawSquare(ctx, node * g + i, X(b.x), Y(b.y), NL.sq * z);
+					}
+				},
+			};
+		};
+		/** Show the node of the hovered (or last clicked) rank; rebuild only when it changes. */
+		const refreshNode = (force = false) => {
+			if (!topo || !nodeLayout || !nodeModel) return;
+			const r = current ?? focus;
+			const node = r === null ? 0 : topo.nodeOf(r);
+			if (!force && node === nodeShown) return;
+			nodeShown = node;
+			nodePane.setScene(nodeScene(topo, nodeLayout, node), !force);
+			if (nodeTitle) nodeTitle.textContent = `Node topology: node ${node.toLocaleString()} (illustrative server model)`;
+		};
+
+		const isFull = () => fig.classList.contains("tx-full");
+		const onHover = (r: number | null) => {
+			const next = r ?? focus;
+			if (next !== current) show(next);
+		};
+		/** Clicking a rank adds it to the selection, or removes it if it is already there. */
+		const onClick = (r: number | null) => {
+			if (r === null) return;
+			if (chosen.has(r)) {
+				chosen.delete(r);
+				focus = focus === r ? ([...chosen].pop() ?? null) : focus;
+			} else if (chosen.size < MAX_SELECTION) {
+				chosen.add(r);
+				focus = r;
+			}
+			refreshSelection();
+		};
+		const logicalPane = new Pane(logicalRoot, 460, isFull, onHover, onClick);
+		const physicalPane = new Pane(physicalRoot, 340, isFull, onHover, onClick);
+		const nodeRoot = q<HTMLElement>(".tx-nodepane") as HTMLElement;
+		const nodePane = new Pane(nodeRoot, 300, isFull, onHover, onClick);
+		const panes = [logicalPane, physicalPane, nodePane];
+		const redraw = () => {
+			for (const p of panes) p.schedule();
+		};
+		window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+			readTheme();
+			redraw();
+		});
+
+		// ---- Full screen: a fixed overlay, plus the Fullscreen API where the browser has it.
+		const setFull = (full: boolean) => {
+			fig.classList.toggle("tx-full", full);
+			document.documentElement.classList.toggle("tx-noscroll", full);
+			if (fullBtn) {
+				fullBtn.textContent = full ? "✕ Exit full screen" : "⛶ Full screen";
+				fullBtn.setAttribute("aria-pressed", String(full));
+			}
+			if (full && !document.fullscreenElement) fig.requestFullscreen?.().catch(() => {});
+			if (!full && document.fullscreenElement === fig) document.exitFullscreen().catch(() => {});
+			requestAnimationFrame(() => {
+				for (const p of panes) p.relayout();
+			});
+		};
+		fullBtn?.addEventListener("click", () => setFull(!isFull()));
+		// Full screen: drag the splitter to share the width between the logical and physical columns.
+		const split = q<HTMLElement>(".tx-split");
+		const views = q<HTMLElement>(".tx-views");
+		if (split && views) {
+			const setLeft = (px: number | null) => {
+				const w = views.clientWidth;
+				fig.style.removeProperty("--tx-right");
+				if (px === null) fig.style.removeProperty("--tx-left");
+				else fig.style.setProperty("--tx-left", `${Math.round(Math.min(w - 220, Math.max(220, px)))}px`);
+			};
+			// Equal sizes: two equal columns, and every view back to its automatic height.
+			q<HTMLButtonElement>("[data-equal]")?.addEventListener("click", () => {
+				fig.style.setProperty("--tx-left", "minmax(0, 1fr)");
+				fig.style.setProperty("--tx-right", "minmax(0, 1fr)");
+				for (const p of panes) p.userHeight = null;
+				requestAnimationFrame(() => {
+					for (const p of panes) p.relayout();
+				});
+			});
+			let dragging = false;
+			split.addEventListener("pointerdown", (e) => {
+				dragging = true;
+				split.setPointerCapture(e.pointerId);
+				e.preventDefault();
+			});
+			split.addEventListener("pointermove", (e) => {
+				if (dragging) setLeft(e.clientX - views.getBoundingClientRect().left);
+			});
+			split.addEventListener("pointerup", () => {
+				dragging = false;
+			});
+			split.addEventListener("pointercancel", () => {
+				dragging = false;
+			});
+			split.addEventListener("dblclick", () => setLeft(null));
+			split.addEventListener("keydown", (e) => {
+				if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+				e.preventDefault();
+				const first = views.firstElementChild as HTMLElement;
+				setLeft(first.getBoundingClientRect().width + (e.key === "ArrowRight" ? 32 : -32));
+			});
+		}
+		document.addEventListener("fullscreenchange", () => {
+			if (!document.fullscreenElement && isFull()) setFull(false);
+		});
+		fig.addEventListener("keydown", (e) => {
+			if (e.key === "Escape" && isFull()) setFull(false);
+		});
+
+		// ---- Controls.
+		const renderOrder = () => {
+			if (orderStr) orderStr.textContent = `order="${state.order.join("-")}"`;
+			if (!orderList) return;
+			orderList.replaceChildren();
+			state.order.forEach((d, i) => {
+				const li = htmlEl("li", `tx-chip ${d}${state.enabled[d] && state.sizes[d] > 1 ? "" : " off"}`);
+				li.draggable = true;
+				const left = htmlEl("button", "tx-move", "‹");
+				left.type = "button";
+				left.disabled = i === 0;
+				left.setAttribute("aria-label", `Move ${d} earlier (faster varying)`);
+				left.addEventListener("click", () => move(i, i - 1));
+				const right = htmlEl("button", "tx-move", "›");
+				right.type = "button";
+				right.disabled = i === state.order.length - 1;
+				right.setAttribute("aria-label", `Move ${d} later (slower varying)`);
+				right.addEventListener("click", () => move(i, i + 1));
+				li.append(left, htmlEl("span", "tx-chip-name", d), right);
+				li.addEventListener("dragstart", (e) => {
+					e.dataTransfer?.setData("text/plain", String(i));
+					li.classList.add("dragging");
+				});
+				li.addEventListener("dragend", () => li.classList.remove("dragging"));
+				li.addEventListener("dragover", (e) => e.preventDefault());
+				li.addEventListener("drop", (e) => {
+					e.preventDefault();
+					const from = Number(e.dataTransfer?.getData("text/plain"));
+					if (Number.isInteger(from)) move(from, i);
+				});
+				orderList.append(li);
+			});
+		};
+		const move = (from: number, to: number) => {
+			if (from === to || to < 0 || to >= state.order.length) return;
+			const [d] = state.order.splice(from, 1);
+			state.order.splice(to, 0, d);
+			update();
+		};
+		const intOf = (el: HTMLInputElement, min: number) => {
+			const v = Number(el.value);
+			return Number.isInteger(v) && v >= min ? v : null;
+		};
+		for (const cb of fig.querySelectorAll<HTMLInputElement>("[data-enable]")) {
+			cb.addEventListener("change", () => {
+				const d = cb.dataset.enable as Dim;
+				state.enabled[d] = cb.checked;
+				// Turning a dimension on at size 1 would change nothing; give it size 2.
+				if (cb.checked && state.sizes[d] === 1) {
+					state.sizes[d] = 2;
+					const el = q<HTMLInputElement>(`[data-size="${d}"]`);
+					if (el) el.value = "2";
+				}
+				update();
+			});
+		}
+		for (const el of fig.querySelectorAll<HTMLInputElement>("[data-size]")) {
+			el.addEventListener("change", () => {
+				const d = el.dataset.size as Dim;
+				const v = intOf(el, 1);
+				if (v === null) return;
+				state.sizes[d] = v;
+				state.enabled[d] = v > 1 || state.enabled[d];
+				const cb = q<HTMLInputElement>(`[data-enable="${d}"]`);
+				if (cb) cb.checked = state.enabled[d];
+				update();
+			});
+		}
+		q<HTMLInputElement>("[data-nodes]")?.addEventListener("change", (e) => {
+			const v = intOf(e.target as HTMLInputElement, 1);
+			if (v === null) return;
+			state.nodes = v;
+			update();
+		});
+		for (const [sel, key] of [
+			["[data-pod]", "nodesPerPod"],
+			["[data-spines]", "spinesPerPod"],
+			["[data-sockets]", "cpuSockets"],
+			["[data-pcie]", "gpusPerPcieSwitch"],
+		] as const) {
+			q<HTMLInputElement>(sel)?.addEventListener("change", (e) => {
+				const v = intOf(e.target as HTMLInputElement, 1);
+				if (v === null) return;
+				state[key] = v;
+				update();
+			});
+		}
+		q<HTMLInputElement>("[data-nvswitch]")?.addEventListener("change", (e) => {
+			state.nvswitch = (e.target as HTMLInputElement).checked;
+			update();
+		});
+		q<HTMLSelectElement>("[data-gpn]")?.addEventListener("change", (e) => {
+			state.gpusPerNode = Number((e.target as HTMLSelectElement).value);
+			update();
+		});
+		const colorSel = q<HTMLSelectElement>("[data-colorby]");
+		colorSel?.addEventListener("change", () => {
+			state.colorBy = colorSel.value as State["colorBy"];
+			drawLegend();
+			applyFilter();
+		});
+		const slowKind = q<HTMLSelectElement>("[data-slow-kind]");
+		const slowId = q<HTMLInputElement>("[data-slow-id]");
+		const onSlow = () => {
+			if (!slowKind || !slowId) return;
+			state.slow = { kind: slowKind.value as State["slow"]["kind"], id: intOf(slowId, 0) ?? 0 };
+			if (state.slow.kind !== "none") {
+				state.colorBy = "time";
+				if (colorSel) colorSel.value = "time";
+			}
+			drawLegend();
+			if (topo) {
+				parts = slowParts(topo, (r) => timeOf(r, isSlow(r)));
+				syncSlider();
+			}
+			applyFilter();
+			show(current);
+		};
+		slowKind?.addEventListener("change", onSlow);
+		slowId?.addEventListener("change", onSlow);
+		q<HTMLInputElement>("[data-goto]")?.addEventListener("change", (e) => {
+			const r = intOf(e.target as HTMLInputElement, 0);
+			if (r === null || !topo || r >= topo.world) return;
+			if (!chosen.has(r) && chosen.size < MAX_SELECTION) chosen.add(r);
+			focus = r;
+			refreshSelection();
+			const ls = logicalPane.scene;
+			const ps = physicalPane.scene;
+			if (ls?.shown(r)) {
+				const p = ls.pos(r);
+				logicalPane.centerOn(p.x + SQ / 2, p.y + SQ / 2);
+			}
+			if (ps?.shown(r)) {
+				const p = ps.pos(r);
+				physicalPane.centerOn(p.x + SQ / 2, p.y + SQ / 2);
+			}
+		});
+		// ---- Slow-parts filter.
+		const filterBox = q<HTMLInputElement>("[data-filter]");
+		const slider = q<HTMLInputElement>("[data-threshold]");
+		const sliderOut = q<HTMLOutputElement>(".tx-threshold");
+		const filterInfo = q<HTMLElement>(".tx-filterinfo");
+		/** Set the slider's range to the job's fastest and slowest rank, in whole ms. */
+		const syncSlider = () => {
+			if (!slider || !parts) return;
+			const lo = Math.floor(parts.min * 1000);
+			const hi = Math.ceil(parts.max * 1000);
+			slider.min = String(lo);
+			slider.max = String(hi);
+			state.thresholdMs = Math.min(hi, Math.max(lo, state.thresholdMs));
+			slider.value = String(state.thresholdMs);
+			if (sliderOut) sliderOut.textContent = `${state.thresholdMs.toLocaleString("en-US")} ms`;
+		};
+		const drawFilterInfo = () => {
+			if (!filterInfo || !topo) return;
+			const f = viewFilter;
+			if (!state.filterOn || !f.stages || !f.replicas || !f.nodes) {
+				filterInfo.textContent = "";
+				return;
+			}
+			const ms = `${state.thresholdMs.toLocaleString("en-US")} ms`;
+			const of = (n: number, total: number, w: string) => `${n.toLocaleString()} of ${total.toLocaleString()} ${w}`;
+			filterInfo.textContent = f.nodes.length
+				? `Showing ${of(f.stages.length, topo.sizes.pp, "PP")}, ${of(f.replicas.length, topo.sizes.dp, "DP")} and ${of(f.nodes.length, topo.nodes, "nodes")} whose slowest rank takes longer than ${ms}.`
+				: `No rank takes longer than ${ms}.`;
+		};
+		/** Re-filter both views, keeping each view's zoom. */
+		const applyFilter = () => {
+			if (!topo || !parts) return;
+			viewFilter = state.filterOn ? parts.filter(state.thresholdMs / 1000) : ALL;
+			logicalPane.setScene(logicalScene(topo, viewFilter), true);
+			if (!focusLayout) physicalPane.setScene(overviewScene(topo, viewFilter.nodes), true);
+			drawFilterInfo();
+			redraw();
+		};
+		const timeColours = () => {
+			if (state.colorBy === "time") return;
+			state.colorBy = "time";
+			if (colorSel) colorSel.value = "time";
+			drawLegend();
+		};
+		filterBox?.addEventListener("change", () => {
+			state.filterOn = filterBox.checked;
+			if (state.filterOn) timeColours();
+			applyFilter();
+		});
+		let sliderFrame = 0;
+		slider?.addEventListener("input", () => {
+			state.thresholdMs = Number(slider.value);
+			if (sliderOut) sliderOut.textContent = `${state.thresholdMs.toLocaleString("en-US")} ms`;
+			// Moving the slider turns the filter on.
+			if (!state.filterOn && filterBox) {
+				filterBox.checked = true;
+				state.filterOn = true;
+				timeColours();
+			}
+			if (sliderFrame) return;
+			sliderFrame = requestAnimationFrame(() => {
+				sliderFrame = 0;
+				applyFilter();
+			});
+		});
+
+		const setDp = (dp: number) => {
+			state.sizes.dp = dp;
+			state.enabled.dp = dp > 1 || state.enabled.dp;
+			const el = q<HTMLInputElement>('[data-size="dp"]');
+			if (el) el.value = String(dp);
+			const cb = q<HTMLInputElement>('[data-enable="dp"]');
+			if (cb) cb.checked = state.enabled.dp;
+			update();
+		};
+
+		// ---- Text: legend, info panel, table.
+		// Only the compute-time scale needs a key; group colours are explained by the table.
+		const drawLegend = () => {
+			legend.replaceChildren();
+			if (state.colorBy !== "time") return;
+			const k = htmlEl("span", "tx-key");
+			k.append(`compute time: ${TIME_DOMAIN[0]} s`, htmlEl("span", "tx-bar"), `${TIME_DOMAIN[1]} s`);
+			legend.append(k);
+		};
+		const nodesText = (g: Group) => {
+			const t = topo as Topology;
+			const ns = t.nodesOf(g);
+			if (ns.length === 1) return `inside node ${ns[0]} (NVLink)`;
+			const where = ns.length <= 4 ? `nodes ${ns.join(", ")}` : `${ns.length.toLocaleString()} nodes`;
+			return `across ${where} · up to ${HOP_NAMES[t.groupHop(g)]}`;
+		};
+		const drawTable = (t: Topology) => {
+			table.replaceChildren();
+			const head = htmlEl("tr");
+			for (const h of ["Dimension", "Size", "Groups", "Stride", "Nodes per group", "Farthest hop", "Rank 0's group"]) {
+				head.append(htmlEl("th", "", h));
+			}
+			table.append(htmlEl("caption", "", "Every group, per dimension"), head);
+			for (const s of t.summary()) {
+				const tr = htmlEl("tr");
+				const name = htmlEl("td");
+				name.append(htmlEl("span", `tx-swatch ${s.dim}`), GROUP_NAMES[s.dim]);
+				const nodes = s.minNodes === s.maxNodes ? s.maxNodes : `${s.minNodes}–${s.maxNodes}`;
+				const cells = [s.size, s.groups, s.stride, nodes].map((c) => htmlEl("td", "num", c.toLocaleString()));
+				if (s.maxNodes > 1) tr.classList.add("crosses");
+				tr.append(
+					name,
+					...cells,
+					htmlEl("td", "", HOP_NAMES[s.maxHop]),
+					htmlEl("td", "mono", `[${formatGroup(t.groupOf(s.dim, 0), 6)}]`),
+				);
+				table.append(tr);
+			}
+		};
+		const selbar = q<HTMLElement>(".tx-selbar");
+		/** Rebuild the physical view for the selection: the focused view, or the overview if empty. */
+		const refreshSelection = () => {
+			if (!topo) return;
+			const t = topo;
+			focusLayout = chosen.size ? new FocusLayout(t, [...chosen], focus ?? undefined) : null;
+			physicalPane.setScene(focusLayout ? focusScene(t, focusLayout) : overviewScene(t, viewFilter.nodes));
+			if (selbar) {
+				selbar.replaceChildren();
+				const F = focusLayout;
+				if (!F) {
+					selbar.append("Click ranks in either view to select them; this view then shows only their nodes and switches.");
+				} else {
+					const plural = (n: number, w: string) => `${n.toLocaleString()} ${w}${n === 1 ? "" : "s"}`;
+					const pairs = (["nvlink", "tor", "spine", "core"] as const)
+						.filter((h) => F.hops[h])
+						.map((h) => `${F.hops[h]} ${{ nvlink: "over NVLink", tor: "via 1 ToR", spine: "via spine", core: "via core" }[h]}`);
+					selbar.append(
+						`${plural(F.ranks.length, "rank")} on ${plural(F.nodes.length, "node")} in ${plural(F.pods.length, "pod")}` +
+							(pairs.length
+								? ` · ${F.star ? `routes from rank ${F.focus} to the others` : "routes between every pair"}: ${pairs.join(", ")}`
+								: "") +
+							(chosen.size >= MAX_SELECTION ? ` · at most ${MAX_SELECTION} ranks` : ""),
+					);
+					const clear = htmlEl("button", "tx-btn", "Clear");
+					clear.type = "button";
+					clear.addEventListener("click", () => {
+						chosen.clear();
+						focus = null;
+						refreshSelection();
+					});
+					selbar.append(" ", clear);
+				}
+			}
+			show(focus);
+		};
+		/** Add (an evenly spaced sample of) a group to the selection. */
+		const selectGroup = (g: Group) => {
+			const room = MAX_SELECTION - chosen.size;
+			const step = Math.max(1, Math.ceil(g.size / Math.max(1, room)));
+			for (let k = 0; k < g.size && chosen.size < MAX_SELECTION; k += step) chosen.add(g.base + k * g.stride);
+			refreshSelection();
+		};
+
+		const show = (sel: number | null) => {
+			if (!topo) return;
+			const t = topo;
+			current = sel;
+			refreshNode();
+			redraw();
+			info.replaceChildren();
+			if (sel === null) {
+				info.append(htmlEl("p", "tx-hint", "Hover a rank to see its groups; click ranks to select them."));
+				return;
+			}
+			const c = t.dense.coordOf(sel);
+			const where = [
+				`PP-${c.pp}`,
+				`DP-${c.dp}`,
+				...(t.sizes.cp > 1 ? [`CP-${c.cp}`] : []),
+				`TP-${c.tp}`,
+			];
+			info.append(
+				htmlEl("p", "tx-info-head", `Rank ${sel} · node ${t.nodeOf(sel)}, GPU ${sel % t.gpusPerNode} · ${where.join(", ")}`),
+			);
+			const dl = htmlEl("dl", "tx-info-rows");
+			const row = (k: string, v: string) => dl.append(htmlEl("dt", "", k), htmlEl("dd", "", v));
+			if (state.colorBy === "time") {
+				row("Compute time", `${timeOf(sel, isSlow(sel)).toFixed(2)} s${isSlow(sel) ? " (straggler)" : ""}`);
+			}
+			if (nodeModel) {
+				const d: Device = { kind: "gpu", i: sel % t.gpusPerNode };
+				row(
+					"In its node",
+					`GPU ${d.i} · PCIe switch ${nodeModel.switchOf(d)} · NUMA ${nodeModel.socketOf(d)} · NIC ${d.i} (rail ${d.i}, to ToR ${d.i})`,
+				);
+			}
+			for (const dim of t.groupDims) {
+				const g = t.groupOf(dim, sel);
+				row(dim === "edp" ? "Expert DP" : `${dim.toUpperCase()} group`, `[${formatGroup(g)}] · ${nodesText(g)}`);
+			}
+			info.append(dl);
+			if (t.groupDims.length) {
+				const bar = htmlEl("p", "tx-groupbar", "Select its group: ");
+				for (const dim of t.groupDims) {
+					const b = htmlEl("button", "tx-btn", dim === "edp" ? "Expert DP" : dim.toUpperCase());
+					b.type = "button";
+					b.addEventListener("click", () => selectGroup(t.groupOf(dim, sel)));
+					bar.append(b, " ");
+				}
+				info.append(bar);
+			}
+		};
+
+		const update = () => {
+			renderOrder();
+			for (const d of Object.keys(state.sizes)) {
+				q(`.tx-dim.${d}`)?.classList.toggle("off", !state.enabled[d as Dim]);
+			}
+			const res = buildTopology(state);
+			status.replaceChildren();
+			if (!res.ok) {
+				topo = null;
+				status.append(res.error);
+				const gpus = state.nodes * state.gpusPerNode;
+				const s = state.enabled;
+				const rest = (s.tp ? state.sizes.tp : 1) * (s.cp ? state.sizes.cp : 1) * (s.pp ? state.sizes.pp : 1);
+				const dp = gpus / rest;
+				if (Number.isInteger(dp) && dp >= 1 && dp !== (s.dp ? state.sizes.dp : 1)) {
+					const b = htmlEl("button", "tx-fix", `Set DP = ${dp.toLocaleString()}`);
+					b.type = "button";
+					b.addEventListener("click", () => setDp(dp));
+					status.append(" ", b);
+				}
+				for (const el of [legend, info, table]) el.replaceChildren();
+				fig.classList.add("broken");
+				return;
+			}
+			fig.classList.remove("broken");
+			topo = res.topo;
+			for (const r of [...chosen]) if (r >= topo.world) chosen.delete(r);
+			if (focus !== null && focus >= topo.world) focus = [...chosen].pop() ?? null;
+			current = focus;
+			drawLegend();
+			parts = slowParts(topo, (r) => timeOf(r, isSlow(r)));
+			syncSlider();
+			viewFilter = state.filterOn ? parts.filter(state.thresholdMs / 1000) : ALL;
+			logicalPane.setScene(logicalScene(topo, viewFilter));
+			drawFilterInfo();
+			drawTable(topo);
+			nodeModel = new NodeTopology({
+				gpus: topo.gpusPerNode,
+				sockets: state.cpuSockets,
+				gpusPerSwitch: state.gpusPerPcieSwitch,
+				nvswitch: state.nvswitch,
+				nvlinks: state.nvlinks,
+			});
+			nodeLayout = new NodeLayout(nodeModel, SQ);
+			nodeShown = -1;
+			refreshNode(true);
+			refreshSelection();
+		};
+
+		update();
+	}
+</script>
+
+<style>
+	.tx {
+		--tp: #4caf50;
+		--cp: #1f9bb0;
+		--ep: #d6456b;
+		--dp: #a86ad8;
+		--pp: #c99a1e;
+		--heat-hi: #d6456b;
+		--node-s: 62%;
+		--node-l: 85%;
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+		font-size: 0.8rem;
+	}
+	@media (prefers-color-scheme: dark) {
+		.tx {
+			--tp: #66c26a;
+			--cp: #3dbcd0;
+			--ep: #ec6f8f;
+			--dp: #b98ae3;
+			--pp: #d8ad3a;
+			--heat-hi: #ec6f8f;
+			--node-s: 50%;
+			--node-l: 40%;
+		}
+	}
+	.tx-title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.6rem;
+	}
+
+	/* Controls. */
+	/* The four groups in one row: logical topology (a little wider), physical cluster, node and
+	   filter. Sized by the figure's own width, so the post's column and full screen both fit;
+	   below ~600px they wrap to two columns, below ~420px to one. */
+	.tx-controls {
+		container: tx-config / inline-size;
+		padding: 0.6rem;
+		border: 1px solid var(--faint);
+		border-radius: 10px;
+		background: var(--surface);
+	}
+	.tx-config {
+		display: grid;
+		grid-template-columns: minmax(0, 1.45fr) repeat(3, minmax(0, 1fr));
+		gap: 0.5rem;
+	}
+	@container tx-config (max-width: 600px) {
+		.tx-config {
+			grid-template-columns: repeat(2, minmax(0, 1fr));
+		}
+	}
+	@container tx-config (max-width: 420px) {
+		.tx-config {
+			grid-template-columns: minmax(0, 1fr);
+		}
+	}
+	.tx-group {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr);
+		align-content: start;
+		gap: 0.4rem;
+		min-width: 0;
+		margin: 0;
+		padding: 0.35rem 0.55rem 0.55rem;
+		border: 1px solid var(--faint);
+		border-radius: 8px;
+		background: var(--bg);
+		font-size: 0.75rem;
+	}
+	.tx-group:only-child {
+		grid-column: 1 / -1;
+	}
+	/* One field per line: label on the left, its input on the right. */
+	.tx-group .tx-stack {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr);
+		gap: 0.3rem;
+	}
+	.tx-group .tx-stack > .tx-field {
+		justify-content: space-between;
+		flex-wrap: nowrap;
+		gap: 0.3rem;
+		min-width: 0;
+		max-width: 15rem;
+		white-space: nowrap;
+	}
+	.tx-group .tx-stack > .tx-field.tx-check {
+		justify-content: flex-start;
+	}
+	.tx-group input[type="number"] {
+		width: 3.6rem;
+		min-width: 2.6rem;
+		flex: 0 1 3.6rem;
+	}
+	.tx-group input[type="number"].wide {
+		width: 5.2rem;
+		flex-basis: 5.2rem;
+	}
+	.tx-group select {
+		flex: 0 1 7.5rem;
+		min-width: 0;
+	}
+	/* The five dimensions as a small grid of checkbox + size. */
+	.tx-group .tx-dims {
+		display: grid;
+		grid-template-columns: repeat(auto-fill, minmax(5.6rem, 1fr));
+		gap: 0.3rem;
+	}
+	.tx-group .tx-dims .tx-dim input[type="number"] {
+		width: 100%;
+		min-width: 0;
+	}
+	.tx-group .tx-order-row {
+		gap: 0.3rem 0.5rem;
+	}
+	.tx-group legend {
+		padding: 0 0.35rem;
+		font-size: 0.72rem;
+		font-weight: 600;
+		letter-spacing: 0.03em;
+		text-transform: uppercase;
+		color: var(--muted);
+	}
+	.tx-row,
+	.tx-tools {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 0.45rem 0.9rem;
+	}
+	.tx-tools {
+		justify-content: flex-end;
+		margin-top: 0.5rem;
+	}
+	.tx-label {
+		color: var(--muted);
+	}
+	.tx-order {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.3rem;
+		margin: 0;
+		padding: 0;
+		list-style: none;
+	}
+	:global(.tx-chip) {
+		display: inline-flex;
+		align-items: center;
+		border: 1.5px solid var(--chip, var(--faint));
+		border-radius: 999px;
+		background: var(--bg);
+		cursor: grab;
+		user-select: none;
+	}
+	:global(.tx-chip.dragging) {
+		opacity: 0.4;
+	}
+	:global(.tx-chip.off) {
+		border-style: dashed;
+		opacity: 0.55;
+	}
+	:global(.tx-chip.tp) {
+		--chip: var(--tp);
+	}
+	:global(.tx-chip.cp) {
+		--chip: var(--cp);
+	}
+	:global(.tx-chip.ep) {
+		--chip: var(--ep);
+	}
+	:global(.tx-chip.dp) {
+		--chip: var(--dp);
+	}
+	:global(.tx-chip.pp) {
+		--chip: var(--pp);
+	}
+	:global(.tx-chip-name) {
+		font-family: var(--mono);
+		font-weight: 600;
+		padding: 0 0.1rem;
+	}
+	:global(.tx-move) {
+		border: 0;
+		background: none;
+		color: var(--muted);
+		font-size: 0.95rem;
+		line-height: 1;
+		padding: 0.15rem 0.35rem;
+		cursor: pointer;
+	}
+	:global(.tx-move:disabled) {
+		visibility: hidden;
+	}
+	:global(.tx-move:hover) {
+		color: var(--accent);
+	}
+	.tx-order-str {
+		font-family: var(--mono);
+		font-size: 0.75rem;
+		color: var(--muted);
+	}
+	.tx-dim {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.3rem;
+		padding: 0.15rem 0.45rem;
+		border-left: 3px solid var(--chip);
+		border-radius: 4px;
+		background: var(--surface);
+	}
+	.tx-dim.tp {
+		--chip: var(--tp);
+	}
+	.tx-dim.cp {
+		--chip: var(--cp);
+	}
+	.tx-dim.ep {
+		--chip: var(--ep);
+	}
+	.tx-dim.dp {
+		--chip: var(--dp);
+	}
+	.tx-dim.pp {
+		--chip: var(--pp);
+	}
+	.tx-dim.off .tx-dim-name,
+	.tx-dim.off input[type="number"] {
+		opacity: 0.45;
+	}
+	.tx-dim-name {
+		font-family: var(--mono);
+		font-weight: 600;
+	}
+	.tx-field {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.35rem;
+		color: var(--muted);
+	}
+	.tx select,
+	.tx input[type="number"] {
+		font: inherit;
+		color: var(--text);
+		background: var(--bg);
+		border: 1px solid var(--faint);
+		border-radius: 6px;
+		padding: 0.1rem 0.25rem;
+	}
+	.tx input[type="number"] {
+		width: 4.2rem;
+	}
+	.tx input[type="number"].wide {
+		width: 6.5rem;
+	}
+	.tx :global(.tx-btn) {
+		font: inherit;
+		color: var(--text);
+		background: var(--bg);
+		border: 1px solid var(--faint);
+		border-radius: 6px;
+		padding: 0.15rem 0.55rem;
+		cursor: pointer;
+	}
+	.tx :global(.tx-btn:hover) {
+		border-color: var(--accent);
+	}
+	.tx-status {
+		margin: 0.6rem 0 0.4rem;
+		text-align: center;
+		color: var(--draft-text);
+	}
+	.tx-status:empty,
+	.tx-legend:empty {
+		display: none;
+	}
+	:global(.tx-fix) {
+		font: inherit;
+		color: var(--bg);
+		background: var(--accent);
+		border: 0;
+		border-radius: 6px;
+		padding: 0.1rem 0.5rem;
+		cursor: pointer;
+	}
+
+	/* Legend. */
+	.tx-legend {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.3rem 1.1rem;
+		margin-top: 0.4rem;
+		color: var(--muted);
+		font-size: 0.75rem;
+	}
+	:global(.tx-key) {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.4rem;
+	}
+	:global(.tx-swatch) {
+		display: inline-block;
+		width: 1.1rem;
+		height: 3px;
+		border-radius: 2px;
+		margin-right: 0.4rem;
+		vertical-align: middle;
+	}
+	:global(.tx-swatch.tp) {
+		background: var(--tp);
+	}
+	:global(.tx-swatch.cp) {
+		background: var(--cp);
+	}
+	:global(.tx-swatch.ep) {
+		background: var(--ep);
+	}
+	:global(.tx-swatch.dp),
+	:global(.tx-swatch.edp) {
+		background: var(--dp);
+	}
+	:global(.tx-swatch.pp) {
+		background: var(--pp);
+	}
+	:global(.tx-bar) {
+		display: inline-block;
+		width: 5rem;
+		height: 0.65rem;
+		border: 1px solid var(--faint);
+		border-radius: 3px;
+		background: linear-gradient(to right, var(--bg), var(--heat-hi));
+	}
+
+	/* Views: each a scroller with an empty spacer (for scrollbars) under a canvas of its size. */
+	.tx-view {
+		margin-top: 0.8rem;
+	}
+	.tx.broken .tx-views {
+		display: none;
+	}
+	.tx-view-title {
+		margin: 0 0 0.25rem;
+		font-size: 0.75rem;
+		font-weight: 600;
+		color: var(--muted);
+		text-align: center;
+	}
+	.tx-pane {
+		position: relative;
+		min-width: 0;
+		border: 1px solid var(--faint);
+		border-radius: 8px;
+		overflow: hidden;
+		background: var(--bg);
+	}
+	.tx-pane :global(.tx-scroller) {
+		overflow: auto;
+		height: 300px;
+		cursor: grab;
+		overscroll-behavior: contain;
+	}
+	.tx-pane :global(.tx-scroller.dragging) {
+		cursor: grabbing;
+	}
+	.tx-pane :global(.tx-scroller:focus-visible) {
+		outline: 2px solid var(--accent);
+		outline-offset: -2px;
+	}
+	.tx-pane :global(canvas) {
+		position: absolute;
+		left: 0;
+		top: 0;
+		pointer-events: none;
+	}
+	.tx-pane :global(.tx-grip) {
+		height: 8px;
+		cursor: ns-resize;
+		touch-action: none;
+		background:
+			linear-gradient(var(--faint), var(--faint)) center / 2.5rem 2px no-repeat,
+			var(--surface);
+		border-top: 1px solid var(--faint);
+	}
+	.tx-pane :global(.tx-grip:hover),
+	.tx-pane :global(.tx-grip:focus-visible) {
+		background:
+			linear-gradient(var(--accent), var(--accent)) center / 2.5rem 2px no-repeat,
+			var(--surface);
+		outline: none;
+	}
+	.tx.tx-full .tx-pane :global(.tx-grip) {
+		flex: none;
+	}
+	.tx-split {
+		display: none;
+		cursor: ew-resize;
+		touch-action: none;
+		border-radius: 4px;
+		background: linear-gradient(var(--faint), var(--faint)) center / 2px 2.5rem no-repeat;
+	}
+	.tx-split:hover,
+	.tx-split:focus-visible {
+		background: linear-gradient(var(--accent), var(--accent)) center / 2px 2.5rem no-repeat;
+		outline: none;
+	}
+	.tx-pane :global(.tx-zoom) {
+		position: absolute;
+		right: 18px;
+		bottom: 18px;
+		display: flex;
+		gap: 0.2rem;
+		opacity: 0.85;
+	}
+	.tx-pane :global(.tx-zoom .tx-btn) {
+		min-width: 1.8rem;
+		padding: 0.1rem 0.4rem;
+	}
+
+	/* Full screen: both views share the window. */
+	:global(html.tx-noscroll) {
+		overflow: hidden;
+	}
+	.tx.tx-full {
+		position: fixed;
+		inset: 0;
+		z-index: 1000;
+		margin: 0;
+		padding: 0.7rem 1rem;
+		display: flex;
+		flex-direction: column;
+		background: var(--bg);
+		overflow: auto;
+	}
+	/* The views fill the window, and grow past it (pushing the text below down, the figure then
+	   scrolls) when dragged views need more room. */
+	.tx.tx-full .tx-views {
+		flex: 1 0 auto;
+		min-height: 18rem;
+		display: grid;
+		grid-template-columns: var(--tx-left, minmax(0, 3fr)) 10px var(--tx-right, minmax(0, 2fr));
+		gap: 0.4rem;
+	}
+	.tx.tx-full .tx-split {
+		display: block;
+	}
+	.tx-equal {
+		display: none;
+	}
+	.tx.tx-full .tx-equal {
+		display: inline-block;
+	}
+	.tx.tx-full .tx-view {
+		display: flex;
+		flex-direction: column;
+		min-height: 0;
+		min-width: 0;
+		margin-top: 0.5rem;
+	}
+	/* Views that were not dragged share what is left, but never shrink below 140px: past that
+	   the column grows instead. */
+	.tx.tx-full .tx-pane {
+		flex: 1 1 auto;
+		min-height: 140px;
+		display: flex;
+		flex-direction: column;
+	}
+	/* A scroller's content (its spacer can be millions of px) must not size the layout. */
+	.tx.tx-full .tx-pane :global(.tx-scroller) {
+		contain: size;
+		flex: 1 1 auto;
+		height: auto;
+		min-height: 0;
+	}
+	.tx-node-title {
+		margin-top: 0.7rem;
+	}
+	.tx.tx-full .tx-bottom {
+		display: grid;
+		grid-template-columns: 1fr 1fr;
+		gap: 1rem;
+		max-height: 30vh;
+		overflow: auto;
+		margin-top: 0.5rem;
+	}
+	@media (max-width: 800px) {
+		.tx.tx-full .tx-views,
+		.tx.tx-full .tx-bottom {
+			grid-template-columns: 1fr;
+		}
+		.tx.tx-full .tx-split {
+			display: none;
+		}
+	}
+
+	/* Info and table. */
+	.tx-filter input[type="range"] {
+		width: 9rem;
+		min-width: 0;
+		flex: 0 1 9rem;
+		accent-color: var(--heat-hi);
+	}
+	.tx-threshold {
+		min-width: 4.6rem;
+		font-variant-numeric: tabular-nums;
+		color: var(--text);
+	}
+	.tx-filterinfo {
+		margin: 0.4rem 0 0;
+		text-align: center;
+		color: var(--muted);
+		font-size: 0.75rem;
+	}
+	.tx-filterinfo:empty {
+		display: none;
+	}
+	.tx-selbar {
+		margin: 0 0 0.35rem;
+		text-align: center;
+		color: var(--muted);
+		font-size: 0.75rem;
+	}
+	.tx-info :global(.tx-groupbar) {
+		margin-top: 0.4rem;
+	}
+	.tx-info {
+		margin: 0.6rem 0 0;
+		min-height: 7.5em;
+		text-align: center;
+		color: var(--muted);
+		line-height: 1.45;
+	}
+	.tx-info :global(p) {
+		margin: 0;
+	}
+	.tx-info :global(.tx-info-head) {
+		font-weight: 600;
+		color: var(--text);
+	}
+	.tx-info :global(.tx-info-rows) {
+		display: inline-grid;
+		grid-template-columns: auto auto;
+		column-gap: 0.75rem;
+		margin: 0;
+		text-align: left;
+	}
+	.tx-info :global(dt) {
+		text-align: right;
+	}
+	.tx-info :global(dd) {
+		margin: 0;
+		color: var(--text);
+	}
+	.tx-table-wrap {
+		overflow-x: auto;
+		margin-top: 0.6rem;
+	}
+	.tx-summary {
+		margin: 0 auto;
+		border-collapse: collapse;
+		font-size: 0.75rem;
+	}
+	.tx-summary :global(caption) {
+		color: var(--muted);
+		margin-bottom: 0.3rem;
+	}
+	.tx-summary :global(th),
+	.tx-summary :global(td) {
+		padding: 0.2rem 0.6rem;
+		border-bottom: 1px solid var(--faint);
+		text-align: left;
+		white-space: nowrap;
+	}
+	.tx-summary :global(th) {
+		color: var(--muted);
+		font-weight: 600;
+	}
+	.tx-summary :global(.num) {
+		text-align: right;
+		font-variant-numeric: tabular-nums;
+	}
+	.tx-summary :global(.mono) {
+		font-family: var(--mono);
+	}
+	.tx-summary :global(tr.crosses td:nth-child(5)) {
+		color: var(--draft-text);
+		font-weight: 600;
+	}
+</style>

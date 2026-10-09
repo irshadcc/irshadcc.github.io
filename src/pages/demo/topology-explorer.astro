@@ -1,0 +1,64 @@
+---
+import TopologyExplorer from "../../component/ProcessGroup/TopologyExplorer.astro";
+import Layout from "../../layouts/Layout.astro";
+---
+
+<Layout title="TopologyExplorer demo">
+	<h1>TopologyExplorer demo</h1>
+	<p>
+		A job's ranks drawn by parallel coordinates (logical view) and by node (physical view). Change the order string,
+		the size of each dimension, the GPUs per node and the number of nodes; hover or click a rank to see its groups.
+	</p>
+
+	<h2>All controls, MoE job</h2>
+	<TopologyExplorer
+		parallel={{ tp: 4, cp: 2, ep: 2, dp: 4, pp: 2 }}
+		enabled={["tp", "ep", "dp", "pp"]}
+		gpusPerNode={8}
+		nodes={4}
+		nodesPerPod={2}
+		spinesPerPod={2}
+		selected={0}
+		title="TP 4 × DP 4 × PP 2, EP 2 on 4 × 8 GPUs"
+	/>
+
+	<h2>100,000 nodes (800,000 GPUs)</h2>
+	<p>Scroll, drag or zoom inside each view, or open it full screen. Zoomed far out, each cell or node is one box.</p>
+	<TopologyExplorer
+		parallel={{ tp: 8, ep: 10, dp: 6250, pp: 16 }}
+		gpusPerNode={8}
+		nodes={100000}
+		nodesPerPod={32}
+		spinesPerPod={8}
+		straggler={{ node: 31337 }}
+		title="TP 8 × DP 6,250 × PP 16, EP 10 on 100,000 × 8 GPUs"
+	/>
+
+	<h2>Context parallel and expert parallel together</h2>
+	<TopologyExplorer
+		parallel={{ tp: 2, cp: 2, ep: 4, dp: 4, pp: 2 }}
+		gpusPerNode={8}
+		nodes={8}
+		selected={5}
+		title="TP 2 × CP 2 × DP 4 × PP 2, EP 4 on 8 × 8 GPUs"
+	/>
+
+	<h2>Static figure with a slow GPU</h2>
+	<TopologyExplorer
+		parallel={{ tp: 8, dp: 2, pp: 4 }}
+		gpusPerNode={8}
+		nodes={8}
+		straggler={{ rank: 37 }}
+		controls={false}
+		title="Rank 37 is slow"
+	/>
+
+	<h2>Rejected configuration (pp not last with EP ≠ CP)</h2>
+	<TopologyExplorer
+		parallel={{ tp: 4, ep: 2, dp: 4, pp: 2 }}
+		order={["tp", "cp", "ep", "pp", "dp"]}
+		gpusPerNode={8}
+		nodes={4}
+		title="Megatron rejects this order"
+	/>
+</Layout>

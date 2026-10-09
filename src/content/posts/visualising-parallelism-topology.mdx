@@ -1,0 +1,116 @@
+---
+title: "Visualising Parallelism, Cluster, Node Topology"
+description: "Ranks laid out by their parallel coordinates next to the nodes they run on, with an explorer to change the parallelism order, group sizes and cluster."
+date: 2026-10-09
+tags: [Distributed training, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import TopologyExplorer from "../../component/ProcessGroup/TopologyExplorer.astro";
+
+## Background
+
+A large training or inference job splits its GPUs into groups: tensor parallel (TP), context
+parallel (CP), expert parallel (EP), data parallel (DP) and pipeline parallel (PP). Each group
+runs its own collectives, so where its GPUs sit in the cluster decides how fast those collectives
+are.
+
+To see a job clearly, you need three views at once, each answering one question:
+
+1. **Which GPUs talk to each other?** The **logical view** draws every parallelism group and the
+   GPUs in it.
+2. **How far apart are they?** The **physical view** places the same GPUs in the cluster, so you
+   can count the switches between two of them: none (NVLink through the NVSwitch inside a node),
+   or 1, 3 or 5 network switches (ToR, spine, core) between nodes.
+3. **What does a node look like inside?** The **node view** draws how one node's GPUs, NICs,
+   PCIe switches and CPU sockets (NUMA nodes) are connected.
+
+The post presents the explorer that shows all three, walks through its default configuration,
+and ends with Megatron-LM's defaults.
+
+> Designed by me, front end made by Claude: front-end work is not my strong suit :(
+
+## Topology explorer
+
+The **logical view** places each rank by its parallel coordinates. Columns are pipeline stages
+(PP-0, PP-1, …), rows are data-parallel replicas (DP-0, DP-1, …), and each cell holds the CP
+chunks, each a row of TP squares. The **physical view** draws the same ranks inside their nodes,
+wired through ToR, spine and core switches. Below it, the **node view** draws the node of the
+hovered rank.
+
+Click ranks in either view to select them; the physical view then shows only their nodes and the
+switches between them. Drag the order chips (fastest-varying first), switch dimensions on or off,
+and change the group sizes, the number of nodes and the GPUs per node.
+
+To find a slow GPU, pick a **Straggler** to colour ranks by compute time, then tick **Only slower
+than** to keep only the PP columns, DP rows and nodes whose slowest rank is above the slider's
+threshold. For large clusters (up to 100,000 nodes), scroll or drag inside a view, zoom with the
+buttons, jump with **Go to rank**, or open it **Full screen**.<Sidenote>Groups follow
+Megatron-LM's `RankGenerator` at commit
+[`8c48720`](https://github.com/NVIDIA/Megatron-LM/blob/8c487209a2ae6eeb276c8244a6495a28950321af/megatron/core/parallel_state.py),
+checked against it for 300 random configurations. Orders Megatron rejects show its reason instead
+of a drawing.</Sidenote>
+
+<TopologyExplorer
+	parallel={{ tp: 4, cp: 2, ep: 2, dp: 4, pp: 2 }}
+	enabled={["tp", "ep", "dp", "pp"]}
+	order={["tp", "cp", "ep", "dp", "pp"]}
+	gpusPerNode={8}
+	nodes={4}
+	nodesPerPod={2}
+	spinesPerPod={2}
+	selected={[0, 8, 12, 16]}
+	title="Parallelism topology explorer"
+/>
+
+### Reading the default figure
+
+The figure starts with TP = 4, EP = 2, DP = 4 and PP = 2 (CP is switched off) on 4 nodes of
+8 GPUs, two nodes per pod. That is $4 \cdot 4 \cdot 2 = 32$ ranks. Rank $r$ runs on GPU
+$r \bmod 8$ of node $\lfloor r / 8 \rfloor$, and GPU $i$'s NIC connects to ToR switch $i$ of its pod
+(one ToR per **rail**).
+
+The order `tp-cp-ep-dp-pp` puts TP fastest and PP slowest, so a dense rank is
+$r = \text{tp} + 4\,\text{dp} + 16\,\text{pp}$. Rank 0's groups are:
+
+| Group | Ranks | Stride | Nodes | Farthest hop |
+| --- | --- | ---: | --- | --- |
+| TP | 0, 1, 2, 3 | 1 | 0 | NVLink |
+| EP | 0, 4 | 4 | 0 | NVLink |
+| DP | 0, 4, 8, 12 | 4 | 0, 1 | 3 switches (spine) |
+| Expert DP | 0, 8 | 8 | 0, 1 | 1 switch (ToR) |
+| PP | 0, 16 | 16 | 0, 2 | 5 switches (core) |
+
+The selected ranks 0, 8, 12 and 16 show all three network hops. Ranks 0 and 8 are GPU 0 of
+nodes 0 and 1: same pod, same rail, so their traffic crosses one ToR switch. Rank 12 is GPU 4 of
+node 1, a different rail, so traffic from rank 0 goes up to a spine and back down (3 switches).
+Rank 16 is on node 2 in the other pod, so it goes through a core switch (5 switches). Hover any of
+them to see its groups highlighted in both views.
+
+TP and EP stay inside node 0, which is what you want: both communicate in every layer. PP, which
+sends one activation per micro-batch, is the group that crosses pods.<Sidenote>Computed with the
+explorer's own `Topology` class (`topologyExplorer.ts`) for this configuration.</Sidenote>
+
+## Megatron-LM's defaults
+
+These come from `initialize_model_parallel` in
+[`parallel_state.py`](https://github.com/NVIDIA/Megatron-LM/blob/8c487209a2ae6eeb276c8244a6495a28950321af/megatron/core/parallel_state.py)
+and `megatron/training/initialize.py` at commit `8c48720`:
+
+- **Order** `tp-cp-ep-dp-pp`: TP varies fastest, so a TP group is consecutive ranks on one node,
+  and PP varies slowest. The flag `--use-tp-pp-dp-mapping` switches to `tp-cp-ep-pp-dp`.
+- **Sizes**: TP, PP, CP and EP all default to 1. DP is not set directly; it is
+  $\text{world} / (\text{TP} \cdot \text{PP} \cdot \text{CP})$.
+- **MoE layers** reuse the same order with expert TP (defaults to TP), EP, CP = 1, and expert DP
+  $= \text{world} / (\text{expert TP} \cdot \text{EP} \cdot \text{PP})$.
+
+## Summary
+
+- A job is easiest to understand from three views together: logical groups, physical placement
+  and the inside of a node.
+- The order string decides each group's stride; the fastest-varying dimension gets stride 1 and
+  stays on one node.
+- A group's cost depends on its farthest hop: NVLink inside a node, then 1, 3 or 5 switches for
+  the same ToR, the same pod or another pod.
+- Put the chattiest groups (TP, EP) innermost and the least chatty (PP, DP) outermost, which is
+  what Megatron-LM's default `tp-cp-ep-dp-pp` does.
