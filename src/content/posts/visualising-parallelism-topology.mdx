@@ -2,7 +2,7 @@
 title: "Visualising Parallelism, Cluster, Node Topology"
 description: "Ranks laid out by their parallel coordinates next to the nodes they run on, with an explorer to change the parallelism order, group sizes and cluster."
 date: 2026-10-09
-tags: [Distributed training, Draft]
+tags: [Distributed training]
 ---
 
 import Sidenote from "../../components/Sidenote.astro";
@@ -28,7 +28,7 @@ To see a job clearly, you need three views at once, each answering one question:
 The post presents the explorer that shows all three, walks through its default configuration,
 and ends with Megatron-LM's defaults.
 
-> Designed by me, front end made by Claude: front-end work is not my strong suit :(
+> Front end made by Claude: front-end work is not my strong suit :(
 
 ## Topology explorer
 
@@ -88,8 +88,7 @@ Rank 16 is on node 2 in the other pod, so it goes through a core switch (5 switc
 them to see its groups highlighted in both views.
 
 TP and EP stay inside node 0, which is what you want: both communicate in every layer. PP, which
-sends one activation per micro-batch, is the group that crosses pods.<Sidenote>Computed with the
-explorer's own `Topology` class (`topologyExplorer.ts`) for this configuration.</Sidenote>
+sends one activation per micro-batch, is the group that crosses pods.
 
 ## Megatron-LM's defaults
 
