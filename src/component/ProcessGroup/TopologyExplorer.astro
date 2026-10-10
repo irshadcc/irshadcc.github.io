@@ -961,11 +961,11 @@ const GPN = [1, 2, 4, 8, 16, 32, 64, 72];
 						if (sw >= 3) {
 							for (let c = 0; c < S; c++) {
 								const q = P.spineXY(p, c);
-								drawSwitch(ctx, X(q.x), Y(q.y), sw, sh, z >= 0.55 ? `spine ${c}` : "");
+								drawSwitch(ctx, X(q.x), Y(q.y), sw, sh, `spine ${c}`, 9 * z, `S${c}`);
 							}
 							for (let r = 0; r < g; r++) {
 								const q = P.torXY(p, r);
-								drawSwitch(ctx, X(q.x), Y(q.y), sw, sh, z >= 0.55 ? `ToR ${r}` : "");
+								drawSwitch(ctx, X(q.x), Y(q.y), sw, sh, `ToR ${r}`, 9 * z, `T${r}`);
 							}
 						}
 						for (const n of P.nodesIn(p)) {
@@ -999,7 +999,7 @@ const GPN = [1, 2, 4, 8, 16, 32, 64, 72];
 						const coreW = Math.min(44, v.w / S - 6);
 						for (let c = 0; c < S; c++) {
 							const cx = (v.w * (c + 0.5)) / S;
-							drawSwitch(ctx, cx - coreW / 2, 10, coreW, 20, coreW >= 30 ? `core ${c}` : "", 9);
+							drawSwitch(ctx, cx - coreW / 2, 10, coreW, 20, `core ${c}`, 9, `C${c}`);
 						}
 					}
 				},
@@ -1062,7 +1062,8 @@ const GPN = [1, 2, 4, 8, 16, 32, 64, 72];
 					const [kind, a, c] = id.split("-");
 					if (kind !== "core" && kind !== "spine" && kind !== "tor") continue;
 					const label = kind === "core" ? `core ${a}` : kind === "spine" ? `spine ${c}` : `ToR ${c}`;
-					drawSwitch(ctx, X(b.x), Y(b.y), b.w * z, b.h * z, z >= 0.55 ? label : "", 9 * z);
+					const short = kind === "core" ? `C${a}` : kind === "spine" ? `S${c}` : `T${c}`;
+					drawSwitch(ctx, X(b.x), Y(b.y), b.w * z, b.h * z, label, 9 * z, short);
 				}
 				for (const n of F.nodes) {
 					for (let k = 0; k < g; k++) {
@@ -1074,6 +1075,21 @@ const GPN = [1, 2, 4, 8, 16, 32, 64, 72];
 			},
 		});
 
+		/** Smallest font for canvas labels, in CSS pixels, so they stay readable when the view is zoomed out. */
+		const MIN_FS = 8;
+		/**
+		 * The font size (at least MIN_FS, shrunk to fit `maxW`) at which `text` fits, or 0 if it would
+		 * need less than 6px. Leaves `ctx.font` set to that size.
+		 */
+		const fitFont = (ctx: CanvasRenderingContext2D, text: string, fs: number, maxW: number, weight = "") => {
+			let size = Math.max(fs, MIN_FS);
+			ctx.font = `${weight}${size}px ${th.sans}`;
+			const w = ctx.measureText(text).width;
+			if (w > maxW) size *= maxW / w;
+			if (size < 6) return 0;
+			ctx.font = `${weight}${size}px ${th.sans}`;
+			return size;
+		};
 		const drawPod = (ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, z: number, p: number) => {
 			ctx.setLineDash([4, 3]);
 			ctx.strokeStyle = th.faint;
@@ -1082,12 +1098,16 @@ const GPN = [1, 2, 4, 8, 16, 32, 64, 72];
 			ctx.roundRect(x, y, w, h, Math.min(8, 8 * z));
 			ctx.stroke();
 			ctx.setLineDash([]);
-			if (z < 0.45) return;
+			// The band above the spine row is podPad + 14 units tall.
+			const fs = Math.min(Math.max(10 * z, MIN_FS), 24 * z - 2);
+			if (fs < 6) return;
 			ctx.textAlign = "left";
+			ctx.textBaseline = "top";
 			ctx.fillStyle = th.muted;
-			ctx.font = `600 ${10 * z}px ${th.sans}`;
-			ctx.fillText(`pod ${p}`, x + 8 * z, y + 10 * z);
+			ctx.font = `600 ${fs}px ${th.sans}`;
+			ctx.fillText(`pod ${p}`, x + Math.max(3, 8 * z), y + Math.max(2, 4 * z));
 			ctx.textAlign = "center";
+			ctx.textBaseline = "middle";
 		};
 		const drawSwitch = (
 			ctx: CanvasRenderingContext2D,
@@ -1097,16 +1117,20 @@ const GPN = [1, 2, 4, 8, 16, 32, 64, 72];
 			h: number,
 			label: string,
 			fs = 9,
+			short = label,
 		) => {
 			ctx.fillStyle = th.surface;
 			ctx.fillRect(x, y, w, h);
 			ctx.strokeStyle = th.muted;
 			ctx.lineWidth = 1;
 			ctx.strokeRect(x, y, w, h);
-			if (!label) return;
+			// Prefer the full label at a readable size; fall back to the short one ("T0") when narrow.
+			const maxW = w - 2;
+			let text = label;
+			if (fitFont(ctx, label, fs, maxW) < 7) text = short;
+			if (!text || !fitFont(ctx, text, fs, maxW)) return;
 			ctx.fillStyle = th.text;
-			ctx.font = `${fs}px ${th.sans}`;
-			ctx.fillText(label, x + w / 2, y + h / 2 + 0.5);
+			ctx.fillText(text, x + w / 2, y + h / 2 + 0.5);
 		};
 		const drawNode = (
 			ctx: CanvasRenderingContext2D,
@@ -1125,12 +1149,16 @@ const GPN = [1, 2, 4, 8, 16, 32, 64, 72];
 			ctx.strokeStyle = on ? th.text : `hsl(${hue(n)}, 45%, 55%)`;
 			ctx.lineWidth = on ? 2 : 1.2;
 			ctx.stroke();
-			if (z < 0.6) return;
+			// The label strip and padding above the GPU squares are 20 units tall.
+			const fs = Math.min(Math.max(10 * z, MIN_FS - 1), 20 * z - 1);
+			if (fs < 6) return;
 			ctx.textAlign = "left";
+			ctx.textBaseline = "top";
 			ctx.fillStyle = th.muted;
-			ctx.font = `600 ${10 * z}px ${th.sans}`;
-			ctx.fillText(`node ${n}`, x + 6 * z, y + 8 * z);
+			ctx.font = `600 ${fs}px ${th.sans}`;
+			ctx.fillText(`node ${n}`, x + Math.max(3, 6 * z), y + Math.max(1, 3 * z));
 			ctx.textAlign = "center";
+			ctx.textBaseline = "middle";
 		};
 
 		// ---- Node view: the inside of one node.
