@@ -102,14 +102,3 @@ and `megatron/training/initialize.py` at commit `8c48720`:
   $\text{world} / (\text{TP} \cdot \text{PP} \cdot \text{CP})$.
 - **MoE layers** reuse the same order with expert TP (defaults to TP), EP, CP = 1, and expert DP
   $= \text{world} / (\text{expert TP} \cdot \text{EP} \cdot \text{PP})$.
-
-## Summary
-
-- A job is easiest to understand from three views together: logical groups, physical placement
-  and the inside of a node.
-- The order string decides each group's stride; the fastest-varying dimension gets stride 1 and
-  stays on one node.
-- A group's cost depends on its farthest hop: NVLink inside a node, then 1, 3 or 5 switches for
-  the same ToR, the same pod or another pod.
-- Put the chattiest groups (TP, EP) innermost and the least chatty (PP, DP) outermost, which is
-  what Megatron-LM's default `tp-cp-ep-dp-pp` does.
