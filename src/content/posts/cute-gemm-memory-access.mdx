@@ -1,0 +1,436 @@
+---
+title: "Inside a CuTe GEMM: Coalescing, Bank Conflicts and Swizzling"
+description: "A line-by-line reading of a small CuTe matrix-multiply kernel, following one warp through its three memory moves: global to shared (coalescing and bank conflicts), shared to registers, and registers back to global (the store). Along the way it explains why the kernel swizzles its shared-memory tile of A."
+date: 2026-10-11
+tags: [CUDA, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import CuteLayoutGemm from "../../component/Cute/CuteLayoutGemm.astro";
+
+## Background
+
+A matrix multiply $C = AB$ does $2MNK$ floating-point operations on $MN + MK + NK$ numbers, so
+in principle each number is reused many times. A GPU kernel only gets that reuse if it moves data
+well: from global memory into fast on-chip **shared memory**, from there into **registers**, and
+finally from registers back to global memory. Each of these moves has its own way to go wrong. A
+global access can drag in far more bytes than it uses. A shared-memory access can be split into
+several slower passes. Done badly, the kernel spends its time waiting on memory instead of
+multiplying.
+
+This post reads one kernel, `matmul_cute_kernel` from the file `core/cuda/matmul_kernel.cu` in
+the fastops project, and follows it through those three moves. The kernel is written with
+**CuTe**, the layout library inside CUTLASS. It is close to CUTLASS's own `sgemm_1` tutorial, with
+one change that is the reason for this post: its shared-memory tile of A is **swizzled**.
+
+We cover, in order:
+
+1. what the kernel does, with its host-side configuration and a scaled-down example;
+2. the copy from global to shared memory, which explains **memory coalescing**, **bank
+   conflicts** and **swizzling**;
+3. the multiply out of shared memory, and why the swizzle does not hurt it;
+4. the **store** of C back to global memory, which turns out to be the weak spot.
+
+If CuTe layouts are new to you, read [A Tour of the CuTe DSL](/blog/cute-dsl/) first. The
+[mathematical foundations](/blog/mathematical-foundations-cute-layout/) post covers the algebra
+behind `zipped_divide` and `local_partition`.
+
+## The kernel at a glance
+
+The file has three matrix multiplies. `simple_tiled_matmul_kernel` is the classic hand-written
+tiled kernel, `matmul_cutlass` calls CUTLASS's ready-made device GEMM, and `matmul_cute_kernel`
+sits in between: you write the kernel yourself, but describe every tile and thread assignment as a
+CuTe **layout**, a function from coordinates to offsets written `shape:stride`.
+
+### The host side
+
+All the interesting decisions are made on the host and passed to the kernel as layouts:
+
+```cpp
+// Row Major A -> (m,k):(k,1)
+// Row Major B -> (k,n):(n,1) = (n, k):(1, n)
+// Row Major C -> (m,n):(n,1)
+auto dA = make_stride(k, Int<1>{});
+auto dB = make_stride(Int<1>{}, n);
+auto dC = make_stride(n, Int<1>{});
+
+auto bM = Int<128>{};
+auto bN = Int<128>{};
+auto bK = Int<8>{};
+auto cta_tiler = make_shape(bM, bN, bK);
+
+// SMem layout
+auto sA = composition(Swizzle<3,2,5>{}, make_layout(make_shape(bM, bK), GenColMajor{}));
+auto sB = make_layout(make_shape(bN, bK), GenColMajor{});
+
+// 256 threads, 8 warps
+auto tA = make_layout(make_shape(Int<32>{}, Int<8>{}), GenRowMajor{});
+auto tB = make_layout(make_shape(Int<32>{}, Int<8>{}), GenColMajor{});
+auto tC = make_layout(make_shape(Int<16>{}, Int<16>{}));
+
+dim3 block(size(tC));
+dim3 grid(size(ceil_div(n, bN)), size(ceil_div(m, bM)));
+```
+
+CuTe always views A as $(M, K)$ and B as $(N, K)$, so both operands have K as their second mode.
+The matrices are row-major, which gives these layouts:
+
+| Name | Layout | Meaning |
+| --- | --- | --- |
+| `mA` | $(M,K):(K,1)$ | A is **K-major**: consecutive k are adjacent in memory |
+| `mB` | $(N,K):(1,N)$ | B is **N-major**: consecutive n are adjacent |
+| `mC` | $(M,N):(N,1)$ | C is row-major: consecutive n are adjacent |
+| `cta_tiler` | $(128,128,8)$ | each block computes a $128 \times 128$ tile of C, 8 columns of K at a time |
+| `sA`, `sB` | $(128,8):(1,128)$ | one k tile of A or B in shared memory, M- or N-major; `sA` is also swizzled |
+| `tA` | $(32,8):(8,1)$ | 256 threads over the A tile, consecutive threads along K |
+| `tB` | $(32,8):(1,32)$ | 256 threads over the B tile, consecutive threads along N |
+| `tC` | $(16,16):(1,16)$ | 256 threads over the C tile, consecutive threads along M |
+
+The thread layouts are the key to everything below. A thread layout maps a coordinate to a thread
+index, so `tA` puts thread $t$ at $(m, k) = (\lfloor t/8 \rfloor, t \bmod 8)$: threads 0 to 7 sit
+along one row of the A tile, threads 8 to 15 along the next, and so on.
+
+### The device side
+
+The kernel body has four parts.
+
+```cpp
+// 1. Whole matrices as tensors
+Tensor mA = make_tensor(A, select<0, 2>(problem_shape), a_stride);  // (M,K)
+
+// 2. This block's tiles: cut into CTA tiles, keep row blockIdx.y and every k tile
+auto tileA = zipped_divide(mA, select<0, 2>(cta_tiler));   // ((bM,bK),(M/bM,K/bK))
+auto gA    = tileA(make_coord(_, _), make_coord(blockIdx.y, _));  // (bM,bK,K/bK)
+
+// 3. Each thread's share: one partition for copying, one for multiplying
+Tensor tAgA = local_partition(gA, a_thread_layout, threadIdx.x);  // (bM/32, bK/8, K/bK)
+Tensor tAsA = local_partition(sA, a_thread_layout, threadIdx.x);  // (bM/32, bK/8)
+TiledMMA mma = make_tiled_mma(UniversalFMA<TC, TA, TB>{}, c_thread_layout);
+auto thr_mma = mma.get_slice(threadIdx.x);
+Tensor tCsA = thr_mma.partition_A(sA);
+Tensor tCsB = thr_mma.partition_B(sB);
+Tensor tCgC = thr_mma.partition_C(gC);
+Tensor tCrC = thr_mma.make_fragment_C(tCgC);   // accumulators in registers
+
+// 4. Mainloop over k tiles, then the epilogue
+for (int kt = 0; kt < size<2>(tAgA); ++kt) {
+  copy(tAgA(_, _, kt), tAsA);       // global -> shared
+  copy(tBgB(_, _, kt), tBsB);
+  __syncthreads();
+  cute::gemm(mma, tCsA, tCsB, tCrC); // shared -> registers, multiply
+  __syncthreads();
+}
+for (int i = 0; i < size(tCrC); ++i) tCgC(i) = alpha * tCrC(i);  // registers -> global
+```
+
+Step 2 uses `zipped_divide` and then slices it. That is exactly what CuTe's `local_tile` does, so
+the figures below label `gA` with the `local_tile` call.<Sidenote>`local_tile(tensor, tiler, coord)`
+is `inner_partition`, which is `zipped_divide` followed by indexing the rest mode with `coord`
+(`include/cute/tensor_impl.hpp`). The kernel builds the coordinate as `(blockIdx.y, blockIdx.x)`, so
+`blockIdx.y` picks the M tile and `blockIdx.x` the N tile; the figures follow that order.</Sidenote>
+The copy loop has no bounds checks, so the kernel needs $M$ and $N$ to be multiples of 128 and $K$
+a multiple of 8.
+
+The rest of the post follows one **warp**, 32 threads with consecutive `threadIdx.x` that the
+hardware runs in lockstep. Every load or store instruction is issued by a whole warp at once, so
+the warp, not the single thread, decides how efficient an access is.
+
+### A scaled-down example
+
+A $128 \times 8$ tile has 1024 elements, too many to draw. The figures below use a scaled-down
+version: $M = N = 64$, $K = 16$ and a $32 \times 32 \times 8$ CTA tile. The thread layouts `tA`,
+`tB` and `tC` are unchanged, with 256 threads, so every warp makes exactly the same access pattern
+as in the real kernel. Only the swizzle changes, for a reason explained in
+[Swizzling](#swizzling).
+
+| | Real kernel | Figures |
+| --- | --- | --- |
+| Problem $M \times N \times K$ | any multiple of $(128, 128, 8)$ | $64 \times 64 \times 16$ |
+| CTA tile | $128 \times 128 \times 8$ | $32 \times 32 \times 8$ |
+| `tA`, `tB`, `tC` | as above, 256 threads | the same |
+| `sA` | `Swizzle<3,2,5>` o $(128,8)$ | `Swizzle<3,2,3>` o $(32,8)$ |
+| A elements per thread per k tile | 4 | 1 |
+| C elements per thread | 64 | 4 |
+
+## Moving a tile from global to shared memory
+
+Each iteration of the mainloop first copies one k tile of A ($128 \times 8$) and one of B into
+shared memory. `copy(tAgA(_, _, kt), tAsA)` is a plain loop: each thread loads its elements from
+global memory into registers and stores them to shared memory. With `tA`, thread $t$ handles
+row $\lfloor t/8 \rfloor$ and column $t \bmod 8$ of the tile, then the same position 32 rows down.
+
+The figure shows this copy for the scaled-down kernel, without the swizzle for now. On the left is
+all of A in global memory. The green strip is the 32 rows this block needs (`blockIdx.y = 1`),
+and the dashed box is the current k tile, coloured by the thread that copies each element.
+Thread 5's element is filled; the dashed outlines mark what the rest of its warp, threads 0 to
+31, copies in the same instruction. In the middle is the tile in shared memory with each
+element's offset. Below the figure, the two memory panels show what that warp's load and store
+cost.
+
+<CuteLayoutGemm
+	stages="copy"
+	blockOrder="yx"
+	cta="(32,32,8)"
+	aMatrix="(64,16):(16,1)"
+	aSmem="(32,8)"
+	aThr="(32,8):(8,1)"
+	bMatrix="(64,16):(1,64)"
+	bSmem="(32,8)"
+	bThr="(32,8)"
+	block={[0, 1]}
+	thread={5}
+	kTile={1}
+/>
+
+Warp 0 covers a block of 4 rows by 8 columns of the k tile. Look at the two panels: the global
+load is perfect, but the shared store is not. The next two sections explain why.
+
+### Memory coalescing
+
+Global memory is read and written in **sectors** of 32 bytes. When a warp issues a load, the
+hardware collects the addresses of all 32 lanes and fetches every sector that any lane touches.
+An access is **coalesced** when the lanes' addresses fall in as few sectors as possible, so that
+every byte moved is a byte used. For 32 lanes reading 4-byte floats, the best case is 128 bytes
+in 4 sectors.
+
+Here A is K-major, so the 8 elements $A(m, k), \ldots, A(m, k+7)$ of one row of the k tile are 32
+contiguous bytes. `tA` gives those 8 elements to 8 consecutive lanes. Warp 0 therefore reads 4
+rows of 8 floats, each row exactly one sector: 4 sectors, 128 bytes moved, 128 bytes used. Check
+one: lane 9 is at $(m, k) = (1, 1)$ of the tile, which is $A(33, 9)$ in the whole matrix (row
+$32 + 1$, column $8 + 1$ in k tile 1), at offset $33 \cdot 16 + 9 = 537$; it shares the sector of
+bytes $2144$ to $2175$ with lanes 8 to 15.
+
+Now give the same copy the other thread layout, `tA` = $(32,8)$ column-major, so that consecutive
+lanes walk down M instead of along K:
+
+<CuteLayoutGemm
+	stages="copy"
+	blockOrder="yx"
+	cta="(32,32,8)"
+	aMatrix="(64,16):(16,1)"
+	aSmem="(32,8)"
+	aThr="(32,8)"
+	bMatrix="(64,16):(1,64)"
+	bSmem="(32,8)"
+	bThr="(32,8)"
+	block={[0, 1]}
+	thread={5}
+	kTile={1}
+/>
+
+Warp 0 now reads one column of the tile, 32 floats that are each a whole row (64 bytes) apart.
+Every lane lands in its own sector: 32 sectors, 1024 bytes moved for 128 bytes used, 12.5%. The
+rule is that **the thread layout's fastest mode must follow the matrix's stride-1 mode**. That is
+why the kernel uses a row-major `tA` for the K-major A, and a column-major `tB` for the N-major B
+(switch the figure to the B tile: its warp reads 32 consecutive n, again 4 sectors).
+
+### Bank conflicts
+
+Shared memory is split into 32 **banks**, each 4 bytes wide, and 4-byte word $w$ lives in bank
+$w \bmod 32$. Each bank can serve one word per cycle. If the lanes of a warp touch 32 different
+banks, or several lanes touch the same word (a **broadcast**), the access finishes in one pass. If
+two lanes need *different* words in the *same* bank, the hardware serves them one after another.
+This is a **bank conflict**, and an access where some bank must serve $n$ different words takes
+$n$ passes: an $n$-way conflict.
+
+The unswizzled `sA` is $(128, 8):(1, 128)$, so $A(m, k)$ sits at offset $m + 128k$. Because 128 is
+a multiple of 32, its bank is just $m \bmod 32$: **every column of the tile maps to the same
+banks.** Warp 0 stores rows 0 to 3 across all 8 columns, so it only uses banks 0 to 3, and each
+of those banks receives 8 different words. That is the red column in the first figure: an 8-way
+conflict, with the store taking 8 passes instead of 1. (In the scaled-down tile, $32k$ plays the
+role of $128k$; the bank is again $m$.)
+
+The column-major `tA` of the second figure has no conflict: its warp stores 32 consecutive $m$
+in one column, 32 different banks. So we face a tension. The thread layout that reads global
+memory well (along K) writes shared memory badly (across columns), and the other way round. We
+could store `sA` K-major instead, but the multiply reads `sA` along M (next section), so that
+would only move the conflict there.
+
+### Swizzling
+
+A **swizzle** breaks the tie by permuting where each element lands in shared memory, without
+changing the logical layout. CuTe's `Swizzle<B, M, S>` takes an offset and XORs $B$ of its bits,
+starting at bit $M + S$, into the $B$ bits starting at bit $M$:
+
+$$
+\text{swizzle}(o) = o \oplus \big((o \mathbin{\&} \texttt{yyy\_mask}) \gg S\big),
+\qquad \texttt{yyy\_mask} = (2^B - 1) \ll (M + S).
+$$
+
+`composition(Swizzle<3,2,5>{}, layout)` applies it after the layout, so $A(m, k)$ now goes to
+$\text{swizzle}(m + 128k)$. In the offset $m + 128k$, bits 0 to 6 hold $m$ and bits 7 to 9 hold
+$k$. `Swizzle<3,2,5>` takes bits 7 to 9 (that is, $k$), shifts them right by 5 and XORs them into
+bits 2 to 4. The result is
+
+$$
+\text{swizzle}(m + 128k) = 128k + (m \oplus 4k), \qquad \text{bank} = (m \oplus 4k) \bmod 32.
+$$
+
+Each column $k$ now permutes its rows in groups of 4, by XOR with a different constant $4k$. For warp 0, rows $m = 0..3$ in
+column $k$ land in banks $4k$ to $4k + 3$, and the 8 columns tile all 32 banks exactly. The
+scaled-down tile has $k$ in bits 5 to 7 of $m + 32k$, so the same effect needs `Swizzle<3,2,3>`.
+The table works it out for a few lanes of warp 0:
+
+| Lane | $(m, k)$ | Offset | Bank | Swizzled offset | Bank |
+| ---: | :---: | ---: | ---: | ---: | ---: |
+| 0 | $(0, 0)$ | 0 | 0 | 0 | 0 |
+| 1 | $(0, 1)$ | 32 | 0 | 36 | 4 |
+| 7 | $(0, 7)$ | 224 | 0 | 252 | 28 |
+| 8 | $(1, 0)$ | 1 | 1 | 1 | 1 |
+| 9 | $(1, 1)$ | 33 | 1 | 37 | 5 |
+| 15 | $(1, 7)$ | 225 | 1 | 253 | 29 |
+| 31 | $(3, 7)$ | 227 | 3 | 255 | 31 |
+
+Check one entry by hand: $A(1, 2)$ is at offset $1 + 32 \cdot 2 = 65 = \texttt{0b1000001}$. Bits 5
+to 7 hold $2$; shifted down by 3 that is $8$, and $65 \oplus 8 = 73$, in bank $73 \bmod 32 = 9$. In
+the real kernel the same element is at $1 + 128 \cdot 2 = 257$, which `Swizzle<3,2,5>` sends to
+$265$, also bank 9.
+
+Here is the copy again with the swizzle. The offsets in the shared tile are now permuted within
+each column, and the bank panel is conflict-free. The global load is unchanged, since the swizzle
+only moves data inside shared memory. Switch to the B tile to see that B never needed one.
+
+<CuteLayoutGemm
+	stages="copy"
+	blockOrder="yx"
+	cta="(32,32,8)"
+	aMatrix="(64,16):(16,1)"
+	aSmem="Sw<3,2,3> o (32,8)"
+	aThr="(32,8):(8,1)"
+	bMatrix="(64,16):(1,64)"
+	bSmem="(32,8)"
+	bThr="(32,8)"
+	block={[0, 1]}
+	thread={9}
+	kTile={1}
+/>
+
+The parameters are not arbitrary. $B = 3$ because there are $2^3 = 8$ columns to spread out. $M =
+2$ leaves the low 2 bits alone, so every aligned run of 4 consecutive $m$ stays contiguous; a
+kernel that copies with 16-byte vector instructions along M would still find its 4 floats side by
+side. $S$ is the distance from the lowest bit of $k$ to bit $M$: $7 - 2 = 5$ for 128 rows, $5 - 2
+= 3$ for 32.<Sidenote>Padding is the older fix: give each column a few extra words so columns
+start in different banks. With `sA` = $(128,8):(1,132)$ the bank is $(m + 4k) \bmod 32$ and warp
+0's store is conflict-free, at the cost of 28 extra words (a cosize of 1052 instead of 1024). The tempting $(1,129)$ is not enough
+for this warp shape: bank $m + k$ still sends 4 words to some banks, a 4-way conflict. Both
+counts are from a script over all 32 lanes.</Sidenote>
+
+The swizzle costs nothing to maintain by hand. Both the copy (`tAsA`) and the multiply (`tCsA`)
+are partitions of the same tensor `sA`, so CuTe applies the swizzle to every address either one
+computes.
+
+## Multiplying out of shared memory
+
+After `__syncthreads()`, each thread multiplies its part of the tiles. `make_tiled_mma` with
+`UniversalFMA` makes each thread a scalar multiply-add unit, and `tC` = $(16,16)$ arranges the 256
+threads over the C tile: thread $t$ owns rows $m \equiv t \bmod 16$ and columns $n \equiv
+\lfloor t/16 \rfloor \pmod{16}$. In the real kernel that is an $8 \times 8$ grid of C elements,
+strided by 16 in both directions.
+
+For shared-memory operands, `cute::gemm` copies one k slice of `tCsA` and `tCsB` into registers
+and then runs an outer product on them.<Sidenote>Dispatch [5] for `is_smem` A and B in
+`include/cute/algorithm/gemm.hpp`: `copy(A(_,_,k), rA(_,_,k)); copy(B(_,_,k), rB(_,_,k));` then
+the register `gemm` for that k.</Sidenote> In the real kernel each thread loads 8 values of A and 8
+of B per k and does $8 \times 8 = 64$ multiply-adds with them: a quarter of a shared load per
+multiply-add. The hand-written `simple_tiled_matmul_kernel` gives each thread one C element and
+needs two shared loads per multiply-add, eight times as many. This **register blocking** is the
+main reason the CuTe kernel is faster.
+
+The figure shows thread 5's share and, below, the shared loads of its warp at one k. Hover a C
+cell to see the sum that `gemm` adds to it.
+
+<CuteLayoutGemm
+	stages="mma"
+	cta="(32,32,8)"
+	aSmem="Sw<3,2,3> o (32,8)"
+	bSmem="(32,8)"
+	mmaThr="(16,16)"
+	gC="(32,32):(64,1)"
+	thread={5}
+	kBlock={2}
+/>
+
+Both loads are conflict-free. For A, lanes 0 to 15 read rows 0 to 15 of one column, and lanes 16
+to 31 read the same 16 words again, which is a broadcast. In the swizzled layout those 16 rows
+land at $m \oplus 4k$, and XOR with a constant only reorders them, so they still sit in 16
+different banks. For B, the warp reads only columns $n = 0$ and $n = 1$: two words, 16 lanes each.
+So the swizzle fixes the copy without hurting the multiply.
+
+## Storing C
+
+After the last k tile, every thread holds its finished C elements in registers, and the epilogue
+writes them out:
+
+```cpp
+for (int i = 0; i < size(tCrC); ++i) {
+  tCgC(i) = alpha * tCrC(i);   // beta == 0
+}
+```
+
+Each iteration is one store instruction for the warp, and the same coalescing rule applies. `tC`
+puts consecutive lanes on consecutive rows $m$, but C is row-major, so consecutive rows are a
+whole row of C ($N$ floats) apart. Warp 0's first store writes $C(0..15, 0)$ and $C(0..15, 1)$:
+16 rows, two adjacent floats in each. That is 16 sectors, 512 bytes of traffic for 128 bytes of
+data, or 25%. Every one of the real kernel's 64 stores per thread looks like this.
+
+<CuteLayoutGemm stages="store" cta="(32,32,8)" aSmem="Sw<3,2,3> o (32,8)" bSmem="(32,8)" mmaThr="(16,16)" gC="(32,32):(64,1)" thread={5} />
+
+The fix is the same rule as for the loads: make the thread layout's fastest mode follow C's
+stride-1 mode. With `tC` = $(16,16):(16,1)$ (row-major), thread $t$ owns rows $\lfloor t/16
+\rfloor$ and columns $t \bmod 16$, so lanes 0 to 15 write 16 consecutive floats of one row and
+lanes 16 to 31 the next row: 4 sectors, all bytes used.
+
+<CuteLayoutGemm stages="store" cta="(32,32,8)" aSmem="Sw<3,2,3> o (32,8)" bSmem="(32,8)" mmaThr="(16,16):(16,1)" gC="(32,32):(64,1)" thread={5} />
+
+The change does not create bank conflicts in the multiply: lanes now read 2 rows of `sA`
+(broadcast) and 16 consecutive rows of `sB` (16 banks).<Sidenote>Checked over every k and every
+load for both the scaled-down and the real tile sizes, with the logic behind these
+figures.</Sidenote> You can try it in the MMA figure above by typing the stride `(16,1)` next to
+the thread layout. CUTLASS's `sgemm_1` tutorial uses the column-major `tC` because it assumes
+column-major C, as BLAS does; this kernel made C row-major but kept the tutorial's `tC`.
+Production CUTLASS epilogues go one step further and stage C through shared memory, so that every
+global store is a wide, fully coalesced write.
+
+## Putting it together
+
+The three kernels in the file compare as follows, per warp instruction, for 4-byte floats. The
+numbers are counts of sectors and bank passes worked out from the layouts, not measurements.
+
+| | Global loads | Shared stores | Shared loads per FMA | Global stores of C |
+| --- | ---: | ---: | ---: | ---: |
+| `simple_tiled_matmul_kernel` | 4 sectors | 1 pass | 2 | 4 sectors |
+| CuTe kernel, no swizzle | 4 sectors | 8 passes (A) | 0.25 | 16 sectors |
+| CuTe kernel as written | 4 sectors | 1 pass | 0.25 | 16 sectors |
+| ... with row-major `tC` | 4 sectors | 1 pass | 0.25 | 4 sectors |
+
+To confirm on a GPU, profile with Nsight Compute (see [the NCU guide](/blog/nsight-compute-guide/)):
+`l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum` counts bank conflicts on shared
+stores, and dividing `l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum` by
+`l1tex__t_requests_pipe_lsu_mem_global_op_st.sum` gives sectors per store request (4 is ideal
+here, 16 is what the column-major `tC` produces).
+
+## Summary
+
+- Every memory instruction is issued by a whole warp, so efficiency depends on what the 32 lanes
+  touch together: sectors in global memory, banks in shared memory.
+- A global access is coalesced when the thread layout's fastest mode follows the matrix's stride-1
+  mode. That is why `tA` is row-major for the K-major A and `tB` column-major for the N-major B.
+- A column-major $128 \times 8$ shared tile puts every column in the same banks, so the
+  coalesced copy of A becomes an 8-way bank conflict.
+- `Swizzle<3,2,5>` XORs the column index into bits 2 to 4 of each offset, spreading the 8 columns
+  over all 32 banks. It costs no memory, and CuTe applies it to every access of `sA`.
+- The epilogue's store of C uses only a quarter of its traffic with the column-major `tC`; a
+  row-major `tC` makes it coalesced without hurting the multiply.
+
+## References
+
+- The kernel: `core/cuda/matmul_kernel.cu` in the fastops project.
+- CUTLASS v4.4.2 (commit `da5e086`):
+  [`examples/cute/tutorial/sgemm_1.cu`](https://github.com/NVIDIA/cutlass/blob/da5e086dab31d63815acafdac9a9c5893b1c69e2/examples/cute/tutorial/sgemm_1.cu),
+  the tutorial this kernel follows;
+  [`include/cute/swizzle.hpp`](https://github.com/NVIDIA/cutlass/blob/da5e086dab31d63815acafdac9a9c5893b1c69e2/include/cute/swizzle.hpp),
+  the definition of `Swizzle<B,M,S>`;
+  [`include/cute/algorithm/gemm.hpp`](https://github.com/NVIDIA/cutlass/blob/da5e086dab31d63815acafdac9a9c5893b1c69e2/include/cute/algorithm/gemm.hpp),
+  the shared-memory dispatch of `gemm`.
+- NVIDIA, [CUDA C++ Best Practices Guide: coalesced access to global memory](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#coalesced-access-to-global-memory).
+- NVIDIA, [CUDA C++ Programming Guide: shared memory](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#shared-memory-5-x), on banks and conflicts.

@@ -36,6 +36,35 @@ import CuteLayoutGemm from "../../component/Cute/CuteLayoutGemm.astro";
 		aSmem="(32,8):(8,1)"
 		bSmem="(16,8):(8,1)"
 		gC="(32,16)"
+		bytes={2}
 		thread={5}
 	/>
+
+	<h2>All three stages, swizzled sA, row-major A and C</h2>
+	<p>
+		The fastops CuTe kernel scaled down from a 128×128×8 to a 32×32×8 CTA tile, with its 256 threads and thread
+		layouts unchanged. A is row-major (K-major), so tA = (32,8):(8,1) puts consecutive threads along K; sA is
+		swizzled with Sw&lt;3,2,3&gt; (Sw&lt;3,2,5&gt; at 128 rows). The memory panels follow one warp: the sectors its
+		global load touches, and the banks its shared store and loads hit. Stage 3 writes C back; with the column-major
+		tC each warp store touches 16 sectors. Type (16,16):(16,1) into the MMA thread layout to make it 4.
+	</p>
+	<CuteLayoutGemm
+		stages="all"
+		blockOrder="yx"
+		cta="(32,32,8)"
+		aMatrix="(64,16):(16,1)"
+		aSmem="Sw<3,2,3> o (32,8)"
+		aThr="(32,8):(8,1)"
+		bMatrix="(64,16):(1,64)"
+		bSmem="(32,8)"
+		bThr="(32,8)"
+		mmaThr="(16,16)"
+		gC="(32,32):(64,1)"
+		block={[0, 1]}
+		thread={5}
+	/>
+
+	<h2>Store stage only</h2>
+	<p>With the MMA stage hidden, the store stage shows its own MMA thread layout and gC inputs.</p>
+	<CuteLayoutGemm stages="store" cta="(32,32,8)" aSmem="(32,8)" bSmem="(32,8)" mmaThr="(16,16):(16,1)" gC="(32,32):(64,1)" thread={17} />
 </Layout>

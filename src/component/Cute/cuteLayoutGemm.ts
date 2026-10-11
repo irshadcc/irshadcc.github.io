@@ -19,6 +19,8 @@
 //   mmaView({ atom: UniversalFMA, thr: parseLayout("(4,4)"), cta: [16, 16, 4], sA: parseLayout("(16,4)"),
 //     sB: parseLayout("(16,4)"), gC: parseLayout("(16,16)"), thread: 5, kBlock: 0 }).tCsA;
 //   // { layout: (1,4,4):(0,4,16), offset: 1 }
+//   parseSmem("Sw<3,2,3> o (32,8)").swizzle?.apply(32);   // 36: sA(0,1) moves from bank 0 to bank 4
+//   bankAccess([0, 32, 64], 4).wavefronts;                // 3: three words in bank 0, a 3-way conflict
 
 import { CuteLayout, type IntTuple, makeLayout } from "./CuteLayout";
 import {
@@ -65,6 +67,140 @@ export function parseLayout(text: string): CuteLayout {
 	return parts.length === 2
 		? new CuteLayout(shape, parseIntTuple(parts[1]))
 		: new CuteLayout(shape);
+}
+
+/**
+ * cute::Swizzle<B,M,S>: XOR the B bits that start at bit M+S into the B bits that start at bit M
+ * (include/cute/swizzle.hpp: offset ^ ((offset & yyy_msk) >> S)). Applied to the offset a layout
+ * produces, so composition(Swizzle<3,2,5>{}, layout) maps a coordinate to swizzle(layout(coord)).
+ */
+export class Swizzle {
+	readonly bits: number;
+	readonly base: number;
+	readonly shift: number;
+
+	constructor(bits: number, base: number, shift: number) {
+		if (bits < 0 || base < 0 || shift < bits) {
+			throw new Error(
+				`Swizzle<${bits},${base},${shift}> needs B, M >= 0 and S >= B`,
+			);
+		}
+		this.bits = bits;
+		this.base = base;
+		this.shift = shift;
+	}
+
+	apply(offset: number): number {
+		const yyy = ((1 << this.bits) - 1) << (this.base + this.shift);
+		return offset ^ ((offset & yyy) >> this.shift);
+	}
+
+	toString(): string {
+		return `Sw<${this.bits},${this.base},${this.shift}>`;
+	}
+}
+
+/** Parse "Sw<3,2,5>", "Swizzle<3,2,5>" or "3,2,5"; empty text means no swizzle. */
+export function parseSwizzle(text: string): Swizzle | undefined {
+	const src = text.replace(/\s+/g, "");
+	if (!src) return undefined;
+	const m = /^(?:Sw(?:izzle)?<)?(\d+),(\d+),(\d+)>?$/.exec(src);
+	if (!m)
+		throw new Error(`Expected a swizzle such as Sw<3,2,5>, got "${text}"`);
+	return new Swizzle(Number(m[1]), Number(m[2]), Number(m[3]));
+}
+
+/** A shared-memory layout, optionally swizzled: "Sw<3,2,3> o (32,8)" or just "(32,8):(1,32)". */
+export interface SmemLayout {
+	layout: CuteLayout;
+	swizzle?: Swizzle;
+}
+
+export function parseSmem(text: string): SmemLayout {
+	const parts = text.split(/\s+o\s+/);
+	if (parts.length > 2) throw new Error(`Too many "o" in "${text}"`);
+	return parts.length === 2
+		? { swizzle: parseSwizzle(parts[0]), layout: parseLayout(parts[1]) }
+		: { layout: parseLayout(text) };
+}
+
+/** Where a layout offset really lands in shared memory, after the swizzle. */
+export function physical(swizzle: Swizzle | undefined, offset: number): number {
+	return swizzle ? swizzle.apply(offset) : offset;
+}
+
+/** Shared memory has 32 banks, each 4 bytes wide: word w lives in bank w mod 32. */
+export const BANKS = 32;
+/** Global memory moves data in 32-byte sectors. */
+export const SECTOR_BYTES = 32;
+
+/** One lane's access: the element offset it reads or writes. */
+export interface LaneAccess {
+	lane: number;
+	offset: number;
+}
+
+export interface BankReport {
+	/** Distinct 4-byte words each bank must serve, by bank. */
+	words: Map<number, Set<number>>;
+	/** Passes the hardware needs: the most distinct words any one bank serves (1 = conflict-free). */
+	wavefronts: number;
+}
+
+/**
+ * Bank conflicts of one warp-wide shared-memory access. Lanes that touch the same word share one
+ * read (a broadcast); different words in the same bank are served one after another.
+ */
+export function bankAccess(offsets: number[], bytes: number): BankReport {
+	const words = new Map<number, Set<number>>();
+	for (const off of offsets) {
+		const word = Math.floor((off * bytes) / 4);
+		const bank = word % BANKS;
+		if (!words.has(bank)) words.set(bank, new Set());
+		words.get(bank)?.add(word);
+	}
+	const wavefronts = Math.max(0, ...[...words.values()].map((w) => w.size));
+	return { words, wavefronts };
+}
+
+export interface SectorReport {
+	/** Touched sectors, ascending, with the lanes that use each. */
+	sectors: { sector: number; lanes: LaneAccess[] }[];
+	/** Bytes the lanes asked for. */
+	used: number;
+	/** Bytes the memory system moves: 32 per touched sector. */
+	moved: number;
+}
+
+/** The 32-byte sectors one warp-wide global access touches; offsets are elements from a 32-byte aligned base. */
+export function sectorAccess(
+	access: LaneAccess[],
+	bytes: number,
+): SectorReport {
+	const bySector = new Map<number, LaneAccess[]>();
+	for (const a of access) {
+		const sector = Math.floor((a.offset * bytes) / SECTOR_BYTES);
+		if (!bySector.has(sector)) bySector.set(sector, []);
+		bySector.get(sector)?.push(a);
+	}
+	const sectors = [...bySector.entries()]
+		.sort((x, y) => x[0] - y[0])
+		.map(([sector, lanes]) => ({ sector, lanes }));
+	const distinct = new Set(access.map((a) => a.offset)).size;
+	return {
+		sectors,
+		used: distinct * bytes,
+		moved: sectors.length * SECTOR_BYTES,
+	};
+}
+
+/** The 32 lanes of the warp that `thread` belongs to, capped at the block size. */
+export function warpLanes(thread: number, threads: number): number[] {
+	const first = Math.floor(thread / 32) * 32;
+	return Array.from(
+		{ length: Math.min(32, threads - first) },
+		(_, i) => first + i,
+	);
 }
 
 /** Who owns one element of the tile. */
@@ -221,6 +357,8 @@ export interface CopyInputs {
 	block: number;
 	/** Shared-memory layout of one (BM,BK) or (BN,BK) tile. */
 	smem: CuteLayout;
+	/** Swizzle applied to smem's offsets, if any. */
+	swizzle?: Swizzle;
 	/** Thread layout used by local_partition. */
 	thr: CuteLayout;
 	thread: number;
@@ -233,6 +371,7 @@ export interface CopyElement {
 	global: [number, number];
 	globalOffset: number;
 	smem: [number, number];
+	/** Offset in shared memory, after the swizzle. */
 	smemOffset: number;
 }
 
@@ -248,9 +387,11 @@ export interface CopyView {
 	tgk: Placed;
 	/** tAsA = local_partition(sA, tA, t). */
 	ts: Placed;
-	/** Owner of every element of the shared tile (and so of the current global tile). */
+	/** Owner of every element of the shared tile (and so of the current global tile); offsets swizzled. */
 	owners: TileView;
 	elements: CopyElement[];
+	/** The elements of every lane in the thread's warp, as [lane, elements]. */
+	warp: { lane: number; elements: CopyElement[] }[];
 }
 
 /** Follow thread `thread` through copy(tAgA(_,_,k_tile), tAsA) of one operand. */
@@ -287,8 +428,35 @@ export function copyView(inp: CopyInputs): CopyView {
 	if (inp.thread < 0 || inp.thread >= thr.size) {
 		throw new Error(`threadIdx.x must be in [0, ${thr.size})`);
 	}
-	const owners = partitionTile(smem, thr);
+	const plain = partitionTile(smem, thr);
+	const owners: TileView = {
+		...plain,
+		cells: plain.cells.map((r) =>
+			r.map((c) => ({ ...c, offset: physical(inp.swizzle, c.offset) })),
+		),
+	};
 	const g = localTile(matrix, tile, inp.block);
+	const gInv = inverse(matrix);
+	const sInv = inverse(smem);
+	/** Thread t's elements at k_tile: where each comes from in global memory and goes in shared. */
+	const laneElements = (t: number) => {
+		const tgRel = g.layout.localPartition(thr, t);
+		const l = tgRel.layout;
+		const base = g.offset + tgRel.offset + l.mode(2).offset(inp.kTile);
+		const tgkLayout = makeLayout([l.mode(0), l.mode(1)]);
+		const ts = smem.localPartition(thr, t);
+		return Array.from({ length: ts.layout.size }, (_, i) => {
+			const globalOffset = base + tgkLayout.offset(i);
+			const logical = ts.offset + ts.layout.offset(i);
+			return {
+				index: i,
+				global: gInv.get(globalOffset) as [number, number],
+				globalOffset,
+				smem: sInv.get(logical) as [number, number],
+				smemOffset: physical(inp.swizzle, logical),
+			};
+		});
+	};
 	const tgRel = g.layout.localPartition(thr, inp.thread);
 	const tg = { layout: tgRel.layout, offset: g.offset + tgRel.offset };
 	const l = tg.layout;
@@ -297,20 +465,12 @@ export function copyView(inp: CopyInputs): CopyView {
 		offset: tg.offset + l.mode(2).offset(inp.kTile),
 	};
 	const ts = smem.localPartition(thr, inp.thread);
-	const gInv = inverse(matrix);
-	const sInv = inverse(smem);
-	const elements = Array.from({ length: ts.layout.size }, (_, i) => {
-		const globalOffset = tgk.offset + tgk.layout.offset(i);
-		const smemOffset = ts.offset + ts.layout.offset(i);
-		return {
-			index: i,
-			global: gInv.get(globalOffset) as [number, number],
-			globalOffset,
-			smem: sInv.get(smemOffset) as [number, number],
-			smemOffset,
-		};
-	});
-	return { tile, tiles, g, tg, tgk, ts, owners, elements };
+	const warp = warpLanes(inp.thread, thr.size).map((lane) => ({
+		lane,
+		elements: laneElements(lane),
+	}));
+	const elements = laneElements(inp.thread);
+	return { tile, tiles, g, tg, tgk, ts, owners, elements, warp };
 }
 
 // ---------- MMA: shared -> registers ----------
@@ -331,6 +491,9 @@ export interface MmaInputs {
 	sA: CuteLayout;
 	/** (BN,BK) tile of B in shared memory. */
 	sB: CuteLayout;
+	/** Swizzles applied to sA's and sB's offsets, if any. */
+	swizzleA?: Swizzle;
+	swizzleB?: Swizzle;
 	/** (BM,BN) tile of C in global memory, offsets relative to its first element. */
 	gC: CuteLayout;
 	thread: number;
@@ -345,7 +508,10 @@ export interface MmaElement {
 	mode: [number, number, number];
 	/** (row, col) in the tile. */
 	coord: [number, number];
+	/** Offset in the tile's layout. */
 	offset: number;
+	/** Offset in memory: the same, after the shared-memory swizzle if there is one. */
+	phys: number;
 }
 
 export interface MmaView {
@@ -365,6 +531,8 @@ export interface MmaView {
 	cOwner: number[][];
 	/** How gemm() updates each of the thread's accumulators in the current k_block. */
 	equations: MmaEquation[];
+	/** Every lane of the thread's warp: its A and B elements in the current k_block, and its C elements. */
+	warp: { lane: number; a: MmaElement[]; b: MmaElement[]; c: MmaElement[] }[];
 }
 
 /** A register: element `index` of thread `thread`'s partition (tCsA or tCsB). */
@@ -380,7 +548,11 @@ export interface MmaEquation {
 	terms: { k: number; a: RegRef; b: RegRef }[];
 }
 
-function elements(p: Partition, tile: CuteLayout): MmaElement[] {
+function elements(
+	p: Partition,
+	tile: CuteLayout,
+	swizzle?: Swizzle,
+): MmaElement[] {
 	const inv = inverse(tile);
 	const s0 = p.layout.mode(0).size;
 	const s1 = p.layout.mode(1).size;
@@ -393,6 +565,7 @@ function elements(p: Partition, tile: CuteLayout): MmaElement[] {
 			mode: [i % s0, Math.floor(i / s0) % s1, Math.floor(i / (s0 * s1))],
 			coord,
 			offset,
+			phys: physical(swizzle, offset),
 		};
 	});
 }
@@ -448,6 +621,14 @@ export function mmaView(inp: MmaInputs): MmaView {
 	}
 	const vmnk = mma.threadCoord(inp.thread);
 	const c = elements(tCgC, inp.gC);
+	const now = (els: MmaElement[]) =>
+		els.filter((e) => e.mode[2] === inp.kBlock);
+	const warp = warpLanes(inp.thread, mma.size).map((lane) => ({
+		lane,
+		a: now(elements(mma.partitionA(inp.sA, lane), inp.sA, inp.swizzleA)),
+		b: now(elements(mma.partitionB(inp.sB, lane), inp.sB, inp.swizzleB)),
+		c: elements(mma.partitionC(inp.gC, lane), inp.gC),
+	}));
 	return {
 		mma,
 		vmnk,
@@ -456,11 +637,12 @@ export function mmaView(inp: MmaInputs): MmaView {
 		tCgC,
 		tCrC: mma.makeFragmentC(tCgC.layout),
 		kBlocks,
-		a: elements(tCsA, inp.sA),
-		b: elements(tCsB, inp.sB),
+		a: elements(tCsA, inp.sA, inp.swizzleA),
+		b: elements(tCsB, inp.sB, inp.swizzleB),
 		c,
 		cOwner,
 		equations: equations(mma, inp, vmnk, c),
+		warp,
 	};
 }
 

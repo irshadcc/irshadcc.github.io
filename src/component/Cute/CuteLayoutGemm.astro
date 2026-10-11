@@ -15,7 +15,13 @@
 //        gemm(mma, tCsA(_,_,k_block), tCsB(_,_,k_block), tCrC);
 //      sB on top (K × N), sA on the left (M × K), C in the middle coloured by owning thread; the
 //      dashed band is the current k_block. Right: the thread's A and B values and accumulators.
-// The CTA shape, threadIdx and the sA / sB layouts are shared by both stages. The thread's
+//   3. Store, registers -> global (stages="all" or "store"):
+//        for (int i = 0; i < size(tCrC); ++i) tCgC(i) = alpha * tCrC(i);
+//      The C tile coloured by owning thread, and the 32-byte sectors one warp's store i touches.
+// Under the copy and MMA stages, memory panels follow one warp-wide instruction (pick it with the
+// slider): the global sectors a load touches (coalescing) and the shared-memory words it hits,
+// drawn as 32 banks (bank conflicts). sA / sB may be swizzled: "Sw<3,2,5> o (128,8)".
+// The CTA shape, threadIdx and the sA / sB layouts are shared by all stages. The thread's
 // elements are filled and numbered with their index in its partition; hover one to find it in
 // the other columns, hover a C cell for the A and B rows it sums, click a cell to switch thread.
 // Under each stage a table gives every variable's CuTe line, layout (+ the offset CuTe adds to the
@@ -24,15 +30,20 @@
 // = compact column-major). Logic and checks: cuteLayoutGemm.ts; TiledMMA: CuteMma.ts.
 // Usage in .mdx:
 //   <CuteLayoutGemm cta="(16,16,4)" aThr="(8,4)" mmaThr="(8,4)" block={[1, 0]} thread={5} />
-//   <CuteLayoutGemm stages="mma" atom="SM80_16x8x8_F32F16F16F32_TN" mmaThr="(2,1)" cta="(32,16,8)" ... />
+//   <CuteLayoutGemm stages="mma" atom="SM80_16x8x8_F32F16F16F32_TN" mmaThr="(2,1)" cta="(32,16,8)" bytes={2} ... />
+//   <CuteLayoutGemm stages="all" blockOrder="yx" aSmem="Sw<3,2,3> o (32,8)" aThr="(32,8):(8,1)" mmaThr="(16,16)" ... />
 interface Props {
-	/** Which stages to draw. */
-	stages?: "both" | "copy" | "mma";
+	/** Which stages to draw: "both" (copy and mma), "all", or a comma list of copy, mma, store. */
+	stages?: string;
+	/** Which blockIdx picks the M tile: "xy" (blockIdx.x, as in CuTe's tutorial) or "yx" (blockIdx.y). */
+	blockOrder?: "xy" | "yx";
+	/** Bytes per element, for banks and sectors: 4 for float, 2 for half. */
+	bytes?: number;
 	/** Operand the copy stage shows first. */
 	operand?: "A" | "B";
 	/** mA, the (M,K) matrix in global memory. */
 	aMatrix?: string;
-	/** sA, one (BM,BK) tile in shared memory. */
+	/** sA, one (BM,BK) tile in shared memory, optionally swizzled: "Sw<3,2,5> o (128,8)". */
 	aSmem?: string;
 	/** tA, the thread layout for copying A. */
 	aThr?: string;
@@ -56,6 +67,8 @@ interface Props {
 
 const {
 	stages = "both",
+	blockOrder = "xy",
+	bytes = 4,
 	operand = "A",
 	aMatrix = "(32,16):(1,32)",
 	aSmem = "(16,4)",
@@ -73,14 +86,21 @@ const {
 	kBlock = 0,
 } = Astro.props;
 
+/** "Sw<3,2,5> o (128,8)" -> { swz: "Sw<3,2,5>", smem: "(128,8)" }. */
+const smemParts = (text: string) => {
+	const [a, b] = text.split(/\s+o\s+/);
+	return b === undefined ? { swz: "", smem: a } : { swz: a, smem: b };
+};
 const split = (layout: string) => {
 	const [shape, stride = ""] = layout.split(":");
 	return { shape, stride };
 };
 const config = {
 	operand,
-	A: { ...split(aMatrix), smem: aSmem, thr: aThr },
-	B: { ...split(bMatrix), smem: bSmem, thr: bThr },
+	A: { ...split(aMatrix), ...smemParts(aSmem), thr: aThr },
+	B: { ...split(bMatrix), ...smemParts(bSmem), thr: bThr },
+	order: blockOrder,
+	bytes,
 	cta,
 	bx: block[0],
 	by: block[1],
@@ -90,9 +110,20 @@ const config = {
 	mmaThr,
 	gC,
 	kb: kBlock,
+	ce: 0,
+	la: 0,
+	lb: 0,
+	se: 0,
 };
-const showCopy = stages !== "mma";
-const showMma = stages !== "copy";
+const stageList =
+	stages === "both"
+		? ["copy", "mma"]
+		: stages === "all"
+			? ["copy", "mma", "store"]
+			: stages.split(/\s*,\s*/);
+const showCopy = stageList.includes("copy");
+const showMma = stageList.includes("mma");
+const showStore = stageList.includes("store");
 ---
 
 <figure class="cl-gemm" data-config={JSON.stringify(config)}>
@@ -104,12 +135,12 @@ const showMma = stages !== "copy";
 			<input type="number" value="0" disabled title="The kernel uses threadIdx.x only" aria-label="threadIdx.y" />
 			<input type="number" value="0" disabled title="The kernel uses threadIdx.x only" aria-label="threadIdx.z" />
 		</span>
-		<span class="cl-field">sA <input data-key="sA" aria-label="sA shape" placeholder="shape" /><span class="cl-sep">:</span><input data-key="sA-stride" title="Stride; empty for compact column-major" aria-label="sA stride" placeholder="stride" /></span>
-		<span class="cl-field">sB <input data-key="sB" aria-label="sB shape" placeholder="shape" /><span class="cl-sep">:</span><input data-key="sB-stride" title="Stride; empty for compact column-major" aria-label="sB stride" placeholder="stride" /></span>
+		<span class="cl-field">sA <input class="cl-swz" data-key="sA-swz" title="Swizzle, e.g. Sw<3,2,5>; empty for none" aria-label="sA swizzle" placeholder="no swizzle" /><span class="cl-sep">o</span><input data-key="sA" aria-label="sA shape" placeholder="shape" /><span class="cl-sep">:</span><input data-key="sA-stride" title="Stride; empty for compact column-major" aria-label="sA stride" placeholder="stride" /></span>
+		<span class="cl-field">sB <input class="cl-swz" data-key="sB-swz" title="Swizzle, e.g. Sw<3,2,5>; empty for none" aria-label="sB swizzle" placeholder="no swizzle" /><span class="cl-sep">o</span><input data-key="sB" aria-label="sB shape" placeholder="shape" /><span class="cl-sep">:</span><input data-key="sB-stride" title="Stride; empty for compact column-major" aria-label="sB stride" placeholder="stride" /></span>
 	</div>
 	<p class="cl-warn" role="status" hidden></p>
 
-	<section class="cl-section" hidden={!showCopy}>
+	<section class="cl-section" data-stage="copy" hidden={!showCopy}>
 		<h4 class="cl-title">1 · Copy a k tile from global to shared memory</h4>
 		<div class="cl-tabs" role="tablist" aria-label="Operand">
 			<button type="button" role="tab" data-op="A">A tile</button>
@@ -148,11 +179,26 @@ const showMma = stages !== "copy";
 				<p class="cl-caption">Registers <span data-name="r"></span></p>
 			</div>
 		</div>
+		<div class="cl-mem">
+			<label class="cl-k">copy element <input type="range" data-key="ce" min="0" max="0" value="0" /> <output data-out="ce"></output></label>
+			<div class="cl-memrow">
+				<div class="cl-memcol">
+					<p class="cl-memtitle">Global load: the 32-byte sectors <span data-name="lp-warp"></span> reads</p>
+					<div class="cl-scroll"><svg class="lp-sectors" role="img" aria-label="Sectors of the global load"></svg></div>
+					<p class="cl-memnote" data-name="lp-sec"></p>
+				</div>
+				<div class="cl-memcol">
+					<p class="cl-memtitle">Shared store: the words it writes, by bank</p>
+					<div class="cl-scroll"><svg class="lp-banks" role="img" aria-label="Shared-memory banks of the store"></svg></div>
+					<p class="cl-memnote" data-name="lp-bank"></p>
+				</div>
+			</div>
+		</div>
 		<p class="cl-error lp-error" role="status" hidden></p>
 		<div class="cl-scroll"><table class="cl-vars lp-vars"><thead><tr><th>Variable</th><th>CuTe</th><th>Layout</th><th>Meaning here</th></tr></thead><tbody></tbody></table></div>
 	</section>
 
-	<section class="cl-section" hidden={!showMma}>
+	<section class="cl-section" data-stage="mma" hidden={!showMma}>
 		<h4 class="cl-title">2 · Multiply the tiles in shared memory into registers</h4>
 		<div class="cl-stage cl-two">
 			<div class="cl-col">
@@ -180,8 +226,48 @@ const showMma = stages !== "copy";
 				<p class="cl-caption">Registers <span data-name="mr"></span></p>
 			</div>
 		</div>
+		<div class="cl-mem">
+			<div class="cl-memrow">
+				<div class="cl-memcol">
+					<p class="cl-memtitle">Shared load of A: the words <span data-name="mp-warp"></span> reads, by bank</p>
+					<label class="cl-k">A element <input type="range" data-key="la" min="0" max="0" value="0" /> <output data-out="la"></output></label>
+					<div class="cl-scroll"><svg class="mp-banks-a" role="img" aria-label="Shared-memory banks of the A load"></svg></div>
+					<p class="cl-memnote" data-name="mp-bank-a"></p>
+				</div>
+				<div class="cl-memcol">
+					<p class="cl-memtitle">Shared load of B: the words it reads, by bank</p>
+					<label class="cl-k">B element <input type="range" data-key="lb" min="0" max="0" value="0" /> <output data-out="lb"></output></label>
+					<div class="cl-scroll"><svg class="mp-banks-b" role="img" aria-label="Shared-memory banks of the B load"></svg></div>
+					<p class="cl-memnote" data-name="mp-bank-b"></p>
+				</div>
+			</div>
+		</div>
 		<p class="cl-error mp-error" role="status" hidden></p>
 		<div class="cl-scroll"><table class="cl-vars mp-vars"><thead><tr><th>Variable</th><th>CuTe</th><th>Layout</th><th>Meaning here</th></tr></thead><tbody></tbody></table></div>
+	</section>
+
+	<section class="cl-section" data-stage="store" hidden={!showStore}>
+		<h4 class="cl-title">3 · Write the accumulators back to C in global memory</h4>
+		<div class="cl-stage cl-two">
+			<div class="cl-col">
+				<div class="cl-art"><svg class="sp-svg" role="img" aria-label="The C tile by owning thread"></svg></div>
+				<p class="cl-caption">gC, coloured by the thread that writes it</p>
+				<label class="cl-k">store element <input type="range" data-key="se" min="0" max="0" value="0" /> <output data-out="se"></output></label>
+				<div class="cl-form" hidden={showMma}>
+					<span class="cl-flabel">MMA thread layout</span>
+					<span class="cl-boxes"><input data-key="mmaThr" aria-label="MMA thread layout shape" placeholder="shape" /><span class="cl-sep">:</span><input data-key="mmaThr-stride" title="Stride; empty for compact column-major" aria-label="MMA thread layout stride" placeholder="stride" /></span>
+					<span class="cl-flabel">gC</span>
+					<span class="cl-boxes"><input data-key="gC" aria-label="gC shape" placeholder="shape" /><span class="cl-sep">:</span><input data-key="gC-stride" title="Stride; empty for compact column-major" aria-label="gC stride" placeholder="stride" /></span>
+				</div>
+			</div>
+			<div class="cl-col">
+				<p class="cl-memtitle">Global store: the 32-byte sectors <span data-name="sp-warp"></span> writes</p>
+				<div class="cl-scroll"><svg class="sp-sectors" role="img" aria-label="Sectors of the global store"></svg></div>
+				<p class="cl-memnote" data-name="sp-sec"></p>
+			</div>
+		</div>
+		<p class="cl-error sp-error" role="status" hidden></p>
+		<div class="cl-scroll"><table class="cl-vars sp-vars"><thead><tr><th>Variable</th><th>CuTe</th><th>Layout</th><th>Meaning here</th></tr></thead><tbody></tbody></table></div>
 	</section>
 </figure>
 
@@ -189,8 +275,11 @@ const showMma = stages !== "copy";
 	import { type CuteLayout, formatTuple } from "./CuteLayout";
 	import {
 		ATOMS,
+		BANKS,
+		bankAccess,
 		type CopyView,
 		copyView,
+		type LaneAccess,
 		type MmaElement,
 		type MmaView,
 		mmaView,
@@ -198,12 +287,19 @@ const showMma = stages !== "copy";
 		type Operand,
 		parseIntTuple,
 		parseLayout,
+		parseSwizzle,
+		physical,
+		SECTOR_BYTES,
+		type Swizzle,
+		sectorAccess,
 	} from "./cuteLayoutGemm";
 
 	interface OperandState {
 		shape: string;
 		stride: string;
 		smem: string;
+		/** Swizzle of the shared tile, e.g. "Sw<3,2,5>", or "" for none. */
+		swz: string;
 		thr: string;
 	}
 	interface State {
@@ -219,6 +315,13 @@ const showMma = stages !== "copy";
 		mmaThr: string;
 		gC: string;
 		kb: number;
+		order: "xy" | "yx";
+		bytes: number;
+		/** Copy element, A and B load elements and store element the memory panels follow. */
+		ce: number;
+		la: number;
+		lb: number;
+		se: number;
 	}
 
 	const SVG = "http://www.w3.org/2000/svg";
@@ -273,8 +376,11 @@ const showMma = stages !== "copy";
 			e.hidden = !msg;
 			e.textContent = msg ?? "";
 		};
-		const copyOn = !$<HTMLElement>(".cl-section:nth-of-type(1)")?.hidden;
-		const mmaOn = !$<HTMLElement>(".cl-section:nth-of-type(2)")?.hidden;
+		const copyOn = !$<HTMLElement>("[data-stage=copy]")?.hidden;
+		const mmaOn = !$<HTMLElement>("[data-stage=mma]")?.hidden;
+		const storeOn = !$<HTMLElement>("[data-stage=store]")?.hidden;
+		/** Every input for a key: the store stage repeats the MMA inputs when the MMA stage is hidden. */
+		const fields = (key: string) => fig.querySelectorAll<HTMLInputElement | HTMLSelectElement>(`[data-key=${key}]`);
 
 		function fillInputs() {
 			const op = st[st.operand];
@@ -284,6 +390,8 @@ const showMma = stages !== "copy";
 				thr: op.thr,
 				sA: st.A.smem,
 				sB: st.B.smem,
+				"sA-swz": st.A.swz,
+				"sB-swz": st.B.swz,
 				cta: st.cta,
 				bx: st.bx,
 				by: st.by,
@@ -293,16 +401,19 @@ const showMma = stages !== "copy";
 				mmaThr: st.mmaThr,
 				gC: st.gC,
 				kb: st.kb,
+				ce: st.ce,
+				la: st.la,
+				lb: st.lb,
+				se: st.se,
 			};
 			for (const [key, value] of Object.entries(values)) {
-				const f = field(key);
-				const strideBox = field(`${key}-stride`);
-				if (strideBox) {
+				const strideBoxes = fields(`${key}-stride`);
+				if (strideBoxes.length) {
 					// A layout: shape in this box, stride in its partner.
 					const [shape, stride = ""] = String(value).split(":");
-					if (f) f.value = shape;
-					strideBox.value = stride;
-				} else if (f) f.value = String(value);
+					for (const f of fields(key)) f.value = shape;
+					for (const f of strideBoxes) f.value = stride;
+				} else for (const f of fields(key)) f.value = String(value);
 			}
 			for (const tab of fig.querySelectorAll<HTMLButtonElement>("[data-op]")) {
 				tab.setAttribute("aria-selected", String(tab.dataset.op === st.operand));
@@ -329,11 +440,13 @@ const showMma = stages !== "copy";
 			op.thr = layoutVal("thr", op.thr);
 			st.A.smem = layoutVal("sA", st.A.smem);
 			st.B.smem = layoutVal("sB", st.B.smem);
+			st.A.swz = val("sA-swz", st.A.swz).trim();
+			st.B.swz = val("sB-swz", st.B.swz).trim();
 			st.cta = val("cta", st.cta);
 			st.atom = val("atom", st.atom);
 			st.mmaThr = layoutVal("mmaThr", st.mmaThr);
 			st.gC = layoutVal("gC", st.gC);
-			for (const key of ["bx", "by", "tx", "k", "kb"] as const) {
+			for (const key of ["bx", "by", "tx", "k", "kb", "ce", "la", "lb", "se"] as const) {
 				const v = Number(field(key)?.value);
 				if (Number.isInteger(v)) st[key] = v;
 			}
@@ -374,7 +487,7 @@ const showMma = stages !== "copy";
 				tryCount("tA", () => parseLayout(st.A.thr).size);
 				tryCount("tB", () => parseLayout(st.B.thr).size);
 			}
-			if (mmaOn) {
+			if (mmaOn || storeOn) {
 				tryCount("the MMA", () => {
 					const cta = parseIntTuple(st.cta) as [number, number, number];
 					return mmaView({
@@ -407,7 +520,7 @@ const showMma = stages !== "copy";
 					: undefined,
 			);
 			if (copyOn) renderCopy();
-			if (mmaOn) renderMma();
+			if (mmaOn || storeOn) renderMma();
 			fillInputs();
 		}
 
@@ -420,12 +533,15 @@ const showMma = stages !== "copy";
 			let smem: CuteLayout;
 			let thr: CuteLayout;
 			let cta: [number, number, number];
-			const key = st.operand === "A" ? "bx" : "by";
+			let swizzle: Swizzle | undefined;
+			const key = blockKey(st.operand);
+			const smemKey = st.operand === "A" ? "sA" : "sB";
 			try {
 				matrix = parse(["shape", "stride"], () =>
 					parseLayout(op.stride.trim() ? `${op.shape}:${op.stride}` : op.shape),
 				);
-				smem = parse([st.operand === "A" ? "sA" : "sB"], () => parseLayout(op.smem));
+				smem = parse([smemKey], () => parseLayout(op.smem));
+				swizzle = parse([`${smemKey}-swz`], () => parseSwizzle(op.swz));
 				thr = parse(["thr"], () => parseLayout(op.thr));
 				cta = parseCta();
 				// Keep the indices in range for the current shapes.
@@ -441,6 +557,7 @@ const showMma = stages !== "copy";
 					cta,
 					block: st[key],
 					smem,
+					swizzle,
 					thr,
 					thread: st.tx,
 					kTile: st.k,
@@ -450,11 +567,177 @@ const showMma = stages !== "copy";
 				return;
 			}
 			showError(".lp-error");
+			st.ce = Math.min(Math.max(0, st.ce), view.elements.length - 1);
+			field("ce")?.setAttribute("max", String(view.elements.length - 1));
 			setText("[data-out=k]", `${st.k} of ${view.tiles[1]}`);
+			setText("[data-out=ce]", `${st.ce} of ${view.elements.length}`);
 			drawGlobal(view, matrix, st[key]);
 			drawSmem(view, smem);
 			drawCopyRegs(view);
-			drawCopyVars(view, { matrix, smem, thr, cta, blk: st[key] });
+			drawCopyMemory(view, smem, swizzle);
+			drawCopyVars(view, { matrix, smem, swizzle, thr, cta, blk: st[key] });
+		}
+
+		/** The blockIdx field that picks this operand's tile: A follows M, B follows N. */
+		function blockKey(operand: Operand): "bx" | "by" {
+			return (operand === "A") === (st.order === "xy") ? "bx" : "by";
+		}
+
+		/** Words of shared memory a layout spans (after the swizzle), for the bank grid. */
+		function smemWords(layout: CuteLayout, swizzle: Swizzle | undefined): number {
+			let cosize = 0;
+			for (let i = 0; i < layout.size; i++) cosize = Math.max(cosize, physical(swizzle, layout.offset(i)) + 1);
+			return Math.ceil((cosize * st.bytes) / 4);
+		}
+
+		const warpName = () => {
+			const w = Math.floor(st.tx / 32);
+			return `warp ${w} (threads ${w * 32}–${w * 32 + 31})`;
+		};
+
+		/** The copy stage's memory panels: element ce of every lane in the thread's warp. */
+		function drawCopyMemory(view: CopyView, smem: CuteLayout, swizzle: Swizzle | undefined) {
+			const n = NAMES[st.operand];
+			const els = view.warp.map((l) => ({ lane: l.lane, e: l.elements[st.ce] }));
+			const gLabel = new Map(els.map(({ e }) => [e.globalOffset, `${n.m}${pair(e.global)}`]));
+			const sLabel = new Map(els.map(({ e }) => [e.smemOffset, `${n.s}${pair(e.smem)}`]));
+			setText("[data-name=lp-warp]", warpName());
+			const sec = drawSectors(
+				".lp-sectors",
+				els.map(({ lane, e }) => ({ lane, offset: e.globalOffset })),
+				(off) => gLabel.get(off),
+			);
+			setText("[data-name=lp-sec]", sectorNote(sec, "read"));
+			const banks = drawBanks(
+				".lp-banks",
+				els.map(({ lane, e }) => ({ lane, offset: e.smemOffset })),
+				smemWords(smem, swizzle),
+				(off) => sLabel.get(off),
+			);
+			setText("[data-name=lp-bank]", bankNote(banks, "store"));
+		}
+
+		// ---------- Memory panels: global sectors and shared-memory banks ----------
+
+		const SLOT = 13;
+
+		/**
+		 * One warp-wide global access as the 32-byte sectors it touches, each drawn as a row of element
+		 * slots: filled slots are used (labelled with the lane), empty ones are moved but wasted.
+		 */
+		function drawSectors(sel: string, access: LaneAccess[], label: (offset: number) => string | undefined) {
+			const report = sectorAccess(access, st.bytes);
+			const svg = $<SVGSVGElement>(sel);
+			if (!svg) return report;
+			const per = SECTOR_BYTES / st.bytes;
+			const width = per * SLOT;
+			const gap = 10;
+			const cols = Math.max(1, Math.min(report.sectors.length, Math.floor(470 / (width + gap))));
+			const rowH = SLOT + 15;
+			const rows = Math.ceil(report.sectors.length / cols);
+			const w = cols * (width + gap) - gap + 4;
+			const h = rows * rowH + 4;
+			svg.replaceChildren();
+			svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+			svg.setAttribute("width", String(w));
+			const lanesAt = new Map<number, number[]>();
+			for (const a of access) lanesAt.set(a.offset, [...(lanesAt.get(a.offset) ?? []), a.lane]);
+			report.sectors.forEach(({ sector }, i) => {
+				const x0 = 2 + (i % cols) * (width + gap);
+				const y0 = 2 + Math.floor(i / cols) * rowH;
+				const first = sector * per;
+				for (let j = 0; j < per; j++) {
+					const off = first + j;
+					const lanes = lanesAt.get(off);
+					const mine = lanes?.includes(st.tx);
+					const g = svgEl("g", { class: `ms-slot${lanes ? " ms-used" : ""}${mine ? " ms-mine" : ""}` });
+					if (mine) g.setAttribute("style", `--hue: ${hueOf(st.tx)}`);
+					g.append(svgEl("rect", { x: x0 + j * SLOT, y: y0, width: SLOT, height: SLOT }));
+					if (lanes) {
+						g.append(
+							svgEl("text", { x: x0 + (j + 0.5) * SLOT, y: y0 + SLOT / 2 + 0.5, "text-anchor": "middle", "dominant-baseline": "middle" }, String(lanes[0] % 32)),
+						);
+					}
+					const what = label(off) ?? `element ${off}`;
+					g.append(svgEl("title", {}, lanes ? `${what}: thread ${lanes.join(", ")}` : `${what}: moved with the sector but not used`));
+					svg.append(g);
+				}
+				svg.append(svgEl("rect", { x: x0, y: y0, width, height: SLOT, class: "ms-frame" }));
+				svg.append(svgEl("text", { x: x0, y: y0 + SLOT + 10, class: "cl-axis" }, `bytes ${first * st.bytes}–${(first + per) * st.bytes - 1}`));
+			});
+			return report;
+		}
+
+		function sectorNote(r: ReturnType<typeof sectorAccess>, verb: string): string {
+			const pct = Math.round((100 * r.used) / r.moved);
+			const lanes = new Set(r.sectors.flatMap((s) => s.lanes.map((l) => l.lane))).size;
+			return `${lanes} lanes ${verb} ${r.used} B that sit in ${r.sectors.length} sector${r.sectors.length > 1 ? "s" : ""}, so ${r.moved} B cross the memory bus: ${pct}% of it is used.${pct === 100 ? " The access is coalesced." : ""} Numbers are lane indices; empty slots are bytes moved for nothing.`;
+		}
+
+		/**
+		 * One warp-wide shared-memory access on a grid of 32 banks (columns) by rows of 32 words. Words
+		 * the warp touches are filled and labelled with the lane; a bank asked for several different
+		 * words is red, with the count on top.
+		 */
+		function drawBanks(sel: string, access: LaneAccess[], words: number, label: (offset: number) => string | undefined) {
+			const report = bankAccess(
+				access.map((a) => a.offset),
+				st.bytes,
+			);
+			const svg = $<SVGSVGElement>(sel);
+			if (!svg) return report;
+			const left = 34;
+			const top = 26;
+			const rows = Math.ceil(words / BANKS);
+			const w = left + BANKS * SLOT + 2;
+			const h = top + rows * SLOT + 2;
+			svg.replaceChildren();
+			svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+			svg.setAttribute("width", String(w));
+			const lanesIn = new Map<number, LaneAccess[]>();
+			for (const a of access) {
+				const word = Math.floor((a.offset * st.bytes) / 4);
+				lanesIn.set(word, [...(lanesIn.get(word) ?? []), a]);
+			}
+			for (let b = 0; b < BANKS; b++) {
+				const n = report.words.get(b)?.size ?? 0;
+				if (b % 4 === 0) svg.append(svgEl("text", { x: left + (b + 0.5) * SLOT, y: 9, class: "cl-axis", "text-anchor": "middle" }, String(b)));
+				if (n > 1) svg.append(svgEl("text", { x: left + (b + 0.5) * SLOT, y: top - 4, class: "bk-count", "text-anchor": "middle" }, `${n}`));
+			}
+			svg.append(svgEl("text", { x: left - 4, y: 9, class: "cl-axis", "text-anchor": "end" }, "bank"));
+			for (let r = 0; r < rows; r++) {
+				if (rows <= 16 || r % 4 === 0) {
+					svg.append(svgEl("text", { x: left - 4, y: top + (r + 0.5) * SLOT, class: "cl-axis", "text-anchor": "end", "dominant-baseline": "middle" }, `w${r * BANKS}`));
+				}
+				for (let b = 0; b < BANKS; b++) {
+					const word = r * BANKS + b;
+					if (word >= words) continue;
+					const hits = lanesIn.get(word);
+					const conflict = (report.words.get(b)?.size ?? 0) > 1;
+					const mine = hits?.some((a) => a.lane === st.tx);
+					const g = svgEl("g", { class: `bk-cell${hits ? (conflict ? " bk-conf" : " bk-used") : ""}${mine ? " bk-mine" : ""}` });
+					g.append(svgEl("rect", { x: left + b * SLOT, y: top + r * SLOT, width: SLOT, height: SLOT }));
+					let tip = `word ${word}, bank ${b}`;
+					if (hits) {
+						g.append(
+							svgEl("text", { x: left + (b + 0.5) * SLOT, y: top + (r + 0.5) * SLOT + 0.5, "text-anchor": "middle", "dominant-baseline": "middle" }, String(hits[0].lane % 32)),
+						);
+						const what = [...new Set(hits.map((a) => label(a.offset) ?? `element ${a.offset}`))].join(", ");
+						tip += `: ${what}, thread ${hits.map((a) => a.lane).join(", ")}`;
+					}
+					g.append(svgEl("title", {}, tip));
+					svg.append(g);
+				}
+			}
+			return report;
+		}
+
+		function bankNote(r: ReturnType<typeof bankAccess>, verb: string): string {
+			if (r.wavefronts <= 1) {
+				return `Every bank serves at most one word, so the ${verb} completes in one pass: no bank conflict. (Lanes that share a word get it by broadcast.)`;
+			}
+			const [bank, words] = [...r.words.entries()].reduce((a, b) => (b[1].size > a[1].size ? b : a));
+			return `Bank ${bank} must serve ${words.size} different words (${[...words].join(", ")}), one per pass, so the ${verb} takes ${r.wavefronts} passes instead of 1: ${/^(8|11|18)/.test(String(r.wavefronts)) ? "an" : "a"} ${r.wavefronts}-way bank conflict.`;
 		}
 
 		function drawGlobal(view: CopyView, matrix: CuteLayout, blk: number) {
@@ -467,6 +750,7 @@ const showMma = stages !== "copy";
 			const top = 18;
 			const [b0, b1] = view.tile;
 			const mine = new Map(view.elements.map((e) => [`${e.global[0]},${e.global[1]}`, e.index]));
+			const warp = new Set(view.warp.map((l) => `${l.elements[st.ce].global[0]},${l.elements[st.ce].global[1]}`));
 			svg.replaceChildren();
 			svg.setAttribute("viewBox", `0 0 ${left + cols * cs + 2} ${top + rows * cs + 2}`);
 			svg.setAttribute("width", String(left + cols * cs + 2));
@@ -491,6 +775,7 @@ const showMma = stages !== "copy";
 						cell.dataset.hl = `g${i}`;
 						tip += `, element ${i} of ${NAMES[st.operand].tg}`;
 					}
+					if (inTile && warp.has(`${r},${c}`)) cell.classList.add("lp-warp");
 					cell.append(svgEl("title", {}, tip));
 					g.append(cell);
 				}
@@ -500,7 +785,7 @@ const showMma = stages !== "copy";
 			for (let c = 0; c <= cols; c += b1) g.append(svgEl("line", { x1: c * cs, y1: 0, x2: c * cs, y2: rows * cs, class: "lp-tline" }));
 			g.append(svgEl("rect", { x: 0, y: blk * b0 * cs, width: cols * cs, height: b0 * cs, class: "lp-outline" }));
 			g.append(svgEl("rect", { x: st.k * b1 * cs, y: blk * b0 * cs, width: b1 * cs, height: b0 * cs, class: "lp-outline lp-cur" }));
-			const axis = st.operand === "A" ? "x" : "y";
+			const axis = blockKey(st.operand) === "bx" ? "x" : "y";
 			for (let t = 0; t < view.tiles[0]; t++) {
 				g.append(svgEl("text", { x: -4, y: (t + 0.5) * b0 * cs, class: "cl-axis", "text-anchor": "end", "dominant-baseline": "middle" }, `${axis}=${t}`));
 			}
@@ -516,6 +801,8 @@ const showMma = stages !== "copy";
 			const rowMode = smem.mode(0);
 			const colMode = smem.mode(1);
 			const mine = new Map(view.elements.map((e) => [`${e.smem[0]},${e.smem[1]}`, e.index]));
+			const warp = new Set(view.warp.map((l) => `${l.elements[st.ce].smem[0]},${l.elements[st.ce].smem[1]}`));
+			table.classList.toggle("cl-dense", view.tile[0] > 16);
 			const head = el("tr");
 			head.append(el("th"));
 			for (let j = 0; j < view.tile[1]; j++) head.append(el("th", undefined, formatTuple(colMode.coord(j))));
@@ -529,6 +816,7 @@ const showMma = stages !== "copy";
 					td.style.setProperty("--hue", hueOf(owner.thread));
 					td.title = `${NAMES[st.operand].s}(${r},${c}) at offset ${owner.offset}, thread ${owner.thread} (click to select)`;
 					td.append(el("span", "cl-value", String(owner.offset)), el("span", "cl-label", `T${owner.thread}`));
+					if (warp.has(`${r},${c}`)) td.classList.add("cl-warp");
 					const i = mine.get(`${r},${c}`);
 					if (i !== undefined) {
 						td.classList.add("cl-mine");
@@ -572,7 +860,14 @@ const showMma = stages !== "copy";
 
 		function drawCopyVars(
 			view: CopyView,
-			c: { matrix: CuteLayout; smem: CuteLayout; thr: CuteLayout; cta: [number, number, number]; blk: number },
+			c: {
+				matrix: CuteLayout;
+				smem: CuteLayout;
+				swizzle: Swizzle | undefined;
+				thr: CuteLayout;
+				cta: [number, number, number];
+				blk: number;
+			},
 		) {
 			const body = $<HTMLElement>(".lp-vars tbody");
 			if (!body) return;
@@ -584,6 +879,14 @@ const showMma = stages !== "copy";
 			const coord = thr.flatCoord(st.tx);
 			const perK = view.elements.length;
 			const kStride = view.tg.layout.mode(2).stride;
+			const blkName = blockKey(op) === "bx" ? "blockIdx.x" : "blockIdx.y";
+			const ctaCoord = st.order === "xy" ? "blockIdx.x, blockIdx.y" : "blockIdx.y, blockIdx.x";
+			const sw = c.swizzle;
+			const smemText = sw ? `${sw} o ${c.smem}` : `${c.smem}`;
+			const swNote = sw
+				? `, stored through ${sw}: bits ${sw.base + sw.shift}–${sw.base + sw.shift + sw.bits - 1} of each offset are XORed into bits ${sw.base}–${sw.base + sw.bits - 1}, so the offsets drawn are already swizzled`
+				: "";
+			const tsNote = sw ? ` (after the swizzle; CuTe prints the layout before it)` : "";
 			fillVars(body, [
 				[
 					n.m,
@@ -599,11 +902,11 @@ const showMma = stages !== "copy";
 				],
 				[
 					n.g,
-					`local_tile(${n.m}, cta_tiler, make_coord(blockIdx.x, blockIdx.y, _), ${n.step})`,
+					`local_tile(${n.m}, cta_tiler, make_coord(${ctaCoord}, _), ${n.step})`,
 					placed(view.g),
-					`The rows ${r0}–${r0 + b0 - 1} of ${op} that the block with ${n.blk} = ${c.blk} needs (green), as ${view.tiles[1]} k tiles of ${b0}×${b1}. The offset ${view.g.offset} is where row ${r0} starts.`,
+					`The rows ${r0}–${r0 + b0 - 1} of ${op} that the block with ${blkName} = ${c.blk} needs (green), as ${view.tiles[1]} k tiles of ${b0}×${b1}. The offset ${view.g.offset} is where row ${r0} starts.`,
 				],
-				[n.s, `make_tensor(make_smem_ptr(smem${op}), ${n.s}_layout)`, `${c.smem}`, `The shared buffer that holds one k tile, ${b0}×${b1}.`],
+				[n.s, `make_tensor(make_smem_ptr(smem${op}), ${n.s}_layout)`, smemText, `The shared buffer that holds one k tile, ${b0}×${b1}${swNote}.`],
 				[
 					n.t,
 					"thread layout",
@@ -620,7 +923,7 @@ const showMma = stages !== "copy";
 					n.ts,
 					`local_partition(${n.s}, ${n.t}, threadIdx.x)`,
 					placed(view.ts),
-					`Where the same ${perK} elements go in shared memory: offsets ${list(view.elements.map((e) => String(e.smemOffset)))}.`,
+					`Where the same ${perK} element${perK === 1 ? "" : "s"} go${perK === 1 ? "es" : ""} in shared memory: offsets ${list(view.elements.map((e) => String(e.smemOffset)))}${tsNote}.`,
 				],
 				[
 					`${n.tg}(_,_,k_tile)`,
@@ -647,7 +950,9 @@ const showMma = stages !== "copy";
 				const sA = parse(["sA"], () => parseLayout(st.A.smem));
 				const sB = parse(["sB"], () => parseLayout(st.B.smem));
 				const gC = parse(["gC"], () => parseLayout(st.gC));
-				const inputs = { atom, thr, cta, sA, sB, gC, thread: 0, kBlock: 0 };
+				const swizzleA = parse(["sA-swz"], () => parseSwizzle(st.A.swz));
+				const swizzleB = parse(["sB-swz"], () => parseSwizzle(st.B.swz));
+				const inputs = { atom, thr, cta, sA, sB, gC, swizzleA, swizzleB, thread: 0, kBlock: 0 };
 				const probe = mmaView(inputs);
 				st.kb = Math.min(Math.max(0, st.kb), probe.kBlocks - 1);
 				field("kb")?.setAttribute("max", String(probe.kBlocks - 1));
@@ -656,15 +961,119 @@ const showMma = stages !== "copy";
 				mmaCurrent = view;
 			} catch (e) {
 				showError(".mp-error", (e as Error).message);
+				showError(".sp-error", (e as Error).message);
 				return;
 			}
 			showError(".mp-error");
+			showError(".sp-error");
+			if (storeOn) renderStore(view, cta);
+			if (!mmaOn) return;
 			setText("[data-out=kb]", `${st.kb} of ${view.kBlocks}`);
 			drawMmaTiles(view, cta);
 			drawMmaRegs(view);
+			drawMmaMemory(view);
 			drawMmaVars(view, cta);
 			drawMmaNote(view);
 			resetEquation();
+		}
+
+		/** The MMA stage's bank panels: element la of every lane's A values, and lb of its B values. */
+		function drawMmaMemory(view: MmaView) {
+			setText("[data-name=mp-warp]", warpName());
+			const words = (layout: CuteLayout, swz: string) => smemWords(layout, parseSwizzle(swz));
+			const panel = (operand: "A" | "B", key: "la" | "lb", pick: (l: MmaView["warp"][number]) => MmaElement[], words: number) => {
+				const count = pick(view.warp[0]).length;
+				st[key] = Math.min(Math.max(0, st[key]), count - 1);
+				field(key)?.setAttribute("max", String(count - 1));
+				setText(`[data-out=${key}]`, `${st[key]} of ${count}`);
+				const els = view.warp.map((l) => ({ lane: l.lane, e: pick(l)[st[key]] }));
+				const labels = new Map(els.map(({ e }) => [e.phys, `s${operand}${pair(e.coord)}`]));
+				const report = drawBanks(
+					`.mp-banks-${operand.toLowerCase()}`,
+					els.map(({ lane, e }) => ({ lane, offset: e.phys })),
+					words,
+					(off) => labels.get(off),
+				);
+				setText(`[data-name=mp-bank-${operand.toLowerCase()}]`, bankNote(report, "load"));
+			};
+			panel("A", "la", (l) => l.a, words(parseLayout(st.A.smem), st.A.swz));
+			panel("B", "lb", (l) => l.b, words(parseLayout(st.B.smem), st.B.swz));
+		}
+
+		// ---------- Stage 3: store, registers -> global ----------
+
+		function renderStore(view: MmaView, cta: [number, number, number]) {
+			const count = view.c.length;
+			st.se = Math.min(Math.max(0, st.se), count - 1);
+			field("se")?.setAttribute("max", String(count - 1));
+			setText("[data-out=se]", `${st.se} of ${count}`);
+			setText("[data-name=sp-warp]", warpName());
+			drawStoreTile(view, cta);
+			const els = view.warp.map((l) => ({ lane: l.lane, e: l.c[st.se] }));
+			const labels = new Map(els.map(({ e }) => [e.offset, `C${pair(e.coord)}`]));
+			const report = drawSectors(
+				".sp-sectors",
+				els.map(({ lane, e }) => ({ lane, offset: e.offset })),
+				(off) => labels.get(off),
+			);
+			setText("[data-name=sp-sec]", sectorNote(report, "write"));
+			drawStoreVars(view, els);
+		}
+
+		function drawStoreTile(view: MmaView, cta: [number, number, number]) {
+			const svg = $<SVGSVGElement>(".sp-svg");
+			if (!svg) return;
+			const [bm, bn] = cta;
+			const cs = Math.max(6, Math.min(20, Math.floor(Math.min(420 / bn, 420 / bm))));
+			const mine = new Map(view.c.map((e) => [`${e.coord[0]},${e.coord[1]}`, e.index]));
+			const warp = new Set(view.warp.map((l) => `${l.c[st.se].coord[0]},${l.c[st.se].coord[1]}`));
+			const gC = parseLayout(st.gC);
+			const w = bn * cs + 4;
+			const h = bm * cs + 4;
+			svg.replaceChildren();
+			svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+			svg.setAttribute("width", String(w));
+			for (let m = 0; m < bm; m++) {
+				for (let n = 0; n < bn; n++) {
+					const owner = view.cOwner[m][n];
+					const i = mine.get(`${m},${n}`);
+					const g = svgEl("g", { class: `mp-cell mp-c${i !== undefined ? " mp-mine" : ""}${warp.has(`${m},${n}`) ? " sp-warp" : ""}` });
+					g.setAttribute("style", `--hue: ${hueOf(owner)}`);
+					g.append(svgEl("rect", { x: 2 + n * cs, y: 2 + m * cs, width: cs, height: cs }));
+					if (i !== undefined && cs >= 12) {
+						g.append(svgEl("text", { x: 2 + (n + 0.5) * cs, y: 2 + (m + 0.5) * cs + 0.5, "text-anchor": "middle", "dominant-baseline": "middle" }, String(i)));
+					}
+					g.append(svgEl("title", {}, `C(${m},${n}) at offset ${gC.offset(m, n)}: thread ${owner}${i !== undefined ? `, tCgC element ${i}` : ""} (click to select)`));
+					g.addEventListener("click", () => selectThread(owner));
+					svg.append(g);
+				}
+			}
+		}
+
+		function drawStoreVars(view: MmaView, els: { lane: number; e: MmaElement }[]) {
+			const body = $<HTMLElement>(".sp-vars tbody");
+			if (!body) return;
+			const step = els.length > 1 ? els[1].e.offset - els[0].e.offset : 0;
+			fillVars(body, [
+				[
+					"tCgC",
+					"thr_mma.partition_C(gC)",
+					placed(view.tCgC),
+					`Thread ${st.tx}'s ${view.c.length} elements of C: ${list(view.c.map((e) => `C${pair(e.coord)}`))}. Its strides ${formatTuple(view.tCgC.layout.stride)} are in elements of C.`,
+				],
+				[
+					"tCrC",
+					"thr_mma.make_fragment_C(tCgC)",
+					`${view.tCrC}`,
+					`The ${view.c.length} accumulators, in registers.`,
+				],
+				[
+					`tCgC(${st.se})`,
+					`tCgC(i) = alpha * tCrC(i);   // i = ${st.se}`,
+					`offset ${els.find((x) => x.lane === st.tx)?.e.offset ?? ""}`,
+					`One store instruction: every lane of ${warpName()} writes its element ${st.se}. Lanes ${els[0]?.lane} and ${els[1]?.lane} write C${pair(els[0].e.coord)} and C${pair(els[1]?.e.coord ?? els[0].e.coord)}, ${Math.abs(step)} element${Math.abs(step) === 1 ? "" : "s"} apart in memory.`,
+				],
+			]);
 		}
 
 		/** Columns [k0, k1) of the tile that the current k_block covers. */
@@ -948,6 +1357,7 @@ const showMma = stages !== "copy";
 		});
 		for (const f of fig.querySelectorAll<HTMLInputElement | HTMLSelectElement>("[data-key]")) {
 			f.addEventListener(f.type === "range" ? "input" : "change", () => {
+				for (const twin of fields(f.dataset.key ?? "")) if (twin !== f) twin.value = f.value;
 				readInputs();
 				render();
 			});
@@ -1323,6 +1733,124 @@ const showMma = stages !== "copy";
 		font-size: 0.5rem;
 		font-weight: 700;
 		color: var(--text);
+	}
+
+	/* ---------- Warp outlines, dense tiles, swizzle box ---------- */
+	.cl-gemm .lp-cell.lp-warp {
+		stroke: var(--text);
+		stroke-width: 1.5;
+		stroke-dasharray: 2 1.5;
+	}
+	.cl-gemm .cl-grid td.cl-warp {
+		box-shadow: inset 0 0 0 1.5px var(--text);
+	}
+	.cl-gemm .cl-grid.cl-dense td,
+	.cl-gemm .cl-grid.cl-dense th {
+		height: 1.4rem;
+		min-width: 1.9rem;
+		font-size: 0.62rem;
+	}
+	.cl-gemm .cl-grid.cl-dense .cl-label {
+		font-size: 0.5rem;
+	}
+	.cl-gemm input.cl-swz {
+		width: 6rem;
+	}
+	.cl-gemm .mp-cell.sp-warp rect {
+		stroke: var(--text);
+		stroke-width: 1.5;
+		stroke-dasharray: 2 1.5;
+	}
+	.cl-gemm .mp-cell.sp-warp.mp-mine rect {
+		stroke-dasharray: none;
+		stroke-width: 2;
+	}
+
+	/* ---------- Memory panels: sectors and banks ---------- */
+	.cl-gemm {
+		--used: color-mix(in oklch, var(--accent) 45%, var(--bg));
+		--conflict: color-mix(in oklch, #d0453f 55%, var(--bg));
+	}
+	.cl-gemm .cl-mem {
+		margin-top: 1rem;
+		padding-top: 0.8rem;
+		border-top: 1.5px dashed var(--faint);
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+	}
+	.cl-gemm .cl-memrow {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+		gap: 1rem;
+		width: 100%;
+	}
+	@media (max-width: 760px) {
+		.cl-gemm .cl-memrow {
+			grid-template-columns: minmax(0, 1fr);
+		}
+	}
+	.cl-gemm .cl-memcol {
+		min-width: 0;
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+	}
+	.cl-gemm .cl-memtitle {
+		margin: 0 0 0.5rem;
+		font-size: 0.78rem;
+		font-weight: 600;
+		color: var(--text);
+		text-align: center;
+	}
+	.cl-gemm .cl-memtitle span {
+		font-weight: 400;
+		color: var(--muted);
+	}
+	.cl-gemm .cl-memnote {
+		max-width: 30rem;
+		margin: 0.5rem auto 0;
+		font-size: 0.74rem;
+		line-height: 1.45;
+		color: var(--muted);
+		text-align: center;
+	}
+	.cl-gemm .ms-slot rect,
+	.cl-gemm .bk-cell rect {
+		fill: var(--surface);
+		stroke: var(--faint);
+		stroke-width: 0.6;
+	}
+	.cl-gemm .ms-slot.ms-used rect,
+	.cl-gemm .bk-cell.bk-used rect {
+		fill: var(--used);
+	}
+	.cl-gemm .bk-cell.bk-conf rect {
+		fill: var(--conflict);
+	}
+	.cl-gemm .ms-slot.ms-mine rect {
+		fill: color-mix(in oklch, oklch(0.72 0.15 var(--hue)) 85%, var(--bg));
+	}
+	.cl-gemm .ms-slot.ms-mine rect,
+	.cl-gemm .bk-cell.bk-mine rect {
+		stroke: var(--text);
+		stroke-width: 1.5;
+	}
+	.cl-gemm .ms-frame {
+		fill: none;
+		stroke: var(--muted);
+		stroke-width: 1.2;
+		pointer-events: none;
+	}
+	.cl-gemm .ms-slot text,
+	.cl-gemm .bk-cell text {
+		font: 600 7px var(--mono);
+		fill: var(--text);
+		pointer-events: none;
+	}
+	.cl-gemm .bk-count {
+		font: 700 9px var(--mono);
+		fill: #c8443f;
 	}
 
 	/* ---------- Hover equation ---------- */
