@@ -62,8 +62,13 @@ export function drawSequence(
 	const phaseH = 20;
 	const head = 46;
 	const pad = 8;
-	const width = parts.length * col;
 	const x = new Map(parts.map((p, i) => [p.id, i * col + col / 2]));
+	// A self-step's label starts right of its lifeline and can run past the last column:
+	// widen the drawing to fit it (9.5px monospace, about 5.8px per character when bold).
+	const selfEnd = msgs
+		.filter((m) => m.from === m.to)
+		.map((m) => (x.get(m.from) as number) + 22 + m.label.length * 5.8 + pad);
+	const width = Math.ceil(Math.max(parts.length * col, ...selfEnd));
 	const marker = `${opts.id ?? "seq"}-arrow`;
 
 	let y = head + 14;

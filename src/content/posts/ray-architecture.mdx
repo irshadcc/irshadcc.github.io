@@ -1,0 +1,951 @@
+---
+title: "Inside Ray: Objects, Tasks and Actors"
+description: "How Ray works under the API: the processes of a cluster, what ray.put and ray.get do step by step, the RPC protocols between workers, raylets and the GCS, and how tasks and actors are scheduled, with UML diagrams and pointers into the code."
+date: 2026-10-13
+tags: [Distributed systems, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import BoxDiagram from "../../utils/payments/BoxDiagram.astro";
+import SequenceSteps from "../../utils/payments/SequenceSteps.astro";
+import UmlClassDiagram from "../../utils/uml/UmlClassDiagram.astro";
+import {
+	clusterNodes,
+	clusterEdges,
+	putParticipants,
+	putMessages,
+	objectClasses,
+	objectRelations,
+	getParticipants,
+	getMessages,
+	protocolNodes,
+	protocolEdges,
+	taskParticipants,
+	taskMessages,
+	schedulingClasses,
+	schedulingRelations,
+	actorParticipants,
+	actorMessages,
+	actorClasses,
+	actorRelations,
+	actorStateNodes,
+	actorStateEdges,
+	pgParticipants,
+	pgMessages,
+	pgClasses,
+	pgRelations,
+	pgStateNodes,
+	pgStateEdges,
+	rdtParticipants,
+	rdtMessages,
+	rdtClasses,
+	rdtRelations,
+} from "../../utils/ray/rayFigures";
+
+## Background
+
+In plain Python, `y = f(x)` runs `f` in your process and leaves the result in a local variable.
+Ray keeps the shape of that program and spreads it over a cluster. `f.remote(x)` runs `f` on some
+machine and returns at once with an **ObjectRef**, a handle to a result that may not exist yet.
+`ray.get(ref)` waits for the value and brings it to you. `ray.put(value)` stores a value in the
+cluster and gives you a ref to pass around. A class decorated with `@ray.remote` becomes an
+**actor**: a process that keeps state between method calls.
+
+The API is small, but most questions about Ray's performance and failures are questions about
+what happens underneath. Why is `ray.get` inside a loop slow? Why can a NumPy array returned by
+`ray.get` not be modified? Why does a task sometimes run on a different node from the one you
+expected, and why do objects disappear when the process that created them dies? Each answer comes
+from one design choice: who stores an object, who tracks it, who decides where a task runs and
+which messages that takes.
+
+This post follows the code. First the architecture: the processes of a cluster, the idea of
+**ownership** and the IDs that name everything. Then `ray.put` and `ray.get`, step by step, with
+the classes involved. Then the protocols the components use to talk to each other. Then
+scheduling: how a task gets a worker, and how an actor is created and called. Last, two extensions
+of these paths: **placement groups**, which reserve resources on several nodes at once, and **Ray
+Direct Transport**, which moves GPU tensors between actors without the object store.<Sidenote>All code
+links point to Ray commit [`6817455`](https://github.com/ray-project/ray/tree/68174559b27a4eba8db6b3c7ef7aaa2678ec20c8)
+(October 2026), which is what the diagrams were drawn from. Ray moves fast; names (for example
+"lease manager", formerly "task manager") may change. A few behaviours were also checked by running
+the released Ray 2.59.0 wheel on a laptop; those checks are noted where they are used.</Sidenote>
+
+## The architecture
+
+### Three kinds of process
+
+A Ray cluster is a set of nodes, each running a handful of processes. Click a box to read what it
+does.
+
+<BoxDiagram
+	nodes={clusterNodes}
+	edges={clusterEdges}
+	grid={{ cellW: 128, gapX: 62, gapY: 34 }}
+	selected="rl1"
+	title="The processes of a two-node Ray cluster"
+/>
+
+- A **worker** is a Python process that runs tasks and actor methods. The **driver** is the
+  worker running your script. Every worker embeds the same C++ library, the **CoreWorker**, which
+  does the real work: it submits tasks, stores small objects, and talks to everything else.
+- A **raylet** runs on every node. It schedules work on the node, starts and stops worker
+  processes, and manages the node's shared-memory **object store** (the **plasma store**, which
+  runs as a thread inside the raylet). Its **ObjectManager** moves objects between nodes.
+- The **Global Control Service (GCS)** runs once per cluster, on the head node. It keeps
+  cluster-wide metadata: which nodes are alive, which actors exist and where, jobs, placement
+  groups and a key-value store.
+
+The GCS is deliberately kept off the hot path. Submitting a task, returning its result and moving
+an object involve only workers and raylets. The GCS is involved in actors, node membership and
+resource accounting, which change much less often than tasks run.
+
+### Ownership
+
+Ray needs to track millions of short-lived objects: where each one is stored, who still uses it,
+and how to rebuild it if a node fails. A central table would see every object creation and every
+reference change in the cluster. Ray instead gives each object an **owner**: the worker that
+created the ref, either by calling `ray.put` or by submitting the task whose result it is.<Sidenote>
+The design and its trade-offs are in Wang et al., [Ownership: a distributed futures system for
+fine-grained tasks](https://www.usenix.org/system/files/nsdi21-wang.pdf), NSDI 2021.</Sidenote>
+
+The owner keeps everything about the object in its own memory:
+
+- the **reference count**: how many refs exist in its own process, in pending tasks, and in
+  other processes that received the ref (**borrowers**);
+- the **locations**: the nodes whose object store holds a copy;
+- the value itself, if it is small;
+- the **lineage**: the task that created it, so it can be re-executed if every copy is lost.
+
+Two consequences follow. Bookkeeping scales with the number of workers, because each one tracks
+only its own objects. And objects **fate-share** with their owner: if the owner process dies, its
+objects become unreachable even if copies survive elsewhere, and `ray.get` raises
+`OwnerDiedError`. This is why the driver should not hand ownership of long-lived data to a
+short-lived task.
+
+### Object IDs
+
+Every ref carries two things: a 28-byte **ObjectID** and the owner's address (IP, port, worker
+ID). The address is what lets any process holding the ref ask the right worker about it. The ID
+is built from the ID of the task that created the object, so it can be made locally without
+asking anyone:
+
+| ID | Bytes | Made of |
+| --- | ---: | --- |
+| `JobID` | 4 | a counter assigned by the GCS |
+| `ActorID` | 16 | 12 unique bytes + `JobID` |
+| `TaskID` | 24 | 8 unique bytes + `ActorID` (a "nil" actor for normal tasks) |
+| `ObjectID` | 28 | `TaskID` + 4-byte index |
+
+The index tells apart the objects one task creates. Indices 1 to `num_returns` are the task's
+return values; `ray.put` uses indices after a block of 100,000,000 reserved for generator
+returns.<Sidenote>[`id_specification.md`](https://github.com/ray-project/ray/blob/68174559b27a4eba8db6b3c7ef7aaa2678ec20c8/src/ray/design_docs/id_specification.md#L56)
+and [`WorkerContext::GetNextPutIndex`](https://github.com/ray-project/ray/blob/68174559b27a4eba8db6b3c7ef7aaa2678ec20c8/src/ray/core_worker/context.cc#L44).
+For puts, the first byte of the task ID is also zeroed, so put IDs and return IDs never
+collide.</Sidenote> A worked example, from running Ray 2.59.0: the driver's task ID is
+`ffff…ff01000000` (the last 4 bytes are the job ID, 1). Its first `ray.put` returns
+
+```
+00ffffffffffffffffffffffffffffffffffffff01000000  01e1f505
+└──────── task ID, first byte zeroed ──────────┘  └ index ┘
+```
+
+The index bytes are little-endian: `0x05f5e101` = 100,000,001, that is 0 return values +
+100,000,000 reserved + the first put. The second put ends in `02e1f505` (100,000,002). A task's
+first return value ends in `01000000`, index 1.
+
+## ray.put
+
+### Step by step
+
+`ray.put(value)` serializes the value into the local node's plasma store and makes the calling
+worker its owner. Step through the figure; the note under each step names the function that does
+it.
+
+<SequenceSteps
+	participants={putParticipants}
+	messages={putMessages}
+	title="ray.put(value) on one node"
+	colWidth={134}
+/>
+
+Three things are worth noticing.
+
+**The data is copied once.** Python asks the store for a buffer of the right size, then
+serializes directly into shared memory through a mapped pointer. No RPC carries the data.
+
+**`ray.put` always uses plasma, even for tiny values.** `CreateOwnedAndIncrementLocalRef` takes
+an `inline_small_object` argument but does not use it; the body always calls
+`plasma_store_provider_->Create`. Running Ray 2.59.0 confirms it: after `ref = ray.put(1)`,
+`core_worker.object_exists(ref, memory_store_only=True)` is `False`. Small *task returns* are
+different, as we will see: they stay in the owner's memory.
+
+**Pinning is a handshake.** The worker holds its own plasma reference until the raylet confirms it
+has pinned the object, then releases it. The code comment explains why:
+
+```cpp
+// Only release the object once the raylet has responded to avoid the race
+// condition that the object could be evicted before the raylet pins it.
+if (!plasma_store_provider_->Release(object_id).ok()) { ... }
+```
+
+The core of the C++ side is short. Abridged from
+[`CoreWorker::CreateOwnedAndIncrementLocalRef`](https://github.com/ray-project/ray/blob/68174559b27a4eba8db6b3c7ef7aaa2678ec20c8/src/ray/core_worker/core_worker.cc#L1320):
+
+```cpp
+*object_id = ObjectID::FromIndex(worker_context_->GetCurrentInternalTaskId(),
+                                 worker_context_->GetNextPutIndex());
+reference_counter_->AddOwnedObject(*object_id, contained_object_ids,
+                                   rpc_address_,  // owner = this worker
+                                   CurrentCallSite(), data_size + metadata->Size(),
+                                   LineageReconstructionEligibility::INELIGIBLE_PUT,
+                                   /*add_local_ref=*/true, ...);
+status = plasma_store_provider_->Create(metadata, data_size, *object_id,
+                                        /*owner_address=*/rpc_address_, data, ...);
+```
+
+`INELIGIBLE_PUT` records that a put object has no lineage: if every copy is lost, Ray cannot
+recreate it, because no task produced it.
+
+#### The classes involved
+
+The same classes serve `ray.put` and `ray.get`. Blue classes live in the worker process, orange
+ones in the raylet. Click a class for its role and a link to its code.
+
+<UmlClassDiagram
+	classes={objectClasses}
+	relations={objectRelations}
+	selected="cw"
+	title="Classes behind ray.put and ray.get"
+/>
+
+Read the diagram from the top left. The Python `Worker` holds a `CoreWorker`, which owns four
+helpers:
+
+- `ReferenceCounter`: the owner's table of objects (counts, borrowers, locations, sizes).
+- `CoreWorkerMemoryStore`: an in-process map from ObjectID to value. It holds small values and,
+  for objects in plasma, a marker that says so.
+- `CoreWorkerPlasmaStoreProvider`: the door to the plasma store, through a `PlasmaClient` that
+  speaks the plasma protocol on a Unix socket and maps the store's shared memory.
+- `FutureResolver`: asks the owner about refs this worker borrowed.
+
+On the raylet side, the `NodeManager` owns the `LocalObjectManager`, which pins primary copies, and
+the `LeaseDependencyManager`, which turns "a worker is waiting for these objects" into pulls. The
+`ObjectManager` does the pulling with its `PullManager`, and finds objects through the
+`OwnershipBasedObjectDirectory`, which, as its name says, has no table of its own: it asks the
+owners.
+
+## ray.get
+
+### Where a value can be
+
+`ray.get(ref)` has to find the value, which can be in one of four places. The cheaper ones are
+tried first, in
+[`CoreWorker::GetObjects`](https://github.com/ray-project/ray/blob/68174559b27a4eba8db6b3c7ef7aaa2678ec20c8/src/ray/core_worker/core_worker.cc#L1577):
+
+| Where the value is | What `ray.get` does | Messages |
+| --- | --- | ---: |
+| In this worker's memory store (a small task return) | Return it | 0 |
+| In this node's plasma store | Map it and return a view | 1 local socket round trip |
+| In another node's plasma store | Ask the raylet to pull it, wait | many (below) |
+| Nowhere yet (the task is still running) | Block on the memory store until the result arrives | 0 while waiting |
+
+The first step always looks in the memory store. If it finds the `OBJECT_IN_PLASMA` marker, the ID
+moves to the plasma path:
+
+```cpp
+RAY_RETURN_NOT_OK(memory_store_->Get(memory_object_ids, timeout_ms,
+                                     *worker_context_, &result_map,
+                                     &got_exception));
+// Erase any objects that were promoted to plasma from the results. These get
+// requests will be retried at the plasma store.
+for (auto it = result_map.begin(); it != result_map.end();) {
+  auto current = it++;
+  if (current->second->IsInPlasmaError()) {
+    plasma_object_ids.insert(current->first);
+    result_map.erase(current);
+  }
+}
+...
+RAY_RETURN_NOT_OK(plasma_store_provider_->Get(object_ids, owner_addresses,
+                                              local_timeout_ms, &result_map));
+```
+
+When the memory store has nothing yet, the call blocks on a condition variable until the owner
+stores the result. A worker blocked like this inside a task sends `NotifyWorkerBlocked` to its
+raylet, which lends the worker's CPU to another task until it resumes.<Sidenote>In
+[`CoreWorkerMemoryStore::GetImpl`](https://github.com/ray-project/ray/blob/68174559b27a4eba8db6b3c7ef7aaa2678ec20c8/src/ray/core_worker/store_provider/memory_store/memory_store.cc#L292).
+Without this, a task that waits for its children could hold the last CPU they need, and the
+cluster would deadlock.</Sidenote> Blocking also explains a common slowdown: calling `ray.get`
+inside the loop that submits tasks waits for each result before submitting the next task, so the
+tasks run one at a time instead of in parallel.
+
+### Fetching an object from another node
+
+The interesting case is a value on another node. Take a driver on node 1 that puts a 12 MiB array
+and passes the ref to a task that lands on node 2. The task calls `ray.get(ref)`. The task's
+worker did not create the ref, so it is a **borrower**; the driver is the owner.
+
+<SequenceSteps
+	participants={getParticipants}
+	messages={getMessages}
+	title="ray.get of a 12 MiB object owned by a worker on node 1, from a task on node 2"
+	colWidth={118}
+/>
+
+Count the messages for the worked example (one 12 MiB object, one copy on node 1):
+
+| Step | Messages | Bytes of data |
+| --- | ---: | ---: |
+| Borrower asks owner for status (`GetObjectStatus`) | 2 | 0 |
+| Worker → local store, miss; worker → raylet (`AsyncGetObjectsRequest`) | 3 | 0 |
+| Raylet subscribes to owner for locations (`PubsubCommandBatch`), long-poll returns `{node 1}` | 4 | 0 |
+| `Pull` to node 1 | 2 | 0 |
+| `Push` × ⌈12 MiB / 5 MiB⌉ = 3 chunks (5, 5, 2 MiB) | 6 | 12,582,912 |
+| New location reported to owner | 2 | 0 |
+| Worker polls local store, hit | 2 | 0 |
+
+The payload crosses the network exactly once, in 5 MiB chunks
+(`object_manager_default_chunk_size`). Everything else is small control messages. Three of the
+exchanges (status, location subscription, location update) are with the owner on node 1, because
+only the owner knows where the object is.<Sidenote>Counted from
+the code path in the figure, counting each request and its reply. Pubsub batches commands and
+long-poll replies, so on a busy worker several objects share these messages.</Sidenote>
+
+Three details explain behaviour you can observe:
+
+- **Small values skip all of this.** The owner's reply to `GetObjectStatus` includes the value
+  when it lives in the owner's memory store
+  ([`PopulateObjectStatus`](https://github.com/ray-project/ray/blob/68174559b27a4eba8db6b3c7ef7aaa2678ec20c8/src/ray/core_worker/core_worker.cc#L4099)).
+  So a borrower gets a small task result in one round trip, with no raylet involved.
+- **Pulls are admitted by memory.** The `PullManager` activates a pull only if the object fits in
+  the store's free memory, and in priority order: `ray.get` before `ray.wait` before task
+  arguments. Under memory pressure a `ray.get` can wait even though the data exists.
+- **Reads are zero-copy and read-only.** The worker maps the store's memory and deserializes in
+  place. A NumPy array from `ray.get` is a view of shared memory, so `arr.flags.writeable` is
+  `False` (checked with Ray 2.59.0). Copy it if you need to modify it.
+
+#### Freeing an object
+
+An object lives while its owner's reference count is above zero. The count includes refs in the
+owner's Python process, refs held by pending tasks that take it as an argument, and borrowers. A
+borrower reports that it dropped its last ref through pubsub (`WORKER_REF_REMOVED_CHANNEL`). When
+the count reaches zero the owner sends `FreeLocalObjects` to every raylet that holds a copy
+([`SendFreeLocalObjectsBatchIfNeeded`](https://github.com/ray-project/ray/blob/68174559b27a4eba8db6b3c7ef7aaa2678ec20c8/src/ray/core_worker/core_worker.cc#L5191)).
+The pinning raylet releases its pin, and the store deletes the object once no local worker still
+holds it.
+
+## The protocols between components
+
+Ray's components talk over four kinds of channel. The figure shows who uses which; click a box to
+see the messages it serves.
+
+<BoxDiagram
+	nodes={protocolNodes}
+	edges={protocolEdges}
+	grid={{ cellW: 140, gapX: 104, gapY: 56 }}
+	selected="nm"
+	title="Which channel each pair of components uses"
+/>
+
+#### gRPC services
+
+Most remote calls are gRPC, defined in `src/ray/protobuf/`. Each process type serves its own
+service:
+
+| Service | Served by | Main calls | Called by |
+| --- | --- | --- | --- |
+| [`CoreWorkerService`](https://github.com/ray-project/ray/blob/68174559b27a4eba8db6b3c7ef7aaa2678ec20c8/src/ray/protobuf/core_worker.proto#L456) | every worker | `PushTask`, `GetObjectStatus`, `UpdateObjectLocationBatch`, `PubsubLongPolling`, `PubsubCommandBatch`, `KillActor`, `CancelTask`, `SpillObjects` | owners, borrowers, raylets, GCS |
+| [`NodeManagerService`](https://github.com/ray-project/ray/blob/68174559b27a4eba8db6b3c7ef7aaa2678ec20c8/src/ray/protobuf/node_manager.proto#L458) | raylet | `RequestWorkerLease`, `ReturnWorkerLease`, `PinObjectIDs`, `FreeLocalObjects`, `PrepareBundleResources`, `CommitBundleResources`, `DrainRaylet` | workers, GCS |
+| [`ObjectManagerService`](https://github.com/ray-project/ray/blob/68174559b27a4eba8db6b3c7ef7aaa2678ec20c8/src/ray/protobuf/object_manager.proto#L52) | raylet (own port) | `Pull`, `Push` | other raylets |
+| [`ActorInfoGcsService`](https://github.com/ray-project/ray/blob/68174559b27a4eba8db6b3c7ef7aaa2678ec20c8/src/ray/protobuf/gcs_service.proto#L179) and others | GCS | `RegisterActor`, `CreateActor`, `GetNamedActorInfo`, `KillActorViaGcs`; `RegisterNode`, `GetAllNodeInfo`; `InternalKVGet/Put`; `CreatePlacementGroup` | workers, raylets |
+
+Two patterns recur. First, **requests carry the address of whoever should act next.** A lease
+reply names a worker, a spillback reply names another raylet, a ref names its owner. The caller
+then talks to that process directly, so no component has to forward messages. Second, most clients
+are wrapped in a `RetryableGrpcClient`, which retries on transient failures; handlers are written
+to be idempotent (a repeated `RequestWorkerLease` with the same lease ID returns the same worker)
+so that retries are safe.
+
+#### Unix sockets and shared memory
+
+Two channels never leave the node:
+
+- **Worker ↔ raylet IPC.** A worker connects to its raylet over a Unix domain socket and sends
+  flatbuffers messages defined in [`node_manager.fbs`](https://github.com/ray-project/ray/blob/68174559b27a4eba8db6b3c7ef7aaa2678ec20c8/src/ray/flatbuffers/node_manager.fbs#L21):
+  `RegisterClientRequest`, `AsyncGetObjectsRequest`, `NotifyWorkerBlocked` /
+  `NotifyWorkerUnblocked`, `WaitRequest`, `DisconnectClientRequest`. The socket doubles as a
+  liveness signal: when it closes, the raylet knows the worker died
+  (`HandleClientConnectionError`).
+- **Worker ↔ plasma store.** Another Unix socket, with the messages in
+  [`plasma.fbs`](https://github.com/ray-project/ray/blob/68174559b27a4eba8db6b3c7ef7aaa2678ec20c8/src/ray/object_manager/plasma/plasma.fbs#L33):
+  `PlasmaCreateRequest`, `PlasmaSealRequest`, `PlasmaGetRequest`, `PlasmaReleaseRequest` and a few
+  more. Replies carry offsets into the store's memory; the file descriptor of that memory is sent
+  once over the socket with `SCM_RIGHTS`, and the client maps it. After that, object data moves
+  through shared memory, never through the socket.
+
+#### Pubsub
+
+Some questions are "tell me when this changes": where is object X now, has borrower B dropped its
+ref, is actor A alive. Ray answers them with a small publish-subscribe layer built on two gRPC
+calls. The subscriber sends `PubsubCommandBatch` (subscribe or unsubscribe to a key on a channel)
+and keeps one `PubsubLongPolling` request open; the publisher answers it with a batch of messages
+whenever it has any.<Sidenote>The [pubsub README](https://github.com/ray-project/ray/blob/68174559b27a4eba8db6b3c7ef7aaa2678ec20c8/src/ray/pubsub/README.md)
+explains the motivation: one long-poll per subscriber instead of one pending RPC per object, which
+cut the memory gRPC spent on unanswered requests.</Sidenote> There is no broker: workers publish
+directly to their subscribers.
+
+| Channel | Publisher | Subscribers | Carries |
+| --- | --- | --- | --- |
+| `WORKER_OBJECT_LOCATIONS_CHANNEL` | owner | raylets pulling the object | node set, size, spill URL |
+| `WORKER_REF_REMOVED_CHANNEL` | borrower | owner | "I dropped my last ref" |
+| `GCS_ACTOR_CHANNEL` | GCS | handle holders | actor state and address |
+| `GCS_NODE_INFO_CHANNEL` | GCS | raylets, workers | nodes joining and dying |
+| `GCS_JOB_CHANNEL` | GCS | raylets | jobs starting and finishing |
+
+#### The resource syncer
+
+Every raylet needs a view of every node's free resources to make scheduling decisions. Raylets
+keep one bidirectional gRPC stream, [`RaySyncer.StartSync`](https://github.com/ray-project/ray/blob/68174559b27a4eba8db6b3c7ef7aaa2678ec20c8/src/ray/protobuf/ray_syncer.proto#L66),
+open to the GCS. Every 100 ms (`raylet_report_resources_period_milliseconds`) a raylet sends a
+versioned `ResourceViewSyncMessage` (available and total resources, labels, whether pulls are
+queued, draining state) if it changed, and the GCS relays it to all other raylets. The view a
+raylet schedules with is therefore up to one period plus a hop stale, which is why scheduling
+decisions are made optimistically and corrected by spillback and rejection, as the next section
+shows.
+
+## Scheduling a task
+
+### Leases, not tasks
+
+Ray does not schedule tasks one at a time. An owner asks a raylet for a **lease**: the right to run
+tasks of one kind on one worker, with some resources reserved. While it holds the lease, the owner
+pushes tasks to that worker directly, one after another, without asking the scheduler again.
+
+"One kind" is the task's **scheduling key**: its scheduling class (resource demand, function,
+scheduling strategy), the IDs of its plasma arguments, and the hash of its runtime environment.
+Tasks with the same key can share a worker because they need the same resources and the same
+environment. A thousand calls to `f.remote(i)` with small arguments share one key, so after the
+first few leases are granted the owner just pushes tasks to warm workers.
+
+The owner requests a new lease only while it has more queued tasks than pending lease requests, and
+gives a lease back when its queue for that key is empty, or after 500 ms
+(`worker_lease_timeout_milliseconds`) so that one owner cannot keep a worker forever.
+
+### Step by step
+
+The figure follows one `f.remote(x)` from a driver on node 1, in a cluster where node 1 is busy, so
+the task spills to node 2.
+
+<SequenceSteps
+	participants={taskParticipants}
+	messages={taskMessages}
+	title="f.remote(x): from submission to result"
+	colWidth={140}
+/>
+
+Some points from the figure are worth repeating:
+
+- **`f.remote()` returns before scheduling starts.** The return refs exist as soon as
+  `TaskManager::AddPendingTask` registers them; the rest happens on the CoreWorker's IO thread.
+- **The owner, not a raylet, drives the protocol.** A raylet answers "use this worker" or "ask that
+  raylet"; it never forwards a request. With `grant_or_reject` on the second request, a task needs
+  at most two lease round trips to place.
+- **The raylet is out of the data path.** The task spec goes from owner to worker, and the result
+  from worker to owner. Small arguments are inlined in the spec, small results in the reply.
+
+#### The classes involved
+
+Owner-side classes are blue, raylet classes orange, the worker that runs the task green.
+
+<UmlClassDiagram
+	classes={schedulingClasses}
+	relations={schedulingRelations}
+	selected="clm"
+	title="Classes that schedule a task"
+/>
+
+On the owner, `NormalTaskSubmitter` holds the per-key queues. It uses `LocalDependencyResolver` to
+wait for and inline arguments, `LocalityAwareLeasePolicy` to choose the first raylet to ask, and
+`TaskManager` to record results and retry failures. In the raylet, scheduling is split in two:
+
+- `ClusterLeaseManager` decides **where** a lease runs. It asks `ClusterResourceScheduler` for the
+  best node, which delegates to a policy behind the `ISchedulingPolicy` interface, by default
+  `HybridSchedulingPolicy`.
+- `LocalLeaseManager` decides **when** a lease placed on this node is granted: once its arguments
+  are local (`LeaseDependencyManager`), its resources can be allocated, and `WorkerPool` has a
+  worker for it.
+
+Abridged from
+[`ClusterLeaseManager::ScheduleAndGrantLeases`](https://github.com/ray-project/ray/blob/68174559b27a4eba8db6b3c7ef7aaa2678ec20c8/src/ray/raylet/scheduling/cluster_lease_manager.cc#L195),
+the outer loop walks the queue of every scheduling class, and every lease in it, so one lease that
+cannot be placed does not block the others:
+
+```cpp
+for (auto shapes_it = leases_to_schedule_.begin();
+     shapes_it != leases_to_schedule_.end();) {
+  auto &work_queue = shapes_it->second;
+  for (auto work_it = work_queue.begin(); work_it != work_queue.end();) {
+    auto scheduling_node_id =
+        cluster_resource_scheduler_.GetBestSchedulableNode(
+        lease.GetLeaseSpecification(),
+        /*preferred_node_id*/ work->PrioritizeLocalNode()
+            ? self_node_id_.Binary()
+            : lease.GetPreferredNodeID(),
+        /*exclude_local_node*/ false,
+        /*requires_object_store_memory*/ false,
+        &is_infeasible);
+    if (scheduling_node_id.IsNil()) break;  // nothing fits: next shape
+    ScheduleOnNode(node_id, work);  // grant here, or reply with spillback
+    work_it = work_queue.erase(work_it);
+  }
+  ...
+}
+local_lease_manager_.ScheduleAndGrantLeases();
+```
+
+### Choosing a node: the hybrid policy
+
+The default policy balances two goals. Running on the local node is cheap: its workers are warm and
+the owner's data is often there. But piling everything on one node overloads it, and a full object
+store starts spilling to disk. The policy's own comment states the rule:<Sidenote>[`hybrid_scheduling_policy.h`](https://github.com/ray-project/ray/blob/68174559b27a4eba8db6b3c7ef7aaa2678ec20c8/src/ray/raylet/scheduling/policy/hybrid_scheduling_policy.h#L29).</Sidenote>
+skip infeasible nodes, prefer nodes with the resources available now, and among those prefer low
+**critical resource utilization**, which is truncated to 0 below a threshold.
+
+A node's score is its highest utilization among CPU, memory and object store memory, and counts as
+0 below `scheduler_spread_threshold` = 0.5:
+
+$$
+\text{score}(n) = \begin{cases} u(n) & u(n) \ge 0.5 \\ 0 & u(n) < 0.5 \end{cases}
+\qquad u(n) = \max_{r \in \{\text{CPU},\ \text{mem},\ \text{obj store}\}} \left(1 - \frac{\text{avail}_r}{\text{total}_r}\right)
+$$
+
+The policy then:
+
+1. keeps the nodes that are **feasible** (their totals can ever fit the request) and splits them
+   into **available** (fits now) and not;
+2. sorts the available ones by node ID, then (stably) by score;
+3. returns the **preferred node** (by default the local one) if its score is no worse than the best;
+4. otherwise picks uniformly at random among the top $k = \max(1, \lfloor 0.2 \cdot N \rfloor)$
+   nodes, where $N$ is the number of nodes in the cluster
+   (`scheduler_top_k_fraction` = 0.2, `scheduler_top_k_absolute` = 1).
+
+If no node is available, it repeats the choice over feasible-but-busy nodes, so the lease queues
+where it can eventually run. A request that needs no GPU is first tried on nodes without GPUs
+(`scheduler_avoid_gpu_nodes` = true), to keep scarce GPUs free.
+
+**Worked example.** Four nodes; the request is `{CPU: 1}` from an owner on node A. Memory and
+object store figures are in GiB.
+
+| Node | CPU free / total | Memory free / total | Store free / total | $u$ | Score | Available |
+| --- | ---: | ---: | ---: | ---: | ---: | :---: |
+| A (local) | 1 / 8 | 20 / 32 | 8 / 10 | 0.875 | 0.875 | yes |
+| B | 6 / 8 | 28 / 32 | 9 / 10 | 0.250 | 0 | yes |
+| C | 10 / 16 | 40 / 64 | 3 / 20 | 0.850 | 0.850 | yes |
+| D (1 GPU) | 8 / 8 | 60 / 64 | 20 / 20 | 0.063 | 0 | yes |
+
+Check one score by hand: C's CPU utilization is $1 - 10/16 = 0.375$, but its object store is
+$1 - 3/20 = 0.85$ full, so $u(C) = 0.85$. The object store, not the CPU, makes C unattractive.
+
+The request needs no GPU, so D is skipped in the first pass. Sorted by score, the candidates are
+B (0), C (0.85), A (0.875). The local node A scores 0.875, worse than B's 0, so it is not chosen.
+With $N = 4$, $k = \max(1, \lfloor 0.8 \rfloor) = 1$, so the policy returns B, and raylet A
+replies with a spillback to B. Two variants:
+
+- If A had 5 of 8 CPUs free, $u(A) = 0.375 < 0.5$ would truncate to 0, tying with B. The preferred
+  node wins ties, so the task would run on A. This is the "pack the local node until half full"
+  behaviour.
+- A request for `{CPU: 1, GPU: 1}` only fits on D, so it goes there whatever the scores.
+
+With 50 nodes, $k = 10$: the choice is random among the ten least-utilized available nodes, which
+spreads a burst of leases instead of sending them all to the single best node.<Sidenote>Scores
+computed with a TypeScript port of `ComputeNodeScoreImpl`, `GetBestNode` and `ScheduleImpl`
+(including the GPU-avoiding first pass and $k$'s integer truncation), run outside the repo.</Sidenote>
+
+The SPREAD strategy, node affinity, node labels and placement-group bundles use other policies
+behind the same interface; `ClusterResourceScheduler::GetBestSchedulableNode` picks the policy
+from the task's `scheduling_strategy`.
+
+### Granting the lease on the chosen node
+
+When the chosen node is the raylet itself, the lease moves to its `LocalLeaseManager`. A lease
+goes through two queues there:
+
+1. **Waiting for arguments.** `LeaseDependencyManager` pulls the lease's plasma arguments to this
+   node, with the lowest pull priority (`TASK_ARGS`).
+2. **Waiting to be granted.** Once the arguments are local,
+   [`GrantScheduledLeasesToWorkers`](https://github.com/ray-project/ray/blob/68174559b27a4eba8db6b3c7ef7aaa2678ec20c8/src/ray/raylet/scheduling/local_lease_manager.cc#L136)
+   pins them (capped so that pinned arguments cannot fill the store), allocates resource
+   *instances* (for example GPU 3), and calls `WorkerPool::PopWorker`. If the resources are gone
+   by then, because the view was stale or another lease got there first, it tries to spill the
+   lease to another node.
+
+When several scheduling classes compete for CPUs, `LocalLeaseManager` applies **fair sharing**: a
+class with more granted leases than the average across classes is skipped for a round. The code's
+comment gives the reason: in a pipeline of producers and consumers, granting all producers first
+would build up a memory peak of produced data.
+
+## Scheduling an actor
+
+### Step by step
+
+An actor is a worker dedicated to one object for its whole life. Creating one is a task too, the
+**actor creation task**, which runs `__init__`. Two things differ from a normal task: the GCS, not
+the owner, drives the scheduling, and afterwards method calls skip the scheduler entirely.
+
+<SequenceSteps
+	participants={actorParticipants}
+	messages={actorMessages}
+	title="Creating an actor, then calling it"
+	colWidth={124}
+/>
+
+The GCS manages actors because their lifetime outlives individual calls and may outlive the owner
+(detached actors), and because someone has to restart an actor when its node dies. The GCS still
+does not run the scheduling policy itself. It forwards the lease request to a raylet chosen by
+[`SelectForwardingNode`](https://github.com/ray-project/ray/blob/68174559b27a4eba8db6b3c7ef7aaa2678ec20c8/src/ray/gcs/actor/gcs_actor_scheduler.cc#L86),
+and the raylet's hybrid policy decides, with spillback as for tasks:
+
+```cpp
+// If an actor has resource requirements, we will try to schedule it on the
+// same node as the owner if possible.
+if (!lease_spec.GetRequiredResources().IsEmpty()) {
+  auto maybe_node = gcs_node_manager_.GetAliveNode(actor->GetOwnerNodeID());
+  node = maybe_node.has_value() ? maybe_node.value()
+                                : gcs_node_manager_.SelectRandomAliveNode();
+} else {
+  node = gcs_node_manager_.SelectRandomAliveNode();
+}
+```
+
+"Resource requirements" here means what the actor holds while it runs. An actor declared with no
+resource options holds 0 CPUs once alive (it needs 1 CPU only to be placed), so by default the GCS
+forwards it to a random alive node, which spreads many small actors over the cluster.<Sidenote>The
+defaults are `DEFAULT_ACTOR_CREATION_CPU_SIMPLE = 0` and `DEFAULT_ACTOR_METHOD_CPU_SIMPLE = 1` in
+`ray_constants.py`; `actor.py` adds the 1 CPU to the placement resources only. A zero entry is
+dropped from a `ResourceSet`, so `GetRequiredResources().IsEmpty()` is true.</Sidenote>
+
+Once the actor is alive, a method call is one `PushTask` from the caller to the actor's worker.
+The caller numbers its calls per handle, and the actor's `OrderedActorTaskExecutionQueue` runs them
+in that order even if the network reorders them. This is why calls from one handle to a synchronous
+actor are executed in submission order, while calls from different handles interleave.
+
+#### The classes involved
+
+Owner-side classes are blue, GCS classes pink, the raylet orange, the actor's worker green.
+
+<UmlClassDiagram
+	classes={actorClasses}
+	relations={actorRelations}
+	selected="gas"
+	title="Classes that create and call an actor"
+/>
+
+On the owner, `ActorCreator` is the client of the GCS actor service; `ActorManager` holds handles
+and subscribes to each actor's state; `ActorTaskSubmitter` keeps a queue per actor and connects it
+when the actor becomes `ALIVE`. In the GCS, `GcsActorManager` holds the `GcsActor` records and
+their state machine, and `GcsActorScheduler` leases a worker and pushes the creation task. On the
+actor's worker, `TaskReceiver` routes method calls to one ordered queue per caller.
+
+#### Actor states
+
+The GCS moves each actor through five states, stored in its actor table and published on
+`GCS_ACTOR_CHANNEL`.<Sidenote>The full transition list, with the cause of each arrow, is in
+[`actor_states.rst`](https://github.com/ray-project/ray/blob/68174559b27a4eba8db6b3c7ef7aaa2678ec20c8/src/ray/design_docs/actor_states.rst).</Sidenote>
+Click a state.
+
+<BoxDiagram
+	nodes={actorStateNodes}
+	edges={actorStateEdges}
+	grid={{ cellW: 92, gapX: 30, gapY: 46 }}
+	selected="restarting"
+	title="Actor states in the GCS"
+/>
+
+`RESTARTING` is where fault tolerance happens. When the GCS learns that an actor's node or worker
+died (from node health checks or the raylet), it checks `max_restarts`. If restarts remain, it
+schedules the actor again from scratch, re-running the creation task on a new worker, and callers'
+`ActorTaskSubmitter`s hold new calls until the actor is `ALIVE` again at its new address. Calls
+that were in flight when it died fail, unless `max_task_retries` allows them to be resent. State
+held in the old process is lost; restoring it is the application's job.
+
+## Placement groups
+
+### Reserving resources together
+
+The schedulers above place one task or one actor at a time. Some workloads need a set of resources
+reserved *together* before anything starts. A training job with four GPU workers is useless if
+only three get GPUs, and it wants its workers close to each other (on one node, for NVLink) or
+apart (one per node, for fault tolerance). A **placement group** is that reservation: a list of
+**bundles**, each a resource request such as `{"CPU": 4, "GPU": 1}`, plus a **strategy** that says
+how bundles may share nodes.
+
+| Strategy | Rule | Fails when |
+| --- | --- | --- |
+| `PACK` | As few nodes as possible; may span several | never for lack of nodes, only for lack of resources |
+| `SPREAD` | A different node for each bundle where possible; may share | only for lack of resources |
+| `STRICT_PACK` | All bundles on one node | no node's *total* resources can hold the sum |
+| `STRICT_SPREAD` | Each bundle on a different node | fewer suitable nodes than bundles |
+
+Once the group exists, tasks and actors are placed *into* it by passing
+`PlacementGroupSchedulingStrategy(pg, placement_group_bundle_index=i)`. They then use only the
+reserved resources, and nothing outside the group can take those.
+
+```python
+pg = placement_group([{"CPU": 1}, {"CPU": 2}], strategy="PACK")
+ray.get(pg.ready())                      # wait until both bundles are reserved
+
+@ray.remote(num_cpus=1)
+def f(): ...
+
+f.options(scheduling_strategy=PlacementGroupSchedulingStrategy(
+    pg, placement_group_bundle_index=1)).remote()
+```
+
+### Step by step
+
+Placement groups are the one thing the GCS schedules by itself, because it is the only component
+that can coordinate several raylets at once. It reserves the bundles in two phases so that a group
+is either fully reserved or not at all. Step through it for a three-bundle group spread over two
+nodes.
+
+<SequenceSteps
+	participants={pgParticipants}
+	messages={pgMessages}
+	title="Creating a placement group, then running a task in bundle 2"
+	colWidth={134}
+/>
+
+**Why two phases.** The GCS chooses nodes from its own view of free resources, which can be up to a
+resource-report period stale. A raylet may therefore refuse a bundle. If bundles were committed one
+node at a time, a refusal on the last node would leave the first nodes holding resources for a
+group that cannot start, and two groups competing for the same GPUs could each hold half of what
+they need and wait for each other forever. With **prepare** then **commit**, a group that cannot
+be fully reserved releases everything it prepared and goes back to the queue with a backoff. The
+group is persisted as `PREPARED` before the commits go out, so a GCS that restarts in between
+commits the prepared bundles when it comes back.
+
+### Bundles as resources
+
+A committed bundle does not create a new kind of object in the raylet. It *renames* resources. On
+the node, the reserved CPUs disappear from the plain `CPU` pool and reappear under names that
+contain the placement group ID, and the task's request is renamed the same way by
+[`AddPlacementGroupConstraint`](https://github.com/ray-project/ray/blob/68174559b27a4eba8db6b3c7ef7aaa2678ec20c8/src/ray/common/bundle_spec.cc#L158).
+The ordinary lease scheduler then does the rest: only the node with the bundle has a resource
+called `CPU_group_1_<id>`, so the task can only go there.
+
+Running the example above on a 4-CPU Ray 2.59.0 instance, `ray.available_resources()` shows
+(group ID shortened to `4168…`):
+
+| Resource | Available | Meaning |
+| --- | ---: | --- |
+| `CPU` | 1.0 | 4 − 1 − 2 reserved by the group |
+| `CPU_group_0_4168…` | 1.0 | bundle 0's CPUs |
+| `CPU_group_1_4168…` | 2.0 | bundle 1's CPUs |
+| `CPU_group_4168…` | 3.0 | wildcard: any bundle of the group (1 + 2) |
+| `bundle_group_0_4168…` | 1000.0 | marker for bundle 0 |
+| `bundle_group_1_4168…` | 1000.0 | marker for bundle 1 |
+| `bundle_group_4168…` | 2000.0 | marker for the group (1000 per bundle) |
+
+The `bundle_group_*` markers (1000 units per bundle, each task asks for 0.001) let a task that
+requests no resources at all still be pinned to the group. Inside the task,
+`get_assigned_resources()` reports plain `{'CPU': 1.0}`: the renaming is invisible to user
+code.<Sidenote>The names come from [`FormatPlacementGroupResource`](https://github.com/ray-project/ray/blob/68174559b27a4eba8db6b3c7ef7aaa2678ec20c8/src/ray/common/bundle_spec.cc#L105):
+`<resource>_group_<index>_<pg id>` and the wildcard `<resource>_group_<pg id>`.</Sidenote>
+
+#### The classes involved
+
+GCS classes are pink, raylet classes orange, the bundle policies grey. The four policies are
+subclasses of one abstract policy, which supplies the shared ordering and scoring.
+
+<UmlClassDiagram
+	classes={pgClasses}
+	relations={pgRelations}
+	grid={{ gapX: 44 }}
+	selected="gps"
+	title="Classes that create a placement group"
+/>
+
+### The strategies on a worked example
+
+All four policies try bundles in order of scarcity (GPU first) and score a node with
+`LeastResourceScorer`: for each requested resource, the fraction of the node's free amount that
+would still be free afterwards, summed; $-1$ if it does not fit. The highest score wins.
+
+$$
+\text{score}(n, b) = \sum_{r \in b} \frac{\text{avail}_r(n) - b_r}{\text{avail}_r(n)}
+$$
+
+Take three idle nodes and three bundles of `{CPU: 4, GPU: 1}`:
+
+| Node | CPU | GPU | Score for the first bundle |
+| --- | ---: | ---: | ---: |
+| N1 | 8 | 1 | $\frac{8-4}{8} + \frac{1-1}{1} = 0.5$ |
+| N2 | 16 | 2 | $\frac{16-4}{16} + \frac{2-1}{2} = 1.25$ |
+| N3 | 16 | 0 | $-1$ (no GPU) |
+
+| Strategy | Bundles 0, 1, 2 go to | Why |
+| --- | --- | --- |
+| `PACK` | N2, N2, N1 | N2 scores best; bundle 1 still fits on N2 (12 CPU, 1 GPU left); bundle 2 does not, so it goes to the next best, N1 |
+| `SPREAD` | N2, N1, N2 | a new node per bundle while one fits; for bundle 2 only N3 is unused and has no GPU, so it reuses N2 |
+| `STRICT_PACK` | infeasible | the sum `{CPU: 12, GPU: 3}` exceeds every node's total |
+| `STRICT_SPREAD` | waits | N2 and N1 take bundles 0 and 1; the third needs a third GPU node |
+
+The last two fail differently. `STRICT_PACK` here is **infeasible**: no node could ever hold the
+group, which the autoscaler sees as demand for a bigger node. `STRICT_SPREAD` is only **not yet
+schedulable** (each bundle alone fits somewhere), so the group stays `PENDING` and is retried with
+backoff until a third GPU node joins.<Sidenote>Placements computed with a TypeScript port of the
+four `Schedule` methods and `LeastResourceScorer` (outside the repo). No two scores tie in this
+example; with ties the result would depend on hash-set iteration order.</Sidenote>
+
+#### Placement group states
+
+<BoxDiagram
+	nodes={pgStateNodes}
+	edges={pgStateEdges}
+	grid={{ cellW: 110, gapX: 84, gapY: 46 }}
+	selected="resched"
+	title="Placement group states in the GCS"
+/>
+
+When a node dies,
+[`GcsPlacementGroupManager::OnNodeDead`](https://github.com/ray-project/ray/blob/68174559b27a4eba8db6b3c7ef7aaa2678ec20c8/src/ray/gcs/gcs_placement_group_manager.cc#L690)
+clears the node from the affected bundles and moves a `CREATED` group to `RESCHEDULING`. Only the
+lost bundles are placed again, through the same prepare and commit; the others keep their nodes.
+
+## Ray Direct Transport
+
+### Why tensors need another path
+
+Everything above moves data through the object store, which lives in host memory. That is the
+wrong path for GPU tensors. Sending a 1 GiB tensor from an actor on GPU 0 to an actor on GPU 1 by
+returning it the normal way copies it from the GPU to host memory, serializes it into plasma, ships
+it in 5 MiB chunks if the actors are on different nodes, and copies it back to the other GPU. GPUs
+can talk to each other directly, over NVLink inside a node or RDMA between nodes, through
+libraries such as NCCL and NIXL.
+
+**Ray Direct Transport (RDT)**, an alpha feature in `ray.experimental.rdt`, lets an actor method
+return tensors that *stay where they are*. The object store carries only the small rest of the
+value and the tensors' metadata. When the ref is passed to another actor, Ray moves the tensors
+directly between the two actors with the chosen **tensor transport**.
+
+```python
+@ray.remote(enable_tensor_transport=True)
+class A:
+    @ray.method(tensor_transport="gloo")       # "nccl" for CUDA tensors
+    def make(self):
+        return torch.arange(6.0).reshape(2, 3)
+
+    def total(self, t):
+        return float(t.sum()), list(t.shape)
+
+s, r = A.remote(), A.remote()
+create_collective_group([s, r], backend="gloo")   # needed by two-sided transports
+ref = s.make.remote()
+ray.get(r.total.remote(ref))   # (15.0, [2, 3]): the tensor went from s to r over GLOO
+```
+
+This ran as shown on Ray 2.59.0 with CPU tensors and GLOO. The driver's `RDTManager` reports the
+ref as managed, and the object is not in the driver's object store. With `"nccl"` the same code
+moves CUDA tensors GPU to GPU (not run here: it needs GPUs).
+
+### Step by step
+
+<SequenceSteps
+	participants={rdtParticipants}
+	messages={rdtMessages}
+	title="An RDT tensor from actor S to actor R over NCCL"
+	colWidth={210}
+/>
+
+The design reuses the existing machinery wherever it can. The method call, its reply and the
+reference counting are ordinary; only the tensors take a side path. The owner (here the driver)
+coordinates, as it does for every object it owns: it learns the tensor metadata from the
+`PushTaskReply` (`ReturnObject.direct_transport_metadata`), starts the transfer when the ref is
+passed on, and frees the producer's copy when the ref goes out of scope. The transfer tasks
+`__ray_send__` and `__ray_recv__` are actor tasks themselves, run in a separate `_ray_system`
+concurrency group so that they are not stuck behind user methods. Their order on that group also
+gives every actor the same global order of collective operations, which NCCL requires to avoid
+deadlock.
+
+### Transports
+
+| Transport | Devices | Sided | Abort on failure | Notes |
+| --- | --- | --- | --- | --- |
+| `NCCL` | CUDA | two-sided | no: actors are killed | needs `create_collective_group` |
+| `GLOO` | CPU | two-sided | no: actors are killed | needs `create_collective_group` |
+| `NIXL` | CUDA, CPU | one-sided | yes | across nodes; allows `ray.get` and `ray.put` from the driver |
+| `CUDA_IPC` | CUDA | one-sided | no | sender and receiver on the same node |
+
+**Two-sided** transports need both peers to call send and receive, so the owner submits a task to
+each. **One-sided** transports let the receiver read the sender's memory alone, so only the
+receive task is sent. That also makes `ray.get` possible from a process outside any collective
+group, such as the driver: the reader fetches the tensors itself. On a two-sided transport,
+`ray.get(ref)` raises `ValueError: ray.get is not allowed on RDT objects using the two-sided
+transport GLOO` (checked on Ray 2.59.0); `ray.get(ref, _use_object_store=True)` instead asks the
+producer to put a copy into the object store. Likewise `ray.put(t, _tensor_transport="nixl")` is
+accepted but a two-sided transport is rejected, since a put has no peer to send to. New
+transports can be added by subclassing `TensorTransportManager` and calling
+`register_tensor_transport`.<Sidenote>Defaults from
+[`util.py`](https://github.com/ray-project/ray/blob/68174559b27a4eba8db6b3c7ef7aaa2678ec20c8/python/ray/experimental/rdt/util.py#L87)
+and each transport's `is_one_sided` and `can_abort_transport`. The 60 s transfer timeout is
+`RAY_rdt_fetch_fail_timeout_milliseconds`.</Sidenote>
+
+#### The classes involved
+
+<UmlClassDiagram
+	classes={rdtClasses}
+	relations={rdtRelations}
+	selected="mgr"
+	title="Classes of Ray Direct Transport"
+	wide={false}
+/>
+
+#### Caveats
+
+RDT changes two guarantees of the object store, and the documentation calls both out:
+
+- **Objects are not immutable.** The producer's `RDTStore` keeps a *reference* to the returned
+  tensor, not a copy. If the actor modifies the tensor in place after returning it, later
+  receivers see the change. `ray.experimental.wait_tensor_freed(t)` blocks until every ref to it
+  is gone, after which it is safe to write again.
+- **Failures are coarser.** A collective transfer that fails or hangs cannot be cancelled, so the
+  owner's monitor thread kills the actors involved rather than leave their peers blocked.
+
+A method using RDT must also have exactly one return value, and the actor class needs
+`enable_tensor_transport=True`.
+
+## Summary
+
+- Every object has an **owner**, the worker that created its ref. The owner keeps its reference
+  count, locations and lineage, so object bookkeeping needs no central table, and objects die with
+  their owner.
+- `ray.put` writes the value once into the node's shared-memory plasma store and pins it there.
+  `ray.get` tries the worker's memory store, then the local store, then asks the raylet to pull
+  the object in 5 MiB chunks from a node the owner lists.
+- Components talk over gRPC services (workers, raylets, object managers, GCS), flatbuffers on Unix
+  sockets plus shared memory inside a node, owner-to-subscriber pubsub, and a resource-view stream
+  through the GCS.
+- Tasks are scheduled as **leases** on workers. Owners request leases, raylets grant them or spill
+  them back using the hybrid policy (pack the local node until half used, then the least-utilized
+  node), and owners push tasks directly to leased workers and reuse them.
+- Actors are created through the GCS, which forwards the lease to a raylet and tracks the actor's
+  state and restarts. After creation, method calls go straight from caller to actor, in
+  per-caller order.
+- Placement groups are scheduled by the GCS itself, with a two-phase prepare / commit across
+  raylets. A committed bundle renames the reserved resources (`CPU_group_<i>_<id>`), so ordinary
+  lease scheduling keeps tasks of the group on its bundles.
+- Ray Direct Transport keeps tensors returned by actor methods on their device. Only metadata goes
+  through the owner; the owner then triggers a direct NCCL, GLOO, NIXL or CUDA IPC transfer
+  between the actors when the ref is passed on.
+
+## References
+
+- Ray source at commit [`6817455`](https://github.com/ray-project/ray/tree/68174559b27a4eba8db6b3c7ef7aaa2678ec20c8),
+  in particular `src/ray/core_worker/`, `src/ray/raylet/`, `src/ray/object_manager/`,
+  `src/ray/gcs/actor/`, `src/ray/gcs/gcs_placement_group_*`, `src/ray/protobuf/` and
+  `python/ray/experimental/rdt/`.
+- Ray design docs in the repository: [ID specification](https://github.com/ray-project/ray/blob/68174559b27a4eba8db6b3c7ef7aaa2678ec20c8/src/ray/design_docs/id_specification.md),
+  [actor states](https://github.com/ray-project/ray/blob/68174559b27a4eba8db6b3c7ef7aaa2678ec20c8/src/ray/design_docs/actor_states.rst),
+  [pubsub](https://github.com/ray-project/ray/blob/68174559b27a4eba8db6b3c7ef7aaa2678ec20c8/src/ray/pubsub/README.md).
+- [Ray 2.0 Architecture white paper](https://docs.google.com/document/d/1tBw9A4j62ruI5omIJbMxly-la5w4q_TjyJgJL_jN2fI/preview).
+- S. Wang et al., [Ownership: A Distributed Futures System for Fine-Grained Tasks](https://www.usenix.org/system/files/nsdi21-wang.pdf), NSDI 2021.
+- P. Moritz et al., [Ray: A Distributed Framework for Emerging AI Applications](https://arxiv.org/abs/1712.05889), OSDI 2018.

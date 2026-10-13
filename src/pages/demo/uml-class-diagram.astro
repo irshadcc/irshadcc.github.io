@@ -1,0 +1,113 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import {
+	schedulingClasses,
+	schedulingRelations,
+} from "../../utils/ray/rayFigures";
+import UmlClassDiagram from "../../utils/uml/UmlClassDiagram.astro";
+import type { UmlClass, UmlRelation } from "../../utils/uml/umlClass";
+
+// A small model that uses every relation kind once.
+const shopClasses: UmlClass[] = [
+	{
+		id: "store",
+		name: "Store",
+		attrs: ["name: str"],
+		methods: ["checkout(cart)"],
+		col: 0,
+		row: 0,
+		group: 1,
+		note: "Owns its inventory (composition) and holds carts it does not own (aggregation).",
+	},
+	{
+		id: "inv",
+		name: "Inventory",
+		attrs: ["stock: map<Sku, int>"],
+		methods: ["reserve(sku, n)"],
+		col: 1,
+		row: 0,
+		group: 1,
+		note: "Created and destroyed with its store.",
+	},
+	{
+		id: "cart",
+		name: "Cart",
+		attrs: ["items: list<Item>"],
+		col: 0,
+		row: 1,
+		group: 2,
+	},
+	{
+		id: "pay",
+		name: "PaymentGateway",
+		stereotype: "interface",
+		methods: ["charge(amount)"],
+		col: 1,
+		row: 1,
+		group: 0,
+	},
+	{
+		id: "card",
+		name: "CardGateway",
+		methods: ["charge(amount)"],
+		col: 2,
+		row: 1,
+		group: 3,
+	},
+	{
+		id: "gift",
+		name: "GiftCardGateway",
+		methods: ["charge(amount)"],
+		col: 2,
+		row: 0,
+		group: 3,
+	},
+	{ id: "user", name: "User", attrs: ["id: int"], col: 0, row: 2, group: 2 },
+	{
+		id: "admin",
+		name: "Admin",
+		attrs: ["level: int"],
+		col: 1,
+		row: 2,
+		group: 4,
+	},
+];
+const shopRelations: UmlRelation[] = [
+	{ from: "store", to: "inv", kind: "composition" },
+	{ from: "store", to: "cart", kind: "aggregation", label: "carts" },
+	{ from: "store", to: "pay", kind: "association", label: "gateway" },
+	{ from: "card", to: "pay", kind: "realization" },
+	{ from: "gift", to: "pay", kind: "realization" },
+	{ from: "cart", to: "user", kind: "dependency", label: "owner" },
+	{ from: "admin", to: "user", kind: "inheritance" },
+];
+---
+
+<Layout title="UML class diagram demo">
+	<h1>UML class diagram demo</h1>
+	<p>
+		<code>UmlClassDiagram</code> draws classes as three-compartment boxes on a grid and joins them with
+		UML relations (layout in <code>umlClass.ts</code>). Click a class with a note to read it and highlight
+		its relations.
+	</p>
+
+	<h2>Every relation kind, kept to the text column</h2>
+	<UmlClassDiagram classes={shopClasses} relations={shopRelations} selected="store" title="A toy shop" wide={false} />
+
+	<h2>A real diagram: Ray task scheduling (wide)</h2>
+	<UmlClassDiagram
+		classes={schedulingClasses}
+		relations={schedulingRelations}
+		selected="clm"
+		title="Classes that schedule a Ray task"
+	/>
+
+	<h2>Fixed column width and no selection</h2>
+	<UmlClassDiagram
+		classes={shopClasses}
+		relations={shopRelations}
+		grid={{ cellW: 160, gapX: 60, gapY: 50 }}
+		hint="Nothing selected yet."
+		wide={false}
+	/>
+</Layout>

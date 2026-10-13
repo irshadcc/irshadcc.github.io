@@ -1,0 +1,311 @@
+---
+// A UML class diagram: classes as three-compartment boxes on a grid, joined by composition,
+// aggregation, association, dependency, inheritance or realization lines. Click (or focus) a
+// class that has a note to read it under the figure and highlight the relations that touch it.
+// A legend lists the relation kinds the diagram uses. Layout and drawing are in umlClass.ts.
+// Usage in .mdx:
+//   import UmlClassDiagram from "../../utils/uml/UmlClassDiagram.astro";
+//   import { putClasses, putRelations } from "../../utils/ray/rayFigures";
+//   <UmlClassDiagram classes={putClasses} relations={putRelations} selected="cw" title="Classes behind ray.put" />
+//   Optional: grid={{ cellW, gapX, gapY }}, wide={false} (keep to the text column), hint="...".
+import {
+	type RelationKind,
+	type UmlClass,
+	type UmlGrid,
+	type UmlRelation,
+	drawUml,
+	usedKinds,
+	validateUml,
+} from "./umlClass";
+
+interface Props {
+	classes: UmlClass[];
+	relations: UmlRelation[];
+	grid?: UmlGrid;
+	/** Class whose note is shown on load. */
+	selected?: string;
+	title?: string;
+	/** Text shown when nothing is selected. */
+	hint?: string;
+	/** On wide screens, extend into the margin-note column. */
+	wide?: boolean;
+}
+
+const {
+	classes,
+	relations,
+	grid,
+	selected,
+	title,
+	hint = "Click a class to read what it does.",
+	wide = true,
+} = Astro.props;
+const err = validateUml(classes, relations);
+if (err) throw new Error(`UmlClassDiagram: ${err}`);
+const hash = [...JSON.stringify(Astro.props)]
+	.reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7)
+	.toString(36);
+const { svg, width } = drawUml(classes, relations, grid, `uml-${hash}`);
+const noted = classes.filter((c) => c.note);
+const legendText: Record<RelationKind, string> = {
+	composition: "owns (composition)",
+	aggregation: "holds (aggregation)",
+	association: "uses (association)",
+	dependency: "calls / depends on",
+	inheritance: "extends",
+	realization: "implements",
+};
+const legendPath: Record<RelationKind, string> = {
+	composition:
+		'<line x1="16" y1="6" x2="40" y2="6"/><path class="mk fill" d="M2 6 L9 2 L16 6 L9 10 z"/>',
+	aggregation:
+		'<line x1="16" y1="6" x2="40" y2="6"/><path class="mk hollow" d="M2 6 L9 2 L16 6 L9 10 z"/>',
+	association:
+		'<line x1="2" y1="6" x2="39" y2="6"/><path class="mk open" d="M31 1.5 L39 6 L31 10.5"/>',
+	dependency:
+		'<line class="dash" x1="2" y1="6" x2="39" y2="6"/><path class="mk open" d="M31 1.5 L39 6 L31 10.5"/>',
+	inheritance:
+		'<line x1="2" y1="6" x2="29" y2="6"/><path class="mk hollow" d="M29 1 L39 6 L29 11 z"/>',
+	realization:
+		'<line class="dash" x1="2" y1="6" x2="29" y2="6"/><path class="mk hollow" d="M29 1 L39 6 L29 11 z"/>',
+};
+---
+
+<figure class:list={["umlf", { "umlf-wide": wide }]} data-selected={selected ?? ""}>
+	{title && <figcaption class="umlf-title">{title}</figcaption>}
+	<div class="umlf-canvas" style={`--natural-w: ${Math.round(width)}px`} set:html={svg} />
+	<div class="umlf-legend">
+		{
+			usedKinds(relations).map((k) => (
+				<span class="umlf-key">
+					<svg viewBox="0 0 42 12" width="42" height="12" aria-hidden="true" set:html={legendPath[k]} />
+					{legendText[k]}
+				</span>
+			))
+		}
+	</div>
+	{
+		noted.length > 0 && (
+			<div class="umlf-notes">
+				<p class="umlf-note" data-id="" hidden={!!selected}>
+					{hint}
+				</p>
+				{noted.map((c) => (
+					<p class="umlf-note" data-id={c.id} hidden={c.id !== selected}>
+						<strong>{c.name}.</strong> <span set:html={c.note} />
+					</p>
+				))}
+			</div>
+		)
+	}
+</figure>
+
+<script>
+	for (const fig of document.querySelectorAll<HTMLElement>(".umlf")) {
+		const notes = [...fig.querySelectorAll<HTMLElement>(".umlf-note")];
+		const boxes = [...fig.querySelectorAll<SVGGElement>(".cls.has-note")];
+		const rels = [...fig.querySelectorAll<SVGGElement>(".rel")];
+		const select = (id: string) => {
+			for (const n of notes) n.hidden = n.dataset.id !== id;
+			for (const b of boxes) b.classList.toggle("sel", b.dataset.id === id);
+			for (const r of rels) r.classList.toggle("lit", !!id && (r.dataset.from === id || r.dataset.to === id));
+		};
+		for (const b of boxes) {
+			const pick = () => select(b.classList.contains("sel") ? "" : (b.dataset.id ?? ""));
+			b.addEventListener("click", pick);
+			b.addEventListener("keydown", (e) => {
+				if (e.key === "Enter" || e.key === " ") {
+					e.preventDefault();
+					pick();
+				}
+			});
+		}
+		select(fig.dataset.selected ?? "");
+	}
+</script>
+
+<style>
+	.umlf {
+		--g0: #5f7380;
+		--g1: #2f6fb0;
+		--g2: #b8742a;
+		--g3: #2f8a5b;
+		--g4: #b33b5e;
+		--g5: #7a62b8;
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+	}
+	@media (prefers-color-scheme: dark) {
+		.umlf {
+			--g0: #98aab5;
+			--g1: #6aa8e6;
+			--g2: #e0a25e;
+			--g3: #5fc08b;
+			--g4: #e2708f;
+			--g5: #a993e6;
+		}
+	}
+	@media (min-width: 1081px) {
+		.umlf-wide {
+			width: calc(100% + var(--gap) + var(--note));
+		}
+	}
+	.umlf-title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.4rem;
+	}
+	/* Wide diagrams scroll inside the figure on phones instead of shrinking to an unreadable size. */
+	.umlf-canvas {
+		overflow-x: auto;
+	}
+	.umlf-canvas :global(svg) {
+		display: block;
+		width: 100%;
+		min-width: min(var(--natural-w), 640px);
+		max-width: var(--natural-w);
+		height: auto;
+		margin: 0 auto;
+	}
+	.umlf-canvas :global(.cls .body) {
+		fill: var(--bg);
+		stroke: var(--c);
+		stroke-width: 1.2;
+	}
+	.umlf-canvas :global(.cls .head) {
+		fill: color-mix(in oklch, var(--c) 16%, var(--bg));
+		stroke: none;
+	}
+	.umlf-canvas :global(.cls .sep) {
+		stroke: var(--c);
+		stroke-width: 0.8;
+	}
+	.umlf-canvas :global(.g0) {
+		--c: var(--g0);
+	}
+	.umlf-canvas :global(.g1) {
+		--c: var(--g1);
+	}
+	.umlf-canvas :global(.g2) {
+		--c: var(--g2);
+	}
+	.umlf-canvas :global(.g3) {
+		--c: var(--g3);
+	}
+	.umlf-canvas :global(.g4) {
+		--c: var(--g4);
+	}
+	.umlf-canvas :global(.g5) {
+		--c: var(--g5);
+	}
+	.umlf-canvas :global(.has-note) {
+		cursor: pointer;
+		outline: none;
+	}
+	.umlf-canvas :global(.has-note:hover .body),
+	.umlf-canvas :global(.has-note:focus-visible .body) {
+		stroke-width: 2;
+	}
+	.umlf-canvas :global(.sel .body) {
+		stroke-width: 2.4;
+	}
+	.umlf-canvas :global(.sel .head) {
+		fill: color-mix(in oklch, var(--c) 34%, var(--bg));
+	}
+	.umlf-canvas :global(.st) {
+		font-size: 8.5px;
+		font-style: italic;
+		text-anchor: middle;
+		fill: var(--muted);
+		pointer-events: none;
+	}
+	.umlf-canvas :global(.cn) {
+		font-size: 11px;
+		font-weight: 700;
+		text-anchor: middle;
+		fill: var(--text);
+		pointer-events: none;
+	}
+	.umlf-canvas :global(.mb) {
+		font-family: var(--mono);
+		font-size: 9px;
+		fill: var(--text);
+		pointer-events: none;
+	}
+	.umlf-canvas :global(.rel line) {
+		stroke: var(--muted);
+		stroke-width: 1.1;
+	}
+	.umlf-canvas :global(.rel.dashed line) {
+		stroke-dasharray: 4 3;
+	}
+	.umlf-canvas :global(.rel.lit line) {
+		stroke: var(--accent);
+		stroke-width: 1.8;
+	}
+	.umlf-canvas :global(.ul) {
+		font-family: var(--mono);
+		font-size: 8.5px;
+		fill: var(--muted);
+		paint-order: stroke;
+		stroke: var(--bg);
+		stroke-width: 3px;
+	}
+	.umlf-canvas :global(.rel.lit .ul) {
+		fill: var(--accent);
+	}
+	.umlf :global(.mk.fill) {
+		fill: var(--muted);
+		stroke: var(--muted);
+	}
+	.umlf :global(.mk.hollow) {
+		fill: var(--bg);
+		stroke: var(--muted);
+		stroke-width: 1.1;
+	}
+	.umlf :global(.mk.open) {
+		fill: none;
+		stroke: var(--muted);
+		stroke-width: 1.1;
+	}
+	.umlf-legend {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.3rem 1rem;
+		margin-top: 0.4rem;
+		font-size: 0.75rem;
+		color: var(--muted);
+	}
+	.umlf-key {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.35rem;
+	}
+	.umlf-key :global(line) {
+		stroke: var(--muted);
+		stroke-width: 1.1;
+	}
+	.umlf-key :global(line.dash) {
+		stroke-dasharray: 4 3;
+	}
+	.umlf-notes {
+		min-height: 3.2em;
+		margin-top: 0.5rem;
+		padding: 0.5rem 0.75rem;
+		border-left: 3px solid var(--accent);
+		background: var(--surface);
+		font-size: 0.82rem;
+		line-height: 1.5;
+	}
+	.umlf-note {
+		margin: 0;
+	}
+	.umlf-note[hidden] {
+		display: none;
+	}
+	.umlf-note[data-id=""] {
+		color: var(--muted);
+	}
+</style>

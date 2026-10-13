@@ -130,6 +130,7 @@ Once a component is stable, it will be migrated to `/src/component`
 | `MegaKernelSteps` | `src/utils/distributed/MegaKernelSteps.astro` | Step-through of a fused kernel on a tiny example: the code on top with the executing line highlighted, below it the input tensors → operation → output tensors with their values (here DeepGEMM's Mega MoE) |
 | `SequenceSteps` | `src/utils/payments/SequenceSteps.astro` | Step-through sequence diagram (participants, messages, replies, lost messages) |
 | `BoxDiagram` | `src/utils/payments/BoxDiagram.astro` | Clickable boxes-and-arrows diagram on a grid: architectures, state machines, deployments |
+| `UmlClassDiagram` | `src/utils/uml/UmlClassDiagram.astro` | UML class diagram on a grid: three-compartment classes (stereotype, attributes, methods), composition / aggregation / association / dependency / inheritance / realization lines with a legend, click a class for its note; `wide` extends into the margin column (layout in `umlClass.ts`) |
 | `DependencyGraph` | `src/utils/graph/DependencyGraph.astro` | Code or build dependency graph laid out by dagre: icon cards, bare icons, placeholders, junctions, right-angled (optionally directed) wires, clickable active node, dark/light theme |
 | `ShardRouting` | `src/utils/payments/ShardRouting.astro` | Keys placed on shards by range, hash mod N or bucket directory, with keys moved when a shard is added |
 | `PagedKvCache` | `src/utils/inference/PagedKvCache.astro` | Contiguous vs paged KV-cache allocation of a request stream |
