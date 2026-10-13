@@ -1,0 +1,368 @@
+---
+// Step-through of a Blackwell tcgen05 (UMMA) GEMM tile: from the global matrices, through
+// local_tile and partition_A / B / C, to the SMEM descriptors and the instructions that accumulate
+// into Tensor Memory. Each step draws its matrices and buffers side by side at one scale; hover a
+// block for its rows, columns and role. Logic and presets: ummaTiling.ts.
+//
+// Presets: "1cta" (CtaGroup.ONE, m128n256k16, mma_tiler 128 × 256 × 64), "2cta" (CtaGroup.TWO,
+// m256n256k16 over a CTA pair, mma_tiler 256 × 256 × 64), "perm" (row ownership with and without
+// permutation_mnk). All on the 512 × 768 × 384 GEMM of NVIDIA's tcgen05 guide.
+// Usage in .mdx:
+//   <UmmaTileSteps preset="1cta" />
+//   <UmmaTileSteps preset="2cta" step={1} caption="..." />
+import { type UmmaPreset, buildUmmaSteps, stepSvg } from "./ummaTiling";
+
+interface Props {
+	preset: UmmaPreset;
+	/** Step shown first. */
+	step?: number;
+	caption?: string;
+}
+
+const { preset, step = 0, caption } = Astro.props;
+const steps = buildUmmaSteps(preset);
+const svgs = steps.map((s) => stepSvg(s));
+const last = steps.length - 1;
+---
+
+<figure class="umma-steps" data-step={step} tabindex="0">
+	{
+		steps.map((s, i) => (
+			<div class="ut-step" data-i={i} hidden={i !== step}>
+				<div class="ut-head">
+					<p class="ut-name">{s.title}</p>
+					<code class="ut-code">{s.code}</code>
+				</div>
+				<div class="ut-shape">
+					{s.shape.map((line) => (
+						<div>{line}</div>
+					))}
+				</div>
+				<div class="ut-stage" set:html={svgs[i]} />
+				<p class="ut-body">{s.body}</p>
+			</div>
+		))
+	}
+	<p class="ut-readout">Hover a block for its rows, columns and role.</p>
+	{
+		last > 0 && (
+			<div class="controls">
+				<div class="buttons">
+					<button type="button" data-act="first" aria-label="First step">
+						<svg viewBox="0 0 16 16" aria-hidden="true">
+							<path d="M3 3v10M13 3 6 8l7 5z" />
+						</svg>
+					</button>
+					<button type="button" data-act="prev" aria-label="Previous step">
+						<svg viewBox="0 0 16 16" aria-hidden="true">
+							<path d="M11 3 4 8l7 5z" />
+						</svg>
+					</button>
+					<button type="button" data-act="play" class="play" aria-label="Play">
+						<svg class="i-play" viewBox="0 0 16 16" aria-hidden="true">
+							<path d="M4 2.5v11L13.5 8z" />
+						</svg>
+						<svg class="i-pause" viewBox="0 0 16 16" aria-hidden="true">
+							<path d="M4 3h3v10H4zM9 3h3v10H9z" />
+						</svg>
+					</button>
+					<button type="button" data-act="next" aria-label="Next step">
+						<svg viewBox="0 0 16 16" aria-hidden="true">
+							<path d="M5 3l7 5-7 5z" />
+						</svg>
+					</button>
+				</div>
+				<div class="timeline" role="group" aria-label="Steps">
+					{steps.map((s, i) => (
+						<button type="button" class="seg" data-i={i} aria-label={s.title} title={s.title} />
+					))}
+				</div>
+				<span class="counter">
+					{step} / {last}
+				</span>
+			</div>
+		)
+	}
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	for (const fig of document.querySelectorAll<HTMLElement>(".umma-steps")) {
+		const panes = [...fig.querySelectorAll<HTMLElement>(".ut-step")];
+		const segs = [...fig.querySelectorAll<HTMLButtonElement>(".seg")];
+		const counter = fig.querySelector(".counter");
+		const readout = fig.querySelector(".ut-readout") as HTMLElement;
+		const play = fig.querySelector<HTMLButtonElement>("[data-act=play]");
+		const last = panes.length - 1;
+		let at = Number(fig.dataset.step ?? 0);
+		let timer: number | undefined;
+		const hint = readout.textContent ?? "";
+
+		const render = () => {
+			panes.forEach((p, i) => {
+				p.hidden = i !== at;
+			});
+			segs.forEach((b, k) => {
+				b.classList.toggle("done", k <= at);
+				b.setAttribute("aria-current", String(k === at));
+			});
+			if (counter) counter.textContent = `${at} / ${last}`;
+			readout.textContent = hint;
+		};
+		const go = (i: number) => {
+			at = Math.min(Math.max(0, i), last);
+			render();
+		};
+		const stop = () => {
+			if (timer !== undefined) clearInterval(timer);
+			timer = undefined;
+			play?.classList.remove("playing");
+			play?.setAttribute("aria-label", "Play");
+		};
+		const start = () => {
+			if (at >= last) go(0);
+			play?.classList.add("playing");
+			play?.setAttribute("aria-label", "Pause");
+			timer = window.setInterval(() => {
+				if (at >= last) stop();
+				else go(at + 1);
+			}, 3200);
+		};
+		for (const b of fig.querySelectorAll<HTMLButtonElement>("[data-act]"))
+			b.addEventListener("click", () => {
+				const act = b.dataset.act;
+				if (act === "play") return timer === undefined ? start() : stop();
+				stop();
+				if (act === "first") go(0);
+				if (act === "prev") go(at - 1);
+				if (act === "next") go(at + 1);
+			});
+		for (const b of segs)
+			b.addEventListener("click", () => {
+				stop();
+				go(Number(b.dataset.i));
+			});
+		fig.addEventListener("keydown", (e) => {
+			if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+			e.preventDefault();
+			stop();
+			go(at + (e.key === "ArrowRight" ? 1 : -1));
+		});
+		const hover = (e: Event) => {
+			const t = e.target as Element;
+			const d = t.getAttribute?.("data-d");
+			if (d) readout.textContent = d;
+		};
+		fig.addEventListener("mouseover", hover);
+		fig.addEventListener("click", hover);
+		render();
+	}
+</script>
+
+<style>
+	.umma-steps {
+		--ug0: #c9dcef;
+		--ug1: #f3d6b4;
+		--ug2: #cfe6c9;
+		--ug3: #e9c8dc;
+		--ug4: #ddd3f0;
+		--ug5: #f1e7b0;
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+		outline: none;
+	}
+	@media (prefers-color-scheme: dark) {
+		.umma-steps {
+			--ug0: #2d4a66;
+			--ug1: #5e4426;
+			--ug2: #2f5230;
+			--ug3: #5a3049;
+			--ug4: #45386a;
+			--ug5: #5a5222;
+		}
+	}
+	.ut-step[hidden] {
+		display: none;
+	}
+	.ut-head {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: baseline;
+		gap: 0.3rem 0.8rem;
+	}
+	.ut-name {
+		margin: 0;
+		font-weight: 600;
+		font-size: 0.9rem;
+	}
+	.ut-code {
+		font-family: var(--mono);
+		font-size: 0.72rem;
+		color: var(--muted);
+		overflow-wrap: anywhere;
+	}
+	.ut-shape {
+		margin: 0.4rem 0 0.6rem;
+		padding: 0.35rem 0.55rem;
+		border-radius: 6px;
+		background: var(--surface);
+		font-family: var(--mono);
+		font-size: 0.76rem;
+		overflow-wrap: anywhere;
+	}
+	.ut-stage {
+		display: flex;
+		justify-content: center;
+	}
+	.ut-stage :global(svg) {
+		display: block;
+		width: 100%;
+		max-width: 680px;
+		height: auto;
+		max-height: 340px;
+	}
+	.ut-stage :global(rect) {
+		stroke: var(--text);
+		stroke-opacity: 0.45;
+		stroke-width: 0.8;
+		cursor: crosshair;
+	}
+	.ut-stage :global(rect:hover) {
+		stroke: var(--accent);
+		stroke-opacity: 1;
+		stroke-width: 2;
+	}
+	.ut-stage :global(.ugp) {
+		fill: var(--surface);
+	}
+	.ut-stage :global(.ugd) {
+		fill: var(--surface);
+		opacity: 0.45;
+	}
+	.ut-stage :global(.ug0) {
+		fill: var(--ug0);
+	}
+	.ut-stage :global(.ug1) {
+		fill: var(--ug1);
+	}
+	.ut-stage :global(.ug2) {
+		fill: var(--ug2);
+	}
+	.ut-stage :global(.ug3) {
+		fill: var(--ug3);
+	}
+	.ut-stage :global(.ug4) {
+		fill: var(--ug4);
+	}
+	.ut-stage :global(.ug5) {
+		fill: var(--ug5);
+	}
+	.ut-stage :global(.ut-title) {
+		font-size: 11px;
+		font-weight: 600;
+		fill: var(--text);
+	}
+	.ut-stage :global(.ut-label) {
+		fill: var(--text);
+		font-family: var(--mono);
+		text-anchor: middle;
+		dominant-baseline: central;
+		pointer-events: none;
+	}
+	.ut-body {
+		margin: 0.5rem 0 0;
+		font-size: 0.8rem;
+		min-height: 3.6rem;
+	}
+	.ut-readout {
+		margin: 0.3rem 0 0;
+		font-family: var(--mono);
+		font-size: 0.72rem;
+		color: var(--text);
+		text-align: center;
+		min-height: 1.2rem;
+	}
+	.controls {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 0.6rem 0.75rem;
+		margin-top: 0.5rem;
+	}
+	.buttons {
+		display: flex;
+		gap: 0.3rem;
+	}
+	.buttons button {
+		display: grid;
+		place-items: center;
+		width: 2rem;
+		height: 2rem;
+		padding: 0;
+		border: 1px solid var(--faint);
+		border-radius: 8px;
+		background: var(--bg);
+		color: var(--text);
+		cursor: pointer;
+		transition: border-color 150ms ease;
+	}
+	.buttons button:hover {
+		border-color: var(--accent);
+	}
+	.buttons svg {
+		width: 0.8rem;
+		height: 0.8rem;
+		fill: currentColor;
+		stroke: currentColor;
+		stroke-width: 1.2;
+		stroke-linejoin: round;
+	}
+	.buttons .play {
+		width: 2.6rem;
+		background: var(--accent);
+		border-color: var(--accent);
+		color: var(--bg);
+	}
+	.play .i-pause,
+	.play.playing .i-play {
+		display: none;
+	}
+	.play.playing .i-pause {
+		display: block;
+	}
+	.timeline {
+		flex: 1;
+		min-width: 8rem;
+		display: flex;
+		gap: 3px;
+	}
+	.seg {
+		flex: 1;
+		height: 0.55rem;
+		padding: 0;
+		border: 0;
+		border-radius: 3px;
+		background: var(--faint);
+		cursor: pointer;
+	}
+	.seg.done {
+		background: var(--accent);
+	}
+	.seg[aria-current="true"] {
+		outline: 2px solid var(--text);
+		outline-offset: 1px;
+	}
+	.counter {
+		font-family: var(--mono);
+		font-size: 0.75rem;
+		color: var(--muted);
+		min-width: 3.2rem;
+		text-align: right;
+	}
+	figcaption {
+		margin-top: 0.4rem;
+		font-size: 0.8rem;
+		color: var(--muted);
+		text-align: center;
+	}
+</style>

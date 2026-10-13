@@ -1,0 +1,310 @@
+---
+// Blackwell Tensor Memory (TMEM) of one CTA, 128 lanes × 512 columns of 32-bit cells, coloured by
+// what a tcgen05 kernel keeps there: accumulator stages, the folded halves of a CTA-pair
+// accumulator, operand A, or the lanes each epilogue warp may read. Lines mark the four 32-lane
+// sub-partitions (one per warp of a warpgroup); hatched columns are not allocated. Hover a cell for
+// its lane, column, TMEM address, reading warp and the (m, n) of the tile stored there. With
+// several presets, tabs switch between them. Layout maps: tmemLayout.ts.
+// Usage in .mdx:
+//   <TmemMap presets={["acc-2stage"]} />
+//   <TmemMap presets={["acc-2stage", "m64", "pair-m128", "pair-m256", "a-tmem"]} />
+import { TMEM_COLS, TMEM_LANES, type TmemPreset, tmemPlan } from "./tmemLayout";
+
+interface Props {
+	presets: TmemPreset[];
+	caption?: string;
+}
+
+const { presets, caption } = Astro.props;
+const plans = presets.map((p) => tmemPlan(p));
+const tabLabel: Record<TmemPreset, string> = {
+	"acc-2stage": "M=128, 2 stages",
+	m64: "M=64",
+	"pair-m128": "pair, M=128",
+	"pair-m256": "pair, M=256",
+	"a-tmem": "A in TMEM",
+	epilogue: "epilogue reads",
+};
+---
+
+<figure class="tmem-map" data-presets={presets.join(",")}>
+	{
+		presets.length > 1 && (
+			<div class="tm-tabs" role="tablist">
+				{presets.map((p, i) => (
+					<button type="button" role="tab" data-i={i} aria-selected={String(i === 0)}>
+						{tabLabel[p]}
+					</button>
+				))}
+			</div>
+		)
+	}
+	<p class="tm-title">{plans[0].title}</p>
+	<div class="tm-stage">
+		<canvas aria-label={`Tensor Memory: ${TMEM_LANES} lanes by ${TMEM_COLS} columns`}></canvas>
+	</div>
+	<div class="tm-legend"></div>
+	<p class="tm-readout">Hover a cell: lane, column, address and the tile element it holds.</p>
+	<p class="tm-body">{plans[0].body}</p>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import { TMEM_COLS, TMEM_LANES, type TmemPreset, describeCell, tmemPlan } from "./tmemLayout";
+
+	const LIGHT = ["#9cc0e2", "#f0be86", "#a6d39c", "#e0a3c6", "#c2b2ea", "#e8d77c"];
+	const DARK = ["#3f6d97", "#8a6232", "#467a47", "#874a6e", "#64539a", "#857a35"];
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".tmem-map")) {
+		const presets = (fig.dataset.presets ?? "").split(",") as TmemPreset[];
+		const canvas = fig.querySelector("canvas") as HTMLCanvasElement;
+		const stage = fig.querySelector(".tm-stage") as HTMLElement;
+		const title = fig.querySelector(".tm-title") as HTMLElement;
+		const body = fig.querySelector(".tm-body") as HTMLElement;
+		const legend = fig.querySelector(".tm-legend") as HTMLElement;
+		const readout = fig.querySelector(".tm-readout") as HTMLElement;
+		const tabs = [...fig.querySelectorAll<HTMLButtonElement>(".tm-tabs button")];
+		const dark = window.matchMedia("(prefers-color-scheme: dark)");
+		const hint = readout.textContent ?? "";
+		let plan = tmemPlan(presets[0]);
+		// Geometry of the last draw: left margin for lane labels, cell size.
+		let geom = { left: 0, top: 0, cw: 1, ch: 1 };
+		const css = (n: string) => getComputedStyle(fig).getPropertyValue(n).trim();
+
+		const draw = () => {
+			const left = 52;
+			const top = 4;
+			const bottom = 18;
+			const w = Math.min(stage.clientWidth || 680, 720);
+			const cw = (w - left - 4) / TMEM_COLS;
+			const ch = Math.max(1.6, Math.min(2.4, cw * 1.6));
+			const h = top + TMEM_LANES * ch + bottom;
+			const dpr = window.devicePixelRatio || 1;
+			canvas.style.width = `${w}px`;
+			canvas.style.height = `${h}px`;
+			canvas.width = Math.round(w * dpr);
+			canvas.height = Math.round(h * dpr);
+			const ctx = canvas.getContext("2d");
+			if (!ctx) return;
+			ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+			geom = { left, top, cw, ch };
+			const pal = dark.matches ? DARK : LIGHT;
+			const text = css("--text");
+			const muted = css("--muted");
+			const surface = css("--surface");
+			const faint = css("--faint");
+			const accent = css("--accent");
+			ctx.clearRect(0, 0, w, h);
+			// Cells: runs of equal colour along each lane, drawn as one rectangle.
+			for (let lane = 0; lane < TMEM_LANES; lane++) {
+				let runStart = 0;
+				let runColor = "";
+				const flush = (end: number) => {
+					if (!runColor) return;
+					ctx.fillStyle = runColor;
+					// Snap to device pixels so neighbouring lanes leave no seams.
+					const x0 = Math.round((left + runStart * cw) * dpr) / dpr;
+					const x1 = Math.round((left + end * cw) * dpr) / dpr;
+					const y0 = Math.round((top + lane * ch) * dpr) / dpr;
+					const y1 = Math.round((top + (lane + 1) * ch) * dpr) / dpr;
+					ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
+				};
+				for (let col = 0; col <= TMEM_COLS; col++) {
+					let color = "";
+					if (col < TMEM_COLS) {
+						if (col >= plan.allocCols) color = "none";
+						else {
+							const c = plan.cell(lane, col);
+							color = c ? pal[plan.regions[c.region].group % 6] : surface;
+						}
+					}
+					if (color !== runColor || col === TMEM_COLS) {
+						if (runColor !== "none") flush(col);
+						runStart = col;
+						runColor = color;
+					}
+				}
+			}
+			// Hatch the unallocated columns.
+			if (plan.allocCols < TMEM_COLS) {
+				const x0 = left + plan.allocCols * cw;
+				const x1 = left + TMEM_COLS * cw;
+				ctx.save();
+				ctx.beginPath();
+				ctx.rect(x0, top, x1 - x0, TMEM_LANES * ch);
+				ctx.clip();
+				ctx.strokeStyle = faint;
+				ctx.lineWidth = 1;
+				for (let x = x0 - TMEM_LANES * ch; x < x1; x += 7) {
+					ctx.beginPath();
+					ctx.moveTo(x, top + TMEM_LANES * ch);
+					ctx.lineTo(x + TMEM_LANES * ch, top);
+					ctx.stroke();
+				}
+				ctx.restore();
+			}
+			// One thread's cells, filled and ringed so a single lane stands out.
+			if (plan.mark) {
+				let x0 = Number.POSITIVE_INFINITY;
+				let x1 = 0;
+				let y0 = Number.POSITIVE_INFINITY;
+				let y1 = 0;
+				ctx.fillStyle = accent;
+				for (let lane = 0; lane < TMEM_LANES; lane++)
+					for (let col = 0; col < TMEM_COLS; col++)
+						if (plan.mark(lane, col)) {
+							ctx.fillRect(left + col * cw, top + lane * ch - 1, cw, ch + 2);
+							x0 = Math.min(x0, left + col * cw);
+							x1 = Math.max(x1, left + (col + 1) * cw);
+							y0 = Math.min(y0, top + lane * ch);
+							y1 = Math.max(y1, top + (lane + 1) * ch);
+						}
+				if (x1 > 0) {
+					ctx.strokeStyle = accent;
+					ctx.lineWidth = 2;
+					ctx.strokeRect(x0 - 4, y0 - 5, x1 - x0 + 8, y1 - y0 + 10);
+				}
+			}
+			// Sub-partition boundaries and warp labels.
+			ctx.strokeStyle = text;
+			ctx.globalAlpha = 0.55;
+			ctx.lineWidth = 1;
+			for (let q = 0; q <= 4; q++) {
+				const y = Math.round(top + q * 32 * ch) + 0.5;
+				ctx.beginPath();
+				ctx.moveTo(left, y);
+				ctx.lineTo(left + TMEM_COLS * cw, y);
+				ctx.stroke();
+			}
+			ctx.strokeRect(left + 0.5, top + 0.5, TMEM_COLS * cw - 1, TMEM_LANES * ch - 1);
+			ctx.globalAlpha = 1;
+			ctx.font = `10px ${css("--sans") || "sans-serif"}`;
+			ctx.fillStyle = muted;
+			ctx.textAlign = "right";
+			ctx.textBaseline = "middle";
+			for (let q = 0; q < 4; q++) {
+				ctx.fillText(`warp ${q}`, left - 6, top + (q * 32 + 10) * ch);
+				ctx.fillText(`${q * 32}–${q * 32 + 31}`, left - 6, top + (q * 32 + 22) * ch);
+			}
+			ctx.textAlign = "center";
+			ctx.textBaseline = "top";
+			for (let c = 0; c <= TMEM_COLS; c += 64) {
+				const x = left + c * cw;
+				ctx.fillText(String(c), Math.min(Math.max(x, left + 8), left + TMEM_COLS * cw - 10), top + TMEM_LANES * ch + 4);
+			}
+		};
+
+		const show = (i: number) => {
+			plan = tmemPlan(presets[i]);
+			title.textContent = plan.title;
+			body.textContent = plan.body;
+			readout.textContent = hint;
+			const pal = dark.matches ? DARK : LIGHT;
+			legend.replaceChildren(
+				...plan.regions.map((r) => {
+					const item = document.createElement("span");
+					const sw = document.createElement("i");
+					sw.style.background = pal[r.group % 6];
+					item.append(sw, r.name);
+					return item;
+				}),
+			);
+			tabs.forEach((t, k) => {
+				t.setAttribute("aria-selected", String(k === i));
+			});
+			draw();
+		};
+
+		const hit = (e: MouseEvent) => {
+			const rect = canvas.getBoundingClientRect();
+			const col = Math.floor((e.clientX - rect.left - geom.left) / geom.cw);
+			const lane = Math.floor((e.clientY - rect.top - geom.top) / geom.ch);
+			if (lane < 0 || col < 0 || lane >= TMEM_LANES || col >= TMEM_COLS) return;
+			readout.textContent = describeCell(plan, lane, col);
+		};
+		canvas.addEventListener("mousemove", hit);
+		canvas.addEventListener("click", hit);
+		for (const t of tabs) t.addEventListener("click", () => show(Number(t.dataset.i)));
+		new ResizeObserver(() => draw()).observe(stage);
+		dark.addEventListener("change", () => show(Math.max(0, tabs.findIndex((t) => t.getAttribute("aria-selected") === "true"))));
+		show(0);
+	}
+</script>
+
+<style>
+	.tmem-map {
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+	}
+	.tm-tabs {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.3rem;
+		margin-bottom: 0.5rem;
+	}
+	.tm-tabs button {
+		padding: 0.25rem 0.6rem;
+		border: 1px solid var(--faint);
+		border-radius: 999px;
+		background: var(--bg);
+		color: var(--text);
+		font-size: 0.75rem;
+		cursor: pointer;
+	}
+	.tm-tabs button[aria-selected="true"] {
+		background: var(--accent);
+		border-color: var(--accent);
+		color: var(--bg);
+	}
+	.tm-title {
+		margin: 0 0 0.4rem;
+		font-weight: 600;
+		font-size: 0.88rem;
+	}
+	.tm-stage {
+		display: flex;
+		justify-content: center;
+	}
+	.tm-stage canvas {
+		display: block;
+		max-width: 100%;
+		cursor: crosshair;
+	}
+	.tm-legend {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.3rem 1rem;
+		margin-top: 0.35rem;
+		font-size: 0.75rem;
+		color: var(--muted);
+	}
+	.tm-legend :global(span) {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.35rem;
+	}
+	.tm-legend :global(i) {
+		display: inline-block;
+		width: 0.8rem;
+		height: 0.8rem;
+		border-radius: 2px;
+	}
+	.tm-readout {
+		margin: 0.35rem 0 0;
+		font-family: var(--mono);
+		font-size: 0.72rem;
+		text-align: center;
+		min-height: 1.2rem;
+	}
+	.tm-body {
+		margin: 0.4rem 0 0;
+		font-size: 0.8rem;
+	}
+	figcaption {
+		margin-top: 0.4rem;
+		font-size: 0.8rem;
+		color: var(--muted);
+		text-align: center;
+	}
+</style>

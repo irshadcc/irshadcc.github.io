@@ -1,0 +1,405 @@
+---
+title: "Warp MMA and Warpgroup MMA in the CuTe DSL, Mode by Mode"
+description: "How the CuTe DSL turns a matrix into the operands of one tensor-core instruction, for Ampere's warp-level mma.sync and Hopper's warpgroup-level wgmma. Starting from the plain M × K matrix, we derive every mode of tCsA, tCgC and tCrA: where k, PIPE, MMA, MMA_M, MMA_N and MMA_K come from, and why each has the size it has."
+date: 2026-10-13
+tags: [CUDA, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import MarginNote from "../../components/MarginNote.astro";
+import Matrix2D from "../../utils/matrix/Matrix2D.astro";
+import MmaPartitionSteps from "../../utils/gpu/MmaPartitionSteps.astro";
+import { mmaAtomFigures as F } from "../../utils/gpu/mmaAtomFigures";
+
+## Background
+
+A matrix multiply $D = A B + C$ on a modern NVIDIA GPU runs on **tensor cores**: units that
+multiply a small fixed-size block of matrices in one instruction. Ampere (SM80) issues these
+blocks from a single **warp** of 32 threads with `mma.sync`. Hopper (SM90) adds `wgmma`, issued by
+a **warpgroup** of four warps (128 threads), which works on blocks of up to $64 \times 256 \times 16$
+(against $16 \times 8 \times 16$ for `mma.sync`) and runs asynchronously. NVIDIA's CuTe DSL guides describe both: the
+[warp-level MMA guide](https://docs.nvidia.com/cutlass/4.5.3/media/docs/pythonDSL/mma_docs/wmma_programming.html)
+and the [warpgroup MMA guide](https://docs.nvidia.com/cutlass/4.5.3/media/docs/pythonDSL/mma_docs/wgmma_programming.html).
+
+Both guides lean on tensors with shapes like `tCsA: (MMA, MMA_M, MMA_K, PIPE)` and
+`tCrC: (MMA, MMA_M, MMA_N)`. Those shapes are the whole story of a GEMM kernel: they say what
+one thread (or one warpgroup) holds, how many instructions it issues along each dimension, and how
+many pipeline stages it cycles through. If you can derive each mode yourself, you can size tiles,
+predict register use and read the example kernels without guessing.
+
+This post derives them from scratch. It starts from the plain matrices of the GEMM, then covers,
+in order: the two instructions and their **thread-value layouts**; how `make_tiled_mma` repeats an
+instruction over several warps or warpgroups; a step-by-step derivation of every mode of
+`partition_A` and `partition_C`, first for the warp MMA and then for the warpgroup MMA; and how
+fragments become registers (warp MMA) or shared-memory descriptors (warpgroup MMA). It assumes the
+layout basics from [A Tour of the CuTe DSL](/blog/cute-dsl/) and
+[Mathematical Foundations for CuTe Layouts](/blog/mathematical-foundations-cute-layout/).
+
+## The GEMM and its names
+
+Take $C \mathrel{+}= A B$ with $A$ of size $M \times K$, $B$ of size $K \times N$ and $C$ of size
+$M \times N$. CuTe stores $B$ as an $N \times K$ tensor, so both operands have $K$ as their second
+mode. When the elements along $K$ are adjacent in memory the operand is **K-major**; the warp MMA
+requires this for both A and B, and the warpgroup MMA requires it for 8-bit types.<Sidenote>The
+warp guide: "A is row-major (K-major) and B is col-major (K-major); transpose is not supported at
+the instruction level." For wgmma, F16/BF16 also accepts MN-major A and B when A comes from
+shared memory.</Sidenote>
+
+The guides name tensors by a prefix for where they live and what they are a view of:
+
+| Name | Meaning | Example shape for A |
+| --- | --- | --- |
+| `mA` | the whole matrix in global memory (GMEM) | `(M, K)` |
+| `gA` | one CTA's tiles of it, still in GMEM | `(BM, BK, k)` |
+| `sA` | the shared-memory (SMEM) buffer | `(BM, BK, PIPE)` |
+| `tCsA` | `sA` partitioned for one thread of the MMA | `(MMA, MMA_M, MMA_K, PIPE)` |
+| `tCrA` | the fragment the MMA reads: registers, or SMEM descriptors | `(MMA, MMA_M, MMA_K)` |
+| `tCgC`, `tCrC` | C partitioned in GMEM, and its register accumulator | `(MMA, MMA_M, MMA_N)` |
+
+A **CTA** (cooperative thread array, a thread block) computes one $BM \times BN$ tile of C, with
+`cta_tiler = (BM, BN, BK)`. The rest of this post explains each mode in the last column.
+
+## Two instructions, two atoms
+
+CuTe wraps one hardware instruction in an **MMA atom**. The atom records the instruction's shape
+$(M, N, K)$, how many threads issue it, and for each operand a **thread-value (TV) layout**: a
+function from (thread, value) to the element of that operand's tile, so that thread $t$'s value
+$v$ is element `TV(t, v)`.<Sidenote>The TV layouts below are copied from CUTLASS's
+[`mma_traits_sm80.hpp`](https://github.com/NVIDIA/cutlass/blob/b9847690c5838ac3d909ebc163ed16c388802485/include/cute/atom/mma_traits_sm80.hpp)
+and [`mma_traits_sm90_gmma.hpp`](https://github.com/NVIDIA/cutlass/blob/b9847690c5838ac3d909ebc163ed16c388802485/include/cute/atom/mma_traits_sm90_gmma.hpp).
+The DSL builds the same atoms through its MLIR dialect.</Sidenote> The output offset is
+column-major in the tile: element $(m, k)$ of a $16 \times 16$ tile is offset $m + 16k$.
+
+| | Warp MMA | Warpgroup MMA |
+| --- | --- | --- |
+| PTX | `mma.sync.aligned.m16n8k16` | `wgmma.mma_async.sync.aligned.m64nNk16` |
+| Architecture | SM80+ | SM90a |
+| Threads per instruction | 32 (one warp) | 128 (one warpgroup) |
+| Shape $(M, N, K)$, F16/BF16 | $(16, 8, 16)$ | $(64, N, 16)$, $N = 8, 16, \ldots, 256$ |
+| A, B come from | registers | SMEM descriptors (A may also come from registers) |
+| Accumulator | registers | registers |
+| Issue model | synchronous | asynchronous: fence, commit, wait |
+| DSL op | `warp.MmaF16BF16Op` | `warpgroup.MmaF16BF16Op` |
+
+### The warp atom: `mma.sync` m16n8k16
+
+The atom `SM80_16x8x16_F32F16F16F32_TN` has these TV layouts:
+
+```text
+C_TV = ((4,8),(2,2)):((32,1),(16,8))           # (T32,V4) -> (M16,N8)
+A_TV = ((4,8),(2,2,2)):((32,1),(16,8,128))     # (T32,V8) -> (M16,K16)
+B_TV = ((4,8),(2,2)):((16,1),(8,64))           # (T32,V4) -> (N8,K16)
+```
+
+Read the thread mode $(4, 8)$ as lane $t = t_0 + 4 t_1$, so $t_0 = t \bmod 4$ and
+$t_1 = \lfloor t / 4 \rfloor$. For C, lane $t$'s value $v = v_0 + 2 v_1$ lands at offset
+$32 t_0 + t_1 + 16 v_0 + 8 v_1$. Since the tile has 16 rows, row $m$ is that offset mod 16 and
+column $n$ is the offset divided by 16:
+
+$$
+m = t_1 + 8 v_1, \qquad n = 2 t_0 + v_0 .
+$$
+
+So each lane holds two adjacent columns in two rows eight apart. The figure inverts the layout:
+each cell of the $16 \times 8$ C tile shows which lane (T) and which value (V) holds it, and
+cells of one lane share a colour.
+
+<Matrix2D name="C tile of one m16n8k16, offset m + 16n" {...F.c} />
+
+Check one lane by hand: lane 5 has $t_0 = 1$, $t_1 = 1$, so it holds rows 1 and 9, columns 2 and
+3. In the figure, row 1 columns 2 and 3 are `T5 V0` and `T5 V1`, and row 9 has `T5 V2` and
+`T5 V3`. This is the accumulator layout in the PTX ISA's fragment tables, with `groupID` $= t_1$
+and `threadID_in_group` $= t_0$.
+
+A has eight values per lane. The extra mode $v_2$ (stride 128, which is $8 \times 16$) moves to
+column $k + 8$, so lane $t$ holds rows $t_1$ and $t_1 + 8$ at columns $2t_0$, $2t_0 + 1$,
+$2t_0 + 8$ and $2t_0 + 9$. To fit the page, the figure splits $k = k_0 + 8 k_1$ and moves $k_1$
+into the rows: the top half is columns 0–7 and the bottom half, row label `(m,1)`, is columns
+8–15. The bottom half repeats the top half's lanes with V4–V7 in place of V0–V3.
+
+<Matrix2D name="A tile of one m16n8k16, k split as (8,2)" {...F.a} />
+
+B, stored as $N \times K$, gives lane $t$ row (column of $B$) $n = t_1$ and the same four $k$ values
+as A: lane 5 holds $n = 1$, $k \in \{2, 3, 10, 11\}$. The figure splits $k$ the same way.
+
+<Matrix2D name="B tile of one m16n8k16 as (n,k), k split as (8,2)" {...F.b} />
+
+### The warpgroup atom: `wgmma` m64nNk16
+
+The accumulator layout of every $64 \times N$ wgmma is
+
+```text
+CLayout_64xN = ((4,8,4),(2,2,N/8)):((128,1,16),(64,8,512))   # (T128,V) -> (M64,N)
+```
+
+Split the thread as $t = t_0 + 4 t_1 + 32 t_2$, so $t_2$ is the warp within the warpgroup. Working
+the offset out as before (the tile now has 64 rows) gives
+
+$$
+m = 16 t_2 + t_1 + 8 v_1, \qquad n = 2 t_0 + v_0 + 8 v_2 .
+$$
+
+This is the m16n8 pattern of `mma.sync` again: warp $t_2$ owns rows $16 t_2$ to $16 t_2 + 15$,
+and the pattern repeats in every 8-column block, $N/8$ times. Thread 37 (warp 1, lane 5) holds
+rows 17 and 25 at columns 2, 3, 10, 11, 18, 19, and so on. Each thread holds
+$2 \cdot 2 \cdot N/8 = N/2$ accumulators: 128 for $N = 256$.
+
+The A and B layouts are different in kind. When an operand comes from shared memory, the atom
+uses
+
+```text
+ABLayout<M,K> = (128,(M,K)):(0,(1,M))
+```
+
+The thread mode has stride 0: all 128 threads map to the **whole** $M \times K$ tile. No thread
+owns a piece of A or B. Instead the warpgroup passes the hardware a **shared-memory descriptor**,
+a 64-bit value with the tile's start address, swizzle mode and strides, and the tensor cores read
+the tile from shared memory themselves. When A comes from registers (`OperandSource.RMEM`), A gets
+a per-thread layout shaped like C's, `ALayout_64x16 = ((4,8,4),(2,2,2)):((128,1,16),(64,8,512))`,
+eight values per thread.
+
+## Tiling the atom: `make_tiled_mma`
+
+One instruction covers too little of a CTA tile, so `make_tiled_mma` repeats it. Its
+`atom_layout_mnk` says how many atoms run side by side along M, N and K, each issued by its own
+warp (or warpgroup). The Ampere example uses $(2, 2, 1)$: four warps, 128 threads.
+
+CuTe combines the atom's threads with this layout into `thr_layout_vmnk`, which maps a thread
+index to (lane, warp-M, warp-N, warp-K). For the warp MMA it is
+`(32,2,2,1):(1,32,64,128)`: thread $i$ is lane $i \bmod 32$ of warp $w = \lfloor i/32 \rfloor$,
+and warp $w$ sits at $(w \bmod 2, \lfloor w/2 \rfloor)$ in the M × N grid. Warp 1 is below warp
+0 and warp 2 is to its right, as in the guide's figure. For the warpgroup MMA with
+$(2, 1, 1)$ it is `(128,2,1,1)`: warpgroup 0 takes the top half of M, warpgroup 1 the bottom.
+
+The tiled MMA covers `atom_layout × atom shape`: $(32, 16, 16)$ for the warp example and
+$(128, 256, 16)$ for the warpgroup example with a $64 \times 256 \times 16$ atom.
+
+### What an integer `permutation_mnk` does
+
+The Ampere example passes `permutation_mnk = (32, 32, 16)`, twice the natural N coverage of 16. The
+guide's figure shows the atom pattern repeated along N. That repetition would happen anyway: with
+an **integer** permutation the partitions are the same as without one.<Sidenote>Checked with
+pycute by running CuTe's `thrfrg_A/B/C` steps on a $128 \times 128 \times 32$ CTA tile with
+permutations $(32, 16, 16)$ and $(32, 32, 16)$: every thread's A, B and C offsets are identical.
+An integer $n$ is the identity layout $n{:}1$, and dividing by it only regroups modes that
+coalesce back together.</Sidenote> What changes is the tiled MMA's **tile size**, which
+`make_tiled_copy_B` uses to build the shared-memory-to-register copy. With an N tile of 32 each
+thread's B slice in one $32 \times 16$ tile is 8 values, exactly what one `ldmatrix.x4` (four
+$8 \times 8$ matrices, four 32-bit registers per lane) delivers. With an N tile of 16 it would be
+4 values, enough only for `ldmatrix.x2`. The example's comment says the same: "to leverage the
+largest coalesced shared memory -> register copy, set the tiled mma's N mode to 16". A permutation
+given as a layout, such as `(4,4,2):(1,8,4)` in the guide, does reorder which coordinates each
+thread gets.
+
+## Deriving each mode, step by step
+
+`partition_A` follows CuTe's `thrfrg_A` ("thread fragment"). Leaving out the permutation, it does
+three things to an $(M, K)$ tile:
+
+1. **Divide by the atom shape** into `((AtomM, AtomK), (RestM, RestK))`: the inside of one
+   instruction, and which instruction-sized tile.
+2. **Compose the atom part with the TV layout**, turning `(AtomM, AtomK)` into
+   `(ThrV, FrgV)`: lane and value.
+3. **Divide the rest by the warp grid** into `((ThrM, ThrK), (MMA_M, MMA_K))`: which warp, and
+   which of that warp's repeats.
+
+Fixing the thread (lane from ThrV, warp from ThrM and ThrK) leaves
+`(FrgV, MMA_M, MMA_K)`, and any modes after the first two, such as `PIPE`, ride along at the end.
+FrgV is what the guides call `MMA`. So, in general,
+
+$$
+\text{MMA\_M} = \frac{BM}{\text{AtomM} \cdot \text{ThrM}}, \quad
+\text{MMA\_N} = \frac{BN}{\text{AtomN} \cdot \text{ThrN}}, \quad
+\text{MMA\_K} = \frac{BK}{\text{AtomK} \cdot \text{ThrK}} .
+$$
+
+`partition_C` is the same with N in place of K. The figures below run these steps on a real
+configuration. Step through with the buttons or the arrow keys, hover a cell to see its
+coordinate and owner, and change the thread in the box: the later steps follow that thread.
+
+### Operand A of the warp MMA
+
+This is a scaled-down version of the guide's example: GEMM $(256, 256, 128)$ instead of
+$(512, 512, 256)$, CTA tile $(64, 64, 32)$ instead of $(128, 128, 32)$, two stages instead of
+four. The atom and the $2 \times 2$ warp grid are the real ones.
+
+<MmaPartitionSteps preset="warp-A" thread={0} caption="From mA to thread 0's tCsA for mma.sync m16n8k16 with 2 × 2 warps. The highlighted part of the layout line is the mode the step adds." />
+
+Each step adds modes:
+
+- `local_tile` adds **k**, the number of K tiles: $K / BK = 128 / 32 = 4$.
+- The SMEM allocation adds **PIPE** = 2 stages. Tile $k$ goes to stage $k \bmod 2$.
+- Dividing a $64 \times 32$ stage by the $16 \times 16$ atom leaves a $4 \times 2$ grid of atom
+  tiles.
+- The warp grid takes $(\text{ThrM}, \text{ThrK}) = (2, 1)$ of that, leaving
+  **MMA_M** $= 64 / (16 \cdot 2) = 2$ and **MMA_K** $= 32 / (16 \cdot 1) = 2$. Warps 0 and 2
+  differ only in N, and A has no N mode, so they get the same A.<Sidenote>In the TV
+  computation, thread 64 (warp 2) gets exactly thread 0's layout and offset; thread 32 (warp 1)
+  gets the same layout shifted down 16 rows.</Sidenote>
+- The TV layout turns the $16 \times 16$ atom into **MMA** $= (2, 2, 2)$, eight values per lane.
+
+So `tCsA = ((2,2,2), 2, 2, 2)`, which is 64 values per thread across both stages and 32 per
+stage. A count confirms it: one stage has $64 \times 32 = 2048$ elements, each read by two warps,
+and $2 \cdot 2048 / 128$ threads $= 32$.
+
+At the guide's real size, $BM = 128$ and $PIPE = 4$, the same formulas give
+`tCsA = ((2,2,2), 4, 2, 4)`: MMA_M $= 128 / 32 = 4$, MMA_K $= 32 / 16 = 2$.
+
+### The accumulator of the warp MMA
+
+<MmaPartitionSteps preset="warp-C" thread={0} caption="From mC to thread 0's tCgC for the same tiled MMA. Each warp keeps a 2 × 4 grid of 16 × 8 atom tiles." />
+
+C has both M and N, so all four warps get different pieces. The $64 \times 64$ tile holds
+$4 \times 8$ atom tiles of $16 \times 8$; the $2 \times 2$ warp grid deals them out round-robin,
+leaving **MMA_M** $= 64 / (16 \cdot 2) = 2$ and **MMA_N** $= 64 / (8 \cdot 2) = 4$, and the C
+TV layout gives **MMA** $= (2, 2)$. So `tCgC = ((2,2), 2, 4)`: 32 accumulators, which matches
+$64 \cdot 64 / 128$. Thread 0 holds columns 0, 1, 16, 17, 32, 33, 48, 49 in rows 0, 8, 32 and 40.
+
+At the guide's size, $BN = 128$ gives MMA_N $= 128 / (8 \cdot 2) = 8$ and
+`tCgC = ((2,2), 4, 8)`: 128 accumulators per thread, $128 \cdot 128 / 128$.<Sidenote>The warp
+guide writes `tCgC: (MMA, 4, 4)` with "MMA_N = BN/perm_N = 4". Counting values shows MMA_N must
+be 8: with MMA $= 4$ and MMA_M $= 4$, a thread holds $4 \cdot 4 \cdot \text{MMA\_N}$ of the
+$128 \cdot 128 / 128 = 128$ accumulators. pycute gives `((2,2),4,8)`, and MMA_N for `tCsB` is 8
+for the same reason. The guide's MMA_M and MMA_K are right because there the permutation tile
+equals the natural atom coverage.</Sidenote> Likewise `tCsB = ((2,2), 8, 2, 4)`.
+
+### Operand A of the warpgroup MMA
+
+The warpgroup figures use the guide's own configuration: GEMM $(512, 768, 256)$, CTA tile
+$(128, 256, 64)$, a $64 \times 256 \times 16$ atom, `atom_layout_mnk = (2, 1, 1)` and four stages.
+
+<MmaPartitionSteps preset="wgmma-A" thread={0} caption="From mA to warpgroup 0's tensor of shared-memory descriptors for wgmma m64n256k16 with two warpgroups." />
+
+The first steps match the warp case: **k** $= 256 / 64 = 4$ and **PIPE** $= 4$. Dividing a
+$128 \times 64$ stage by the $64 \times 16$ atom leaves $2 \times 4$ atom tiles. The two
+warpgroups split M, leaving **MMA_M** $= 128 / (64 \cdot 2) = 1$ and
+**MMA_K** $= 64 / 16 = 4$.
+
+The difference is the **MMA** mode. Because the A layout's thread stride is 0, composing it with
+the atom tile keeps the whole tile: MMA $= (64, 16)$, 1024 elements, the same for all 128 threads
+of a warpgroup. So `tCsA = ((64,16), 1, 4, 4)`. It is a view, not a fragment: no thread will
+load those elements.
+
+### The accumulator of the warpgroup MMA
+
+<MmaPartitionSteps preset="wgmma-C" thread={0} caption="From mC to thread 0's accumulator for wgmma m64n256k16 with two warpgroups. Each warp of a warpgroup owns 16 rows." />
+
+One instruction covers $64 \times 256$, and the two warpgroups stack along M, so the tiled MMA
+covers the whole $128 \times 256$ CTA tile: **MMA_M** $= 128 / (64 \cdot 2) = 1$ and
+**MMA_N** $= 256 / 256 = 1$. Everything sits in the **MMA** mode, $(2, 2, 32)$: 128
+accumulators per thread, `tCgC = ((2,2,32), 1, 1)`. The guide's note says this is typical:
+the wgmma shape is so large that MMA_M and MMA_N are usually 1 and only MMA_K repeats.
+
+With one warpgroup and a $(128, 128, 64)$ tile and a $64 \times 128$ atom, the same formulas give
+MMA_M $= 128 / 64 = 2$, so `tCsA = ((64,16), 2, 4, 4)` and `tCgC = ((2,2,16), 2, 1)`: a single
+warpgroup now issues two instructions along M.
+
+### All the shapes at the guides' sizes
+
+| Tensor | Warp MMA, $(128,128,32)$, 2 × 2 warps, 4 stages | Warpgroup MMA, $(128,256,64)$, 2 warpgroups, 4 stages |
+| --- | --- | --- |
+| `gA` | `(128, 32, 8)` | `(128, 64, 4)` |
+| `sA` | `(128, 32, 4)` | `(128, 64, 4)` |
+| `tCsA` | `((2,2,2), 4, 2, 4)` | `((64,16), 1, 4, 4)` |
+| `tCsB` | `((2,2), 8, 2, 4)` | `((256,16), 1, 4, 4)` |
+| `tCgC` | `((2,2), 4, 8)` | `((2,2,32), 1, 1)` |
+| values of C per thread | 128 | 128 |
+
+Every entry was computed with pycute, CUTLASS's Python layout algebra, by running the steps of
+`thrfrg_A/B/C` from `mma_atom.hpp`, and the figures above use a TypeScript port that gives the
+same offsets for every thread checked.<Sidenote>The CuTe DSL itself needs a CUDA machine to run,
+so these shapes were not printed from a live kernel. The DSL computes partitions in its MLIR
+dialect with the same algorithm, so nesting may print differently (for example `(2,4)` instead of
+`8`), while sizes and offsets match.</Sidenote>
+
+## From partitions to fragments
+
+A **fragment** is the tensor an MMA instruction actually reads. This is where the two
+instruction families part ways.
+
+### Warp MMA: registers, filled by `ldmatrix`
+
+`mma.sync` reads A and B from registers, so `make_fragment_A` allocates a register tensor with
+one stage of `tCsA`'s shape:
+
+```python
+tCsA = thr_mma.partition_A(sA)                          # ((2,2,2), 4, 2, 4)
+tCrA = tiled_mma.make_fragment_A(tCsA[None, None, None, 0])  # ((2,2,2), 4, 2) registers
+tCrC = tiled_mma.make_fragment_C(thr_mma.partition_C(gC))    # ((2,2), 4, 8) registers
+```
+
+Nothing is loaded yet. Each k-block, an `ldmatrix` copy moves one `MMA_K` slice from SMEM into
+`tCrA`. `make_tiled_copy_A(atom, tiled_mma)` builds that copy so its thread-value layout matches
+the MMA's, and `retile(tCrA)` reshapes the fragment to the order `ldmatrix` writes. `tCsA` itself
+is never read: it only fixes the fragment's shape.
+
+### Warpgroup MMA: descriptors
+
+`wgmma` reads A and B from shared memory, so `make_fragment_A` makes a tensor of descriptors
+instead. In CUTLASS it replaces the MMA mode, the whole $64 \times 16$ tile, with a single
+element `1:0`, the descriptor that points at it:<Sidenote>`MakeTensor<GMMA::smem_desc>` in
+`mma_traits_sm90_gmma.hpp`: `replace<0>(recast<uint128_t const>(smem_tensor).layout(), Layout<_1,_0>{})`.</Sidenote>
+
+```python
+tCsA = thr_mma.partition_A(sA)        # ((64,16), 1, 4, 4)  SMEM view
+tCrA = tiled_mma.make_fragment_A(tCsA)  # (1, 1, 4, 4)       one descriptor per (MMA_M, MMA_K, PIPE)
+acc = cute.make_rmem_tensor(thr_mma.partition_C(gC).shape, cutlass.Float32)  # ((2,2,32), 1, 1)
+```
+
+There is no SMEM-to-register copy for A or B. Only the accumulator lives in registers. When A
+comes from registers instead (`OperandSource.RMEM`, as in the Hopper FMHA example, where the
+first GEMM's output feeds the second), A gets the per-thread `ALayout_64x16` and a real register
+fragment of shape `((2,2,2), MMA_M, MMA_K)`.
+
+## Running the main loop
+
+The warp main loop is synchronous. Each k-block loads the next A and B slices with `ldmatrix` and
+calls `cute.gemm`, which emits `mma.sync` instructions that finish in program order:
+
+```python
+for k_block in cutlass.range(num_k_block, unroll_full=True):
+    k_next = (k_block + 1) % num_k_block
+    cute.copy(tiled_copy_s2r_A, tCsA_p[None, None, k_next], tCrA_copy_view[None, None, k_next])
+    cute.copy(tiled_copy_s2r_B, tCsB_p[None, None, k_next], tCrB_copy_view[None, None, k_next])
+    cute.gemm(tiled_mma, tCrC, tCrA[None, None, k_block], tCrB[None, None, k_block], tCrC)
+```
+
+The warpgroup main loop is asynchronous. `cute.gemm` takes a whole stage, all MMA_K = 4
+descriptors, and queues four `wgmma` instructions. Three calls order them:
+
+```python
+cute.nvgpu.warpgroup.fence()                       # order earlier writes before the wgmmas below
+cute.gemm(tiled_mma, acc, tCrA[None, None, None, stage], tCrB[None, None, None, stage], acc)
+cute.nvgpu.warpgroup.commit_group()                # close this batch of wgmmas
+cute.nvgpu.warpgroup.wait_group(k_pipe_mmas)       # allow at most k_pipe_mmas batches in flight
+```
+
+`fence` orders earlier writes (the guide names shared memory; PTX's `wgmma.fence` also covers the
+accumulator registers) before the wgmmas read them, `commit_group` closes a batch, and
+`wait_group(n)` blocks until at most $n$ batches are still running, so the next stage's TMA load
+overlaps the current MMAs. A `wait_group(0)` after the loop drains everything before the epilogue.
+The warpgroup MMA also has an accumulate flag, `Field.ACCUMULATE`: `True` computes $D = AB + D$,
+`False` computes $D = AB$. The dense example zero-fills `acc` and sets it to `True`.
+
+## Summary
+
+- An MMA atom is one instruction plus a thread-value layout per operand. The warp atom
+  (m16n8k16) gives each lane 8 values of A, 4 of B and 4 of C; the warpgroup accumulator is the
+  same m16n8 pattern repeated over 4 warps and N/8 column blocks.
+- Every partition has the shape `(MMA, MMA_M, MMA_N or MMA_K, ...)`: MMA is the atom's values
+  for one thread, and each repeat count is the tile size divided by atom size times atoms along
+  that dimension. `k` comes from `local_tile` and `PIPE` from the SMEM allocation.
+- Warps that differ only in N share A, and warps that differ only in M share B.
+- For a wgmma operand in shared memory, the thread stride is 0, so MMA is the whole $64 \times 16$
+  tile and the fragment is a tensor of descriptors, `(1, MMA_M, MMA_K, PIPE)`. No thread loads A
+  or B.
+- An integer `permutation_mnk` leaves the partitions unchanged; it enlarges the tile used to build
+  the `ldmatrix` copy, so a warp can load B with `ldmatrix.x4`.
+
+## References
+
+- NVIDIA, [Warp-Level MMA Instructions Programming Guide](https://docs.nvidia.com/cutlass/4.5.3/media/docs/pythonDSL/mma_docs/wmma_programming.html), CUTLASS 4.5.3.
+- NVIDIA, [Warpgroup MMA Programming Guide](https://docs.nvidia.com/cutlass/4.5.3/media/docs/pythonDSL/mma_docs/wgmma_programming.html), CUTLASS 4.5.3.
+- CUTLASS, [`mma_atom.hpp`](https://github.com/NVIDIA/cutlass/blob/b9847690c5838ac3d909ebc163ed16c388802485/include/cute/atom/mma_atom.hpp) (`thrfrg_A/B/C`, `get_layoutB_TV`), [`mma_traits_sm80.hpp`](https://github.com/NVIDIA/cutlass/blob/b9847690c5838ac3d909ebc163ed16c388802485/include/cute/atom/mma_traits_sm80.hpp) and [`mma_traits_sm90_gmma.hpp`](https://github.com/NVIDIA/cutlass/blob/b9847690c5838ac3d909ebc163ed16c388802485/include/cute/atom/mma_traits_sm90_gmma.hpp), commit b984769.
+- CUTLASS CuTe DSL examples, [`ampere/tensorop_gemm.py`](https://github.com/NVIDIA/cutlass/blob/b9847690c5838ac3d909ebc163ed16c388802485/examples/python/CuTeDSL/ampere/tensorop_gemm.py) and [`hopper/dense_gemm.py`](https://github.com/NVIDIA/cutlass/blob/b9847690c5838ac3d909ebc163ed16c388802485/examples/python/CuTeDSL/hopper/dense_gemm.py).
+- NVIDIA, [PTX ISA](https://docs.nvidia.com/cuda/parallel-thread-execution/): the matrix fragment tables for `mma.m16n8k16`, and the asynchronous warpgroup-level `wgmma` instructions.

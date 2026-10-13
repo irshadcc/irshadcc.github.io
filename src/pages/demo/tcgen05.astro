@@ -1,0 +1,27 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import TmemMap from "../../utils/gpu/TmemMap.astro";
+import UmmaPipeline from "../../utils/gpu/UmmaPipeline.astro";
+import UmmaTileSteps from "../../utils/gpu/UmmaTileSteps.astro";
+---
+
+<Layout title="tcgen05 components demo">
+	<h1>tcgen05 components demo</h1>
+
+	<h2>TmemMap</h2>
+	<p>Every preset as a tab: accumulator layouts for M = 128, 64 and CTA pairs, A in TMEM, and the epilogue's lanes.</p>
+	<TmemMap presets={["acc-2stage", "m64", "pair-m128", "pair-m256", "a-tmem", "epilogue"]} />
+
+	<h2>UmmaTileSteps</h2>
+	<p>One CTA, starting at the partition step.</p>
+	<UmmaTileSteps preset="1cta" step={2} />
+	<p>A CTA pair, at the pair instruction.</p>
+	<UmmaTileSteps preset="2cta" step={3} />
+	<p>Row ownership with permutation_mnk.</p>
+	<UmmaTileSteps preset="perm" step={1} />
+
+	<h2>UmmaPipeline</h2>
+	<p>Default: 4 tiles of 4 k-blocks. Below, 6 tiles with 2 SMEM stages and a slow load (TMA = 2 units).</p>
+	<UmmaPipeline />
+	<UmmaPipeline tiles={6} abStages={2} tma={2} epi={2} />
+</Layout>

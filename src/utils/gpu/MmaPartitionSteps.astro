@@ -1,0 +1,456 @@
+---
+// Step-through derivation of a CuTe MMA partition: starts from the whole matrix (A or C), applies
+// local_tile, the shared-memory stages, the atom tiling, the warp / warpgroup split and the atom's
+// thread-value layout, and ends at one thread's fragment (tCsA, tCgC) or, for a wgmma A operand,
+// at the tensor of shared-memory descriptors (tCrA). Above the grid, the layout built so far, with
+// the mode the step adds highlighted. The grid is drawn on a canvas: one cell per block at the
+// matrix level, one per element after that. Hover a cell for its coordinate and owner; the thread
+// box picks the thread the later steps follow. Logic and atom layouts: mmaPartition.ts.
+//
+// Presets: "warp-A" and "warp-C" (Ampere mma.sync m16n8k16, 2×2 warps, 64×64×32 CTA tile, scaled
+// down from the 128×128×32 of NVIDIA's guide), "wgmma-A" and "wgmma-C" (Hopper wgmma m64n256k16,
+// 2 warpgroups, 128×256×64 CTA tile, as in NVIDIA's guide).
+// Usage in .mdx:
+//   <MmaPartitionSteps preset="warp-A" thread={0} />
+import { type Preset, buildSteps, threadCount } from "./mmaPartition";
+
+interface Props {
+	preset: Preset;
+	/** Thread followed by the later steps. */
+	thread?: number;
+	/** Step shown first. */
+	step?: number;
+	caption?: string;
+}
+
+const { preset, thread = 0, step = 0, caption } = Astro.props;
+const steps = buildSteps(preset, thread);
+const first = steps[step];
+const maxThread = threadCount(preset) - 1;
+---
+
+<figure class="mma-steps" data-preset={preset} data-thread={thread} data-step={step} tabindex="0">
+	<div class="mps-head">
+		<p class="mps-title">{first.title}</p>
+		<code class="mps-code">{first.code}</code>
+	</div>
+	<p class="mps-shape">{first.shape.map((s) => (s.hl ? <span class="new">{s.t}</span> : s.t))}</p>
+	<div class="mps-stage">
+		<canvas aria-label="Partition grid"></canvas>
+	</div>
+	<p class="mps-axes"></p>
+	<p class="mps-readout">Hover a cell for its coordinate and owner.</p>
+
+	<div class="controls">
+		<div class="buttons">
+			<button type="button" data-act="first" aria-label="First step">
+				<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 3v10M13 3 6 8l7 5z"></path></svg>
+			</button>
+			<button type="button" data-act="prev" aria-label="Previous step">
+				<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M11 3 4 8l7 5z"></path></svg>
+			</button>
+			<button type="button" data-act="play" class="play" aria-label="Play">
+				<svg class="i-play" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5v11L13.5 8z"></path></svg>
+				<svg class="i-pause" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 3h3v10H4zM9 3h3v10H9z"></path></svg>
+			</button>
+			<button type="button" data-act="next" aria-label="Next step">
+				<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 3l7 5-7 5z"></path></svg>
+			</button>
+		</div>
+		<div class="timeline" role="group" aria-label="Steps">
+			{steps.map((s, i) => <button type="button" class="seg" data-i={i} aria-label={s.title} title={s.title} />)}
+		</div>
+		<span class="counter">{step} / {steps.length - 1}</span>
+		<label class="mps-thread">
+			thread
+			<input type="number" min="0" max={maxThread} value={thread} />
+		</label>
+	</div>
+	<p class="mps-body">{first.body}</p>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import { buildSteps, type Grid, type Preset, type Step } from "./mmaPartition";
+
+	const hue = (k: number) => (25 + k * 137.508) % 360;
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".mma-steps")) {
+		const preset = fig.dataset.preset as Preset;
+		const canvas = fig.querySelector("canvas") as HTMLCanvasElement;
+		const stage = fig.querySelector(".mps-stage") as HTMLElement;
+		const title = fig.querySelector(".mps-title") as HTMLElement;
+		const code = fig.querySelector(".mps-code") as HTMLElement;
+		const shape = fig.querySelector(".mps-shape") as HTMLElement;
+		const body = fig.querySelector(".mps-body") as HTMLElement;
+		const axes = fig.querySelector(".mps-axes") as HTMLElement;
+		const readout = fig.querySelector(".mps-readout") as HTMLElement;
+		const counter = fig.querySelector(".counter") as HTMLElement;
+		const segs = [...fig.querySelectorAll<HTMLButtonElement>(".seg")];
+		const play = fig.querySelector<HTMLButtonElement>("[data-act=play]");
+		const threadInput = fig.querySelector<HTMLInputElement>(".mps-thread input");
+		const maxThread = Number(threadInput?.max ?? 0);
+		const dark = window.matchMedia("(prefers-color-scheme: dark)");
+
+		let thread = Number(fig.dataset.thread ?? 0);
+		let steps: Step[] = buildSteps(preset, thread);
+		let at = Number(fig.dataset.step ?? 0);
+		const last = steps.length - 1;
+		let timer: number | undefined;
+		// Cell geometry of the last draw, for hit testing.
+		let geom = { cw: 1, ch: 1, grid: steps[0].grid };
+
+		const css = (name: string) => getComputedStyle(fig).getPropertyValue(name).trim();
+
+		const draw = () => {
+			const grid: Grid = steps[at].grid;
+			const maxW = stage.clientWidth || 640;
+			const maxH = Math.min(440, Math.max(260, window.innerHeight * 0.5));
+			const totalW = grid.cols * grid.unitW;
+			const totalH = grid.rows * grid.unitH;
+			const scale = Math.min(maxW / totalW, maxH / totalH);
+			const w = totalW * scale;
+			const h = totalH * scale;
+			const dpr = window.devicePixelRatio || 1;
+			canvas.style.width = `${w}px`;
+			canvas.style.height = `${h}px`;
+			canvas.width = Math.round(w * dpr);
+			canvas.height = Math.round(h * dpr);
+			const ctx = canvas.getContext("2d");
+			if (!ctx) return;
+			ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+			const cw = grid.unitW * scale;
+			const ch = grid.unitH * scale;
+			geom = { cw, ch, grid };
+			const isDark = dark.matches;
+			const surface = css("--surface");
+			const text = css("--text");
+			const bg = css("--bg");
+			const accent = css("--accent");
+			ctx.clearRect(0, 0, w, h);
+			const gap = cw > 6 && ch > 6 ? 0.6 : 0;
+			for (let r = 0; r < grid.rows; r++)
+				for (let c = 0; c < grid.cols; c++) {
+					const i = r * grid.cols + c;
+					const g = grid.group[i];
+					const marked = grid.mark ? grid.mark[i] === 1 : true;
+					ctx.globalAlpha = grid.mark && !marked ? 0.28 : 1;
+					ctx.fillStyle =
+						g < 0 ? surface : `hsl(${hue(g).toFixed(1)} ${isDark ? "38%" : "62%"} ${isDark ? "36%" : "80%"})`;
+					ctx.fillRect(c * cw + gap / 2, r * ch + gap / 2, cw - gap, ch - gap);
+				}
+			ctx.globalAlpha = 1;
+			// Outline the cells a thread holds when the step follows one thread and few are marked.
+			if (grid.mark) {
+				let n = 0;
+				for (const m of grid.mark) n += m;
+				if (n <= 512) {
+					ctx.strokeStyle = accent;
+					ctx.lineWidth = Math.min(2, Math.max(1, cw / 6));
+					for (let i = 0; i < grid.mark.length; i++)
+						if (grid.mark[i]) {
+							const r = Math.floor(i / grid.cols);
+							const c = i % grid.cols;
+							ctx.strokeRect(c * cw + 0.5, r * ch + 0.5, cw - 1, ch - 1);
+						}
+				}
+			}
+			// Text inside cells, when it fits.
+			if (grid.text && cw >= 16 && ch >= 11) {
+				ctx.fillStyle = text;
+				ctx.textAlign = "center";
+				ctx.textBaseline = "middle";
+				const size = Math.min(12, ch * 0.55, cw * 0.32);
+				ctx.font = `${size}px ${css("--mono") || "monospace"}`;
+				for (let i = 0; i < grid.text.length; i++) {
+					const t = grid.text[i];
+					if (!t) continue;
+					const r = Math.floor(i / grid.cols);
+					const c = i % grid.cols;
+					ctx.fillText(t, c * cw + cw / 2, r * ch + ch / 2, cw - 2);
+				}
+			}
+			// Boxes and their labels.
+			ctx.strokeStyle = text;
+			ctx.globalAlpha = 0.75;
+			ctx.lineWidth = 1;
+			for (const b of grid.boxes) ctx.strokeRect(b.c0 * cw + 0.5, b.r0 * ch + 0.5, (b.c1 - b.c0) * cw - 1, (b.r1 - b.r0) * ch - 1);
+			ctx.globalAlpha = 1;
+			ctx.font = `600 10px ${css("--sans") || "sans-serif"}`;
+			ctx.textAlign = "left";
+			ctx.textBaseline = "top";
+			for (const b of grid.boxes) {
+				if (!b.label) continue;
+				const bw = (b.c1 - b.c0) * cw;
+				const tw = ctx.measureText(b.label).width;
+				if (bw < tw + 6 || (b.r1 - b.r0) * ch < 14) continue;
+				ctx.fillStyle = bg;
+				ctx.fillRect(b.c0 * cw + 2, b.r0 * ch + 2, tw + 4, 12);
+				ctx.fillStyle = text;
+				ctx.fillText(b.label, b.c0 * cw + 4, b.r0 * ch + 3);
+			}
+			const unit =
+				grid.unitH === 1 && grid.unitW === 1 ? "one cell = one element" : `one cell = a ${grid.unitH} × ${grid.unitW} block`;
+			axes.textContent = `rows: ${grid.rowName} (${grid.rows * grid.unitH}), columns: ${grid.colName} (${grid.cols * grid.unitW}); ${unit}`;
+		};
+
+		const render = () => {
+			const s = steps[at];
+			title.textContent = s.title;
+			code.textContent = s.code;
+			shape.replaceChildren(
+				...s.shape.map((p) => {
+					if (!p.hl) return document.createTextNode(p.t);
+					const span = document.createElement("span");
+					span.className = "new";
+					span.textContent = p.t;
+					return span;
+				}),
+			);
+			body.textContent = s.body;
+			counter.textContent = `${at} / ${last}`;
+			segs.forEach((b, k) => {
+				b.classList.toggle("done", k <= at);
+				b.setAttribute("aria-current", String(k === at));
+			});
+			fig.classList.toggle("uses-thread", s.usesThread);
+			readout.textContent = "Hover a cell for its coordinate and owner.";
+			draw();
+		};
+
+		const go = (i: number) => {
+			at = Math.min(Math.max(0, i), last);
+			render();
+		};
+		const stop = () => {
+			if (timer !== undefined) clearInterval(timer);
+			timer = undefined;
+			play?.classList.remove("playing");
+			play?.setAttribute("aria-label", "Play");
+		};
+		const start = () => {
+			if (at >= last) go(0);
+			play?.classList.add("playing");
+			play?.setAttribute("aria-label", "Pause");
+			timer = window.setInterval(() => {
+				if (at >= last) stop();
+				else go(at + 1);
+			}, 2600);
+		};
+
+		for (const b of fig.querySelectorAll<HTMLButtonElement>("[data-act]"))
+			b.addEventListener("click", () => {
+				const act = b.dataset.act;
+				if (act === "play") return timer === undefined ? start() : stop();
+				stop();
+				if (act === "first") go(0);
+				if (act === "prev") go(at - 1);
+				if (act === "next") go(at + 1);
+			});
+		for (const b of segs)
+			b.addEventListener("click", () => {
+				stop();
+				go(Number(b.dataset.i));
+			});
+		fig.addEventListener("keydown", (e) => {
+			if (e.target instanceof HTMLInputElement) return;
+			if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+			e.preventDefault();
+			stop();
+			go(at + (e.key === "ArrowRight" ? 1 : -1));
+		});
+		threadInput?.addEventListener("change", () => {
+			const t = Math.min(maxThread, Math.max(0, Math.round(Number(threadInput.value) || 0)));
+			threadInput.value = String(t);
+			thread = t;
+			steps = buildSteps(preset, thread);
+			render();
+		});
+
+		const hit = (e: MouseEvent) => {
+			const rect = canvas.getBoundingClientRect();
+			const c = Math.floor((e.clientX - rect.left) / geom.cw);
+			const r = Math.floor((e.clientY - rect.top) / geom.ch);
+			if (r < 0 || c < 0 || r >= geom.grid.rows || c >= geom.grid.cols) return;
+			readout.textContent = geom.grid.describe(r, c);
+		};
+		canvas.addEventListener("mousemove", hit);
+		canvas.addEventListener("click", hit);
+
+		new ResizeObserver(() => draw()).observe(stage);
+		dark.addEventListener("change", draw);
+		render();
+	}
+</script>
+
+<style>
+	.mma-steps {
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+		outline: none;
+	}
+	.mps-head {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: baseline;
+		gap: 0.3rem 0.8rem;
+	}
+	.mps-title {
+		margin: 0;
+		font-weight: 600;
+		font-size: 0.9rem;
+	}
+	.mps-code {
+		font-family: var(--mono);
+		font-size: 0.72rem;
+		color: var(--muted);
+		overflow-wrap: anywhere;
+	}
+	.mps-shape {
+		margin: 0.4rem 0 0.6rem;
+		padding: 0.35rem 0.55rem;
+		border-radius: 6px;
+		background: var(--surface);
+		font-family: var(--mono);
+		font-size: 0.78rem;
+		overflow-wrap: anywhere;
+	}
+	.mps-shape :global(.new) {
+		padding: 0 0.15rem;
+		border-radius: 3px;
+		background: var(--accent);
+		color: var(--bg);
+	}
+	.mps-stage {
+		display: flex;
+		justify-content: center;
+		min-height: 120px;
+	}
+	.mps-stage canvas {
+		display: block;
+		cursor: crosshair;
+		max-width: 100%;
+	}
+	.mps-axes,
+	.mps-readout {
+		margin: 0.3rem 0 0;
+		font-size: 0.74rem;
+		color: var(--muted);
+		text-align: center;
+	}
+	.mps-readout {
+		font-family: var(--mono);
+		color: var(--text);
+		min-height: 1.2rem;
+	}
+
+	.controls {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 0.6rem 0.75rem;
+		margin-top: 0.5rem;
+	}
+	.buttons {
+		display: flex;
+		gap: 0.3rem;
+	}
+	.buttons button {
+		display: grid;
+		place-items: center;
+		width: 2rem;
+		height: 2rem;
+		padding: 0;
+		border: 1px solid var(--faint);
+		border-radius: 8px;
+		background: var(--bg);
+		color: var(--text);
+		cursor: pointer;
+		transition: border-color 150ms ease;
+	}
+	.buttons button:hover {
+		border-color: var(--accent);
+	}
+	.buttons svg {
+		width: 0.8rem;
+		height: 0.8rem;
+		fill: currentColor;
+		stroke: currentColor;
+		stroke-width: 1.2;
+		stroke-linejoin: round;
+	}
+	.buttons .play {
+		width: 2.6rem;
+		background: var(--accent);
+		border-color: var(--accent);
+		color: var(--bg);
+	}
+	.play .i-pause,
+	.play.playing .i-play {
+		display: none;
+	}
+	.play.playing .i-pause {
+		display: block;
+	}
+	.timeline {
+		flex: 1;
+		min-width: 8rem;
+		display: flex;
+		gap: 3px;
+	}
+	.seg {
+		flex: 1;
+		height: 0.55rem;
+		padding: 0;
+		border: 0;
+		border-radius: 3px;
+		background: var(--faint);
+		cursor: pointer;
+	}
+	.seg.done {
+		background: var(--accent);
+	}
+	.seg[aria-current="true"] {
+		outline: 2px solid var(--text);
+		outline-offset: 1px;
+	}
+	.counter {
+		font-family: var(--mono);
+		font-size: 0.75rem;
+		color: var(--muted);
+		min-width: 3.2rem;
+		text-align: right;
+	}
+	.mps-thread {
+		display: flex;
+		align-items: center;
+		gap: 0.35rem;
+		font-size: 0.75rem;
+		color: var(--muted);
+	}
+	.mma-steps.uses-thread .mps-thread {
+		color: var(--accent);
+		font-weight: 600;
+	}
+	.mps-thread input {
+		width: 4.2rem;
+		padding: 0.2rem 0.3rem;
+		border: 1px solid var(--faint);
+		border-radius: 6px;
+		background: var(--bg);
+		color: var(--text);
+		font-family: var(--mono);
+		font-size: 0.75rem;
+	}
+	.mps-body {
+		margin: 0.5rem 0 0;
+		font-size: 0.8rem;
+		min-height: 4.6rem;
+	}
+	figcaption {
+		margin-top: 0.4rem;
+		font-size: 0.8rem;
+		color: var(--muted);
+		text-align: center;
+	}
+</style>

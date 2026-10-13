@@ -1,0 +1,28 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import MmaPartitionSteps from "../../utils/gpu/MmaPartitionSteps.astro";
+---
+
+<Layout title="MmaPartitionSteps demo">
+	<h1>MmaPartitionSteps demo</h1>
+
+	<h2>Warp MMA, operand A</h2>
+	<p>
+		mma.sync m16n8k16 with 2 × 2 warps on a 64 × 64 × 32 CTA tile and two stages, following thread 37 (warp 1,
+		lane 5). Starts at the warp step.
+	</p>
+	<MmaPartitionSteps preset="warp-A" thread={37} step={4} />
+	<p>The same figure at its last step: thread 37's 32 values per stage, numbered by their index in tCsA.</p>
+	<MmaPartitionSteps preset="warp-A" thread={37} step={6} />
+
+	<h2>Warp MMA, accumulator</h2>
+	<p>Thread 0's 32 accumulators, at the last step.</p>
+	<MmaPartitionSteps preset="warp-C" thread={0} step={5} />
+
+	<h2>Warpgroup MMA, operand A</h2>
+	<p>wgmma m64n256k16 with two warpgroups, following thread 200 (warpgroup 1). Starts at the last step, the descriptor tensor tCrA.</p>
+	<MmaPartitionSteps preset="wgmma-A" thread={200} step={6} />
+
+	<h2>Warpgroup MMA, accumulator</h2>
+	<MmaPartitionSteps preset="wgmma-C" thread={37} step={5} caption="Thread 37: rows 17 and 25 in every 8-column block." />
+</Layout>

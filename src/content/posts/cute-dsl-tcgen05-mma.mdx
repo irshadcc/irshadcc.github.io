@@ -1,0 +1,559 @@
+---
+title: "Blackwell's tcgen05 MMA in the CuTe DSL"
+description: "How a Blackwell (SM100) GEMM kernel drives the fifth-generation tensor core from the CuTe Python DSL: one thread issues each MMA, the accumulator lives in Tensor Memory instead of registers, and two CTAs can share one instruction. We follow a tile from global memory to TMEM and back, with every shape worked out on NVIDIA's 512 × 768 × 384 example."
+date: 2026-10-13
+tags: [CUDA, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import MarginNote from "../../components/MarginNote.astro";
+import BoxDiagram from "../../utils/payments/BoxDiagram.astro";
+import TmemMap from "../../utils/gpu/TmemMap.astro";
+import UmmaTileSteps from "../../utils/gpu/UmmaTileSteps.astro";
+import UmmaPipeline from "../../utils/gpu/UmmaPipeline.astro";
+import { tcgen05FlowNodes, tcgen05FlowEdges } from "../../utils/gpu/tcgen05Figures";
+
+## Background
+
+On Ampere and Hopper, the result of a matrix multiply sits in registers while the kernel runs.
+A warp's `mma.sync` or a warpgroup's `wgmma` adds its product into registers spread over 32 or
+128 threads. That puts a ceiling on the tile a CTA can compute. A $128 \times 256$ FP32
+accumulator is 128 KiB. Spread over the 128 threads of a warpgroup, that is 256 registers per
+thread, more than the 255 a thread can address. So on Hopper the tile has to be split over
+several warpgroups.
+
+Blackwell (SM100) removes the ceiling. Its fifth-generation tensor-core instructions,
+**tcgen05**, keep the accumulator in **Tensor Memory (TMEM)**, a new 256 KiB on-chip memory next
+to the tensor cores. A single thread issues each multiply. Two neighbouring CTAs can also run one
+instruction together, which doubles the tile again. NVIDIA's
+[tcgen05 MMA Programming Guide](https://docs.nvidia.com/cutlass/4.5.3/media/docs/pythonDSL/mma_docs/tcgen05_programming.html)
+for the CuTe Python DSL describes how to program it, and puts its throughput at 2–4× Hopper's
+`wgmma`, depending on data type.
+
+This post works through that guide in order, drawing each step:
+
+1. what changed from `mma.sync` and `wgmma`, and the data flow of a tcgen05 GEMM;
+2. Tensor Memory: its lanes and columns, how an accumulator is laid out in it, and which warp
+   can read which part;
+3. building the MMA op and the tiled MMA;
+4. partitioning the matrices, for one CTA, for a CTA pair, and with a permutation;
+5. the fragments: shared-memory descriptors for A and B, a TMEM tensor for the accumulator;
+6. the main loop, overlapping it with the epilogue, and reading the result back out of TMEM;
+7. block-scaled MMAs for FP8 and FP4.
+
+It builds on [Warp MMA and Warpgroup MMA in the CuTe DSL](/blog/cute-dsl-warp-and-warpgroup-mma/),
+which derives the `(MMA, MMA_M, MMA_K)` modes for the older instructions, and on
+[A Tour of the CuTe DSL](/blog/cute-dsl/) for layouts. I could not run any of the kernels here,
+since they need a Blackwell GPU. Every shape and layout below was computed from CUTLASS's layout
+definitions with scripts, as the sidenotes say.
+
+## What tcgen05 changes
+
+Three instruction generations side by side, for FP16 inputs and an FP32 accumulator:
+
+| | `mma.sync` (SM80) | `wgmma` (SM90a) | `tcgen05.mma` (SM100a) |
+| --- | --- | --- | --- |
+| Threads that issue one instruction | 32 | 128 | 1 |
+| Largest shape $M \times N \times K$ | $16 \times 8 \times 16$ | $64 \times 256 \times 16$ | $128 \times 256 \times 16$; $256 \times 256 \times 16$ on a CTA pair |
+| FLOPs per instruction | 4,096 | 524,288 | 1,048,576; 2,097,152 on a pair |
+| A comes from | registers | SMEM or registers | SMEM or TMEM |
+| B comes from | registers | SMEM | SMEM |
+| Accumulator | registers | registers | TMEM |
+| Completion | synchronous | `wgmma.wait_group` | `tcgen05.commit` signals an mbarrier |
+
+Each row changes how a kernel is written:
+
+- **One thread issues.** A whole warpgroup no longer has to agree to start an MMA. One thread
+  issues it and moves on, and the other warps are free to load data or run the epilogue. Kernels
+  therefore split into roles: a TMA producer, an MMA issuer, and epilogue warps.
+- **The accumulator is not in registers.** The MMA writes to TMEM. To read the result, threads
+  copy it from TMEM into registers with `tcgen05.ld`, a step that `mma.sync` and `wgmma`
+  kernels never needed.
+- **CTA pairs.** With `cta_group::2`, two CTAs in a cluster run one instruction together. Each
+  CTA keeps half of A and half of B in its shared memory, and each gets half of the accumulator in
+  its own TMEM.
+- **Completion goes through an mbarrier.** `tcgen05.commit` makes an **mbarrier** (a
+  shared-memory barrier object that threads can wait on) fire once all earlier MMAs from that
+  thread have finished. This is how the issuer tells the producer that a shared-memory buffer has
+  been read and can be refilled.<Sidenote>PTX ISA, "Issue Granularity" (§9.7.18.5): `.mma`,
+  `.cp`, `.shift` and `.commit` are issued "from a single thread in the current CTA", or "from a
+  single thread from the CTA-Pair" for `cta_group::2`. `.alloc` and `.dealloc` are issued by one
+  warp; `.ld` and `.st` by a warp that "can access only 1/4 of the Tensor Memory".</Sidenote>
+
+### The data flow of one GEMM
+
+The guide's overview diagram has three tracks: operand A, operand B, and the accumulator. Here
+it is drawn as boxes. A and B share a track because their paths are the same. Click a box to read
+what it does.
+
+<BoxDiagram
+	nodes={tcgen05FlowNodes}
+	edges={tcgen05FlowEdges}
+	selected="tmem"
+	grid={{ cellW: 104, gapX: 64 }}
+	title="Data flow of a tcgen05 GEMM: GMEM → SMEM → tensor core → TMEM → registers → GMEM"
+/>
+
+Two copies happen for the inputs and two for the output. TMA moves A and B from global to
+shared memory, and the tensor core reads them from there directly. The accumulator stays in TMEM
+for the whole K loop. Only at the end do the epilogue warps copy it to registers and then store
+it to global memory. The guide's naming follows the same flow:
+
+| Name | What it is | Shape (A shown) |
+| --- | --- | --- |
+| `mA` | the matrix in global memory (GMEM) | `(M, K)` |
+| `gA` | the CTA's tiles of it, from `local_tile` | `(BM, BK, k)` |
+| `tCgA` | `gA` cut into per-instruction pieces by `partition_A` | `(MMA, MMA_M, MMA_K, k)` |
+| `sA` | the staged shared-memory (SMEM) buffer that TMA fills | `(MMA, MMA_M, MMA_K, STAGE)` |
+| `tCrA` | SMEM descriptors over `sA`, what the MMA reads | `(MMA, MMA_M, MMA_K, STAGE)` |
+| `tAgA`, `tAsA` | `tCgA` and `sA` partitioned for the TMA copy | |
+| `tCtAcc` | the accumulator in TMEM | `(MMA, MMA_M, MMA_N[, ACC_STAGE])` |
+| `tTR_*` | tensors partitioned for the TMEM → register copy | |
+
+`mma_tiler_mnk = (BM, BN, BK)` is the tile one CTA computes, or one CTA pair with
+`cta_group::2`. The `tC` prefix means "partitioned by the MMA, in C's coordinates".
+
+## Tensor Memory
+
+### Lanes, columns and addresses
+
+TMEM is a two-dimensional array per SM, owned by the CTA running there: **128 lanes** (rows) by
+**512 columns**, each cell 32 bits, so $128 \times 512 \times 4$ B $= 256$ KiB. A TMEM
+address is 32 bits: the lane in the upper 16 bits and the column in the lower 16.<Sidenote>PTX
+ISA §9.7.18.1: "512 columns and 128 rows per CTA, with each cell being 32-bits in size", and
+§9.7.18.1.1 for the address format. CUTLASS writes the same limit as
+`MAX_CAPACITY_BITS = Int<128*512*32>` in
+[`tmem_allocator_sm100.hpp`](https://github.com/NVIDIA/cutlass/blob/b9847690c5838ac3d909ebc163ed16c388802485/include/cute/arch/tmem_allocator_sm100.hpp#L46).</Sidenote>
+
+A kernel allocates TMEM by columns. One warp runs `tcgen05.alloc` with a power-of-two column
+count of at least 32, and every allocated column comes with all 128 lanes. The kernel must free
+the columns before it exits.
+
+For the guide's main example, an M = 128 instruction with N = 256 and an FP32 accumulator, the
+layout is as simple as it can be: row $m$ of the tile is lane $m$ and column $n$ is TMEM column
+$n$. One $128 \times 256$ accumulator therefore takes 256 columns, half of TMEM. The guide
+allocates two of them so the MMA can fill one while the epilogue empties the other. Hover a cell
+to see which accumulator element it holds.
+
+<TmemMap presets={["acc-2stage"]} />
+
+Check one cell: element $(m, n) = (5, 44)$ of stage 1 is in lane 5 and column $256 + 44 = 300$,
+so its address is $5 \cdot 2^{16} + 300$ = `0x0005012c`. Hovering lane 5, column 300 in the
+figure shows "stage 1, (m, n) = (5, 44)".<Sidenote>The map is `UMMA::tmem_frg::make` in
+[`mma_traits_sm100.hpp`](https://github.com/NVIDIA/cutlass/blob/b9847690c5838ac3d909ebc163ed16c388802485/include/cute/atom/mma_traits_sm100.hpp#L461).
+It builds the layout `(128, N):(1, 128)` in "virtual" addresses (lane stride 1, column stride 128),
+tiles the stage mode with `tiled_product`, and then converts to real lane/column addresses. I
+recomputed that composition with the blog's layout code for every element of every layout in
+this section and compared it with the closed forms the figure uses: all 65,536 + 16,384 + 16,384 +
+32,768 elements match. Addresses are relative to the column `tcgen05.alloc` returns, which is 0
+when the kernel allocates all 512 columns.</Sidenote>
+
+### Which warp can read which lane
+
+TMEM cannot be read by any thread at will. A warp's position in its warpgroup, $w = $ warp id
+mod 4, fixes the 32 lanes it can reach: lanes $32w$ to $32w + 31$. Every warp can reach every
+column. Reading the whole accumulator therefore takes a full warpgroup of four warps, one per
+quarter of the rows. This is why the guide's kernels launch 128 threads per CTA even though only
+one thread issues MMAs.
+
+The epilogue uses `tcgen05.ld` with the `32x32b` shape: each of a warp's 32 threads reads one
+lane, 32 bits per column, and the `.x64` repetition reads 64 consecutive columns. The tutorial
+kernel `fp16_gemm_0.py` cuts the 256 columns into 4 sub-tiles of 64, so each thread does 4
+loads of 64 registers each. Thread 37 is lane 5 of warp 1, so it reads TMEM lane $32 + 5 = 37$,
+which is row 37 of the tile. The highlighted strip below is its second load: columns 64–127.
+
+<TmemMap presets={["epilogue"]} />
+
+### Other accumulator shapes
+
+Only M = 128 (one CTA) and M = 256 (a pair) fill all 128 lanes with one row each. The other
+shapes in the PTX table use a different **datapath layout**, and the tabs below show three of
+them, plus operand A stored in TMEM:
+
+- **M = 64, one CTA.** The instruction uses only 16 lanes of each 32-lane sub-partition. Row
+  $m$ lands in lane $(m \bmod 16) + 32 \lfloor m / 16 \rfloor$, so rows 16–31 go to lanes 32–47.
+  CuTe's default `Interleaved` mode puts a second tile in the unused halves, at the same columns.
+- **M = 128 on a pair**, 64 rows per CTA. Each CTA's $64 \times 256$ half is folded: columns
+  0–127 in lanes 0–63 and columns 128–255 in lanes 64–127. It needs only 128 columns.
+- **M = 256 on a pair**, 128 rows per CTA. Each CTA's half looks exactly like a one-CTA M = 128
+  accumulator.
+- **A in TMEM.** With `OperandSource.TMEM`, operand A sits after the accumulator's columns. A
+  cell holds two FP16 values, so a $128 \times 64$ FP16 block of A needs 32 columns.
+
+<TmemMap
+	presets={["m64", "pair-m128", "pair-m256", "a-tmem"]}
+	caption="Click the tabs. Hatched columns are not allocated."
+/>
+
+Check one M = 64 entry: row 17, column 3 is lane $(17 \bmod 16) + 32 \cdot 1 = 33$, column 3.
+Warp 1 is the warp that can read it.<Sidenote>PTX ISA §9.7.18.10.5, "Data Path Layout
+Organization", lists M = 64 with `cta_group::1` as "4x1 (1/2 datapath utilized)" with lane
+alignment 0 or 16; dense M = 128 with `cta_group::2` as "2x2"; and M = 128 (`::1`) and M = 256
+(`::2`) as "4x1". CUTLASS's three branches of `tmem_frg::make` implement exactly these.</Sidenote>
+
+## Building the MMA
+
+### The MMA op
+
+An **MMA op** names one hardware instruction: element types, shape, CTA group, where A comes
+from, and the major mode of each operand. The guide's running example:
+
+```python
+op = tcgen05.MmaF16BF16Op(
+    cutlass.Float16,              # A/B element type
+    cutlass.Float32,              # accumulator type
+    (128, 256, 16),               # instruction shape (M, N, K)
+    tcgen05.CtaGroup.ONE,         # one CTA, not a pair
+    tcgen05.OperandSource.SMEM,   # A from shared memory
+    OperandMajorMode.K,           # A is K-major
+    OperandMajorMode.K,           # B is K-major
+)
+```
+
+**K-major** means elements adjacent along K are adjacent in memory. Both operands are stored
+with K as the second mode, A as `(M, K)` and B as `(N, K)`. `OperandMajorMode.MN` transposes an
+operand. That is allowed only when it comes from SMEM: A read from TMEM is always K-major.
+
+The instruction's K is not a free choice. One instruction always consumes 256 bits of K per row,
+so K = 16 for FP16 and BF16, 8 for TF32, 32 for 8-bit types and 64 for FP4.<Sidenote>
+`mma_traits_sm100.hpp`: "Logical shape-K is always 256bits, transform to units of elements",
+`K = 256 / sizeof_bits<ValTypeA>`. The guide's block-scaled examples match: `(128, 256, 32)` for
+FP8 and `(128, 256, 64)` for NVFP4.</Sidenote> M and N are limited too. For dense FP16 the PTX
+ISA allows:
+
+| CTA group | M | N | K |
+| --- | ---: | --- | ---: |
+| `ONE` | 64 or 128 | 8 to 256, in steps of 8 | 16 |
+| `TWO` | 128 or 256 | 16 to 256, in steps of 16 | 16 |
+
+With `CtaGroup.TWO`, M is the size of the whole pair's tile. An op built with `(256, 256, 16)`
+gives each CTA 128 rows. The guide's two-CTA example calls this atom "128x256x16" because it
+counts rows per CTA.
+
+The DSL has one op class per PTX `kind`: `MmaTF32Op`, `MmaF16BF16Op`, `MmaI8Op`,
+`MmaF8F6F4Op`, and the block-scaled `MmaMXF8F6F4Op`, `MmaMXF4Op` and `MmaMXF4NVF4Op`.
+
+### The tiled MMA
+
+`cute.make_tiled_mma(op)` wraps the op in an atom and the atom in a **tiled MMA**, the object
+the partitioning functions take. As with older instructions, `atom_layout_mnk` repeats the atom.
+`make_tiled_mma(atom, (2, 2, 1))` places $2 \times 2$ atoms over a $256 \times 512$ tile. CuTe
+names each atom by a coordinate $(v, m, n, k)$, where $v$ is the CTA inside an atom: always 0 for
+`CtaGroup.ONE`, 0 or 1 for `CtaGroup.TWO`.
+
+For the older instructions the "threads" of a tiled MMA were real threads. For tcgen05 the atom
+has one thread (`ThrID = 1`) for one CTA or two for a pair, and those "threads" are CTAs.
+`get_slice(i)` takes such an index, not a thread index.<Sidenote>From the atom traits in
+`mma_traits_sm100.hpp`, 1-SM atoms have `ThrID = Layout<_1>` and A layout
+`(1, (M, K)):(0, (1, M))`; 2-SM atoms have `ThrID = Layout<_2>` and A layout
+`(2, (M/2, K)):(M/2, (1, M))`, so the "thread" index $v$ picks rows $v \cdot M/2$ onward. With
+`(2, 2, 1)` one-CTA atoms, `get_slice(0..3)` picks the atom at $(m, n) = (0,0), (1,0), (0,1), (1,1)$;
+the slice's shape stays `((128,256),1,1)` for C.</Sidenote>
+
+Since one tcgen05 instruction is already as large as a whole Hopper CTA tile, most kernels use a
+**trivial tiled MMA**: one atom, no repetition, no permutation. `make_trivial_tiled_mma` in
+`cutlass.utils.blackwell_helpers` builds one from the data types, major modes, CTA group and
+`mma_tiler_mn`, and picks the op class for you. For FP16 it creates
+`MmaF16BF16Op(..., (*mma_tiler_mn, 16), ...)`, so the instruction's M and N are the tile's.
+
+## Partitioning, step by step
+
+### One CTA
+
+The guide's first example is a GEMM with $(M, N, K) = (512, 768, 384)$, an
+`mma_tiler_mnk` of $(128, 256, 64)$ and the m128n256k16 atom with `CtaGroup.ONE`. Step through
+it below. Each step shows the matrices or buffers it touches at one scale, and the shapes it
+produces. Hover a block for its rows and columns.
+
+<UmmaTileSteps preset="1cta" />
+
+The numbers in each step come from dividing the problem by the tile, then the tile by the
+instruction:
+
+- **Tiles.** $512 / 128 = 4$ tiles in M, $768 / 256 = 3$ in N, $384 / 64 = 6$ in K. That is
+  12 CTAs, each running a 6-iteration main loop.
+- **`local_tile`.** The CTA at `mma_coord = (0, 1)` gets
+  `gA: (128, 64, 6)`, `gB: (256, 64, 6)` and `gC: (128, 256)`. Check one entry:
+  `gB[0, 0, 2]` is $B(256 \cdot 1 + 0,\ 64 \cdot 2 + 0) = B(256, 128)$, the first element of the
+  third K block of the CTA's B rows.
+- **`partition_A`.** One CTA owns the whole tile, so partitioning is only a reshape.
+  `tCgA` has layout `((128,16),1,4,6):((1,128),0,2048,8192)` for a column-major $128 \times 64$
+  tile. The MMA mode `(128,16)` is one instruction's slice of A. `MMA_M = 128 / 128 = 1`,
+  `MMA_K = 64 / 16 = 4`, and the last mode is `k`.<Sidenote>Computed by running `thrfrg_A` (the
+  partition code of CuTe's `mma_atom.hpp`, reimplemented in the blog's `CuteMma.ts`) on the atom
+  layouts above. For B it gives `((256,16),1,4,6)` and for C `((128,256),1,1)`, as the guide
+  says.</Sidenote>
+- **Instructions.** Each k-block takes `MMA_K = 4` instructions, so a whole tile takes
+  $4 \times 6 = 24$ instructions, all issued by one thread. Together they do
+  $24 \times 1{,}048{,}576 = 25{,}165{,}824$ FLOPs, which is $2 \cdot 128 \cdot 256 \cdot 384$.
+
+### A CTA pair
+
+With `CtaGroup.TWO` the same GEMM uses an `mma_tiler_mnk` of $(256, 256, 64)$: 2 × 3 output
+tiles, one per pair of CTAs, so 12 CTAs again. The pair splits the tile by its $v$ coordinate.
+
+<UmmaTileSteps preset="2cta" />
+
+The rule for each operand:
+
+- **A and C** are split by rows. CTA $v$ owns rows $128v$ to $128v + 127$ of A and of C, and
+  its TMEM holds that half of the accumulator.
+- **B** is split by rows of N, but only for loading. Each CTA's TMA loads half of B into its own
+  SMEM. The pair instruction reads both halves, so each CTA's 128 rows of A meet all 256 rows of
+  B.<Sidenote>Per CTA, `partition_B` gives `((128,16),1,4,6)` with CTA 0's rows 0–127 and CTA 1's
+  rows 128–255, from the 2-SM B layout `(2, (N/2, K)):(N/2, (1, N))`. For A and C the split is in
+  M the same way. The guide's own diagrams show the same split.</Sidenote>
+
+In the code, each CTA finds its $v$ as `bidx % 2` and calls `get_slice(v)`. Only the leader CTA,
+$v = 0$, issues the MMA (`is_leader_cta = mma_tile_coord_v == 0` in the CUTLASS
+[`dense_gemm.py`](https://github.com/NVIDIA/cutlass/blob/b9847690c5838ac3d909ebc163ed16c388802485/examples/python/CuTeDSL/blackwell/dense_gemm.py#L494)
+example). The other CTA still loads its halves of A and B and runs its own epilogue. Each CTA
+keeps half of B in SMEM but computes a 128 × 256 output, so the pair reads half as much B per
+FLOP as two separate CTAs would.
+
+### Interleaving rows with `permutation_mnk`
+
+`make_tiled_mma` also takes `permutation_mnk`, a layout per mode that reorders the rows (or
+columns) before the atoms are placed. The guide's example uses an m256 pair atom tiled twice in
+M (512 rows) and the M permutation `(128, 2, 2):(1, 256, 128)`. It sends logical row
+$a + 128b + 256c$ to physical row $a + 256b + 128c$.
+
+<UmmaTileSteps preset="perm" />
+
+Without the permutation, CTA 0 owns physical rows 0–127 and 256–383, two separate ranges. With
+it, instruction tile 0 reads rows 0–127 (CTA 0) and 256–383 (CTA 1), and tile 1 reads 128–255
+and 384–511, so CTA 0 owns the contiguous rows 0–255. Each CTA's partition still has shape
+`((128,16), 2, 1)`. Only the strides change, from `(…, 256, …)` to `(…, 128, …)` in the
+`MMA_M` mode.<Sidenote>Computed with `thrfrg_A` on a 512 × 16 tile. The guide's diagram agrees,
+but the text under it says "CTA 0 owns rows `{0-127, 256-383}`" for both the default and the
+permuted case. The second one should be rows 0–255.</Sidenote>
+
+## Fragments: descriptors and TMEM
+
+The partitions so far are views of global memory. The MMA itself reads **fragments**: A and B
+as shared-memory descriptors, C as a tensor in TMEM. Unlike on Ampere, no fragment of a tcgen05
+MMA is in a thread's registers. The SMEM tensors themselves are not partitioned. They are used
+whole.
+
+### A and B: shared-memory descriptors
+
+A **shared-memory descriptor** is a 64-bit value that tells the tensor core where an operand
+starts in SMEM, how it is strided and how it is swizzled. `make_fragment_A(sA)` turns the staged
+SMEM tensor into a tensor of them:
+
+```python
+tCrA = tiled_mma.make_fragment_A(sA)   # (MMA, MMA_M, MMA_K, STAGE)
+tCrB = tiled_mma.make_fragment_B(sB)   # (MMA, MMA_N, MMA_K, STAGE)
+```
+
+With 3 stages, `tCrA` has shape `(1, 1, 4, 3)`, one descriptor per (k-slice, stage). The MMA
+mode has size 1 because one descriptor stands for the whole $128 \times 16$ slice the
+instruction reads. Step 3 of the one-CTA figure draws these 12 descriptors for A and 12 for B.
+
+`sA` itself comes from `make_smem_layout_a`, which builds a staged, swizzled layout in four
+steps: read the major mode from the op, ask the tiled MMA for the partitioned shape, pick the
+widest swizzle whose row fits the contiguous dimension, and tile that atom to the full shape
+with a stage mode appended. The swizzles, by how many contiguous bits they cover:
+
+| Swizzle | Contiguous bits | Bytes |
+| --- | ---: | ---: |
+| SW128 | 1024 | 128 |
+| SW64 | 512 | 64 |
+| SW32 | 256 | 32 |
+| Interleave | 128 | 16 |
+
+For K-major FP16 with $BK = 64$, a row is $64 \times 16 = 1024$ bits, so the helper picks SW128.
+That is the `cute.Swizzle(3, 4, 3)` in the guide's "without utilities" example.
+
+The SMEM budget limits how many stages a kernel can afford. One stage holds
+$128 \times 64 \times 2$ B $= 16$ KiB of A and $256 \times 64 \times 2$ B $= 32$ KiB of B, so
+48 KiB. The tutorial `fp16_gemm_0.py` uses 4 stages, 192 KiB, inside SM100's 227 KiB per
+block. A fifth stage would need 240 KiB and would not fit.<Sidenote>`sm100_smem_capacity_bytes
+= 232448` (227 KiB) in CUTLASS
+[`arch.h`](https://github.com/NVIDIA/cutlass/blob/b9847690c5838ac3d909ebc163ed16c388802485/include/cutlass/arch/arch.h#L44).
+The real budget is a little smaller, since the mbarriers and the TMEM-address slot also live in
+SMEM.</Sidenote>
+
+### The accumulator: a TMEM tensor
+
+The accumulator takes four steps. The first three only build a layout. The last binds it to the
+TMEM address that the allocation returned:
+
+```python
+# 1. (MMA, MMA_M, MMA_N) = (MMA, 1, 1)
+acc_shape = tiled_mma.partition_shape_C(mma_tiler_mnk[:2])
+# 2. add a stage mode: (MMA, 1, 1, 2)
+acc_shape_staged = cute.append(acc_shape, 2)
+# 3. the layout: ((128,256), 1, 1, 2)
+tCtAcc = tiled_mma.make_fragment_C(acc_shape_staged)
+# 4. bind it to the allocated TMEM
+tmem_ptr = tmem.retrieve_ptr(cutlass.Float32)
+tCtAcc = cute.make_tensor(tmem_ptr, tCtAcc.layout)
+```
+
+Before that, one warp allocates the columns with `TmemAllocator.allocate(512)`, and all threads
+wait for it with `wait_for_alloc()`, since they need the returned address. Check the budget: one
+stage is $128 \times 256$ FP32 values $= 128$ KiB $= 256$ columns of 128 lanes, so two stages
+use all 512 columns, as in the first TMEM figure.
+
+### A from TMEM
+
+For fused attention and mixed-input GEMMs, A can come from TMEM instead of SMEM
+(`OperandSource.TMEM`). This is useful when A is produced on chip, for example a softmax output
+or values converted from a narrower type, because it never has to be written to SMEM. The guide
+still builds the SMEM layout, but only to get the shape the MMA expects. It then points the
+fragment at the TMEM columns after the accumulator:
+
+```python
+tCrA_layout = tiled_mma.make_fragment_A(a_smem_layout.outer).layout
+tmem_ptr_a = cute.recast_ptr(
+    accumulators.iterator + num_acc_tmem_cols * column_to_element_scale,
+    dtype=mma_dtype,
+)
+tCrA = cute.make_tensor(tmem_ptr_a, tCrA_layout)
+```
+
+The "A in TMEM" tab of the TMEM figure shows the result.
+
+## The main loop
+
+Each k-block, the MMA thread waits for TMA to fill a stage, issues one instruction per k-slice,
+and releases the stage. The CUTLASS tutorial writes it like this:
+
+```python
+for k_tile_idx in cutlass.range(num_k_tiles):
+    # wait until TMA has filled this stage
+    ab_full = ab_consumer.wait_and_advance()
+    for k_block_idx in cutlass.range_constexpr(4):  # MMA_K = 4
+        crd = (None, None, k_block_idx, ab_full.index)
+        cute.gemm(tiled_mma, tCtAcc, tCrA[crd], tCrB[crd], tCtAcc)
+        # every later MMA adds to D
+        tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+    # tcgen05.commit: the stage is free once these MMAs finish
+    ab_full.release()
+```
+
+Three details matter here:
+
+- **`ACCUMULATE`.** A field of the atom that selects $D = AB$ (False) or $D = AB + D$ (True).
+  It must be False for the very first instruction of a tile, because TMEM is not zeroed. It is
+  True for every instruction after that.<Sidenote>The guide's version sets
+  `ACCUMULATE = (k_tile_idx != 0)` and passes all four k-slices to one `cute.gemm`. The CUTLASS
+  examples (`fp16_gemm_0.py`, `dense_gemm.py`, `nvfp4_gemm_0.py`) instead loop over k-slices and
+  set `ACCUMULATE` to True after each `cute.gemm`. With the guide's form, if all four slices of
+  the first k-tile ran with ACCUMULATE False, each would overwrite the last. I could not run
+  either form, so the post follows the examples. `nvfp4_gemm_0.py` sets it to False explicitly
+  before the loop.</Sidenote>
+- **Asynchrony.** `cute.gemm` returns as soon as the instruction is issued. PTX guarantees
+  that MMAs from the same warp into the same accumulator (same address and shape) write and read
+  it in issue order, so the next instruction can be issued at once.<Sidenote>PTX ISA §9.7.18.6.2,
+  "Pipelined tcgen05 Instructions": in general asynchronous tcgen05 operations "may execute and
+  complete in a different order than they were issued", but pairs such as
+  `tcgen05.mma (D writes) -> tcgen05.mma (C reads)` with the same accumulator address and shape
+  are ordered.</Sidenote>
+- **Barriers.** `PipelineTmaUmma` pairs a "full" mbarrier (TMA has written the stage) with an
+  "empty" one per stage. `release()` issues `tcgen05.commit` to the empty barrier, which fires
+  only when the MMAs reading that stage have finished. Only then can TMA overwrite it.
+
+### Overlapping the MMA with the epilogue
+
+The guide's simple kernel computes one tile per CTA, so it needs one accumulator stage. A
+**persistent kernel** keeps each CTA alive across many output tiles. There, with one accumulator,
+the MMA thread has to wait for the epilogue to drain TMEM before it starts the next tile. With
+two, it starts the next tile in the other half of TMEM straight away. The timelines below
+simulate four tiles of four k-blocks each. A unit of time is one k-block of MMAs, and loads and
+epilogue lengths are illustrative.
+
+<UmmaPipeline caption="Toy model, not a measurement. Drop to 1 SMEM stage to see loads serialise with the MMAs." />
+
+With the defaults (4 SMEM stages, epilogue = 3 units), one accumulator stage takes 29 units and
+keeps the MMA busy 55% of the time. Two stages take 20 units and 80%. Two stages pay off
+whenever the epilogue is shorter than a tile's MMAs: the 20 units are 1 for the first load, 16
+for the MMAs, and 3 for the last epilogue. Once the epilogue is longer than a tile's MMAs, the
+epilogue sets the pace instead.<Sidenote>Times from `simulatePipeline` in `ummaPipeline.ts`,
+which applies the three waits of the CUTLASS pipelines: a load waits for its buffer to be
+released, an MMA waits for its load (and, on a tile's first k-block, for its accumulator to be
+drained), and an epilogue waits for its tile's last MMA.</Sidenote>
+
+## The epilogue: TMEM → registers → global memory
+
+To read the accumulator, the epilogue warps build a **tiled copy** from a TMEM load atom, and
+partition both TMEM and the global output with it:
+
+```python
+atom = cute.make_copy_atom(
+    tcgen05.Ld32x32bOp(tcgen05.Repetition.x64), cutlass.Float32
+)
+# the copy is built for one 128 × 64 sub-tile
+t2r = tcgen05.make_tmem_copy(atom, tCtAcc_epi[None, 0])
+thr = t2r.get_slice(tidx)
+# (TmemCpy, NumTmemCpy, NumTiles): source in TMEM, destination in GMEM
+tDtC = thr.partition_S(tCtAcc_epi)
+tDgC = thr.partition_D(gC_epi)
+for i in cutlass.range(4):
+    cute.copy(t2r, tDtC[None, None, i], tCrAcc)     # tcgen05.ld: 64 FP32
+    tCrC.store(tCrAcc.load().to(cutlass.Float16))  # convert in registers
+    cute.autovec_copy(tCrC, tDgC[None, None, i])    # store to GMEM
+```
+
+Worked through for the $128 \times 256$ accumulator: `zipped_divide` by an epilogue tile of
+$(128, 64)$ gives 4 sub-tiles. In each sub-tile, thread $t$ holds row $t$ (lane $t$) and 64
+columns, so 64 registers. Over 4 sub-tiles that is the whole row of 256 values, but only 64
+registers are live at a time. That is the reason for sub-tiling, and the comment in the tutorial
+says so: "Sub-tiling for better instruction-level parallelism". The partitioned GMEM view
+`tDgC` puts each thread's 64 values at row $t$ of the CTA's C tile, so the store writes 64
+consecutive FP16 values, 128 bytes.
+
+## Block-scaled MMA
+
+FP8 and FP4 lose too much range with one scale per tensor. **Block scaling** gives every
+`sf_vec_size` consecutive K elements their own **scale factor**, and the instruction computes
+$D = (\mathrm{SF}_A \cdot A)(\mathrm{SF}_B \cdot B) + C$ in hardware. The DSL's ops are
+`MmaMXF8F6F4Op`, `MmaMXF4Op` (`sf_vec_size` 32) and `MmaMXF4NVF4Op` (16 or
+32).<Sidenote>`make_blockscaled_trivial_tiled_mma` in `blackwell_helpers.py` accepts
+`sf_vec_size` 32 or 16, and raises an error for anything else.</Sidenote> Compared with a dense
+kernel, five things change:
+
+1. **The op.** The accumulator is fixed to FP32, and the op takes the scale-factor type (UE8M0
+   or UE4M3 for NVF4).
+2. **Two more tensors.** SFA and SFB get their own global layouts (`tile_atom_to_shape_SF`) and
+   staged SMEM layouts.
+3. **Two more TMA loads per k-block.** These are counted in the pipeline's byte total.
+4. **Scale factors go to TMEM.** Unlike A and B, the scale factors must be in TMEM before the
+   MMA. Each k-block copies them from SMEM to TMEM with `tcgen05.cp` (the DSL's
+   `Cp4x32x128bOp`), issued like an MMA by one thread.
+5. **`cute.gemm` takes pairs.** Each operand is a `[value, scale]` pair, as in
+   `cute.gemm(tiled_mma, tCtAcc, [tCrA[s], tCtSFA], [tCrB[s], tCtSFB], tCtAcc)`.
+
+The epilogue does not change: the accumulator is still FP32 in TMEM.
+
+## Summary
+
+- tcgen05 moves the accumulator out of registers into **Tensor Memory**: 128 lanes × 512
+  columns of 32 bits per SM. A $128 \times 256$ FP32 tile takes 256 columns, so two fit.
+- **One thread** issues each MMA, asynchronously, and `tcgen05.commit` signals an mbarrier on
+  completion. Kernels split into TMA, MMA and epilogue roles.
+- **Partitioning** works as on older GPUs, except that the atom's "threads" are CTAs. With one
+  CTA, `partition_A` only reshapes the tile into `(MMA, MMA_M, MMA_K, k)`. With a CTA pair,
+  each CTA takes half the rows of A and C, and half of B to load.
+- **Fragments** are SMEM descriptors for A and B and a TMEM tensor for C. Nothing per-thread
+  sits in registers until the epilogue.
+- **Reading TMEM** takes a warpgroup: warp $w$ reaches only lanes $32w$ to $32w + 31$, so in a
+  `32x32b` load thread $t$ reads row $t$.
+
+## References
+
+- NVIDIA, [tcgen05 MMA Programming Guide](https://docs.nvidia.com/cutlass/4.5.3/media/docs/pythonDSL/mma_docs/tcgen05_programming.html),
+  CUTLASS 4.5.3 CuTe DSL documentation. The source of the examples and figures' numbers.
+- NVIDIA, [PTX ISA, TensorCore 5th Generation Family Instructions](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#tensorcore-5th-generation-family-instructions):
+  Tensor Memory (§9.7.18.1), matrix shapes (Table 48), issue granularity (§9.7.18.5), access
+  restrictions (§9.7.18.8.1), datapath layouts (§9.7.18.10.5).
+- CUTLASS at commit [`b984769`](https://github.com/NVIDIA/cutlass/tree/b9847690c5838ac3d909ebc163ed16c388802485):
+  [`mma_traits_sm100.hpp`](https://github.com/NVIDIA/cutlass/blob/b9847690c5838ac3d909ebc163ed16c388802485/include/cute/atom/mma_traits_sm100.hpp)
+  (atom layouts, `tmem_frg`),
+  [`fp16_gemm_0.py`](https://github.com/NVIDIA/cutlass/blob/b9847690c5838ac3d909ebc163ed16c388802485/examples/python/CuTeDSL/blackwell/tutorial_gemm/fp16_gemm_0.py)
+  (the tutorial kernel quoted above),
+  [`dense_gemm.py`](https://github.com/NVIDIA/cutlass/blob/b9847690c5838ac3d909ebc163ed16c388802485/examples/python/CuTeDSL/blackwell/dense_gemm.py)
+  and [`blackwell_helpers.py`](https://github.com/NVIDIA/cutlass/blob/b9847690c5838ac3d909ebc163ed16c388802485/python/CuTeDSL/cutlass/utils/blackwell_helpers.py).
+- [Warp MMA and Warpgroup MMA in the CuTe DSL, Mode by Mode](/blog/cute-dsl-warp-and-warpgroup-mma/),
+  the Ampere and Hopper counterpart of this post.

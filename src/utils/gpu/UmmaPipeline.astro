@@ -1,0 +1,220 @@
+---
+// Timelines of a persistent tcgen05 GEMM CTA with one and with two TMEM accumulator stages, on one
+// time axis: TMA loads k-blocks into SMEM, one thread issues the MMAs, the epilogue warps drain each
+// finished accumulator. The reader can change the number of SMEM stages and the epilogue's length;
+// hover a span for what it is. Illustrative units (one unit = one k-block of MMAs), simulated in
+// ummaPipeline.ts.
+// Usage in .mdx:
+//   <UmmaPipeline />
+//   <UmmaPipeline tiles={4} kBlocks={4} abStages={4} epi={3} />
+import { pipelineSvg, simulatePipeline } from "./ummaPipeline";
+
+interface Props {
+	tiles?: number;
+	kBlocks?: number;
+	abStages?: number;
+	tma?: number;
+	mma?: number;
+	epi?: number;
+	caption?: string;
+}
+
+const {
+	tiles = 4,
+	kBlocks = 4,
+	abStages = 4,
+	tma = 1,
+	mma = 1,
+	epi = 3,
+	caption,
+} = Astro.props;
+const base = { tiles, kBlocks, abStages, tma, mma, epi };
+const one = simulatePipeline({ ...base, accStages: 1 });
+const two = simulatePipeline({ ...base, accStages: 2 });
+const endAt = Math.max(one.end, two.end);
+const unitPx = 560 / endAt;
+const pct = (x: number) => `${Math.round(x * 100)}%`;
+---
+
+<figure class="umma-pipe" data-cfg={JSON.stringify(base)}>
+	<div class="up-controls">
+		<label>
+			SMEM stages
+			<select data-k="abStages">
+				{[1, 2, 3, 4].map((s) => <option value={s} selected={s === abStages}>{s}</option>)}
+			</select>
+		</label>
+		<label>
+			epilogue length
+			<input type="range" min="1" max="8" step="1" value={epi} data-k="epi" />
+			<span class="up-epi">{epi}</span>
+		</label>
+	</div>
+	<div class="up-plot" set:html={pipelineSvg(one, "1 accumulator stage in TMEM", unitPx, endAt)} />
+	<div class="up-plot" set:html={pipelineSvg(two, "2 accumulator stages in TMEM", unitPx, endAt)} />
+	<p class="up-summary">
+		1 stage: {one.end} units, MMA busy {pct(one.mmaBusy)}. 2 stages: {two.end} units, MMA busy {pct(two.mmaBusy)}.
+	</p>
+	<p class="up-readout">Hover a span. Labels are tile.k-block; colours are output tiles.</p>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import { pipelineSvg, simulatePipeline } from "./ummaPipeline";
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".umma-pipe")) {
+		const cfg = JSON.parse(fig.dataset.cfg ?? "{}");
+		const plots = [...fig.querySelectorAll<HTMLElement>(".up-plot")];
+		const summary = fig.querySelector(".up-summary") as HTMLElement;
+		const readout = fig.querySelector(".up-readout") as HTMLElement;
+		const epiOut = fig.querySelector(".up-epi") as HTMLElement;
+		const pct = (x: number) => `${Math.round(x * 100)}%`;
+
+		const update = () => {
+			const one = simulatePipeline({ ...cfg, accStages: 1 });
+			const two = simulatePipeline({ ...cfg, accStages: 2 });
+			const endAt = Math.max(one.end, two.end);
+			const unitPx = 560 / endAt;
+			plots[0].innerHTML = pipelineSvg(one, "1 accumulator stage in TMEM", unitPx, endAt);
+			plots[1].innerHTML = pipelineSvg(two, "2 accumulator stages in TMEM", unitPx, endAt);
+			summary.textContent = `1 stage: ${one.end} units, MMA busy ${pct(one.mmaBusy)}. 2 stages: ${two.end} units, MMA busy ${pct(two.mmaBusy)}.`;
+			epiOut.textContent = String(cfg.epi);
+		};
+		for (const el of fig.querySelectorAll<HTMLInputElement | HTMLSelectElement>("[data-k]"))
+			el.addEventListener("input", () => {
+				cfg[el.dataset.k as string] = Number(el.value);
+				update();
+			});
+		fig.addEventListener("mouseover", (e) => {
+			const d = (e.target as Element).getAttribute?.("data-d");
+			if (d) readout.textContent = d;
+		});
+	}
+</script>
+
+<style>
+	.umma-pipe {
+		--up0: #9cc0e2;
+		--up1: #f0be86;
+		--up2: #a6d39c;
+		--up3: #e0a3c6;
+		--up4: #c2b2ea;
+		--up5: #e8d77c;
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+	}
+	@media (prefers-color-scheme: dark) {
+		.umma-pipe {
+			--up0: #3f6d97;
+			--up1: #8a6232;
+			--up2: #467a47;
+			--up3: #874a6e;
+			--up4: #64539a;
+			--up5: #857a35;
+		}
+	}
+	.up-controls {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.5rem 1.4rem;
+		font-size: 0.78rem;
+		color: var(--muted);
+		margin-bottom: 0.4rem;
+	}
+	.up-controls label {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.4rem;
+	}
+	.up-controls select {
+		padding: 0.1rem 0.3rem;
+		border: 1px solid var(--faint);
+		border-radius: 6px;
+		background: var(--bg);
+		color: var(--text);
+	}
+	.up-epi {
+		font-family: var(--mono);
+		color: var(--text);
+	}
+	.up-plot :global(svg) {
+		display: block;
+		width: 100%;
+		max-width: 680px;
+		height: auto;
+		margin: 0.3rem auto 0;
+	}
+	.up-plot :global(.up-title) {
+		font-size: 11px;
+		font-weight: 600;
+		fill: var(--text);
+	}
+	.up-plot :global(.up-lane) {
+		font-size: 10px;
+		fill: var(--muted);
+		text-anchor: end;
+		dominant-baseline: central;
+	}
+	.up-plot :global(.up-track) {
+		fill: var(--surface);
+	}
+	.up-plot :global(.up-span) {
+		stroke: var(--text);
+		stroke-opacity: 0.35;
+		stroke-width: 0.8;
+	}
+	.up-plot :global(.up-span:hover) {
+		stroke: var(--accent);
+		stroke-opacity: 1;
+		stroke-width: 2;
+	}
+	.up-plot :global(.up-t0) {
+		fill: var(--up0);
+	}
+	.up-plot :global(.up-t1) {
+		fill: var(--up1);
+	}
+	.up-plot :global(.up-t2) {
+		fill: var(--up2);
+	}
+	.up-plot :global(.up-t3) {
+		fill: var(--up3);
+	}
+	.up-plot :global(.up-t4) {
+		fill: var(--up4);
+	}
+	.up-plot :global(.up-t5) {
+		fill: var(--up5);
+	}
+	.up-plot :global(.up-label) {
+		font-size: 9px;
+		font-family: var(--mono);
+		fill: var(--text);
+		text-anchor: middle;
+		dominant-baseline: central;
+		pointer-events: none;
+	}
+	.up-plot :global(.up-tick) {
+		font-size: 9px;
+		fill: var(--muted);
+		text-anchor: middle;
+	}
+	.up-summary,
+	.up-readout {
+		margin: 0.35rem 0 0;
+		font-size: 0.76rem;
+		text-align: center;
+	}
+	.up-readout {
+		font-family: var(--mono);
+		font-size: 0.72rem;
+		color: var(--muted);
+		min-height: 1.2rem;
+	}
+	figcaption {
+		margin-top: 0.4rem;
+		font-size: 0.8rem;
+		color: var(--muted);
+		text-align: center;
+	}
+</style>
