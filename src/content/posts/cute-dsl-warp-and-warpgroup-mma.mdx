@@ -28,7 +28,8 @@ many pipeline stages it cycles through. If you can derive each mode yourself, yo
 predict register use and read the example kernels without guessing.
 
 This post derives them from scratch. It starts from the plain matrices of the GEMM, then covers,
-in order: the two instructions and their **thread-value layouts**; how `make_tiled_mma` repeats an
+in order: the two instructions and their **thread-value layouts**; how CuTe writes those layouts
+down from the hardware's diagrams; how `make_tiled_mma` repeats an
 instruction over several warps or warpgroups; a step-by-step derivation of every mode of
 `partition_A` and `partition_C`, first for the warp MMA and then for the warpgroup MMA; and how
 fragments become registers (warp MMA) or shared-memory descriptors (warpgroup MMA). It assumes the
@@ -91,25 +92,66 @@ A_TV = ((4,8),(2,2,2)):((32,1),(16,8,128))     # (T32,V8) -> (M16,K16)
 B_TV = ((4,8),(2,2)):((16,1),(8,64))           # (T32,V4) -> (N8,K16)
 ```
 
-Read the thread mode $(4, 8)$ as lane $t = t_0 + 4 t_1$, so $t_0 = t \bmod 4$ and
-$t_1 = \lfloor t / 4 \rfloor$. For C, lane $t$'s value $v = v_0 + 2 v_1$ lands at offset
-$32 t_0 + t_1 + 16 v_0 + 8 v_1$. Since the tile has 16 rows, row $m$ is that offset mod 16 and
-column $n$ is the offset divided by 16:
+Reading `C_TV` takes three steps: split the thread and value indices into coordinates, turn the
+coordinates into an offset, and turn the offset into a row and column.
+
+**1. Split the indices.** The layout has two modes. The first, the thread mode, has shape
+$(4, 8)$ and strides $(32, 1)$; the second, the value mode, has shape $(2, 2)$ and strides
+$(16, 8)$. A nested shape splits its index with the first coordinate counting fastest, like the
+digits of a number written in a mixed base. So the 32 lanes are read as
+
+$$
+t = t_0 + 4 t_1, \qquad t_0 = t \bmod 4 \in \{0, \ldots, 3\}, \qquad t_1 = \lfloor t / 4 \rfloor \in \{0, \ldots, 7\},
+$$
+
+and the four values of a lane as $v = v_0 + 2 v_1$ with $v_0, v_1 \in \{0, 1\}$. Lane 5, for
+example, is $t_0 = 1$, $t_1 = 1$, because $5 = 1 + 4 \cdot 1$.
+
+**2. Coordinates to offset.** The offset is each coordinate times its stride, summed:
+
+$$
+\text{offset}(t, v) = 32 t_0 + 1 \cdot t_1 + 16 v_0 + 8 v_1 .
+$$
+
+**3. Offset to $(m, n)$.** The tile is $16 \times 8$ and column-major, so offset $= m + 16 n$.
+Reading it back, the row is the remainder and the column is the quotient: $m = \text{offset} \bmod 16$
+and $n = \lfloor \text{offset} / 16 \rfloor$. Each term of the offset falls cleanly into one of the two:
+
+| Term | Values | Effect |
+| --- | --- | --- |
+| $32 t_0 = 16 \cdot 2 t_0$ | 0, 32, 64, 96 | a multiple of 16: moves $2 t_0$ columns |
+| $16 v_0$ | 0, 16 | a multiple of 16: moves $v_0$ columns |
+| $t_1$ | 0 … 7 | less than 16: moves $t_1$ rows |
+| $8 v_1$ | 0, 8 | less than 16: moves $8 v_1$ rows |
+
+The two row terms never carry into the column, because $t_1 + 8 v_1 \le 7 + 8 = 15$. That gives
 
 $$
 m = t_1 + 8 v_1, \qquad n = 2 t_0 + v_0 .
 $$
 
-So each lane holds two adjacent columns in two rows eight apart. The figure inverts the layout:
-each cell of the $16 \times 8$ C tile shows which lane (T) and which value (V) holds it, and
-cells of one lane share a colour.
+Here are lane 5's four values worked through:
+
+| $v$ | $v_0$ | $v_1$ | offset $= 32 + 1 + 16 v_0 + 8 v_1$ | $m = $ offset mod 16 | $n = $ offset div 16 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 0 | 0 | 33 | 1 | 2 |
+| 1 | 1 | 0 | 49 | 1 | 3 |
+| 2 | 0 | 1 | 41 | 9 | 2 |
+| 3 | 1 | 1 | 57 | 9 | 3 |
+
+So each lane holds two adjacent columns ($v_0$ picks which) in two rows eight apart ($v_1$ picks
+which). The $t_1$ term spreads the eight groups of four lanes down the rows, and $t_0$ spreads the
+four lanes of a group across column pairs.<Sidenote>A script checked that the formula for $m$ and
+$n$ matches the layout for all 32 lanes and 4 values, and that the 128 (lane, value) pairs cover
+the 128 cells of the tile exactly once.</Sidenote> The figure inverts the layout: each cell of the
+$16 \times 8$ C tile shows which lane (T) and which value (V) holds it, and cells of one lane share
+a colour.
 
 <Matrix2D name="C tile of one m16n8k16, offset m + 16n" {...F.c} />
 
-Check one lane by hand: lane 5 has $t_0 = 1$, $t_1 = 1$, so it holds rows 1 and 9, columns 2 and
-3. In the figure, row 1 columns 2 and 3 are `T5 V0` and `T5 V1`, and row 9 has `T5 V2` and
-`T5 V3`. This is the accumulator layout in the PTX ISA's fragment tables, with `groupID` $= t_1$
-and `threadID_in_group` $= t_0$.
+Find lane 5 in the figure: row 1 columns 2 and 3 are `T5 V0` and `T5 V1`, and row 9 has `T5 V2`
+and `T5 V3`, as in the table. This is the accumulator layout in the PTX ISA's fragment tables,
+with `groupID` $= t_1$ and `threadID_in_group` $= t_0$.
 
 A has eight values per lane. The extra mode $v_2$ (stride 128, which is $8 \times 16$) moves to
 column $k + 8$, so lane $t$ holds rows $t_1$ and $t_1 + 8$ at columns $2t_0$, $2t_0 + 1$,
@@ -126,26 +168,120 @@ as A: lane 5 holds $n = 1$, $k \in \{2, 3, 10, 11\}$. The figure splits $k$ the 
 
 ### The warpgroup atom: `wgmma` m64nNk16
 
+A **warpgroup** is four consecutive warps of a CTA whose first warp index is a multiple of 4: threads
+0–127, 128–255, and so on. All 128 threads issue the same `wgmma` together; if some of them skip it, the
+behaviour is undefined.<Sidenote>PTX ISA, section 9.7.17.1: "A warpgroup
+is a set of four contiguous warps such that the warp-rank of the first warp is a multiple of 4."
+The `.aligned` qualifier requires that "all threads in the warpgroup must execute the same
+wgmma.mma_async instruction".</Sidenote> Inside the warpgroup, thread $t$ is lane $t \bmod 32$ of
+warp $\lfloor t / 32 \rfloor$.
+
+#### The shape: M fixed, N chosen, K set by the type
+
+Every `wgmma` has $M = 64$, which is 16 rows for each of the four warps. N is the programmer's
+choice: any multiple of 8 from 8 to 256 for the floating-point types. K is fixed by the element
+type so that one row of A, K elements long, is always 32 bytes:
+
+| A and B type | Bytes per element | K |
+| --- | ---: | ---: |
+| f16, bf16 | 2 | 16 |
+| tf32 | 4 | 8 |
+| e4m3, e5m2 (FP8), s8, u8 | 1 | 32 |
+| b1 | 1/8 | 256 |
+
+The accumulator is f32 (f16 is also allowed for f16 and FP8 inputs) or s32 for integer inputs. The integer
+and b1 shapes allow a smaller set of N above 32 (multiples of 16).<Sidenote>From the shape and
+type tables in PTX ISA sections 9.7.17.2 and 9.7.17.3, for dense (non-sparse) wgmma.</Sidenote>
+
+The point of the large shape is work per instruction. One m64n256k16 does
+$64 \cdot 256 \cdot 16 = 262{,}144$ multiply-adds, 2048 per thread, against $2048$ for one
+m16n8k16, which is 64 per thread. Because the instruction is also asynchronous, the issuing warps can go on to
+other work, such as waiting for the next stage's data, while the tensor cores run.
+
+#### Where the operands live
+
+| Operand | `mma.sync` | `wgmma` |
+| --- | --- | --- |
+| A | registers | shared memory (descriptor) or registers |
+| B | registers | shared memory (descriptor) only |
+| C / D | registers | registers |
+
+So B is never split across threads, and A usually is not either. Only the accumulator always has
+a per-thread layout. The rest of this section covers the accumulator first, then the
+shared-memory operands, then A in registers.
+
+#### The accumulator, value by value
+
 The accumulator layout of every $64 \times N$ wgmma is
 
 ```text
 CLayout_64xN = ((4,8,4),(2,2,N/8)):((128,1,16),(64,8,512))   # (T128,V) -> (M64,N)
 ```
 
-Split the thread as $t = t_0 + 4 t_1 + 32 t_2$, so $t_2$ is the warp within the warpgroup. Working
-the offset out as before (the tile now has 64 rows) gives
+Read it with the same three steps as `C_TV`. The thread mode now has three parts, so split
+$t = t_0 + 4 t_1 + 32 t_2$: $t_0 = t \bmod 4$ and $t_1 = \lfloor t / 4 \rfloor \bmod 8$ are the
+same as in the warp atom, and $t_2 = \lfloor t / 32 \rfloor$ is the warp. The value mode has a
+third part too, so $v = v_0 + 2 v_1 + 4 v_2$ with $v_2 \in \{0, \ldots, N/8 - 1\}$. The offset is
+
+$$
+\text{offset}(t, v) = 128 t_0 + t_1 + 16 t_2 + 64 v_0 + 8 v_1 + 512 v_2 ,
+$$
+
+and since the tile now has 64 rows, offset $= m + 64 n$. Sort the terms as before:
+
+| Term | Values | Effect |
+| --- | --- | --- |
+| $128 t_0 = 64 \cdot 2 t_0$ | 0, 128, 256, 384 | moves $2 t_0$ columns |
+| $64 v_0$ | 0, 64 | moves $v_0$ columns |
+| $512 v_2 = 64 \cdot 8 v_2$ | 0, 512, … | moves $8 v_2$ columns |
+| $t_1$ | 0 … 7 | moves $t_1$ rows |
+| $8 v_1$ | 0, 8 | moves $8 v_1$ rows |
+| $16 t_2$ | 0, 16, 32, 48 | moves $16 t_2$ rows |
+
+The row terms add up to at most $7 + 8 + 48 = 63$, so again nothing carries into the column, and
 
 $$
 m = 16 t_2 + t_1 + 8 v_1, \qquad n = 2 t_0 + v_0 + 8 v_2 .
 $$
 
-This is the m16n8 pattern of `mma.sync` again: warp $t_2$ owns rows $16 t_2$ to $16 t_2 + 15$,
-and the pattern repeats in every 8-column block, $N/8$ times. Thread 37 (warp 1, lane 5) holds
-rows 17 and 25 at columns 2, 3, 10, 11, 18, 19, and so on. Each thread holds
-$2 \cdot 2 \cdot N/8 = N/2$ accumulators: 128 for $N = 256$.
+Compare with the warp atom's $m = t_1 + 8 v_1$, $n = 2 t_0 + v_0$. The two new terms are the
+whole difference: $16 t_2$ stacks the four warps down the 64 rows, and $8 v_2$ repeats the
+pattern in every block of 8 columns. Here is thread 37 for $N = 16$. It is warp 1, lane 5, so
+$t_0 = 1$, $t_1 = 1$, $t_2 = 1$, and the offset starts at $128 + 1 + 16 = 145$:
 
-The A and B layouts are different in kind. When an operand comes from shared memory, the atom
-uses
+| $v$ | $v_0$ | $v_1$ | $v_2$ | offset | $m$ | $n$ |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 0 | 0 | 0 | 145 | 17 | 2 |
+| 1 | 1 | 0 | 0 | 209 | 17 | 3 |
+| 2 | 0 | 1 | 0 | 153 | 25 | 2 |
+| 3 | 1 | 1 | 0 | 217 | 25 | 3 |
+| 4 | 0 | 0 | 1 | 657 | 17 | 10 |
+| 5 | 1 | 0 | 1 | 721 | 17 | 11 |
+| 6 | 0 | 1 | 1 | 665 | 25 | 10 |
+| 7 | 1 | 1 | 1 | 729 | 25 | 11 |
+
+Values 0–3 are lane 5's four values from the warp atom (rows 1 and 9, columns 2 and 3), moved down
+16 rows into warp 1's block. Values 4–7 are the same four, 8 columns to the right. Each thread
+holds $2 \cdot 2 \cdot N/8 = N/2$ accumulators: 128 for $N = 256$, which matches the PTX ISA's
+"N/2 number of .f32 registers". Value $v$ is the register PTX calls $d_v$.<Sidenote>A script
+checked the formula for $m$ and $n$ against the layout for every valid N from 8 to 256, and that
+the $128 \cdot N/2$ (thread, value) pairs cover the $64 \times N$ tile exactly once. The table
+matches Figure 152 of the PTX ISA, where thread 37 holds $d_0, d_1$ in row 17.</Sidenote>
+
+A $64 \times N$ grid of cells would not fit the page, so the figure below draws one cell per
+$16 \times 8$ block for $N = 32$. Each block is a copy of the C tile drawn for `mma.sync` above,
+with lane $\ell$ replaced by thread $32 w + \ell$ of warp $w$. Block rows are warps (one colour
+each); block columns are the four 8-column blocks, and the cell names the accumulator registers
+that land there.
+
+<Matrix2D name="16 × 8 blocks of the 64 × 32 wgmma accumulator" {...F.wgmmaC} />
+
+Read off thread 37 again: it is in warp 1, the second row of blocks, and its registers
+$d_4$–$d_7$ sit in the second block column, columns 8–15, as in the table.
+
+#### A and B in shared memory: the descriptor
+
+When an operand comes from shared memory, the atom uses
 
 ```text
 ABLayout<M,K> = (128,(M,K)):(0,(1,M))
@@ -153,10 +289,223 @@ ABLayout<M,K> = (128,(M,K)):(0,(1,M))
 
 The thread mode has stride 0: all 128 threads map to the **whole** $M \times K$ tile. No thread
 owns a piece of A or B. Instead the warpgroup passes the hardware a **shared-memory descriptor**,
-a 64-bit value with the tile's start address, swizzle mode and strides, and the tensor cores read
-the tile from shared memory themselves. When A comes from registers (`OperandSource.RMEM`), A gets
-a per-thread layout shaped like C's, `ALayout_64x16 = ((4,8,4),(2,2,2)):((128,1,16),(64,8,512))`,
-eight values per thread.
+a 64-bit register that tells the tensor cores where the tile is and how it is laid out, and the
+tensor cores read the tile from shared memory themselves. Every warp must pass the same
+descriptor. Its fields are:<Sidenote>PTX ISA section 9.7.17.5.1.2.2, "Matrix Descriptor
+Format". Each 14-bit field stores $(x \mathbin{\&} \text{0x3FFFF}) \gg 4$, so addresses and
+offsets are in units of 16 bytes, which is why shared-memory operands must be 16-byte
+aligned.</Sidenote>
+
+| Bits | Field | Meaning |
+| --- | --- | --- |
+| 13–0 | start address | where the tile starts in shared memory, in 16-byte units |
+| 29–16 | leading dimension byte offset (LBO) | K-major without swizzle: the step between the two 16-byte halves of a row's 32 bytes; unused with swizzle |
+| 45–32 | stride dimension byte offset (SBO) | K-major: the step from one group of 8 rows to the next |
+| 51–49 | base offset | corrects the swizzle pattern when the tile does not start on the pattern's boundary |
+| 63–62 | swizzle mode | 0 none, 1 128-byte, 2 64-byte, 3 32-byte |
+
+The **swizzle mode** says how the rows were permuted when they were written: XOR-ing address bits
+spreads the rows of a K-major tile over all shared-memory banks, so the tensor cores can read them
+without bank conflicts. TMA writes the tile in that same pattern, so the producer and the MMA agree
+without any thread touching the data.
+
+Take the guide's tile, a K-major A stage of $128 \times 64$ in f16 or bf16. A K row is
+$64 \cdot 2 = 128$ bytes, so the DSL's `get_smem_layout_atom` picks the 128-byte swizzle
+(`K_SW128`).<Sidenote>`hopper_helpers.py` at the pinned commit: it returns `K_SW128` when the
+K extent in bits is a multiple of 1024.</Sidenote> Eight rows make one 1024-byte swizzle atom, so
+SBO $= 1024$ bytes, stored as $1024 \gg 4 = 64$, and LBO is unused. One wgmma reads a
+$64 \times 16$ slice, 32 bytes of each row. The next k-block's slice starts 32 bytes later, so its
+descriptor differs only in the start address, by $32 \gg 4 = 2$. This is what `tCrA` holds: one
+descriptor per (MMA_M, MMA_K, PIPE) entry, all alike except for the start address.
+
+#### A in registers
+
+When A comes from registers (`OperandSource.RMEM`), A gets a per-thread layout shaped like C's:
+
+```text
+ALayout_64x16 = ((4,8,4),(2,2,2)):((128,1,16),(64,8,512))   # (T128,V8) -> (M64,K16)
+```
+
+The same three steps give $m = 16 t_2 + t_1 + 8 v_1$ and $k = 2 t_0 + v_0 + 8 v_2$: each warp
+holds its 16 rows of A exactly as an `mma.sync` lane holds the $16 \times 16$ A tile, eight values
+per thread.<Sidenote>Checked by script: for every thread and value, the element equals that
+of the m16n8k16 `A_TV` for lane $t \bmod 32$, shifted down $16 t_2$ rows.</Sidenote> This is
+useful when A is computed, not loaded: in attention, the softmax output P lives in registers as
+the accumulator of the first GEMM and feeds the second GEMM as A without a trip through shared
+memory. B must still come from shared memory.
+
+#### What issuing one instruction involves
+
+A wgmma call takes the accumulator registers, the A descriptor (or registers), the B descriptor,
+and a few flags:
+
+- **scale-d**, which the DSL exposes as `Field.ACCUMULATE`: `True` computes $D = AB + D$,
+  `False` computes $D = AB$ and ignores the old D.
+- **imm-scale-a**, **imm-scale-b**: $1$ or $-1$, to negate A or B (floating-point types).
+- **imm-trans-a**, **imm-trans-b**: transpose a shared-memory operand on the fly, which is how
+  f16 and bf16 accept MN-major A and B. Other types must be K-major.
+
+The instruction returns at once, before D is written. That is why the main loop below brackets
+it with `fence`, `commit_group` and `wait_group`, and why D must not be read until the matching
+wait.
+
+## Where an atom's layouts come from
+
+So far the TV layouts were given, and we read them forwards: from (thread, value) to an element.
+CuTe's own [MMA atom documentation](https://docs.nvidia.com/cutlass/4.5.3/media/docs/cpp/cute/0t_mma_atom.html)
+explains the other direction: how CuTe's authors wrote those layouts down in the first place,
+starting from the picture of the instruction in NVIDIA's documentation. This section follows that
+document. It also shows that the same machinery covers instructions issued by one thread, eight
+threads, a warp or a warpgroup.
+
+### Operation and traits
+
+CuTe describes each instruction with two C++ structs, and an **atom** is the pair.
+
+The **Operation** struct wraps the PTX instruction and nothing else. It lists how many registers
+each thread passes for D, A, B and C, and has one static `fma` function containing the inline
+assembly. It uses no layouts or tensors. Here is the Ampere one, trimmed:
+
+```cpp
+struct SM80_16x8x16_F32F16F16F32_TN {
+  using DRegisters = float[4];      // 4 f32 accumulators per thread
+  using ARegisters = uint32_t[4];   // 8 f16 values of A, two per 32-bit register
+  using BRegisters = uint32_t[2];   // 4 f16 values of B
+  using CRegisters = float[4];
+  static void fma(float& d0, ..., uint32_t const& a0, ..., float const& c3);
+  // asm: mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+};
+```
+
+The counts are the value modes of the TV layouts from earlier: 4 values of C, 8 of A and 4 of B
+per lane. The name spells out the instruction:
+
+| Part | Meaning |
+| --- | --- |
+| `SM80` | first architecture with the instruction (Ampere) |
+| `16x8x16` | $M \times N \times K$ |
+| `F32F16F16F32` | types of D, A, B, C, in that order, for $D = AB + C$ |
+| `TN` | A is K-major ("T", row-major) and B is K-major ("N", column-major); PTX writes `.row.col` |
+
+The **`MMA_Traits`** struct, specialised for each Operation, adds what the Operation leaves out:
+the logical types, the shape, and the layouts.
+
+```cpp
+template <> struct MMA_Traits<SM80_16x8x16_F32F16F16F32_TN> {
+  using ValTypeD = float;   using ValTypeA = half_t;
+  using ValTypeB = half_t;  using ValTypeC = float;
+  using Shape_MNK = Shape<_16,_8,_16>;
+  using ThrID   = Layout<_32>;                   // logical thread -> lane
+  using ALayout = /* (T32,V8) -> (M16,K16) */;   // A_TV above
+  using BLayout = /* (T32,V4) -> (N8,K16)  */;   // B_TV above
+  using CLayout = SM80_16x8_Row;                 // C_TV above
+};
+```
+
+The traits are what the rest of CuTe reads: `make_tiled_mma`, `partition_A` and
+`make_fragment_A` never look at the PTX. The DSL's `warp.MmaF16BF16Op` builds the same atom.
+
+**`ThrID`** is the one field not seen yet. It maps the atom's **logical** thread index to the
+thread's index in the warp. For Ampere and Hopper it is the identity, `32:1` and `128:1`. It is
+not always: Volta's `mma.m8n8k4` is executed by a **quadpair**, eight lanes in two groups of four,
+and its ThrID is
+
+```text
+SM70_QuadPair = (4,2):(1,16)     # logical thread 0..7 -> lanes 0,1,2,3,16,17,18,19
+```
+
+Every other layout of the atom is written in logical threads, so ThrID is the only place where
+the quadpair's odd lane numbering appears.<Sidenote>A warp holds four quadpairs, which run four of these
+MMAs at once (the CuTe document counts the warp's work as a $16 \times 16 \times 4$ tile). CuTe
+models each quadpair as its own $8 \times 8 \times 4$ atom.</Sidenote>
+
+### Writing a layout from the hardware's picture
+
+To write a TV layout, read the instruction's diagram and record where each thread and value lands,
+as a column-major offset $m + M n$. Then find the strides that produce those offsets. The CuTe
+document does this for Volta's f32 accumulator, the $8 \times 8$ C of `SM70_8x8x4_F32F16F16F32_NT`.
+
+#### Step 1: the shape
+
+Eight threads each hold eight accumulators, so the layout has shape $(8, 8)$: **8 threads by 8
+values**, not the $8 \times 8$ matrix.
+
+#### Step 2: the thread strides
+
+Fix $V0$ and walk the threads. From the diagram:
+
+| Logical thread | Lane | $(m, n)$ of V0 | Offset $m + 8n$ |
+| ---: | ---: | :---: | ---: |
+| 0 | 0 | (0, 0) | 0 |
+| 1 | 1 | (1, 0) | 1 |
+| 2 | 2 | (0, 2) | 16 |
+| 3 | 3 | (1, 2) | 17 |
+| 4 | 16 | (4, 0) | 4 |
+| 5 | 17 | (5, 0) | 5 |
+| 6 | 18 | (4, 2) | 20 |
+| 7 | 19 | (5, 2) | 21 |
+
+The offsets are not one arithmetic sequence, but they are three nested ones. Thread 1 is thread 0
+plus 1. Threads 2–3 are threads 0–1 plus 16. Threads 4–7 are threads 0–3 plus 4. Each "plus"
+becomes one mode of size 2, so the thread mode is $(2, 2, 2) : (1, 16, 4)$. Check thread 6, which
+is $0 + 2 \cdot 1 + 4 \cdot 1$, so coordinates $(0, 1, 1)$: offset $16 + 4 = 20$.
+
+#### Step 3: the value strides
+
+Fix thread 0 and walk its values:
+
+| Value | $(m, n)$ | Offset |
+| ---: | :---: | ---: |
+| 0 | (0, 0) | 0 |
+| 1 | (0, 1) | 8 |
+| 2 | (2, 0) | 2 |
+| 3 | (2, 1) | 10 |
+| 4 | (0, 4) | 32 |
+| 5 | (0, 5) | 40 |
+| 6 | (2, 4) | 34 |
+| 7 | (2, 5) | 42 |
+
+The same three doublings give $(2, 2, 2) : (8, 2, 32)$, and together
+
+```text
+SM70_8x8_32b = ((2,2,2),(2,2,2)):((1,16,4),(8,2,32))   # (T8,V8) -> (M8,N8)
+```
+
+which is the layout in CUTLASS's `mma_traits_sm70.hpp`. The figure inverts it, with each cell
+labelled by its warp lane (through ThrID), so lanes 16–19 appear where logical threads 4–7 are.
+
+<Matrix2D name="C tile of one Volta m8n8k4 (f32), offset m + 8n" {...F.volta} />
+
+The method works for any operand. For the NT variant's A, an $8 \times 4$ tile, thread 0's four
+values run down M (rows 0–3 of column 0), logical thread 4 continues at rows 4–7, and thread 1
+moves to column 1: values have stride 1, thread 4 adds 4, thread 1 adds 8, giving
+`((4,2),4):((8,4),1)`. With f16 accumulators the picture is simpler, one row per thread, and the
+layout is just `(8,8):(1,8)`.<Sidenote>A script checked every offset in the two tables against
+the final layouts, and that each layout covers its tile exactly once. The layouts match
+`SM70_8x8_32b`, `SM70_8x4_Col` and `SM70_8x8_16b` in `mma_traits_sm70.hpp` at the pinned
+commit.</Sidenote>
+
+#### The same method on Hopper
+
+The wgmma accumulator layout derived earlier can be built the same way, from the PTX diagram's
+**core matrix**: an $8 \times 8$ block of C held by 32 threads, two values each. Each step adds
+one mode:
+
+| Observation | Adds | Layout so far, thread : value |
+| --- | --- | --- |
+| Four threads share a row, two adjacent columns each | thread `4:128`, value `2:64` | `(4):(128)`, `(2):(64)` |
+| Those four repeat down 8 rows | thread `8:1` | `(4,8):(128,1)`, `(2):(64)` |
+| Thread 0 continues 8 rows down, as V2 | value `2:8` | `(4,8):(128,1)`, `(2,2):(64,8)` |
+| Each warp repeats this 16 rows lower | thread `4:16` | `(4,8,4):(128,1,16)`, `(2,2):(64,8)` |
+| The whole $64 \times 8$ pattern repeats every 8 columns | value `(N/8):512` | `(4,8,4):(128,1,16)`, `(2,2,N/8):(64,8,512)` |
+
+The last row is `CLayout_64xN` exactly. The strides are offsets in the $64 \times N$ tile: 128
+is two columns, 64 one column, 16 and 8 and 1 are rows, and 512 is eight columns.
+
+The shared-memory operands are the exception to this whole method. Their layout,
+`(128,(64,16)):(0,(1,64))`, maps every thread to element 0 and keeps the whole tile as values,
+because no thread owns part of it: the descriptor is built from the tile's own shared-memory
+layout, and CuTe rejects a layout that wgmma cannot describe.
 
 ## Tiling the atom: `make_tiled_mma`
 
@@ -188,8 +537,24 @@ thread's B slice in one $32 \times 16$ tile is 8 values, exactly what one `ldmat
 $8 \times 8$ matrices, four 32-bit registers per lane) delivers. With an N tile of 16 it would be
 4 values, enough only for `ldmatrix.x2`. The example's comment says the same: "to leverage the
 largest coalesced shared memory -> register copy, set the tiled mma's N mode to 16". A permutation
-given as a layout, such as `(4,4,2):(1,8,4)` in the guide, does reorder which coordinates each
-thread gets.
+given as a layout does reorder which coordinates each thread gets.
+
+CuTe's MMA atom document shows both effects on the Volta atom. Four quadpair atoms in a
+$2 \times 2$ grid cover $16 \times 16 \times 4$. A tile of $(32, 32, 4)$ repeats that pattern
+across **values**: no new threads, each thread just gets a second copy of its values in each
+$16 \times 16$ quadrant. Thread 0's eight A values then sit at rows 0–3 and 16–19 of column 0.
+To make them adjacent, the document passes the M entry of `permutation_mnk` as the layout
+`(4,4,2):(1,8,4)`. Read it as a **scatter**: old row $m$ moves to new row
+$\text{layout}(m)$.
+
+| Old $m$ | 0–3 | 4–7 | 8–11 | 12–15 | 16–19 | 20–23 | 24–27 | 28–31 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| New $m$ | 0–3 | 8–11 | 16–19 | 24–27 | 4–7 | 12–15 | 20–23 | 28–31 |
+
+Row 16 is coordinate $(0, 0, 1)$ of the shape $(4, 4, 2)$, so it goes to $0 + 0 + 4 = 4$. Thread
+0's rows 16–19 become 4–7, next to its rows 0–3. The same move applies to A and C, since both have
+an M mode, and nothing changes in N or K. Contiguous rows per thread are what a vectorised copy
+between shared memory and registers wants, which is the reason to permute.
 
 ## Deriving each mode, step by step
 
@@ -378,8 +743,14 @@ cute.nvgpu.warpgroup.wait_group(k_pipe_mmas)       # allow at most k_pipe_mmas b
 accumulator registers) before the wgmmas read them, `commit_group` closes a batch, and
 `wait_group(n)` blocks until at most $n$ batches are still running, so the next stage's TMA load
 overlaps the current MMAs. A `wait_group(0)` after the loop drains everything before the epilogue.
-The warpgroup MMA also has an accumulate flag, `Field.ACCUMULATE`: `True` computes $D = AB + D$,
-`False` computes $D = AB$. The dense example zero-fills `acc` and sets it to `True`.
+The dense example zero-fills `acc` and sets `Field.ACCUMULATE` to `True`.
+
+wgmma reads shared memory through the **async proxy**, a separate path from ordinary loads and
+stores. TMA writes through the same proxy, so a TMA-filled stage only needs the pipeline's barrier
+wait. If threads instead write a stage with ordinary stores, they must issue `fence.proxy.async`
+before the wgmma reads it.<Sidenote>PTX ISA section 9.7.17.4, "Async Proxy": "For the async
+proxy, fence.proxy.async should be used to synchronize memory between generic proxy and the async
+proxy."</Sidenote>
 
 ## Summary
 
@@ -399,7 +770,8 @@ The warpgroup MMA also has an accumulate flag, `Field.ACCUMULATE`: `True` comput
 ## References
 
 - NVIDIA, [Warp-Level MMA Instructions Programming Guide](https://docs.nvidia.com/cutlass/4.5.3/media/docs/pythonDSL/mma_docs/wmma_programming.html), CUTLASS 4.5.3.
+- NVIDIA, [CuTe's support for Matrix Multiply-Accumulate instructions](https://docs.nvidia.com/cutlass/4.5.3/media/docs/cpp/cute/0t_mma_atom.html), CUTLASS 4.5.3.
 - NVIDIA, [Warpgroup MMA Programming Guide](https://docs.nvidia.com/cutlass/4.5.3/media/docs/pythonDSL/mma_docs/wgmma_programming.html), CUTLASS 4.5.3.
-- CUTLASS, [`mma_atom.hpp`](https://github.com/NVIDIA/cutlass/blob/b9847690c5838ac3d909ebc163ed16c388802485/include/cute/atom/mma_atom.hpp) (`thrfrg_A/B/C`, `get_layoutB_TV`), [`mma_traits_sm80.hpp`](https://github.com/NVIDIA/cutlass/blob/b9847690c5838ac3d909ebc163ed16c388802485/include/cute/atom/mma_traits_sm80.hpp) and [`mma_traits_sm90_gmma.hpp`](https://github.com/NVIDIA/cutlass/blob/b9847690c5838ac3d909ebc163ed16c388802485/include/cute/atom/mma_traits_sm90_gmma.hpp), commit b984769.
+- CUTLASS, [`mma_atom.hpp`](https://github.com/NVIDIA/cutlass/blob/b9847690c5838ac3d909ebc163ed16c388802485/include/cute/atom/mma_atom.hpp) (`thrfrg_A/B/C`, `get_layoutB_TV`), [`mma_traits_sm70.hpp`](https://github.com/NVIDIA/cutlass/blob/b9847690c5838ac3d909ebc163ed16c388802485/include/cute/atom/mma_traits_sm70.hpp), [`mma_traits_sm80.hpp`](https://github.com/NVIDIA/cutlass/blob/b9847690c5838ac3d909ebc163ed16c388802485/include/cute/atom/mma_traits_sm80.hpp) and [`mma_traits_sm90_gmma.hpp`](https://github.com/NVIDIA/cutlass/blob/b9847690c5838ac3d909ebc163ed16c388802485/include/cute/atom/mma_traits_sm90_gmma.hpp), commit b984769.
 - CUTLASS CuTe DSL examples, [`ampere/tensorop_gemm.py`](https://github.com/NVIDIA/cutlass/blob/b9847690c5838ac3d909ebc163ed16c388802485/examples/python/CuTeDSL/ampere/tensorop_gemm.py) and [`hopper/dense_gemm.py`](https://github.com/NVIDIA/cutlass/blob/b9847690c5838ac3d909ebc163ed16c388802485/examples/python/CuTeDSL/hopper/dense_gemm.py).
 - NVIDIA, [PTX ISA](https://docs.nvidia.com/cuda/parallel-thread-execution/): the matrix fragment tables for `mma.m16n8k16`, and the asynchronous warpgroup-level `wgmma` instructions.

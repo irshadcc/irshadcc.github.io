@@ -5,7 +5,7 @@
 // Each entry is spread into a <Matrix2D>; data and labels are keyed by the element's offset in the
 // column-major tile, which is exactly what the TV layout returns.
 import { CuteLayout } from "../../component/Cute/CuteLayout";
-import { SM80_16x8x16 } from "./mmaPartition";
+import { SM80_16x8x16, gmmaCLayout } from "./mmaPartition";
 
 interface Figure {
 	layout: CuteLayout;
@@ -18,6 +18,7 @@ function invert(
 	rows: number,
 	cols: number,
 	display: CuteLayout = new CuteLayout([rows, cols]),
+	thrID: CuteLayout = new CuteLayout(tv.mode(0).size),
 ): Figure {
 	const data: Record<number, string> = {};
 	const labels: Record<number, string> = {};
@@ -31,11 +32,37 @@ function invert(
 					`${tv} maps two (thread, value) pairs to offset ${off}`,
 				);
 			data[off] = `V${v}`;
-			labels[off] = `T${t}`;
+			labels[off] = `T${thrID.offset(t)}`;
 		}
 	if (Object.keys(data).length !== rows * cols)
 		throw new Error(`${tv} does not cover the ${rows}×${cols} tile`);
 	return { layout: display, data, labels };
+}
+
+/**
+ * The 64 × N wgmma accumulator drawn one cell per 16 × 8 block: block (w, j) holds rows 16w–16w+15
+ * and columns 8j–8j+7. Checks that every element of a block belongs to warp w (threads 32w–32w+31)
+ * and to values 4j–4j+3, then labels the block with that warp and those values.
+ */
+function wgmmaBlocks(n: number): Figure {
+	const tv = gmmaCLayout(n);
+	const blocks = n / 8;
+	for (let t = 0; t < 128; t++)
+		for (let v = 0; v < n / 2; v++) {
+			const off = tv.offset(t, v);
+			const w = Math.floor((off % 64) / 16);
+			const j = Math.floor(Math.floor(off / 64) / 8);
+			if (w !== Math.floor(t / 32) || j !== Math.floor(v / 4))
+				throw new Error(`${tv} puts (T${t}, V${v}) in block (${w}, ${j})`);
+		}
+	const data: Record<number, string> = {};
+	const labels: Record<number, string> = {};
+	for (let j = 0; j < blocks; j++)
+		for (let w = 0; w < 4; w++) {
+			data[w + 4 * j] = `d${4 * j}–d${4 * j + 3}`;
+			labels[w + 4 * j] = `T${32 * w}–T${32 * w + 31}`;
+		}
+	return { layout: new CuteLayout([4, blocks]), data, labels };
 }
 
 export const mmaAtomFigures = {
@@ -58,4 +85,27 @@ export const mmaAtomFigures = {
 		16,
 		new CuteLayout([[8, 2], 8], [[1, 64], 8]),
 	),
+	/**
+	 * Volta SM70_8x8x4_F32F16F16F32_NT accumulator, 8 × 8, CLayout SM70_8x8_32b from
+	 * mma_traits_sm70.hpp. Labels are warp lanes: logical thread t is lane ThrID(t) of the
+	 * quadpair layout (4,2):(1,16).
+	 */
+	volta: invert(
+		new CuteLayout(
+			[
+				[2, 2, 2],
+				[2, 2, 2],
+			],
+			[
+				[1, 16, 4],
+				[8, 2, 32],
+			],
+		),
+		8,
+		8,
+		undefined,
+		new CuteLayout([4, 2], [1, 16]),
+	),
+	/** wgmma m64n32k16 accumulator, one cell per 16 × 8 block (rows: warp, columns: 8-column block). */
+	wgmmaC: wgmmaBlocks(32),
 };
