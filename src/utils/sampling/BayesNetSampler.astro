@@ -1,0 +1,192 @@
+---
+// Ancestral sampling of a directed graphical model (eqs 14.47–14.48) on the cloudy / sprinkler /
+// rain / wet-grass network. Three methods, chosen with a menu:
+//  - ancestral: sample every node in order from p(zᵢ | pa(i)); estimates P(Rain = 1).
+//  - logic sampling: same, but with evidence WetGrass = 1 the sample is thrown away when the
+//    sampled WetGrass disagrees; estimates P(Rain = 1 | WetGrass = 1) from the kept samples.
+//  - likelihood weighting: WetGrass is clamped to 1 and the sample gets weight
+//    r = P(WetGrass = 1 | Sprinkler, Rain); the estimate is the weighted fraction with Rain = 1.
+// Left: the network with the current sample's values and conditional probabilities. Right: the
+// running estimate against the exact answer. The narration walks through the newest sample node
+// by node. Logic in sampling.ts (`sampleNet`, `exactPosterior`).
+// Usage in .mdx:
+//   <BayesNetSampler method="weighting" />
+import Player from "./Player.astro";
+import "./sampling.css";
+
+interface Props {
+	method?: "ancestral" | "logic" | "weighting";
+	seed?: number;
+	title?: string;
+	caption?: string;
+}
+
+const { method = "ancestral", seed = 12, title, caption } = Astro.props;
+---
+
+<figure class="smp-fig smp-bn" data-seed={seed}>
+	{title && <div class="smp-title">{title}</div>}
+	<div class="smp-legend">
+		<span><i class="dot k-ok"></i>value 1 (true)</span>
+		<span><i class="dot" style="background: var(--muted)"></i>value 0 (false)</span>
+		<span><i class="k-q"></i>evidence node</span>
+		<span><i class="k-p"></i>running estimate</span>
+		<span><i class="k-text"></i>exact</span>
+	</div>
+	<svg class="smp-svg" viewBox="0 0 640 300" role="img" aria-label="Sampling a Bayesian network"></svg>
+	<div class="smp-controls">
+		<Player />
+		<button type="button" class="smp-btn" data-add="100">+100 samples</button>
+		<button type="button" class="smp-btn" data-add="1000">+1000</button>
+		<label>method
+			<select class="i-method">
+				<option value="ancestral" selected={method === "ancestral"}>ancestral, no evidence</option>
+				<option value="logic" selected={method === "logic"}>logic sampling, WetGrass = 1</option>
+				<option value="weighting" selected={method === "weighting"}>likelihood weighting, WetGrass = 1</option>
+			</select>
+		</label>
+	</div>
+	<div class="smp-metrics">
+		<div><span>samples drawn</span><strong class="m-n"></strong></div>
+		<div><span class="l-used">used</span><strong class="m-used"></strong></div>
+		<div><span class="l-est">estimate</span><strong class="m-est"></strong></div>
+		<div><span>exact</span><strong class="m-exact"></strong></div>
+	</div>
+	<p class="smp-narration"></p>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import { type NetSample, conditional, exactPosterior, mulberry32, sampleNet, sprinkler } from "./sampling";
+	import { axes, bindPlayer, el, fmt } from "./plot";
+
+	const MAX = 5000;
+	const RAIN = 2;
+	const pos: [number, number][] = [
+		[150, 50],
+		[60, 150],
+		[240, 150],
+		[150, 250],
+	];
+
+	function attach(fig: HTMLElement) {
+		const svg = fig.querySelector("svg")!;
+		const say = fig.querySelector(".smp-narration")!;
+		const select = fig.querySelector<HTMLSelectElement>(".i-method")!;
+		let samples: NetSample[] = [];
+		// Start with some draws shown so the figure is not empty.
+		let n = 200;
+
+		const evidence = () => (select.value === "ancestral" ? {} : { 3: 1 });
+		const recompute = () => {
+			const rng = mulberry32(Number(fig.dataset.seed));
+			const m = select.value as "ancestral" | "logic" | "weighting";
+			samples = Array.from({ length: MAX }, () => sampleNet(sprinkler, m, evidence(), rng));
+		};
+
+		function draw() {
+			const m = select.value;
+			const exact = exactPosterior(sprinkler, RAIN, evidence());
+			svg.replaceChildren();
+			const cur = n > 0 ? samples[n - 1] : null;
+			// Edges.
+			sprinkler.forEach((node, i) => {
+				for (const p of node.parents) {
+					const [x0, y0] = pos[p];
+					const [x1, y1] = pos[i];
+					const len = Math.hypot(x1 - x0, y1 - y0);
+					const ux = (x1 - x0) / len;
+					const uy = (y1 - y0) / len;
+					el("line", { x1: x0 + ux * 30, y1: y0 + uy * 24, x2: x1 - ux * 34, y2: y1 - uy * 28, class: "smp-muted-line", "stroke-dasharray": "none" }, svg);
+					const tx = x1 - ux * 34;
+					const ty = y1 - uy * 28;
+					el("path", { d: `M${tx},${ty}l${-ux * 8 - uy * 4},${-uy * 8 + ux * 4}l${uy * 8},${-ux * 8}z`, class: "smp-faint-dot" }, svg);
+				}
+			});
+			// Nodes.
+			sprinkler.forEach((node, i) => {
+				const [x, y] = pos[i];
+				const v = cur ? cur.z[i] : -1;
+				const isEv = m !== "ancestral" && i === 3;
+				el("rect", { x: x - 52, y: y - 22, width: 104, height: 44, rx: 8, class: "smp-current", style: isEv ? "stroke: var(--smp-q); stroke-width: 3" : "" }, svg);
+				el("text", { x, y: y - 5, class: "smp-text", "text-anchor": "middle" }, svg, node.name);
+				const label = v < 0 ? (cur ? "not reached" : "?") : `= ${v}`;
+				const t = el("text", { x, y: y + 12, class: "smp-text", "text-anchor": "middle", "font-weight": 600 }, svg, label);
+				t.setAttribute("style", v === 1 ? "fill: var(--smp-ok)" : v === 0 ? "fill: var(--muted)" : "fill: var(--muted)");
+				if (cur && v >= 0) {
+					const p1 = conditional(node, cur.z, 1);
+					el("text", { x, y: y + 35, class: "smp-note", "text-anchor": "middle", style: "paint-order: stroke; stroke: var(--bg); stroke-width: 4px" }, svg, `P(=1 | parents) = ${p1}`);
+				}
+			});
+
+			// Running estimate.
+			const est: number[] = [];
+			let num = 0;
+			let den = 0;
+			for (let k = 0; k < n; k++) {
+				const s = samples[k];
+				const w = m === "logic" ? (s.rejectedAt < 0 ? 1 : 0) : s.weight;
+				den += w;
+				if (s.z[RAIN] === 1) num += w;
+				est.push(den > 0 ? num / den : Number.NaN);
+			}
+			const span = Math.max(n, 50);
+			const A = axes(svg, { x: 380, y: 14, w: 240, h: 240 }, [0, span], [0, 1], { xLabel: "samples drawn", yLabel: m === "ancestral" ? "estimate of P(Rain = 1)" : "estimate of P(Rain = 1 | Wet = 1)", xTicks: 4, yTicks: 5 });
+			el("line", { x1: A.box.x, x2: A.box.x + A.box.w, y1: A.sy(exact), y2: A.sy(exact), class: "smp-text-line" }, svg);
+			let d = "";
+			let pen = false;
+			const stride = Math.max(1, Math.floor(n / 500));
+			for (let k = 0; k < n; k += stride) {
+				if (!Number.isFinite(est[k])) continue;
+				d += `${pen ? "L" : "M"}${A.sx(k + 1).toFixed(1)},${A.sy(est[k]).toFixed(1)}`;
+				pen = true;
+			}
+			el("path", { d, class: "smp-p", style: "stroke-width: 1.5" }, svg);
+
+			fig.querySelector(".m-n")!.textContent = String(n);
+			fig.querySelector(".l-used")!.textContent = m === "logic" ? "kept (WetGrass agreed)" : m === "weighting" ? "total weight Σ r" : "used";
+			fig.querySelector(".m-used")!.textContent = m === "weighting" ? fmt(den, 2) : String(den);
+			fig.querySelector(".m-est")!.textContent = den > 0 ? fmt(num / den, 4) : "–";
+			fig.querySelector(".m-exact")!.textContent = fmt(exact, 4);
+
+			if (!cur) {
+				say.textContent = "Press play or step to sample the nodes in order: Cloudy, Sprinkler, Rain, WetGrass.";
+				return;
+			}
+			const parts: string[] = [];
+			sprinkler.forEach((node, i) => {
+				if (cur.z[i] < 0) return;
+				const p1 = conditional(node, cur.z, 1);
+				if (Number.isNaN(cur.u[i])) parts.push(`${node.name} clamped to ${cur.z[i]}, weight × ${p1}`);
+				else parts.push(`${node.name}: u = ${fmt(cur.u[i], 2)} ${cur.u[i] < p1 ? "<" : "≥"} ${p1} → ${cur.z[i]}`);
+			});
+			const tail = m === "logic" ? (cur.rejectedAt >= 0 ? " Disagrees with the evidence: discarded." : " Agrees with the evidence: kept.") : m === "weighting" ? ` Weight r = ${fmt(cur.weight, 2)}.` : "";
+			say.textContent = `Sample ${n}: ${parts.join("; ")}.${tail}`;
+		}
+
+		const step = (dir: 1 | -1) => {
+			n = Math.max(0, Math.min(MAX, n + dir));
+			draw();
+			return n < MAX;
+		};
+		bindPlayer(fig, step, () => {
+			n = 0;
+			draw();
+		}, 350);
+		fig.querySelectorAll<HTMLButtonElement>("[data-add]").forEach((b) =>
+			b.addEventListener("click", () => {
+				n = Math.min(MAX, n + Number(b.dataset.add));
+				draw();
+			}),
+		);
+		select.addEventListener("change", () => {
+			recompute();
+			n = 0;
+			draw();
+		});
+		recompute();
+		draw();
+	}
+
+	document.querySelectorAll<HTMLElement>(".smp-bn").forEach(attach);
+</script>

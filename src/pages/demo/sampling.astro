@@ -1,0 +1,51 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import AdaptiveRejectionSteps from "../../utils/sampling/AdaptiveRejectionSteps.astro";
+import BayesNetSampler from "../../utils/sampling/BayesNetSampler.astro";
+import BoxMullerMap from "../../utils/sampling/BoxMullerMap.astro";
+import Chain2D from "../../utils/sampling/Chain2D.astro";
+import EbmTraining from "../../utils/sampling/EbmTraining.astro";
+import ImportanceResampler from "../../utils/sampling/ImportanceResampler.astro";
+import InverseCdfSampler from "../../utils/sampling/InverseCdfSampler.astro";
+import MarkovChainSteps from "../../utils/sampling/MarkovChainSteps.astro";
+import RejectionSampler from "../../utils/sampling/RejectionSampler.astro";
+---
+
+<Layout title="Sampling figures">
+	<main>
+		<h1>Sampling figures</h1>
+		<h2>InverseCdfSampler</h2>
+		<InverseCdfSampler dist="exponential" title="Exponential target" />
+		<InverseCdfSampler dist="cauchy" title="Cauchy target" />
+		<h2>BoxMullerMap</h2>
+		<BoxMullerMap />
+		<h2>RejectionSampler</h2>
+		<RejectionSampler preset="gamma" a={10} title="Gamma, a = 10" />
+		<RejectionSampler preset="gamma" a={3} title="Gamma, a = 3" />
+		<RejectionSampler preset="gaussian" sigmaQ={1.2} title="Gaussian, σq = 1.2" />
+		<h2>AdaptiveRejectionSteps</h2>
+		<AdaptiveRejectionSteps grid={[1, 5]} />
+		<AdaptiveRejectionSteps grid={[0.5, 2, 8]} seed={7} title="Three starting points" />
+		<h2>ImportanceResampler</h2>
+		<ImportanceResampler sigmaQ={2} samples={200} />
+		<ImportanceResampler sigmaQ={0.5} samples={1000} title="Narrow proposal" />
+		<h2>MarkovChainSteps</h2>
+		<MarkovChainSteps pTilde={[1, 3, 6, 4, 2]} />
+		<MarkovChainSteps pTilde={[5, 1, 5]} start={1} steps={20} title="Two modes" />
+		<h2>Chain2D</h2>
+		<Chain2D method="metropolis" param={0.2} />
+		<Chain2D method="metropolis" param={1} sMax={0.6} sMin={0.4} angle={0} title="Rounder target, big steps" />
+		<Chain2D method="gibbs" param={0} />
+		<Chain2D method="gibbs" param={-0.9} title="Over-relaxed Gibbs" />
+		<Chain2D method="langevin" param={0.005} />
+		<h2>BayesNetSampler</h2>
+		<BayesNetSampler method="ancestral" />
+		<BayesNetSampler method="logic" />
+		<h2>EbmTraining</h2>
+		<EbmTraining iterations={300} />
+	</main>
+</Layout>
+
+<style>
+	main { max-width: 780px; margin: 3rem auto; padding: 0 1rem; }
+</style>

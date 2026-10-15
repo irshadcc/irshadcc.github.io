@@ -1,0 +1,170 @@
+---
+// Rejection sampling (eqs 14.13–14.16). Top: the unnormalized target p̃(z), the comparison
+// function k q(z) and the grey rejection region between them. Each draw is a point (z0, u0):
+// z0 from q, u0 uniform on [0, k q(z0)]; green points fall under p̃ and are kept, red ones are
+// rejected. Bottom: histogram of kept z0 against the normalized target. A slider scales k above
+// its smallest valid value k_min, so the reader can watch the acceptance rate fall as 1/k.
+// Presets: "gamma" is the book's Gam(z | a, b) with a Cauchy proposal (c = a − 1,
+// scale² = 2a − 1); "gaussian" is the book's N(0, 1) target with a wider N(0, σq²) proposal.
+// Logic in sampling.ts (`gammaCauchy`, `rejectionStep`).
+// Usage in .mdx:
+//   <RejectionSampler preset="gamma" a={10} />
+//   <RejectionSampler preset="gaussian" sigmaQ={1.5} />
+import Player from "./Player.astro";
+import "./sampling.css";
+
+interface Props {
+	preset?: "gamma" | "gaussian";
+	/** Gamma shape (rate is 1). */
+	a?: number;
+	/** Proposal standard deviation for the Gaussian preset (target has σ = 1). */
+	sigmaQ?: number;
+	seed?: number;
+	title?: string;
+	caption?: string;
+}
+
+const {
+	preset = "gamma",
+	a = 10,
+	sigmaQ = 1.5,
+	seed = 9,
+	title,
+	caption,
+} = Astro.props;
+---
+
+<figure class="smp-fig smp-rej" data-preset={preset} data-a={a} data-sq={sigmaQ} data-seed={seed}>
+	{title && <div class="smp-title">{title}</div>}
+	<div class="smp-legend">
+		<span><i class="k-p"></i>p̃(z)</span>
+		<span><i class="k-q"></i>k q(z)</span>
+		<span><i class="box k-shade"></i>rejection region</span>
+		<span><i class="dot k-ok"></i>kept</span>
+		<span><i class="dot k-bad"></i>rejected</span>
+		<span><i class="box k-hist"></i>kept z</span>
+	</div>
+	<svg class="smp-svg" viewBox="0 0 640 410" role="img" aria-label="Rejection sampling under a comparison function"></svg>
+	<div class="smp-controls">
+		<Player />
+		<button type="button" class="smp-btn" data-add="500">+500 draws</button>
+		<label class="smp-slider">k = <strong class="k-val"></strong>
+			<input type="range" class="k-mult" min="1" max="3" step="0.05" value="1" aria-label="k as a multiple of its smallest value" />
+		</label>
+	</div>
+	<div class="smp-metrics">
+		<div><span>proposed</span><strong class="m-n"></strong></div>
+		<div><span>kept</span><strong class="m-acc"></strong></div>
+		<div><span>acceptance rate</span><strong class="m-rate"></strong></div>
+		<div><span>theory ∫p̃ dz / k</span><strong class="m-theory"></strong></div>
+	</div>
+	<p class="smp-narration"></p>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import { type RejectionSetup, gammaCauchy, gaussianPdf, mulberry32 } from "./sampling";
+	import { area, axes, bars, bindPlayer, curve, el, fmt, histogram } from "./plot";
+
+	const MAX = 6000;
+
+	function setupFor(fig: HTMLElement): RejectionSetup {
+		if (fig.dataset.preset === "gamma") return gammaCauchy(Number(fig.dataset.a), 1);
+		const sq = Number(fig.dataset.sq);
+		// Unnormalized target exp(−z²/2): area √(2π); k_min q(0) = 1 gives k_min = σq √(2π).
+		return {
+			pTilde: (z) => Math.exp(-0.5 * z * z),
+			q: (z) => gaussianPdf(z, 0, sq),
+			sampleQ: () => 0,
+			kMin: sq * Math.sqrt(2 * Math.PI),
+			area: Math.sqrt(2 * Math.PI),
+			range: [-5, 5],
+		};
+	}
+
+	function attach(fig: HTMLElement) {
+		const svg = fig.querySelector("svg")!;
+		const say = fig.querySelector(".smp-narration")!;
+		const slider = fig.querySelector<HTMLInputElement>(".k-mult")!;
+		const s = setupFor(fig);
+		const rng = mulberry32(Number(fig.dataset.seed));
+		// Draw z0 from q and a uniform v once; u0 = v k q(z0) is rescaled when k changes.
+		const sq = Number(fig.dataset.sq);
+		const z0s: number[] = [];
+		const vs: number[] = [];
+		for (let i = 0; i < MAX; i++) {
+			if (fig.dataset.preset === "gamma") z0s.push(s.sampleQ(rng));
+			else {
+				// Box–Muller (cosine form) for the Gaussian proposal.
+				const u1 = rng();
+				const u2 = rng();
+				z0s.push(sq * Math.sqrt(-2 * Math.log(1 - u1)) * Math.cos(2 * Math.PI * u2));
+			}
+			vs.push(rng());
+		}
+		// Start with some draws shown so the figure is not empty.
+		let n = 400;
+		const [lo, hi] = s.range;
+		const grid = Array.from({ length: 400 }, (_, i) => lo + ((hi - lo) * i) / 399);
+		const peak = Math.max(...grid.map(s.pTilde));
+		const qPeak = Math.max(...grid.map(s.q));
+
+		function draw() {
+			const k = Number(slider.value) * s.kMin;
+			svg.replaceChildren();
+			const top = axes(svg, { x: 52, y: 10, w: 568, h: 200 }, [lo, hi], [0, Math.max(peak, k * qPeak) * 1.08], { yLabel: "p̃(z), k q(z)" });
+			el("path", { d: `${curve(top, (z) => k * s.q(z))}L${top.sx(hi)},${top.sy(0)}L${top.sx(lo)},${top.sy(0)}Z`, class: "smp-shade" }, svg);
+			el("path", { d: area(top, s.pTilde), class: "smp-p-area" }, svg);
+			let kept = 0;
+			const acc: number[] = [];
+			for (let i = 0; i < n; i++) {
+				const z = z0s[i];
+				const u = vs[i] * k * s.q(z);
+				const ok = u <= s.pTilde(z);
+				if (ok) {
+					kept++;
+					acc.push(z);
+				}
+				if (z < lo || z > hi) continue;
+				el("circle", { cx: top.sx(z), cy: top.sy(u), r: i === n - 1 ? 4.5 : 1.8, class: i === n - 1 ? "smp-current" : ok ? "smp-ok" : "smp-bad" }, svg);
+			}
+			el("path", { d: curve(top, (z) => k * s.q(z)), class: "smp-q" }, svg);
+			el("path", { d: curve(top, s.pTilde), class: "smp-p" }, svg);
+
+			const pn = (z: number) => s.pTilde(z) / s.area;
+			const bot = axes(svg, { x: 52, y: 250, w: 568, h: 120 }, [lo, hi], [0, (peak / s.area) * 1.35], { xLabel: "z", yLabel: "density", yTicks: 3 });
+			bars(svg, bot, histogram(acc, lo, hi, 50), lo, hi, "smp-hist");
+			el("path", { d: curve(bot, pn), class: "smp-p" }, svg);
+
+			fig.querySelector(".k-val")!.textContent = `${fmt(k, 3)} (${fmt(Number(slider.value), 2)} × k_min)`;
+			fig.querySelector(".m-n")!.textContent = String(n);
+			fig.querySelector(".m-acc")!.textContent = String(kept);
+			fig.querySelector(".m-rate")!.textContent = n ? fmt(kept / n, 3) : "–";
+			fig.querySelector(".m-theory")!.textContent = fmt(s.area / k, 3);
+			if (n > 0) {
+				const z = z0s[n - 1];
+				const u = vs[n - 1] * k * s.q(z);
+				const p = s.pTilde(z);
+				say.textContent = `Draw ${n}: z0 = ${fmt(z, 3)} from q, k q(z0) = ${fmt(k * s.q(z0s[n - 1]), 4)}, u0 = ${fmt(u, 4)}, p̃(z0) = ${fmt(p, 4)}: ${u <= p ? "u0 ≤ p̃(z0), kept" : "u0 > p̃(z0), rejected"}. Acceptance probability of this z0 is p̃/kq = ${fmt(p / (k * s.q(z)), 3)}.`;
+			} else say.textContent = "Press play or step to draw z0 from q and u0 uniformly under k q(z0).";
+		}
+
+		const step = (dir: 1 | -1) => {
+			n = Math.max(0, Math.min(MAX, n + dir));
+			draw();
+			return n < MAX && n < 120;
+		};
+		bindPlayer(fig, step, () => {
+			n = 0;
+			draw();
+		}, 160);
+		fig.querySelector("[data-add]")!.addEventListener("click", () => {
+			n = Math.min(MAX, n + 500);
+			draw();
+		});
+		slider.addEventListener("input", draw);
+		draw();
+	}
+
+	document.querySelectorAll<HTMLElement>(".smp-rej").forEach(attach);
+</script>

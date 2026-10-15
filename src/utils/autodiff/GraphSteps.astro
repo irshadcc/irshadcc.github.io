@@ -1,0 +1,388 @@
+---
+// Step through a computation on a small graph: the units of a network during forward propagation
+// and backpropagation, or the variables of an evaluation trace during forward-mode (tangent) and
+// reverse-mode (adjoint) automatic differentiation. Nodes sit at fixed grid positions and show the
+// values known so far; lit edges show which way information flows in this step (forward in the
+// accent colour, backward in red with the arrow pointing back to the parent). An optional table
+// (weights, gradients) and a note (HTML with $TeX$) sit under the graph. Every step is rendered at
+// build time; the controls only switch which one is visible. Data model in graphSteps.ts; the
+// backpropagation post's figures are built in backpropFigures.ts.
+// Usage in .mdx:
+//   import GraphSteps from "../../utils/autodiff/GraphSteps.astro";
+//   import { networkSteps } from "../../utils/autodiff/backpropFigures";
+//   <GraphSteps data={networkSteps} title="Backpropagation on a 2-3-2 network" />
+import StepControls from "../compiler/StepControls.astro";
+import {
+	type GraphStepsData,
+	edgeKey,
+	tex,
+	validateGraphSteps,
+} from "./graphSteps";
+
+interface Props {
+	data: GraphStepsData;
+	/** Step shown on load. */
+	step?: number;
+	title?: string;
+	/** Horizontal and vertical distance between grid cells, and node width, in SVG units. */
+	colGap?: number;
+	rowGap?: number;
+	nodeWidth?: number;
+}
+
+const {
+	data,
+	step = 0,
+	title,
+	colGap = 190,
+	rowGap = 92,
+	nodeWidth = 112,
+} = Astro.props;
+const err = validateGraphSteps(data);
+if (err) throw new Error(`GraphSteps: ${err}`);
+const at = Math.max(0, Math.min(data.steps.length - 1, step));
+
+const PAD = 14;
+const HEAD = 20;
+const LINE = 15;
+const R = 11; // bias node radius
+const maxLines = Math.max(
+	1,
+	...data.steps.flatMap((s) =>
+		Object.values(s.nodes).map((n) => n.lines?.length ?? 0),
+	),
+);
+const nodeH = HEAD + maxLines * LINE + 6;
+const maxCol = Math.max(...data.nodes.map((n) => n.col));
+const maxRow = Math.max(...data.nodes.map((n) => n.row));
+const W = PAD * 2 + maxCol * colGap + nodeWidth;
+const H = PAD * 2 + maxRow * rowGap + nodeH;
+const byId = new Map(data.nodes.map((n) => [n.id, n]));
+const box = (id: string) => {
+	const n = byId.get(id);
+	if (!n) throw new Error(id);
+	const x = PAD + n.col * colGap;
+	const y = PAD + n.row * rowGap;
+	// A bias node sits at the right edge of its column, so its edges leave from the same x as the
+	// boxes' and clear the boxes below it.
+	return n.bias
+		? {
+				l: x + nodeWidth - 2 * R,
+				r: x + nodeWidth,
+				cx: x + nodeWidth - R,
+				cy: y + nodeH / 2,
+				x,
+				y,
+			}
+		: {
+				l: x,
+				r: x + nodeWidth,
+				cx: x + nodeWidth / 2,
+				cy: y + nodeH / 2,
+				x,
+				y,
+			};
+};
+const edges = data.edges.map((e) => {
+	const a = box(e.from);
+	const b = box(e.to);
+	return { key: edgeKey(e), x1: a.r, y1: a.cy, x2: b.l, y2: b.cy };
+});
+const uid = `gs${Math.random().toString(36).slice(2, 8)}`;
+const notes = data.steps.map((s) => tex(s.note));
+---
+
+<figure class="gs" data-step={at} data-count={data.steps.length} tabindex="-1">
+	{title && <figcaption class="gs-title">{title}</figcaption>}
+	<StepControls labels={data.steps.map((s) => s.label)} step={at} />
+	<div class="gs-canvas">
+		<svg viewBox={`0 0 ${W} ${H}`} style={`min-width: ${Math.min(W, 520)}px`} role="img" aria-label={title ?? "computation graph"}>
+			<defs>
+				<marker id={`${uid}-base`} viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+					<path d="M0 0 10 5 0 10z" class="gs-m-base"></path>
+				</marker>
+				<marker id={`${uid}-fwd`} viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+					<path d="M0 0 10 5 0 10z" class="gs-m-fwd"></path>
+				</marker>
+				<marker id={`${uid}-bwd`} viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+					<path d="M0 0 10 5 0 10z" class="gs-m-bwd"></path>
+				</marker>
+			</defs>
+			{
+				data.steps.map((s, k) => (
+					<g class="gs-step" data-k={k} hidden={k !== at}>
+						{edges.map((e) => {
+							const st = s.edges?.[e.key];
+							const hi = st?.hi;
+							return (
+								<line
+									class:list={["gs-edge", hi]}
+									x1={e.x1}
+									y1={e.y1}
+									x2={e.x2}
+									y2={e.y2}
+									marker-end={hi === "bwd" ? undefined : `url(#${uid}-${hi ?? "base"})`}
+									marker-start={hi === "bwd" ? `url(#${uid}-bwd)` : undefined}
+								/>
+							);
+						})}
+						{edges.map((e) => {
+							const st = s.edges?.[e.key];
+							if (!st?.label) return null;
+							const t = 0.6;
+							const x = e.x1 + (e.x2 - e.x1) * t;
+							const y = e.y1 + (e.y2 - e.y1) * t;
+							const w = st.label.length * 6.1 + 8;
+							return (
+								<g class:list={["gs-elabel", st.hi]}>
+									<rect x={x - w / 2} y={y - 8} width={w} height={16} rx={4} />
+									<text x={x} y={y + 4} text-anchor="middle">
+										{st.label}
+									</text>
+								</g>
+							);
+						})}
+						{data.nodes.map((n) => {
+							const b = box(n.id);
+							const st = s.nodes[n.id];
+							if (n.bias)
+								return (
+									<g class:list={["gs-node", "bias", st?.hi]}>
+										<circle cx={b.cx} cy={b.cy} r={R} />
+										<text x={b.cx} y={b.cy + 4} text-anchor="middle">
+											1
+										</text>
+									</g>
+								);
+							return (
+								<g class:list={["gs-node", st?.hi]}>
+									<rect x={b.x} y={b.y} width={nodeWidth} height={nodeH} rx={7} />
+									<text class="gs-head" x={b.x + 8} y={b.y + 14}>
+										{n.label}
+										{n.sub && <tspan class="gs-sub">{`  ${n.sub}`}</tspan>}
+									</text>
+									<line class="gs-rule" x1={b.x} x2={b.x + nodeWidth} y1={b.y + HEAD} y2={b.y + HEAD} />
+									{(st?.lines ?? []).map((l, i) => (
+										<text class="gs-val" x={b.x + 8} y={b.y + HEAD + 13 + i * LINE}>
+											{l}
+										</text>
+									))}
+								</g>
+							);
+						})}
+					</g>
+				))
+			}
+		</svg>
+	</div>
+	{
+		data.steps.map((s, k) =>
+			s.table ? (
+				<div class="gs-scroll" data-k={k} hidden={k !== at}>
+					<table class="gs-table">
+						{s.table.caption && <caption>{s.table.caption}</caption>}
+						<thead>
+							<tr>
+								{s.table.columns.map((c) => (
+									<th>{c}</th>
+								))}
+							</tr>
+						</thead>
+						<tbody>
+							{s.table.rows.map((r) => (
+								<tr>
+									{r.map((c) => (
+										<td>{c}</td>
+									))}
+								</tr>
+							))}
+						</tbody>
+					</table>
+				</div>
+			) : null,
+		)
+	}
+	<div class="gs-notes" aria-live="polite">
+		{notes.map((n, k) => <div class="gs-note" data-k={k} hidden={k !== at} set:html={n} />)}
+	</div>
+</figure>
+
+<script>
+	import { bindStepper } from "../compiler/stepper";
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".gs")) {
+		const parts = [...fig.querySelectorAll<Element>("[data-k]")];
+		bindStepper(fig, Number(fig.dataset.count), (k) => {
+			for (const el of parts) {
+				if (Number(el.getAttribute("data-k")) === k) el.removeAttribute("hidden");
+				else el.setAttribute("hidden", "");
+			}
+		});
+	}
+</script>
+
+<style>
+	.gs {
+		--gs-bwd: #b3322b;
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+		outline: none;
+	}
+	@media (prefers-color-scheme: dark) {
+		.gs {
+			--gs-bwd: #f08b80;
+		}
+	}
+	.gs-title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.3rem;
+	}
+	.gs-canvas {
+		overflow-x: auto;
+		margin-top: 0.5rem;
+	}
+	.gs-canvas svg {
+		display: block;
+		width: 100%;
+		height: auto;
+	}
+	.gs-step[hidden],
+	.gs-scroll[hidden],
+	.gs-note[hidden] {
+		display: none;
+	}
+	.gs-edge {
+		stroke: var(--faint);
+		stroke-width: 1.3;
+	}
+	.gs-edge.fwd {
+		stroke: var(--accent);
+		stroke-width: 2;
+	}
+	.gs-edge.bwd {
+		stroke: var(--gs-bwd);
+		stroke-width: 2;
+	}
+	.gs-m-base {
+		fill: var(--faint);
+	}
+	.gs-m-fwd {
+		fill: var(--accent);
+	}
+	.gs-m-bwd {
+		fill: var(--gs-bwd);
+	}
+	.gs-elabel rect {
+		fill: var(--bg);
+		stroke: var(--faint);
+	}
+	.gs-elabel.fwd rect {
+		stroke: var(--accent);
+	}
+	.gs-elabel.bwd rect {
+		stroke: var(--gs-bwd);
+	}
+	.gs-elabel text {
+		font-family: var(--mono);
+		font-size: 10px;
+		fill: var(--text);
+	}
+	.gs-node rect,
+	.gs-node circle {
+		fill: var(--surface);
+		stroke: var(--faint);
+		stroke-width: 1.2;
+	}
+	.gs-node.fwd rect,
+	.gs-node.fwd circle {
+		stroke: var(--accent);
+		stroke-width: 2;
+		fill: color-mix(in oklch, var(--accent) 12%, var(--surface));
+	}
+	.gs-node.bwd rect,
+	.gs-node.bwd circle {
+		stroke: var(--gs-bwd);
+		stroke-width: 2;
+		fill: color-mix(in oklch, var(--gs-bwd) 12%, var(--surface));
+	}
+	.gs-node text {
+		fill: var(--text);
+	}
+	.gs-node.bias text {
+		font-family: var(--mono);
+		font-size: 11px;
+		fill: var(--muted);
+	}
+	.gs-head {
+		font-size: 12px;
+		font-weight: 600;
+	}
+	.gs-sub {
+		font-weight: 400;
+		font-family: var(--mono);
+		font-size: 10px;
+		fill: var(--muted);
+	}
+	.gs-rule {
+		stroke: var(--faint);
+	}
+	.gs-val {
+		font-family: var(--mono);
+		font-size: 10.5px;
+	}
+	.gs-scroll {
+		overflow-x: auto;
+		margin-top: 0.6rem;
+		border: 1px solid var(--faint);
+		border-radius: 8px;
+	}
+	.gs-table {
+		width: 100%;
+		border-collapse: collapse;
+		margin: 0;
+		font-size: 0.74rem;
+	}
+	.gs-table caption {
+		caption-side: top;
+		text-align: left;
+		padding: 0.35rem 0.6rem 0.1rem;
+		font-size: 0.72rem;
+		color: var(--muted);
+	}
+	.gs-table th,
+	.gs-table td {
+		text-align: right;
+		padding: 0.25rem 0.6rem;
+		border-bottom: 1px solid var(--faint);
+		white-space: nowrap;
+	}
+	.gs-table th:first-child,
+	.gs-table td:first-child {
+		text-align: left;
+	}
+	.gs-table td {
+		font-family: var(--mono);
+		font-size: 0.7rem;
+	}
+	.gs-table th {
+		font-weight: 600;
+		color: var(--muted);
+		font-size: 0.72rem;
+	}
+	.gs-table tr:last-child td {
+		border-bottom: none;
+	}
+	.gs-notes {
+		margin-top: 0.6rem;
+		font-size: 0.82rem;
+		line-height: 1.5;
+		min-height: 3em;
+	}
+	.gs-note :global(.katex-display) {
+		margin: 0.4rem 0;
+		overflow-x: auto;
+		overflow-y: hidden;
+	}
+</style>

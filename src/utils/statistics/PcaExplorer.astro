@@ -1,0 +1,364 @@
+---
+// Two-dimensional PCA figure. In "direction" mode it draws the points with a line through
+// their mean at an angle the reader sets with a slider; each point drops a dashed
+// perpendicular onto the line and a dot marks its projection. Readouts give the variance of
+// the projections, the mean squared distance to the line and their (constant) sum, and a
+// second panel plots both against the angle so the reader can see the variance peak and the
+// distance dip at the first principal direction. Buttons snap to PC1 / PC2, a checkbox shows
+// both principal axes, and hovering a point reports its coordinates, score and distance.
+// In "scatter" mode it plots points coloured by group (for example PCA scores) with a legend.
+// The PCA itself is in pca.ts.
+// Usage in .mdx:
+//   <PcaExplorer points={[[1, 1], [2, 1], [3, 3], [5, 6]]} xLabel="x₁" yLabel="x₂" angle={0} />
+//   <PcaExplorer mode="scatter" points={scores} groups={groups} groupNames={["a", "b"]}
+//     xLabel="PC1" yLabel="PC2" />
+import { type Point, pca2 } from "./pca";
+
+interface Props {
+	points: Point[];
+	mode?: "direction" | "scatter";
+	/** Starting angle of the line in degrees ("direction" mode). */
+	angle?: number;
+	/** Group index of each point ("scatter" mode). */
+	groups?: number[];
+	groupNames?: string[];
+	xLabel?: string;
+	yLabel?: string;
+	title?: string;
+	caption?: string;
+}
+
+const {
+	points,
+	mode = "direction",
+	angle = 0,
+	groups,
+	groupNames = [],
+	xLabel = "x₁",
+	yLabel = "x₂",
+	title,
+	caption,
+} = Astro.props;
+const pca = pca2(points);
+const data = {
+	points,
+	mode,
+	angle,
+	groups: groups ?? null,
+	groupNames,
+	pca,
+	xLabel,
+	yLabel,
+};
+---
+
+<figure class="pca-explorer" data-pca={JSON.stringify(data)}>
+	{title && <div class="pca-title">{title}</div>}
+	<div class="pca-panels">
+		<svg class="pca-plot" viewBox="0 0 420 320" role="img" aria-label={title ?? "Scatter plot"}>
+			<defs>
+				<clipPath id="pca-clip"><rect x="40" y="10" width="370" height="270" /></clipPath>
+			</defs>
+			<g class="pca-axes"></g>
+			<g class="pca-dynamic" clip-path="url(#pca-clip)"></g>
+			<g class="pca-dots"></g>
+		</svg>
+		{mode === "direction" && (
+			<svg class="pca-curve" viewBox="0 0 420 222" role="img" aria-label="Variance and squared distance against the line angle">
+				<g class="pca-curve-g"></g>
+			</svg>
+		)}
+	</div>
+	{mode === "direction" && (
+		<div class="pca-controls">
+			<label class="pca-angle">
+				Line angle θ = <strong class="pca-angle-value"></strong>
+				<input type="range" min="0" max="179.5" step="0.5" value={angle} />
+			</label>
+			<div class="pca-buttons">
+				<button type="button" data-snap="0">Snap to PC1</button>
+				<button type="button" data-snap="1">Snap to PC2</button>
+				<label class="pca-check"><input type="checkbox" class="pca-show-axes" /> principal axes</label>
+			</div>
+		</div>
+	)}
+	{mode === "direction" && (
+		<div class="pca-metrics">
+			<div class="m-var"><span>variance along the line</span><strong></strong></div>
+			<div class="m-res"><span>mean squared distance to the line</span><strong></strong></div>
+			<div><span>sum (total variance)</span><strong class="m-sum"></strong></div>
+		</div>
+	)}
+	<p class="pca-hover">Hover a point to see its numbers.</p>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import { type Point, type Pca2, directionalVariance, project } from "./pca";
+
+	const NS = "http://www.w3.org/2000/svg";
+	const fmt = (v: number, d = 2) => (Math.abs(v) < 5e-4 ? 0 : v).toFixed(d);
+
+	function el(tag: string, attrs: Record<string, string | number>, parent: Element, text?: string) {
+		const e = document.createElementNS(NS, tag);
+		for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+		if (text !== undefined) e.textContent = text;
+		parent.append(e);
+		return e;
+	}
+
+	/** Round tick step: 1, 2 or 5 times a power of ten. */
+	function tickStep(range: number, target = 6) {
+		const raw = range / target;
+		const p = 10 ** Math.floor(Math.log10(raw));
+		const m = raw / p;
+		return (m < 1.5 ? 1 : m < 3.5 ? 2 : m < 7.5 ? 5 : 10) * p;
+	}
+
+	interface Data {
+		points: Point[];
+		mode: "direction" | "scatter";
+		angle: number;
+		groups: number[] | null;
+		groupNames: string[];
+		pca: Pca2;
+		xLabel: string;
+		yLabel: string;
+	}
+
+	function attach(figure: HTMLElement) {
+		const d = JSON.parse(figure.dataset.pca!) as Data;
+		const { points, pca } = d;
+		const axes = figure.querySelector(".pca-axes")!;
+		const dyn = figure.querySelector(".pca-dynamic")!;
+		const dots = figure.querySelector(".pca-dots")!;
+		const hover = figure.querySelector(".pca-hover")!;
+		// Unique clip id per figure.
+		const clipId = `pca-clip-${Math.random().toString(36).slice(2)}`;
+		figure.querySelector("clipPath")!.id = clipId;
+		dyn.setAttribute("clip-path", `url(#${clipId})`);
+
+		// Equal scale on both axes so perpendicular lines look perpendicular.
+		const box = { x: 40, y: 10, w: 370, h: 270 };
+		const xs = points.map((p) => p[0]);
+		const ys = points.map((p) => p[1]);
+		let [x0, x1, y0, y1] = [Math.min(...xs), Math.max(...xs), Math.min(...ys), Math.max(...ys)];
+		const pad = 0.12 * Math.max(x1 - x0, y1 - y0, 1e-9);
+		x0 -= pad; x1 += pad; y0 -= pad; y1 += pad;
+		const k = Math.min(box.w / (x1 - x0), box.h / (y1 - y0));
+		const cx = (x0 + x1) / 2;
+		const cy = (y0 + y1) / 2;
+		const sx = (x: number) => box.x + box.w / 2 + (x - cx) * k;
+		const sy = (y: number) => box.y + box.h / 2 - (y - cy) * k;
+		const [vx0, vx1] = [cx - box.w / 2 / k, cx + box.w / 2 / k];
+		const [vy0, vy1] = [cy - box.h / 2 / k, cy + box.h / 2 / k];
+
+		el("rect", { x: box.x, y: box.y, width: box.w, height: box.h, class: "pca-frame" }, axes);
+		const step = tickStep(Math.max(vx1 - vx0, vy1 - vy0));
+		for (let t = Math.ceil(vx0 / step) * step; t <= vx1; t += step) {
+			el("line", { x1: sx(t), x2: sx(t), y1: box.y, y2: box.y + box.h, class: "pca-grid" }, axes);
+			el("text", { x: sx(t), y: box.y + box.h + 14, class: "pca-tick", "text-anchor": "middle" }, axes, fmt(t, step < 1 ? 1 : 0));
+		}
+		for (let t = Math.ceil(vy0 / step) * step; t <= vy1; t += step) {
+			el("line", { x1: box.x, x2: box.x + box.w, y1: sy(t), y2: sy(t), class: "pca-grid" }, axes);
+			el("text", { x: box.x - 6, y: sy(t) + 4, class: "pca-tick", "text-anchor": "end" }, axes, fmt(t, step < 1 ? 1 : 0));
+		}
+		el("text", { x: box.x + box.w / 2, y: 312, class: "pca-axis-label", "text-anchor": "middle" }, axes, d.xLabel);
+		el("text", { x: 12, y: box.y + box.h / 2, class: "pca-axis-label", "text-anchor": "middle", transform: `rotate(-90 12 ${box.y + box.h / 2})` }, axes, d.yLabel);
+
+		const circles = points.map((p, i) => {
+			const g = d.groups ? d.groups[i] : -1;
+			const c = el("circle", { cx: sx(p[0]), cy: sy(p[1]), r: d.mode === "scatter" ? 3.6 : 5, class: `pca-point g${g}` }, dots);
+			return c;
+		});
+
+		if (d.mode === "scatter") {
+			const legend = el("g", {}, dots);
+			d.groupNames.forEach((name, g) => {
+				const y = box.y + 14 + g * 16;
+				el("circle", { cx: box.x + 12, cy: y - 4, r: 4, class: `pca-point g${g}` }, legend);
+				el("text", { x: box.x + 22, y, class: "pca-legend" }, legend, name);
+			});
+			circles.forEach((c, i) => {
+				c.addEventListener("mouseenter", () => {
+					const name = d.groups ? d.groupNames[d.groups[i]] ?? "" : "";
+					hover.textContent = `point ${i + 1}${name ? ` (${name})` : ""}: ${d.xLabel} = ${fmt(points[i][0])}, ${d.yLabel} = ${fmt(points[i][1])}`;
+				});
+			});
+			return;
+		}
+
+		// Direction mode.
+		const slider = figure.querySelector<HTMLInputElement>(".pca-angle input")!;
+		const showAxes = figure.querySelector<HTMLInputElement>(".pca-show-axes")!;
+		const total = pca.values[0] + pca.values[1];
+		const [mx, my] = pca.mean;
+		const far = 4 * Math.max(vx1 - vx0, vy1 - vy0);
+		let current = project(pca.centred, Number(slider.value));
+		let hovered = -1;
+
+		// Curve panel: variance and squared distance against θ.
+		const cg = figure.querySelector(".pca-curve-g")!;
+		const cb = { x: 40, y: 34, w: 360, h: 150 };
+		const tx = (deg: number) => cb.x + (deg / 180) * cb.w;
+		const ty = (v: number) => cb.y + cb.h - (v / (total * 1.08)) * cb.h;
+		el("rect", { x: cb.x, y: cb.y, width: cb.w, height: cb.h, class: "pca-frame" }, cg);
+		for (let deg = 0; deg <= 180; deg += 45) {
+			el("line", { x1: tx(deg), x2: tx(deg), y1: cb.y, y2: cb.y + cb.h, class: "pca-grid" }, cg);
+			el("text", { x: tx(deg), y: cb.y + cb.h + 14, class: "pca-tick", "text-anchor": "middle" }, cg, `${deg}°`);
+		}
+		const vstep = tickStep(total * 1.08, 4);
+		for (let v = 0; v <= total * 1.08; v += vstep) {
+			el("line", { x1: cb.x, x2: cb.x + cb.w, y1: ty(v), y2: ty(v), class: "pca-grid" }, cg);
+			el("text", { x: cb.x - 6, y: ty(v) + 4, class: "pca-tick", "text-anchor": "end" }, cg, fmt(v, vstep < 1 ? 1 : 0));
+		}
+		const curve = (f: (deg: number) => number) =>
+			Array.from({ length: 361 }, (_, i) => i / 2)
+				.map((deg, i) => `${i ? "L" : "M"}${tx(deg).toFixed(1)},${ty(f(deg)).toFixed(1)}`)
+				.join(" ");
+		el("path", { d: `M${tx(0)},${ty(total)} L${tx(180)},${ty(total)}`, class: "pca-total" }, cg);
+		el("path", { d: curve((deg) => directionalVariance(pca.cov, deg)), class: "pca-var-curve" }, cg);
+		el("path", { d: curve((deg) => total - directionalVariance(pca.cov, deg)), class: "pca-res-curve" }, cg);
+		el("line", { x1: tx(pca.angle), x2: tx(pca.angle), y1: cb.y, y2: cb.y + cb.h, class: "pca-pc-mark" }, cg);
+		el("text", { x: tx(pca.angle) + 4, y: cb.y + 12, class: "pca-tick" }, cg, "PC1");
+		const marker = el("line", { y1: cb.y, y2: cb.y + cb.h, class: "pca-marker" }, cg);
+		const dotVar = el("circle", { r: 4.5, class: "pca-var-dot" }, cg);
+		const dotRes = el("circle", { r: 4.5, class: "pca-res-dot" }, cg);
+		el("text", { x: cb.x + cb.w / 2, y: 216, class: "pca-axis-label", "text-anchor": "middle" }, cg, "line angle θ");
+		const lg = el("g", {}, cg);
+		el("line", { x1: 50, x2: 66, y1: 14, y2: 14, class: "pca-var-curve" }, lg);
+		el("text", { x: 70, y: 18, class: "pca-legend" }, lg, "variance along line");
+		el("line", { x1: 190, x2: 206, y1: 14, y2: 14, class: "pca-res-curve" }, lg);
+		el("text", { x: 210, y: 18, class: "pca-legend" }, lg, "mean sq. distance");
+		el("line", { x1: 318, x2: 334, y1: 14, y2: 14, class: "pca-total" }, lg);
+		el("text", { x: 338, y: 18, class: "pca-legend" }, lg, "total");
+
+		const axisLine = (u: Point, cls: string) =>
+			el("line", { x1: sx(mx - far * u[0]), y1: sy(my - far * u[1]), x2: sx(mx + far * u[0]), y2: sy(my + far * u[1]), class: cls }, dyn);
+
+		function hoverText(i: number) {
+			const p = points[i];
+			const s = current.scores[i];
+			const dist2 = (pca.centred[i][0] - current.feet[i][0]) ** 2 + (pca.centred[i][1] - current.feet[i][1]) ** 2;
+			hover.textContent = `point (${fmt(p[0])}, ${fmt(p[1])}): centred (${fmt(pca.centred[i][0])}, ${fmt(pca.centred[i][1])}), score along line ${fmt(s)}, squared distance ${fmt(dist2)}`;
+		}
+
+		let angle = Number(slider.value);
+		function draw(deg = angle) {
+			angle = deg;
+			current = project(pca.centred, deg);
+			const u = current.u;
+			dyn.replaceChildren();
+			if (showAxes.checked) {
+				axisLine(pca.vectors[0], "pca-pc-axis");
+				axisLine(pca.vectors[1], "pca-pc-axis");
+			}
+			axisLine(u, "pca-line");
+			points.forEach((p, i) => {
+				const f: Point = [mx + current.feet[i][0], my + current.feet[i][1]];
+				el("line", { x1: sx(p[0]), y1: sy(p[1]), x2: sx(f[0]), y2: sy(f[1]), class: i === hovered ? "pca-res hl" : "pca-res" }, dyn);
+				el("circle", { cx: sx(f[0]), cy: sy(f[1]), r: 3.2, class: "pca-foot" }, dyn);
+			});
+			el("circle", { cx: sx(mx), cy: sy(my), r: 4, class: "pca-mean" }, dyn);
+			figure.querySelector(".pca-angle-value")!.textContent = `${deg.toFixed(1)}°`;
+			figure.querySelector(".m-var strong")!.textContent = fmt(current.variance);
+			figure.querySelector(".m-res strong")!.textContent = fmt(current.residual);
+			figure.querySelector(".m-sum")!.textContent = fmt(current.variance + current.residual);
+			marker.setAttribute("x1", String(tx(deg)));
+			marker.setAttribute("x2", String(tx(deg)));
+			dotVar.setAttribute("cx", String(tx(deg)));
+			dotVar.setAttribute("cy", String(ty(current.variance)));
+			dotRes.setAttribute("cx", String(tx(deg)));
+			dotRes.setAttribute("cy", String(ty(current.residual)));
+			if (hovered >= 0) hoverText(hovered);
+		}
+
+		circles.forEach((c, i) => {
+			c.addEventListener("mouseenter", () => { hovered = i; draw(); });
+			c.addEventListener("mouseleave", () => { hovered = -1; draw(); });
+		});
+		slider.addEventListener("input", () => draw(Number(slider.value)));
+		showAxes.addEventListener("change", () => draw());
+		figure.querySelectorAll<HTMLButtonElement>("[data-snap]").forEach((b) => {
+			b.addEventListener("click", () => {
+				const v = pca.vectors[Number(b.dataset.snap)];
+				const deg = ((((Math.atan2(v[1], v[0]) * 180) / Math.PI) % 180) + 180) % 180;
+				// The slider rounds to its 0.5° step, so draw the exact angle rather than its value.
+				slider.value = String(deg);
+				draw(deg);
+			});
+		});
+
+		draw(angle);
+	}
+
+	document.querySelectorAll<HTMLElement>(".pca-explorer").forEach(attach);
+</script>
+
+<style>
+	.pca-explorer {
+		--pca-res: #c2674c;
+		--pca-g0: #2e7d5b;
+		--pca-g1: #c2674c;
+		--pca-g2: #6a5acd;
+		margin: 2rem 0;
+		border: 1px solid var(--faint);
+		border-radius: 8px;
+		padding: 0.8rem 1rem 0.9rem;
+		background: var(--surface);
+	}
+	@media (prefers-color-scheme: dark) {
+		.pca-explorer {
+			--pca-res: #e8a07a;
+			--pca-g0: #6fcf9f;
+			--pca-g1: #e8a07a;
+			--pca-g2: #a99cf0;
+		}
+	}
+	.pca-title { margin-bottom: 0.5rem; color: var(--text); font: 600 0.88rem var(--sans); text-align: center; }
+	.pca-panels svg { display: block; width: 100%; height: auto; font: 12px var(--sans); background: var(--bg); border-radius: 5px; }
+	.pca-curve { margin-top: 0.5rem; }
+	/* Everything inside the SVGs is created by the script, so it needs :global(). */
+	.pca-explorer :global(.pca-frame) { fill: none; stroke: var(--faint); }
+	.pca-explorer :global(.pca-grid) { stroke: var(--faint); stroke-width: 0.6; }
+	.pca-explorer :global(.pca-tick), .pca-explorer :global(.pca-legend) { fill: var(--muted); font-size: 11px; }
+	.pca-explorer :global(.pca-axis-label) { fill: var(--muted); font-size: 12px; }
+	.pca-explorer :global(.pca-point) { fill: var(--accent); stroke: var(--bg); stroke-width: 1; cursor: pointer; }
+	.pca-explorer :global(.pca-point.g0) { fill: var(--pca-g0); }
+	.pca-explorer :global(.pca-point.g1) { fill: var(--pca-g1); }
+	.pca-explorer :global(.pca-point.g2) { fill: var(--pca-g2); }
+	.pca-explorer :global(.pca-point:hover) { stroke: var(--text); stroke-width: 2; }
+	.pca-explorer :global(.pca-line) { stroke: var(--text); stroke-width: 1.6; }
+	.pca-explorer :global(.pca-pc-axis) { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 2 4; }
+	.pca-explorer :global(.pca-res) { stroke: var(--pca-res); stroke-width: 1.4; stroke-dasharray: 4 3; }
+	.pca-explorer :global(.pca-res.hl) { stroke-width: 3; stroke-dasharray: none; }
+	.pca-explorer :global(.pca-foot) { fill: var(--bg); stroke: var(--text); stroke-width: 1.3; }
+	.pca-explorer :global(.pca-mean) { fill: var(--text); }
+	.pca-explorer :global(.pca-var-curve) { fill: none; stroke: var(--accent); stroke-width: 2.2; }
+	.pca-explorer :global(.pca-res-curve) { fill: none; stroke: var(--pca-res); stroke-width: 2.2; stroke-dasharray: 5 3; }
+	.pca-explorer :global(.pca-total) { fill: none; stroke: var(--muted); stroke-width: 1.2; stroke-dasharray: 1 3; }
+	.pca-explorer :global(.pca-pc-mark) { stroke: var(--muted); stroke-dasharray: 2 3; }
+	.pca-explorer :global(.pca-marker) { stroke: var(--text); stroke-width: 1; }
+	.pca-explorer :global(.pca-var-dot) { fill: var(--accent); }
+	.pca-explorer :global(.pca-res-dot) { fill: var(--pca-res); }
+	.pca-controls { display: flex; flex-wrap: wrap; align-items: end; gap: 0.6rem 1.2rem; margin-top: 0.7rem; color: var(--muted); font: 0.86rem var(--sans); }
+	.pca-angle { flex: 1; min-width: 12rem; }
+	.pca-angle input { display: block; width: 100%; accent-color: var(--accent); }
+	.pca-buttons { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
+	.pca-buttons button { border: 1px solid var(--faint); border-radius: 4px; padding: 0.3rem 0.65rem; color: var(--text); background: var(--bg); cursor: pointer; font: 0.82rem var(--sans); }
+	.pca-buttons button:hover { border-color: var(--accent); }
+	.pca-check { display: flex; align-items: center; gap: 0.3rem; }
+	.pca-check input { accent-color: var(--accent); }
+	.pca-metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.5rem; margin-top: 0.7rem; }
+	.pca-metrics div { padding: 0.45rem 0.65rem; border: 1px solid var(--faint); border-radius: 5px; background: var(--bg); }
+	.pca-metrics span, .pca-metrics strong { display: block; font-family: var(--sans); }
+	.pca-metrics span { color: var(--muted); font-size: 0.74rem; }
+	.pca-metrics strong { margin-top: 0.1rem; font-size: 1.05rem; font-variant-numeric: tabular-nums; }
+	.m-var strong { color: var(--accent); }
+	.m-res strong { color: var(--pca-res); }
+	.pca-hover { margin: 0.55rem 0 0; min-height: 1.3em; color: var(--muted); font: 0.8rem var(--sans); font-variant-numeric: tabular-nums; }
+	figcaption { margin-top: 0.4rem; color: var(--muted); font-size: 0.88rem; }
+	@media (max-width: 560px) {
+		.pca-metrics { grid-template-columns: 1fr; }
+	}
+</style>

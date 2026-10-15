@@ -421,58 +421,111 @@ models each quadpair as its own $8 \times 8 \times 4$ atom.</Sidenote>
 
 ### Writing a layout from the hardware's picture
 
-To write a TV layout, read the instruction's diagram and record where each thread and value lands,
-as a column-major offset $m + M n$. Then find the strides that produce those offsets. The CuTe
-document does this for Volta's f32 accumulator, the $8 \times 8$ C of `SM70_8x8x4_F32F16F16F32_NT`.
+To write a TV layout, start from the instruction's diagram, which shows which thread holds each
+cell. The layout is a formula that gives the same answer: given a thread $t$ and a value $v$, it
+returns the cell, as the column-major offset $m + M n$. The CuTe document works this out for
+Volta's f32 accumulator, the $8 \times 8$ C of `SM70_8x8x4_F32F16F16F32_NT`. We follow the same
+example in three steps.
 
 #### Step 1: the shape
 
-Eight threads each hold eight accumulators, so the layout has shape $(8, 8)$: **8 threads by 8
-values**, not the $8 \times 8$ matrix.
+Eight threads share the tile, and each holds eight accumulators (V0 to V7) in its registers. So
+the layout's shape is $(8, 8)$: **8 threads by 8 values**. It is not the $8 \times 8$ matrix. Here
+is the hardware's assignment, with each cell labelled by the logical thread and value that hold it:
+
+```text
+        n=0   n=1   n=2   n=3   n=4   n=5   n=6   n=7
+m=0    T0V0  T0V1  T2V0  T2V1  T0V4  T0V5  T2V4  T2V5
+m=1    T1V0  T1V1  T3V0  T3V1  T1V4  T1V5  T3V4  T3V5
+m=2    T0V2  T0V3  T2V2  T2V3  T0V6  T0V7  T2V6  T2V7
+m=3    T1V2  T1V3  T3V2  T3V3  T1V6  T1V7  T3V6  T3V7
+m=4    T4V0  T4V1  T6V0  T6V1  T4V4  T4V5  T6V4  T6V5
+m=5    T5V0  T5V1  T7V0  T7V1  T5V4  T5V5  T7V4  T7V5
+m=6    T4V2  T4V3  T6V2  T6V3  T4V6  T4V7  T6V6  T6V7
+m=7    T5V2  T5V3  T7V2  T7V3  T5V6  T5V7  T7V6  T7V7
+```
+
+Look at T0's eight cells, then at T1's. T1's cells are T0's moved one row down. The same holds for
+every thread: each one fills **the same pattern**, starting from a different cell. So the question
+"where is $(t, v)$?" splits into two smaller ones:
+
+- **Where does thread $t$ start?** That is the cell of its V0. Step 2 answers it, and the answer
+  is the **thread strides**.
+- **Where is value $v$, relative to that start?** This is the pattern all threads share. Step 3
+  answers it, and the answer is the **value strides**.
+
+The two answers add up, because a CuTe layout's offset is a sum of coordinate × stride terms:
+$\text{offset}(t, v) = \text{offset}(t, 0) + \text{offset}(0, v)$.
 
 #### Step 2: the thread strides
 
-Fix $V0$ and walk the threads. From the diagram:
+Keep the value at V0 and read off where each thread starts:
 
-| Logical thread | Lane | $(m, n)$ of V0 | Offset $m + 8n$ |
-| ---: | ---: | :---: | ---: |
-| 0 | 0 | (0, 0) | 0 |
-| 1 | 1 | (1, 0) | 1 |
-| 2 | 2 | (0, 2) | 16 |
-| 3 | 3 | (1, 2) | 17 |
-| 4 | 16 | (4, 0) | 4 |
-| 5 | 17 | (5, 0) | 5 |
-| 6 | 18 | (4, 2) | 20 |
-| 7 | 19 | (5, 2) | 21 |
+| Thread $t$ | $t$ in binary | V0 at $(m, n)$ | Offset $m + 8n$ |
+| ---: | :---: | :---: | ---: |
+| 0 | 000 | (0, 0) | 0 |
+| 1 | 001 | (1, 0) | 1 |
+| 2 | 010 | (0, 2) | 16 |
+| 3 | 011 | (1, 2) | 17 |
+| 4 | 100 | (4, 0) | 4 |
+| 5 | 101 | (5, 0) | 5 |
+| 6 | 110 | (4, 2) | 20 |
+| 7 | 111 | (5, 2) | 21 |
 
-The offsets are not one arithmetic sequence, but they are three nested ones. Thread 1 is thread 0
-plus 1. Threads 2–3 are threads 0–1 plus 16. Threads 4–7 are threads 0–3 plus 4. Each "plus"
-becomes one mode of size 2, so the thread mode is $(2, 2, 2) : (1, 16, 4)$. Check thread 6, which
-is $0 + 2 \cdot 1 + 4 \cdot 1$, so coordinates $(0, 1, 1)$: offset $16 + 4 = 20$.
+The offsets 0, 1, 16, 17, 4, … do not grow by a fixed step, so a single stride cannot produce them.
+Look at the binary column instead. Each bit of $t$ causes one fixed move, no matter what the other
+bits are:
+
+| When this bit of $t$ is 1 | V0 moves | Offset change |
+| --- | --- | ---: |
+| bit 0 (worth 1) | down 1 row | +1 |
+| bit 1 (worth 2) | right 2 columns | +16 |
+| bit 2 (worth 4) | down 4 rows | +4 |
+
+Moving down one row adds 1 to $m + 8n$, and moving right one column adds 8, so "right 2 columns"
+is $+16$.
+
+A mode of size 2 is exactly one such bit: its coordinate is 0 or 1, and its stride is the move. So
+three bits make three modes of size 2, and the thread mode is $(2, 2, 2) : (1, 16, 4)$. Check
+thread 6: it is binary 110, so bits 1 and 2 are set and its offset is $16 + 4 = 20$. That is
+$(m, n) = (4, 2)$, as in the table.
 
 #### Step 3: the value strides
 
-Fix thread 0 and walk its values:
+Now keep the thread at T0 and walk through its values:
 
-| Value | $(m, n)$ | Offset |
-| ---: | :---: | ---: |
-| 0 | (0, 0) | 0 |
-| 1 | (0, 1) | 8 |
-| 2 | (2, 0) | 2 |
-| 3 | (2, 1) | 10 |
-| 4 | (0, 4) | 32 |
-| 5 | (0, 5) | 40 |
-| 6 | (2, 4) | 34 |
-| 7 | (2, 5) | 42 |
+| Value $v$ | $v$ in binary | $(m, n)$ | Offset |
+| ---: | :---: | :---: | ---: |
+| 0 | 000 | (0, 0) | 0 |
+| 1 | 001 | (0, 1) | 8 |
+| 2 | 010 | (2, 0) | 2 |
+| 3 | 011 | (2, 1) | 10 |
+| 4 | 100 | (0, 4) | 32 |
+| 5 | 101 | (0, 5) | 40 |
+| 6 | 110 | (2, 4) | 34 |
+| 7 | 111 | (2, 5) | 42 |
 
-The same three doublings give $(2, 2, 2) : (8, 2, 32)$, and together
+The same trick works. Each bit of $v$ is one fixed move:
+
+| When this bit of $v$ is 1 | the cell moves | Offset change |
+| --- | --- | ---: |
+| bit 0 | right 1 column | +8 |
+| bit 1 | down 2 rows | +2 |
+| bit 2 | right 4 columns | +32 |
+
+So the value mode is $(2, 2, 2) : (8, 2, 32)$. Putting the thread mode first and the value mode
+second gives the whole layout:
 
 ```text
 SM70_8x8_32b = ((2,2,2),(2,2,2)):((1,16,4),(8,2,32))   # (T8,V8) -> (M8,N8)
 ```
 
-which is the layout in CUTLASS's `mma_traits_sm70.hpp`. The figure inverts it, with each cell
-labelled by its warp lane (through ThrID), so lanes 16–19 appear where logical threads 4–7 are.
+This is the layout in CUTLASS's `mma_traits_sm70.hpp`. Check one entry that uses both modes, T6 V3.
+T6 starts at offset 20 (step 2), and V3 is binary 011, so it adds $8 + 2 = 10$ (step 3). The total
+is $30 = 6 + 8 \cdot 3$, which is cell $(6, 3)$, and the tile above shows `T6V3` there.
+
+The figure below draws the same layout. It labels each cell by its warp lane instead of its
+logical thread (through ThrID), so lanes 16–19 appear where logical threads 4–7 are.
 
 <Matrix2D name="C tile of one Volta m8n8k4 (f32), offset m + 8n" {...F.volta} />
 

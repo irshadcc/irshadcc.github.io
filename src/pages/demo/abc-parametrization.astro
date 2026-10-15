@@ -1,0 +1,20 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import AbcExplorer from "../../utils/training/AbcExplorer.astro";
+---
+
+<Layout title="abc-parametrization explorer">
+	<main>
+		<h1>abc-parametrization explorer</h1>
+		<h2>μP (default)</h2>
+		<AbcExplorer />
+		<h2>Standard parametrization with a constant learning rate (unstable)</h2>
+		<AbcExplorer preset="sp" />
+		<h2>NTK parametrization (kernel regime)</h2>
+		<AbcExplorer preset="ntp" />
+	</main>
+</Layout>
+
+<style>
+	main { max-width: 780px; margin: 3rem auto; padding: 0 1rem; }
+</style>

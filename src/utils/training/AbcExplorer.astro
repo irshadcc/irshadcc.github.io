@@ -1,0 +1,408 @@
+---
+// Interactive classification of abc-parametrizations of an L-hidden-layer MLP (Tensor Programs IV,
+// Section 3.2). The reader sets the exponents a_l, b_l (layer l has W^l = n^{-a_l} w^l with
+// w^l ~ N(0, n^{-2 b_l})) and c (SGD learning rate eta n^{-c}), or picks a preset (SP, NTP, mean
+// field, muP). The figure shows each layer's effective init variance and learning rate exponents,
+// the growth exponent of every quantity that Theorem 3.3 constrains (drawn on a number line, with
+// 0 = width-independent), the stability conditions, and the verdict: unstable, trivial, kernel
+// regime or feature learning (Theorems 3.3, 3.4, 3.6, 3.8). The "shift" buttons apply the symmetry
+// a_l += t, b_l -= t, c -= 2t of eq. (5), which changes no verdict. Logic in abcParametrization.ts.
+// Usage in .mdx:
+//   <AbcExplorer preset="sp" />
+import { PRESETS } from "./abcParametrization";
+
+interface Props {
+	/** Initial preset: "sp", "spSmall", "ntp", "mfp" or "mup". */
+	preset?: keyof typeof PRESETS;
+}
+
+const { preset = "mup" } = Astro.props;
+const presets = PRESETS;
+const fields = [
+	{ key: "a1", label: "a₁" },
+	{ key: "b1", label: "b₁" },
+	{ key: "aH", label: "a (hidden)" },
+	{ key: "bH", label: "b (hidden)" },
+	{ key: "aOut", label: "aᴸ⁺¹" },
+	{ key: "bOut", label: "bᴸ⁺¹" },
+	{ key: "c", label: "c" },
+];
+---
+
+<figure class="abc-explorer" data-preset={preset} data-presets={JSON.stringify(presets)}>
+	<div class="abc-presets" role="group" aria-label="Presets">
+		{
+			Object.entries(presets).map(([key, p]) => (
+				<button type="button" data-key={key} aria-pressed={key === preset ? "true" : "false"}>
+					{p.label}
+				</button>
+			))
+		}
+	</div>
+	<div class="abc-inputs">
+		<label>
+			L (hidden layers)
+			<select data-field="L">
+				<option value="1">1</option>
+				<option value="2">2</option>
+				<option value="3">3</option>
+			</select>
+		</label>
+		{
+			fields.map((f) => (
+				<label>
+					{f.label}
+					<input type="number" step="0.25" data-field={f.key} />
+				</label>
+			))
+		}
+		<div class="abc-shift">
+			<span>Symmetry (5)</span>
+			<button type="button" data-shift="-0.5">θ = −½</button>
+			<button type="button" data-shift="0.5">θ = +½</button>
+		</div>
+	</div>
+	<div class="abc-verdict" aria-live="polite"><strong class="abc-verdict-name"></strong><span class="abc-verdict-text"></span></div>
+	<div class="abc-panels">
+		<div>
+			<h4>Growth exponent e of each quantity, Θ(nᵉ)</h4>
+			<svg class="abc-lines" role="img" aria-label="Growth exponent of each quantity on a number line">
+				<title>Growth exponent of each quantity</title>
+			</svg>
+			<p class="abc-legend">
+				<span class="abc-dot abc-ok"></span> width-independent
+				<span class="abc-dot abc-small"></span> vanishes
+				<span class="abc-dot abc-bad"></span> blows up / not allowed
+			</p>
+		</div>
+		<div>
+			<h4>Per layer (exponents of n)</h4>
+			<table class="abc-layers">
+				<thead><tr><th>layer</th><th>a</th><th>b</th><th>init var of W</th><th>SGD LR on W</th><th>rₗ</th></tr></thead>
+				<tbody></tbody>
+			</table>
+			<h4>Theorem 3.3 conditions</h4>
+			<table class="abc-conds">
+				<tbody></tbody>
+			</table>
+		</div>
+	</div>
+	<figcaption>
+		Set the exponents or pick a preset. A number line shows how each quantity scales with width n:
+		on the dashed line it stays the same size as n grows, to the right it blows up, to the left it
+		vanishes. “init var of W” and “SGD LR on W” are the exponents −2(a + b) and −(2a + c) of the
+		effective weight W = n<sup>−a</sup>w.
+	</figcaption>
+</figure>
+
+<script>
+	import { type Abc, classify, fmt, shift } from "./abcParametrization";
+	const NS = "http://www.w3.org/2000/svg";
+	const E_MIN = -2;
+	const E_MAX = 2;
+	const VERDICT_TEXT: Record<string, string> = {
+		unstable: "Some quantity grows with width, so a wide enough network overflows. See the failed conditions.",
+		trivial: "Stable, but the output f does not move during training in the infinite-width limit.",
+		"kernel regime": "Stable and nontrivial with r > 0: features freeze as n → ∞ and training reduces to kernel gradient descent (Theorem 3.8).",
+		"feature learning": "Stable and nontrivial with r = 0: the last-layer features move by Θ(1) (Theorem 3.6).",
+	};
+
+	function el(name: string, attrs: Record<string, string | number>, text?: string) {
+		const node = document.createElementNS(NS, name);
+		for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, String(v));
+		if (text !== undefined) node.textContent = text;
+		return node;
+	}
+
+	function attach(fig: HTMLElement) {
+		const presets: Record<string, { label: string; abc: Abc }> = JSON.parse(fig.dataset.presets ?? "{}");
+		let state: Abc = { ...presets[fig.dataset.preset ?? "mup"].abc };
+		const inputs = [...fig.querySelectorAll<HTMLInputElement | HTMLSelectElement>("[data-field]")];
+		const svg = fig.querySelector<SVGSVGElement>(".abc-lines")!;
+
+		function write() {
+			for (const input of inputs) input.value = String(state[input.dataset.field as keyof Abc]);
+			for (const input of inputs) {
+				if (input.dataset.field === "aH" || input.dataset.field === "bH") input.disabled = state.L < 2;
+			}
+		}
+
+		function markPreset() {
+			for (const b of fig.querySelectorAll<HTMLButtonElement>(".abc-presets button")) {
+				const p = presets[b.dataset.key ?? ""].abc;
+				const same = (Object.keys(p) as (keyof Abc)[]).every(
+					(k) => (state.L < 2 && (k === "aH" || k === "bH")) || Math.abs(p[k] - state[k]) < 1e-9,
+				);
+				b.setAttribute("aria-pressed", same ? "true" : "false");
+			}
+		}
+
+		function render() {
+			const c = classify(state);
+			markPreset();
+			fig.dataset.verdict = c.verdict;
+			fig.querySelector(".abc-verdict-name")!.textContent = `${c.verdict[0].toUpperCase()}${c.verdict.slice(1)}`;
+			fig.querySelector(".abc-verdict-text")!.textContent = ` (r = ${fmt(c.r)}). ${VERDICT_TEXT[c.verdict]}`;
+
+			// Number lines.
+			const W = 560;
+			const LEFT = 250;
+			const RIGHT = W - 16;
+			const ROW = 30;
+			const H = 30 + c.sizes.length * ROW;
+			const sx = (e: number) => LEFT + ((Math.max(E_MIN, Math.min(E_MAX, e)) - E_MIN) / (E_MAX - E_MIN)) * (RIGHT - LEFT);
+			svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+			svg.replaceChildren(el("title", {}, "Growth exponent of each quantity"));
+			for (let e = E_MIN; e <= E_MAX; e += 0.5) {
+				svg.append(el("line", { x1: sx(e), x2: sx(e), y1: 14, y2: H - 4, class: e === 0 ? "abc-zero" : "abc-grid" }));
+				if (Number.isInteger(e)) svg.append(el("text", { x: sx(e), y: 10, "text-anchor": "middle", class: "abc-tick" }, e > 0 ? `+${e}` : fmt(e)));
+			}
+			c.sizes.forEach((s, i) => {
+				const y = 30 + i * ROW;
+				const cls = s.exp > 1e-9 || (s.rule === "eq0" && s.exp < -1e-9) ? "abc-bad" : s.exp < -1e-9 ? "abc-small" : "abc-ok";
+				svg.append(el("text", { x: 4, y: y + 4, class: "abc-label" }, s.label));
+				svg.append(el("line", { x1: LEFT, x2: RIGHT, y1: y, y2: y, class: "abc-axis" }));
+				svg.append(el("circle", { cx: sx(s.exp), cy: y, r: 6, class: `abc-pt ${cls}` }));
+				const off = s.exp > E_MAX - 0.4 ? -10 : 10;
+				svg.append(el("text", { x: sx(s.exp) + off, y: y - 8, "text-anchor": off < 0 ? "end" : "start", class: "abc-val" }, fmt(s.exp)));
+			});
+
+			// Tables.
+			const names = (l: number) => (l === 1 ? "1 (input)" : l === state.L + 1 ? `${l} (output)` : `${l} (hidden)`);
+			fig.querySelector(".abc-layers tbody")!.replaceChildren(
+				...c.layers.map((l) => {
+					const tr = document.createElement("tr");
+					for (const v of [names(l.l), fmt(l.a), fmt(l.b), fmt(l.initVar), fmt(l.lr), l.rl === undefined ? "" : fmt(l.rl)]) {
+						const td = document.createElement("td");
+						td.textContent = v;
+						tr.append(td);
+					}
+					return tr;
+				}),
+			);
+			fig.querySelector(".abc-conds tbody")!.replaceChildren(
+				...c.conditions.map((k) => {
+					const tr = document.createElement("tr");
+					tr.className = k.ok ? "abc-pass" : "abc-fail";
+					tr.innerHTML = `<td>${k.ok ? "✓" : "✗"}</td><td></td><td></td>`;
+					tr.children[1].textContent = k.text;
+					tr.children[2].textContent = k.value;
+					return tr;
+				}),
+			);
+		}
+
+		for (const input of inputs) {
+			input.addEventListener("input", () => {
+				const v = Number(input.value);
+				if (!Number.isFinite(v)) return;
+				state = { ...state, [input.dataset.field as keyof Abc]: v };
+				if (input.dataset.field === "L") write();
+				render();
+			});
+		}
+		for (const b of fig.querySelectorAll<HTMLButtonElement>(".abc-presets button")) {
+			b.addEventListener("click", () => {
+				state = { ...presets[b.dataset.key ?? "mup"].abc };
+				write();
+				render();
+			});
+		}
+		for (const b of fig.querySelectorAll<HTMLButtonElement>("[data-shift]")) {
+			b.addEventListener("click", () => {
+				state = shift(state, Number(b.dataset.shift));
+				write();
+				render();
+			});
+		}
+		write();
+		render();
+	}
+	document.querySelectorAll<HTMLElement>(".abc-explorer").forEach(attach);
+</script>
+
+<style>
+	.abc-explorer {
+		--abc-bad: #b42f2f;
+		--abc-ok: #2f7d4f;
+		margin: 2rem 0;
+		font: 0.88rem var(--sans);
+	}
+	@media (prefers-color-scheme: dark) {
+		.abc-explorer {
+			--abc-bad: #ef8b8b;
+			--abc-ok: #7ccf9b;
+		}
+	}
+	.abc-presets {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.4rem;
+		margin-bottom: 0.6rem;
+	}
+	button {
+		border: 1px solid var(--faint);
+		border-radius: 4px;
+		padding: 0.3rem 0.6rem;
+		color: var(--text);
+		background: var(--surface);
+		cursor: pointer;
+		font: inherit;
+	}
+	button[aria-pressed="true"] {
+		border-color: var(--accent);
+		background: var(--accent-soft);
+		color: var(--accent);
+		font-weight: 600;
+	}
+	.abc-inputs {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.5rem 0.8rem;
+		align-items: end;
+		color: var(--muted);
+	}
+	.abc-inputs label {
+		display: flex;
+		flex-direction: column;
+		font-size: 0.8rem;
+	}
+	.abc-inputs input,
+	.abc-inputs select {
+		width: 4.6rem;
+		margin-top: 0.15rem;
+		padding: 0.2rem 0.35rem;
+		color: var(--text);
+		background: var(--surface);
+		border: 1px solid var(--faint);
+		border-radius: 4px;
+		font: inherit;
+	}
+	.abc-inputs input:disabled {
+		opacity: 0.45;
+	}
+	.abc-shift {
+		display: flex;
+		gap: 0.3rem;
+		align-items: center;
+		font-size: 0.8rem;
+	}
+	.abc-verdict {
+		margin: 0.8rem 0;
+		padding: 0.55rem 0.75rem;
+		border-left: 4px solid var(--abc-ok);
+		background: var(--surface);
+		color: var(--text);
+	}
+	.abc-explorer[data-verdict="unstable"] .abc-verdict {
+		border-color: var(--abc-bad);
+	}
+	.abc-explorer[data-verdict="kernel regime"] .abc-verdict,
+	.abc-explorer[data-verdict="trivial"] .abc-verdict {
+		border-color: var(--muted);
+	}
+	.abc-panels {
+		display: grid;
+		grid-template-columns: 1fr;
+		gap: 0.6rem;
+	}
+	h4 {
+		margin: 0.4rem 0 0.2rem;
+		font: 600 0.82rem var(--sans);
+		color: var(--muted);
+	}
+	svg {
+		display: block;
+		width: 100%;
+		height: auto;
+		font: 12px var(--sans);
+	}
+	.abc-explorer :global(.abc-grid) {
+		stroke: var(--faint);
+	}
+	.abc-explorer :global(.abc-zero) {
+		stroke: var(--muted);
+		stroke-dasharray: 4 3;
+	}
+	.abc-explorer :global(.abc-axis) {
+		stroke: var(--faint);
+		stroke-width: 2;
+	}
+	.abc-explorer :global(.abc-tick),
+	.abc-explorer :global(.abc-val) {
+		fill: var(--muted);
+	}
+	.abc-explorer :global(.abc-label) {
+		fill: var(--text);
+	}
+	.abc-explorer :global(.abc-pt.abc-ok),
+	.abc-dot.abc-ok {
+		fill: var(--abc-ok);
+		background: var(--abc-ok);
+	}
+	.abc-explorer :global(.abc-pt.abc-small),
+	.abc-dot.abc-small {
+		fill: var(--accent);
+		background: var(--accent);
+	}
+	.abc-explorer :global(.abc-pt.abc-bad),
+	.abc-dot.abc-bad {
+		fill: var(--abc-bad);
+		background: var(--abc-bad);
+	}
+	.abc-legend {
+		margin: 0.2rem 0 0;
+		color: var(--muted);
+		font-size: 0.8rem;
+	}
+	.abc-dot {
+		display: inline-block;
+		width: 0.65rem;
+		height: 0.65rem;
+		margin: 0 0.2rem 0 0.6rem;
+		border-radius: 50%;
+		vertical-align: -0.05rem;
+	}
+	table {
+		width: 100%;
+		border-collapse: collapse;
+		font-variant-numeric: tabular-nums;
+	}
+	th,
+	td {
+		padding: 0.22rem 0.4rem;
+		border-bottom: 1px solid var(--faint);
+		text-align: right;
+	}
+	th:first-child,
+	td:first-child {
+		text-align: left;
+	}
+	th {
+		color: var(--muted);
+		font-weight: 600;
+	}
+	.abc-conds :global(td:nth-child(2)) {
+		text-align: left;
+	}
+	.abc-conds :global(.abc-pass td:first-child) {
+		color: var(--abc-ok);
+	}
+	.abc-conds :global(.abc-fail) {
+		color: var(--abc-bad);
+	}
+	figcaption {
+		margin-top: 0.6rem;
+		color: var(--muted);
+		font-size: 0.85rem;
+	}
+	@media (max-width: 560px) {
+		svg {
+			font-size: 16px;
+		}
+		th,
+		td {
+			padding: 0.2rem 0.2rem;
+		}
+	}
+</style>

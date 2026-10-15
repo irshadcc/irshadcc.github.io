@@ -1,0 +1,392 @@
+/* Shared look of the sampling figures (src/utils/sampling). Every class starts with smp- so it
+   cannot clash with site.css. SVG content is created by scripts, so these rules are global. */
+
+.smp-fig {
+	--smp-p: var(--accent);
+	--smp-q: #c2674c;
+	--smp-ok: #2e7d5b;
+	--smp-bad: #c0392b;
+	--smp-model: #6a5acd;
+	--smp-hist: rgba(31, 79, 120, 0.22);
+	--smp-hist-model: rgba(106, 90, 205, 0.25);
+	--smp-shade: rgba(120, 120, 110, 0.16);
+	margin: 2rem 0;
+	border: 1px solid var(--faint);
+	border-radius: 8px;
+	padding: 0.8rem 1rem 0.9rem;
+	background: var(--surface);
+	font-family: var(--sans);
+}
+@media (prefers-color-scheme: dark) {
+	.smp-fig {
+		--smp-q: #e8a07a;
+		--smp-ok: #6fcf9f;
+		--smp-bad: #f08070;
+		--smp-model: #a99cf0;
+		--smp-hist: rgba(141, 187, 227, 0.25);
+		--smp-hist-model: rgba(169, 156, 240, 0.25);
+		--smp-shade: rgba(200, 200, 190, 0.12);
+	}
+}
+.smp-title {
+	margin-bottom: 0.5rem;
+	color: var(--text);
+	font: 600 0.88rem var(--sans);
+	text-align: center;
+}
+.smp-fig svg.smp-svg {
+	display: block;
+	width: 100%;
+	height: auto;
+	font: 11px var(--sans);
+	background: var(--bg);
+	border-radius: 5px;
+	touch-action: manipulation;
+}
+.smp-fig svg.smp-svg + svg.smp-svg {
+	margin-top: 0.5rem;
+}
+.smp-row {
+	display: grid;
+	grid-template-columns: 1fr 1fr;
+	gap: 0.5rem;
+}
+.smp-row svg.smp-svg + svg.smp-svg {
+	margin-top: 0;
+}
+@media (max-width: 620px) {
+	.smp-row {
+		grid-template-columns: 1fr;
+	}
+}
+
+/* Axes and marks */
+.smp-fig .smp-plotbox {
+	fill: none;
+	stroke: var(--faint);
+}
+.smp-fig .smp-grid {
+	stroke: var(--faint);
+	stroke-width: 0.5;
+}
+.smp-fig .smp-tick {
+	fill: var(--muted);
+	font-size: 10px;
+}
+.smp-fig .smp-label {
+	fill: var(--muted);
+	font-size: 11.5px;
+}
+.smp-fig .smp-text {
+	fill: var(--text);
+	font-size: 11px;
+}
+.smp-fig .smp-note {
+	fill: var(--muted);
+	font-size: 10.5px;
+}
+.smp-fig .smp-p {
+	fill: none;
+	stroke: var(--smp-p);
+	stroke-width: 2;
+}
+.smp-fig .smp-q {
+	fill: none;
+	stroke: var(--smp-q);
+	stroke-width: 2;
+}
+.smp-fig .smp-q-dash {
+	fill: none;
+	stroke: var(--smp-q);
+	stroke-width: 1.6;
+	stroke-dasharray: 5 3;
+}
+.smp-fig .smp-model {
+	fill: none;
+	stroke: var(--smp-model);
+	stroke-width: 2;
+}
+.smp-fig .smp-muted-line {
+	fill: none;
+	stroke: var(--muted);
+	stroke-width: 1.2;
+	stroke-dasharray: 3 3;
+}
+.smp-fig .smp-text-line {
+	fill: none;
+	stroke: var(--text);
+	stroke-width: 1.3;
+}
+.smp-fig .smp-shade {
+	fill: var(--smp-shade);
+	stroke: none;
+}
+.smp-fig .smp-p-area {
+	fill: var(--smp-hist);
+	stroke: none;
+}
+.smp-fig .smp-hist {
+	fill: var(--smp-hist);
+}
+.smp-fig .smp-hist-model {
+	fill: var(--smp-hist-model);
+}
+.smp-fig .smp-ok {
+	fill: var(--smp-ok);
+}
+.smp-fig .smp-bad {
+	fill: var(--smp-bad);
+}
+.smp-fig .smp-ok-line {
+	stroke: var(--smp-ok);
+	stroke-width: 1.3;
+	fill: none;
+}
+.smp-fig .smp-bad-line {
+	stroke: var(--smp-bad);
+	stroke-width: 1.1;
+	fill: none;
+	opacity: 0.8;
+}
+.smp-fig .smp-dot {
+	fill: var(--smp-p);
+}
+.smp-fig .smp-dot-q {
+	fill: var(--smp-q);
+}
+.smp-fig .smp-dot-model {
+	fill: var(--smp-model);
+}
+.smp-fig .smp-faint-dot {
+	fill: var(--muted);
+	opacity: 0.35;
+}
+.smp-fig .smp-current {
+	fill: var(--bg);
+	stroke: var(--text);
+	stroke-width: 2;
+}
+.smp-fig .smp-guide {
+	stroke: var(--text);
+	stroke-width: 1;
+	stroke-dasharray: 3 2;
+	fill: none;
+}
+.smp-fig .smp-hl {
+	stroke: var(--text);
+	stroke-width: 2;
+}
+
+/* Controls */
+.smp-controls {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 0.5rem 1rem;
+	margin-top: 0.6rem;
+	color: var(--muted);
+	font-size: 0.84rem;
+}
+.smp-controls label {
+	display: flex;
+	align-items: center;
+	gap: 0.4rem;
+}
+.smp-controls label.smp-slider {
+	flex: 1;
+	min-width: 11rem;
+}
+.smp-controls input[type="range"] {
+	flex: 1;
+	min-width: 5rem;
+	accent-color: var(--accent);
+}
+.smp-controls input[type="checkbox"] {
+	accent-color: var(--accent);
+}
+.smp-controls strong {
+	color: var(--text);
+	font-variant-numeric: tabular-nums;
+	min-width: 2.6rem;
+}
+.smp-controls select,
+.smp-btn {
+	border: 1px solid var(--faint);
+	border-radius: 4px;
+	padding: 0.28rem 0.6rem;
+	color: var(--text);
+	background: var(--bg);
+	cursor: pointer;
+	font: 0.82rem var(--sans);
+}
+.smp-btn:hover,
+.smp-controls select:hover {
+	border-color: var(--accent);
+}
+.smp-player {
+	display: flex;
+	gap: 0.3rem;
+}
+.smp-player button {
+	display: grid;
+	place-items: center;
+	width: 2rem;
+	height: 2rem;
+	padding: 0;
+	border: 1px solid var(--faint);
+	border-radius: 8px;
+	background: var(--bg);
+	color: var(--text);
+	cursor: pointer;
+}
+.smp-player button:hover {
+	border-color: var(--accent);
+}
+.smp-player svg {
+	width: 0.8rem;
+	height: 0.8rem;
+	fill: currentColor;
+	stroke: currentColor;
+	stroke-width: 1.2;
+	stroke-linejoin: round;
+}
+.smp-player .play {
+	width: 2.6rem;
+	background: var(--accent);
+	border-color: var(--accent);
+	color: var(--bg);
+}
+.smp-player .play .i-pause,
+.smp-player .play.playing .i-play {
+	display: none;
+}
+.smp-player .play.playing .i-pause {
+	display: block;
+}
+
+/* Readouts */
+.smp-metrics {
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(8.5rem, 1fr));
+	gap: 0.45rem;
+	margin-top: 0.6rem;
+}
+.smp-metrics div {
+	padding: 0.4rem 0.6rem;
+	border: 1px solid var(--faint);
+	border-radius: 5px;
+	background: var(--bg);
+}
+.smp-metrics span,
+.smp-metrics strong {
+	display: block;
+}
+.smp-metrics span {
+	color: var(--muted);
+	font-size: 0.72rem;
+}
+.smp-metrics strong {
+	margin-top: 0.1rem;
+	font-size: 1rem;
+	font-variant-numeric: tabular-nums;
+	color: var(--text);
+}
+.smp-narration {
+	margin: 0.55rem 0 0;
+	min-height: 2.6em;
+	color: var(--text);
+	font-size: 0.84rem;
+	line-height: 1.45;
+	font-variant-numeric: tabular-nums;
+}
+.smp-legend {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.3rem 1rem;
+	margin: 0 0 0.45rem;
+	color: var(--muted);
+	font-size: 0.78rem;
+}
+.smp-legend i {
+	display: inline-block;
+	width: 1.1rem;
+	height: 0;
+	margin-right: 0.35rem;
+	vertical-align: middle;
+	border-top: 2px solid;
+}
+.smp-legend i.dot {
+	width: 0.55rem;
+	height: 0.55rem;
+	border: none;
+	border-radius: 50%;
+}
+.smp-legend i.box {
+	width: 0.8rem;
+	height: 0.6rem;
+	border: none;
+}
+.smp-legend .k-p {
+	border-color: var(--smp-p);
+}
+.smp-legend .k-q {
+	border-color: var(--smp-q);
+}
+.smp-legend .k-qd {
+	border-color: var(--smp-q);
+	border-top-style: dashed;
+}
+.smp-legend .k-model {
+	border-color: var(--smp-model);
+}
+.smp-legend .k-ok {
+	background: var(--smp-ok);
+}
+.smp-legend .k-bad {
+	background: var(--smp-bad);
+}
+.smp-legend .k-dot-p {
+	background: var(--smp-p);
+}
+.smp-legend .k-dot-model {
+	background: var(--smp-model);
+}
+.smp-legend .k-hist {
+	background: var(--smp-hist);
+}
+.smp-legend .k-hist-model {
+	background: var(--smp-hist-model);
+}
+.smp-legend .k-shade {
+	background: var(--smp-shade);
+}
+.smp-legend .k-text {
+	border-color: var(--text);
+}
+.smp-fig figcaption {
+	margin-top: 0.45rem;
+	color: var(--muted);
+	font-size: 0.86rem;
+	line-height: 1.45;
+}
+.smp-table {
+	width: 100%;
+	margin-top: 0.6rem;
+	border-collapse: collapse;
+	font-size: 0.8rem;
+	font-variant-numeric: tabular-nums;
+}
+.smp-table th,
+.smp-table td {
+	padding: 0.2rem 0.4rem;
+	border-bottom: 1px solid var(--faint);
+	text-align: right;
+}
+.smp-table th:first-child,
+.smp-table td:first-child {
+	text-align: left;
+}
+.smp-table th {
+	color: var(--muted);
+	font-weight: 500;
+}

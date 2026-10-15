@@ -1,0 +1,870 @@
+---
+title: "Backpropagation: From Error Signals to Automatic Differentiation"
+description: "A walk through chapter 8 of Bishop and Bishop's Deep Learning: how backpropagation computes every derivative of a network's error in one backward sweep, why that beats finite differences, how the same idea gives Jacobians and Hessians, and how forward- and reverse-mode automatic differentiation generalise it. Every equation is worked through on small examples with real numbers."
+date: 2026-10-15
+tags: [Machine learning, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import GraphSteps from "../../utils/autodiff/GraphSteps.astro";
+import LineChart from "../../utils/charts/LineChart.astro";
+import BoxDiagram from "../../utils/payments/BoxDiagram.astro";
+import {
+	costRow,
+	deltaFlowSteps,
+	epsGrid,
+	fdSeries,
+	forwardModeSteps,
+	gradCheckRows,
+	jacobianSteps,
+	linearSeries,
+	moduleEdges,
+	moduleNodes,
+	networkSteps,
+	reverseModeSteps,
+} from "../../utils/autodiff/backpropFigures";
+import { hessianFinal, hessianRecords, hessianSetup, swell } from "../../utils/autodiff/backpropData";
+
+export const big = costRow(784, 100, 10);
+export const sci = (x) => { const [m, e] = x.toExponential(1).split("e"); return `${m} × 10${[...String(Number(e))].map((c) => "⁻⁰¹²³⁴⁵⁶⁷⁸⁹"["-0123456789".indexOf(c)]).join("")}`; };
+export const first = hessianRecords[0];
+export const last = hessianRecords[hessianRecords.length - 1];
+
+## Background
+
+Training a neural network means nudging every weight a little in the direction that lowers the
+error. To know that direction we need the **gradient**: the derivative of the error with respect
+to every one of the network's $W$ weights and biases. A small image classifier has tens of
+thousands of them; a language model has billions. The question this post answers is how to compute
+all of those derivatives at once, cheaply.
+
+The answer is **backpropagation**: a forward sweep computes every unit's activation, then a
+backward sweep passes "error signals" from the outputs towards the inputs, and each weight's
+derivative falls out as a product of two numbers already sitting at its ends. The whole gradient
+costs about as much as two or three forward passes. The obvious alternative, nudging each weight
+and re-running the network, costs $W$ times more. That gap is why deep learning is practical.
+
+This post follows chapter 8 of Bishop and Bishop's *Deep Learning: Foundations and
+Concepts*,<Sidenote>C. M. Bishop and H. Bishop, *Deep Learning: Foundations and Concepts*, Springer, 2024, chapter 8, pp. 233–252. Equation numbers such as (8.13) refer to the book.</Sidenote>
+equation by equation. We derive backpropagation for a general network, run it by hand on a tiny
+one, compare it with finite differences, reuse it for the **Jacobian** (derivatives of outputs with
+respect to inputs) and the **Hessian** (second derivatives), and finally see it as one case of
+**automatic differentiation**, in both its forward and reverse modes. The
+[matrix calculus post](/blog/matrix-calculus/) covers the same ideas in matrix form, and
+[Inside JAX](/blog/jax-internals/) shows how a real library implements them.
+
+A word on the name. "Backpropagation" is sometimes used for a whole training procedure, or even
+for feed-forward networks themselves. Here, as in the book, it means only the procedure that
+*evaluates derivatives*. What you then do with the gradient (gradient descent, Adam) is a separate
+step.
+
+## Gradients of a feed-forward network
+
+### One error term at a time
+
+Most error functions used in practice, including every one derived by maximum likelihood on
+independent data points, are a sum of one term per data point:
+
+$$
+E(\mathbf{w}) = \sum_{n=1}^{N} E_n(\mathbf{w}). \tag{8.1}
+$$
+
+So it is enough to compute $\nabla E_n$ for a single data point $n$. Stochastic gradient descent
+uses it directly; for a batch or mini-batch we add the per-point gradients:
+
+$$
+\frac{\partial E}{\partial w_{ji}} = \sum_n \frac{\partial E_n}{\partial w_{ji}}. \tag{8.14}
+$$
+
+From here on we fix one data point and drop the subscript $n$ from the network's variables.
+
+### A single-layer network
+
+Start with the simplest case, a linear model whose outputs are weighted sums of the inputs, with a
+**sum-of-squares error**:
+
+$$
+y_k = \sum_i w_{ki} x_i, \qquad E_n = \frac{1}{2}\sum_k (y_{nk} - t_{nk})^2. \tag{8.2, 8.3}
+$$
+
+The weight $w_{ji}$ only affects output $y_j$, so
+
+$$
+\frac{\partial E_n}{\partial w_{ji}} = (y_{nj} - t_{nj})\, x_{ni}. \tag{8.4}
+$$
+
+Read this as a **local** computation on the link $w_{ji}$: an **error signal** $y_{nj} - t_{nj}$ at
+the link's output end, times the variable $x_{ni}$ at its input end. For example, with inputs
+$\mathbf{x} = (2, -1)$, an output $y_1 = 0.3$ and a target $t_1 = 1$, the error signal is $-0.7$, so
+$\partial E_n/\partial w_{11} = -0.7 \times 2 = -1.4$ and $\partial E_n/\partial w_{12} = -0.7
+\times (-1) = 0.7$. Gradient descent raises $w_{11}$ and lowers $w_{12}$, both of which raise $y_1$
+towards its target. The same form also appears for a logistic sigmoid output with cross-entropy
+error, and for softmax with multiclass cross-entropy, because those pairs are matched (each is the
+**canonical link** for its error function).<Sidenote>Bishop and Bishop, sections 5.4.3 and 5.4.6. For each matched pair, $\partial E_n / \partial a_k = y_k - t_k$, where $a_k$ is the output unit's input before its activation function.</Sidenote>
+The whole of backpropagation is the extension of (8.4) to networks with hidden layers.
+
+### A general network
+
+In a general feed-forward network, each unit $j$ forms a weighted sum of its inputs, the
+**pre-activation**, and passes it through a nonlinear **activation function** $h$:
+
+$$
+a_j = \sum_i w_{ji} z_i, \qquad z_j = h(a_j). \tag{8.5, 8.6}
+$$
+
+Here $z_i$ is either an input or another unit's activation. A bias is handled by adding a unit whose
+activation is fixed at $+1$; its weight is then the bias, so biases need no separate treatment.
+Running (8.5) and (8.6) for every unit in order, from inputs to outputs, is **forward
+propagation**.
+
+Now take the derivative of $E_n$ with respect to one weight $w_{ji}$. The weight affects the error
+only through $a_j$, so the chain rule gives two factors:
+
+$$
+\frac{\partial E_n}{\partial w_{ji}} = \frac{\partial E_n}{\partial a_j}\,\frac{\partial a_j}{\partial w_{ji}}. \tag{8.7}
+$$
+
+The first factor gets a name. The **error** of unit $j$ is
+
+$$
+\delta_j \equiv \frac{\partial E_n}{\partial a_j}, \tag{8.8}
+$$
+
+and the second factor follows from (8.5), since $a_j$ is linear in $w_{ji}$:
+
+$$
+\frac{\partial a_j}{\partial w_{ji}} = z_i. \tag{8.9}
+$$
+
+Substituting both into (8.7):
+
+$$
+\boxed{\frac{\partial E_n}{\partial w_{ji}} = \delta_j\, z_i.} \tag{8.10}
+$$
+
+This is (8.4) again: the $\delta$ at the weight's output end times the $z$ at its input end (with
+$z = 1$ for a bias). So once we know $\delta_j$ for every hidden and output unit, every derivative
+is one multiplication.
+
+For output units with the canonical link, the error is already known:
+
+$$
+\delta_k = y_k - t_k. \tag{8.11}
+$$
+
+For a hidden unit $j$, use the chain rule again. Unit $j$ influences the error only through the
+pre-activations $a_k$ of the units $k$ it sends connections to:
+
+$$
+\delta_j \equiv \frac{\partial E_n}{\partial a_j} = \sum_k \frac{\partial E_n}{\partial a_k}\frac{\partial a_k}{\partial a_j}. \tag{8.12}
+$$
+
+The first factor is $\delta_k$. For the second, $a_k = \sum_j w_{kj} h(a_j)$, so $\partial a_k /
+\partial a_j = w_{kj} h'(a_j)$. Together they give the **backpropagation formula**:
+
+$$
+\boxed{\delta_j = h'(a_j)\sum_k w_{kj}\,\delta_k.} \tag{8.13}
+$$
+
+A unit's error is the weighted sum of the errors of the units it feeds, scaled by the slope of its
+own activation function. Step through the figure: the forward step shows (8.5) and (8.6), the
+backward step shows the same weights carrying $\delta$s the other way.
+
+<GraphSteps data={deltaFlowSteps} title="Errors flow back along the forward connections (after Figure 8.1)" colGap={235} nodeWidth={132} />
+
+Look at the indices. In the forward sum (8.5) the sum runs over the *second* index of $w_{ji}$
+(the units feeding $j$). In (8.13) it runs over the *first* index of $w_{kj}$ (the units $j$
+feeds). In a layered network with weight matrix $\mathbf{W}$, forward propagation multiplies by
+$\mathbf{W}$ and backpropagation multiplies by $\mathbf{W}^\top$.<Sidenote>This is the book's Exercise 8.2. With $\mathbf{a}^{(l)} = \mathbf{W}^{(l)}\mathbf{z}^{(l-1)}$, (8.13) becomes $\boldsymbol{\delta}^{(l-1)} = h'(\mathbf{a}^{(l-1)}) \odot \mathbf{W}^{(l)\top}\boldsymbol{\delta}^{(l)}$, and (8.10) becomes the outer product $\nabla_{\mathbf{W}^{(l)}} E_n = \boldsymbol{\delta}^{(l)}\mathbf{z}^{(l-1)\top}$.</Sidenote>
+Because the output $\delta$s are known from (8.11), applying (8.13) from the top of the network
+down gives every hidden $\delta$, for any feed-forward topology. If different units use different
+activation functions, each just uses its own $h'$.
+
+### The algorithm
+
+The book collects the steps as Algorithm 8.1:
+
+1. **Forward propagation.** For every hidden and output unit in order, compute $a_j$ by (8.5) and
+   $z_j$ by (8.6). Keep them.
+2. **Error evaluation.** For every output unit, compute $\delta_k = \partial E_n / \partial a_k$
+   (by (8.11) for a canonical link).
+3. **Backward propagation.** For every hidden unit in *reverse* order, compute $\delta_j$ by
+   (8.13), and every derivative $\partial E_n / \partial w_{ji} = \delta_j z_i$ by (8.10).
+
+For a network with one hidden layer, in NumPy:
+
+```python
+import numpy as np
+
+def backprop(W1, W2, x, t):
+    # Forward propagation (8.18)-(8.20); x0 = z0 = 1 carry the biases.
+    x = np.concatenate([[1.0], x])
+    a = W1 @ x
+    z = np.concatenate([[1.0], np.tanh(a)])
+    y = W2 @ z
+    # Error evaluation (8.21).
+    d_out = y - t
+    # Backward propagation (8.22): drop the bias column, z0 has no delta.
+    d_hid = (1 - z[1:] ** 2) * (W2[:, 1:].T @ d_out)
+    # Derivatives (8.23): delta at the output end times activation at the input end.
+    return np.outer(d_hid, x), np.outer(d_out, z)
+```
+
+Note the `W2[:, 1:].T`: the transpose is the "first index" of (8.13).
+
+## A worked example
+
+The book's example is a two-layer network: $D$ inputs, $M$ hidden units with
+$h(a) = \tanh(a)$, and $K$ linear outputs ($y_k = a_k$), trained with sum-of-squares error. Tanh
+has a convenient derivative, expressed through its own output:
+
+$$
+h(a) = \tanh(a), \qquad h'(a) = 1 - h(a)^2. \tag{8.15, 8.16}
+$$
+
+So the backward pass needs only the stored $z_j$, not $a_j$. With $x_0 = z_0 = 1$ for the biases,
+forward propagation is
+
+$$
+a_j = \sum_{i=0}^{D} w^{(1)}_{ji} x_i, \qquad z_j = \tanh(a_j), \qquad y_k = \sum_{j=0}^{M} w^{(2)}_{kj} z_j, \tag{8.18–8.20}
+$$
+
+the error for one data point is
+
+$$
+E_n = \frac{1}{2}\sum_{k=1}^{K}(y_k - t_k)^2, \tag{8.17}
+$$
+
+and the backward pass is
+
+$$
+\delta_k = y_k - t_k, \qquad \delta_j = (1 - z_j^2)\sum_{k=1}^{K} w^{(2)}_{kj}\delta_k, \tag{8.21, 8.22}
+$$
+
+$$
+\frac{\partial E_n}{\partial w^{(1)}_{ji}} = \delta_j x_i, \qquad \frac{\partial E_n}{\partial w^{(2)}_{kj}} = \delta_k z_j. \tag{8.23}
+$$
+
+Here it is with $D = 2$, $M = 3$, $K = 2$, one input $\mathbf{x} = (0.8, -0.5)$ and target
+$\mathbf{t} = (0.5, -0.5)$. The weights are listed in the first step. Step through the forward
+pass, the output errors, the backward pass (first for one hidden unit, then for all three) and the
+two gradient matrices. Blue marks the forward direction and red the backward one.
+
+<GraphSteps data={networkSteps} title="Backpropagation on a 2-3-2 tanh network (8.17)–(8.23)" />
+
+Check one hidden error by hand, the last row of the "All hidden δ" table. Unit 3 has
+$z_3 = -0.462$, so $h'(a_3) = 1 - z_3^2 = 0.786$. It feeds output 1 with
+weight $0.3$ and output 2 with weight $-0.8$, so
+$\sum_k w^{(2)}_{k3}\delta_k = 0.3 \times (-0.090) + (-0.8) \times 1.045 = -0.863$
+and $\delta_3 = 0.786 \times (-0.863) = -0.679$. Its derivative for the weight from $x_2$ is
+$\delta_3 x_2 = -0.679 \times (-0.5) = 0.3395$, matching the last table.
+Every number in the figure agrees with PyTorch's `autograd` to within $10^{-16}$.<Sidenote>Computed in float64 by `src/utils/autodiff/backprop.ts`, the module that generates the figure, and compared with `torch.autograd` (torch 2.9.1) on the same weights: the largest difference over all 17 derivatives was 0.</Sidenote>
+
+Two things are worth seeing in the numbers. Output 2 is far from its target ($\delta_2 =
+1.045$) while output 1 is close ($\delta_1 = -0.090$), so the hidden errors
+are dominated by output 2 and its weights. And hidden unit 2 has $a_2 = 0.030$, where tanh
+is steepest, so $h'(a_2) \approx 1$ and its error passes through almost unscaled; a unit deep in
+tanh's flat tails would pass almost nothing back.
+
+## Why backpropagation is efficient
+
+### The cost of a forward pass
+
+Let $W$ be the total number of weights and biases. One forward pass costs $O(W)$ operations: each
+term of the sum (8.5) is one multiplication and one addition, and except in very sparse networks
+there are far more weights than units, so the activation functions are a small overhead.
+
+The backward pass has the same shape. The sums in (8.13) touch each weight once more, and (8.10)
+is one more multiplication per weight. So backpropagation gets all $W$ derivatives in $O(W)$, a
+small constant times the cost of the forward pass.
+
+### Numerical differentiation
+
+The alternative needs no derivation at all: perturb one weight, re-run the network, and divide.
+The **forward difference** is
+
+$$
+\frac{\partial E_n}{\partial w_{ji}} = \frac{E_n(w_{ji} + \epsilon) - E_n(w_{ji})}{\epsilon} + O(\epsilon), \tag{8.24}
+$$
+
+and the **central difference**, which perturbs both ways, is
+
+$$
+\frac{\partial E_n}{\partial w_{ji}} = \frac{E_n(w_{ji} + \epsilon) - E_n(w_{ji} - \epsilon)}{2\epsilon} + O(\epsilon^2). \tag{8.25}
+$$
+
+Why the different error orders? Expand in a Taylor series, writing $E'$, $E''$, $E'''$ for
+derivatives along $w_{ji}$:
+
+$$
+E(w \pm \epsilon) = E \pm \epsilon E' + \tfrac{1}{2}\epsilon^2 E'' \pm \tfrac{1}{6}\epsilon^3 E''' + O(\epsilon^4).
+$$
+
+The forward difference keeps the $\tfrac12 \epsilon E''$ term, an $O(\epsilon)$ error. In the
+central difference the even terms cancel when the two expansions are subtracted, leaving
+$E' + \tfrac16 \epsilon^2 E''' + O(\epsilon^4)$.<Sidenote>This is the book's Exercise 8.3.</Sidenote>
+
+Shrinking $\epsilon$ does not help forever. A double has a relative precision of about
+$u = 1.1 \times 10^{-16}$, so the difference in the numerator carries a rounding error of roughly
+$u|E|$, which the division by $\epsilon$ blows up into $u|E|/\epsilon$. The total error is about
+$\epsilon|E''| + u|E|/\epsilon$ for forward differences, smallest near $\epsilon \approx \sqrt{u}
+\approx 10^{-8}$, and $\epsilon^2|E'''| + u|E|/\epsilon$ for central differences, smallest near
+$\epsilon \approx u^{1/3} \approx 10^{-5}$. The chart reproduces the book's Figure 8.2 on our
+network, for the derivative with respect to $w^{(1)}_{11}$. On the right, truncation error
+dominates and the lines have slope 1 and 2. On the left, rounding dominates and the lines turn
+noisy and rise.
+
+<LineChart
+	x={epsGrid}
+	series={fdSeries}
+	title="Error of numerical derivatives against backpropagation (after Figure 8.2)"
+	xLabel="log₁₀ ε"
+	yLabel="log₁₀ |error|"
+/>
+
+At $\epsilon = 10^{-6}$, the table compares four derivatives from backpropagation with both
+estimates. Central differences are about a thousand times more accurate for the same $\epsilon$.
+
+| weight | backprop | forward diff. (8.24) | error | central diff. (8.25) | error |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| {gradCheckRows[0].name} | {gradCheckRows[0].g.toFixed(10)} | {gradCheckRows[0].fd.toFixed(10)} | {sci(gradCheckRows[0].fdErr)} | {gradCheckRows[0].cd.toFixed(10)} | {sci(gradCheckRows[0].cdErr)} |
+| {gradCheckRows[1].name} | {gradCheckRows[1].g.toFixed(10)} | {gradCheckRows[1].fd.toFixed(10)} | {sci(gradCheckRows[1].fdErr)} | {gradCheckRows[1].cd.toFixed(10)} | {sci(gradCheckRows[1].cdErr)} |
+| {gradCheckRows[2].name} | {gradCheckRows[2].g.toFixed(10)} | {gradCheckRows[2].fd.toFixed(10)} | {sci(gradCheckRows[2].fdErr)} | {gradCheckRows[2].cd.toFixed(10)} | {sci(gradCheckRows[2].cdErr)} |
+| {gradCheckRows[3].name} | {gradCheckRows[3].g.toFixed(10)} | {gradCheckRows[3].fd.toFixed(10)} | {sci(gradCheckRows[3].fdErr)} | {gradCheckRows[3].cd.toFixed(10)} | {sci(gradCheckRows[3].cdErr)} |
+
+The real problem with numerical differentiation is cost, not accuracy. Each estimate needs one or
+two forward passes of $O(W)$ work, and there are $W$ weights, so the gradient costs $O(W^2)$. The
+table counts multiplications for our toy network and for a 784–100–10 network (an MNIST-sized
+classifier), using a forward pass of $W$ multiplications and a backward pass of
+$KM + M + W$.<Sidenote>Backward: $KM$ for the sums in (8.22), $M$ for the $(1 - z_j^2)$ factors, $W$ for the products $\delta z$ in (8.23). Additions and the activation functions are ignored, so these are rough counts, not timings.</Sidenote>
+
+| network | $W$ | forward pass | backprop (forward + backward) | central differences ($2W$ forward passes) |
+| --- | ---: | ---: | ---: | ---: |
+| 2–3–2 | {costRow(2, 3, 2).W} | {costRow(2, 3, 2).fwd} | {costRow(2, 3, 2).backprop} | {costRow(2, 3, 2).central.toLocaleString("en-US")} |
+| 784–100–10 | {big.W.toLocaleString("en-US")} | {big.fwd.toLocaleString("en-US")} | {big.backprop.toLocaleString("en-US")} | {big.central.toLocaleString("en-US")} |
+
+Backpropagation costs about two forward passes; central differences cost
+{Math.round(big.central / big.backprop).toLocaleString("en-US")} times more on the MNIST-sized
+network, and the ratio grows linearly with $W$.
+
+Numerical differentiation still has one essential use: **gradient checking**. It only needs the
+forward code, so comparing it with a hand-written backward pass (or a new autodiff rule) on a few
+weights, as in the table above, catches most bugs.
+
+## The Jacobian matrix
+
+Backpropagation computes more than the gradient of an error. The **Jacobian** of a network is the
+matrix of derivatives of its outputs with respect to its inputs,
+
+$$
+J_{ki} \equiv \frac{\partial y_k}{\partial x_i}, \tag{8.26}
+$$
+
+each taken with the other inputs held fixed.
+
+### Why Jacobians matter
+
+Jacobians are the glue in systems built from several differentiable modules. In the figure below,
+module 2 sits between the parameter $w$ of module 1 and the error. To train $w$ we need
+
+$$
+\frac{\partial E}{\partial w} = \sum_{k,j} \frac{\partial E}{\partial y_k}\frac{\partial y_k}{\partial z_j}\frac{\partial z_j}{\partial w}, \tag{8.27}
+$$
+
+and the middle factor is module 2's Jacobian. Module 2 can be anything differentiable, fixed or
+learnable, linear or not: as long as it can multiply an error signal by its Jacobian, errors pass
+through it. Click the boxes; the bottom row is the backward flow.
+
+<BoxDiagram nodes={moduleNodes} edges={moduleEdges} selected="m2" title="Error signals through a modular system (after Figure 8.3)" />
+
+The Jacobian also measures **sensitivity**. If the inputs carry small known errors $\Delta x_i$,
+the outputs move by about
+
+$$
+\Delta y_k \simeq \sum_i \frac{\partial y_k}{\partial x_i}\Delta x_i. \tag{8.28}
+$$
+
+This is a first-order approximation. A trained network is nonlinear, so the Jacobian changes with
+the input and (8.28) holds only for small $\Delta x$. The chart moves $x_1$ of our example network
+by $\Delta x_1$ and compares the true change in $y_2$ with $J_{21}\Delta x_1$ ($J_{21} =
+0.8211$). Near zero they agree: at $\Delta x_1 = 0.25$ the estimate is off by 4%. At $\Delta x_1 = 1$ it is off by 22%, and at $2$ by 60%. (On the negative side the curves happen to cross again near $\Delta x_1 = -2$; that is a coincidence of this network's shape, not a sign that (8.28) holds there.)
+
+<LineChart
+	x={() => Array.from({ length: 81 }, (_, i) => -2 + i / 20)}
+	series={linearSeries}
+	title="Change in y₂ when x₁ moves, and its linear estimate (8.28)"
+	xLabel="Δx₁"
+	yLabel="Δy₂"
+/>
+
+### Computing the Jacobian by backpropagation
+
+The derivation copies the one for the gradient. Input $i$ reaches the outputs only through the
+pre-activations $a_j$ of the units it connects to, and $\partial a_j / \partial x_i = w_{ji}$ by
+(8.5):
+
+$$
+J_{ki} = \frac{\partial y_k}{\partial x_i} = \sum_j \frac{\partial y_k}{\partial a_j}\frac{\partial a_j}{\partial x_i} = \sum_j w_{ji}\frac{\partial y_k}{\partial a_j}. \tag{8.29}
+$$
+
+The quantities $\partial y_k / \partial a_j$ play the role of $\delta_j$, and obey the same
+recursion, where $l$ runs over the units that $j$ feeds:
+
+$$
+\frac{\partial y_k}{\partial a_j} = \sum_l \frac{\partial y_k}{\partial a_l}\frac{\partial a_l}{\partial a_j} = h'(a_j)\sum_l w_{lj}\frac{\partial y_k}{\partial a_l}. \tag{8.30}
+$$
+
+The recursion starts at the output units. For linear outputs, $y_k = a_k$, so
+
+$$
+\frac{\partial y_k}{\partial a_l} = \delta_{kl}, \qquad \delta_{kl} = \begin{cases} 1 & k = l \\ 0 & \text{otherwise,} \end{cases} \tag{8.31, 8.32}
+$$
+
+where $\delta_{kl}$ is the **Kronecker delta**, the entries of the identity matrix (not an error
+$\delta$). Other output activations change only this starting point:
+
+$$
+\text{logistic sigmoid: } \frac{\partial y_k}{\partial a_l} = \delta_{kl}\,\sigma'(a_l), \qquad \text{softmax: } \frac{\partial y_k}{\partial a_l} = \delta_{kl}\,y_k - y_k y_l. \tag{8.33, 8.34}
+$$
+
+A sigmoid output depends only on its own pre-activation, so its starting matrix is diagonal. A
+softmax couples all outputs, because they must sum to one. For example, softmax of
+$\mathbf{a} = (1, 0, -1)$ gives $\mathbf{y} = (0.665, 0.245, 0.090)$, and (8.34) gives a full
+matrix whose first row is $(0.223, -0.163, -0.060)$. Check the first entry:
+$y_1 - y_1^2 = 0.665 - 0.443 = 0.223$. The row sums to zero: raising $a_1$ takes probability from
+the other outputs.<Sidenote>Values from `torch.softmax` and `torch.autograd.functional.jacobian`, which matches $\mathrm{diag}(\mathbf{y}) - \mathbf{y}\mathbf{y}^\top$ to $3 \times 10^{-17}$. For the sigmoid at the same $\mathbf{a}$, the diagonal is $\sigma(1 - \sigma) = (0.197, 0.25, 0.197)$.</Sidenote>
+
+So the procedure is: forward-propagate the input, then for each output $k$ (each row of
+$\mathbf{J}$) seed the outputs with (8.31), (8.33) or (8.34), backpropagate with (8.30) to the
+hidden units, and finish with (8.29). One backward pass per row. Step through it on our network:
+
+<GraphSteps data={jacobianSteps} title="The Jacobian of the 2-3-2 network, one row per backward pass (8.29)–(8.31)" />
+
+The last step checks the result with central differences, now perturbing inputs instead of
+weights:
+
+$$
+\frac{\partial y_k}{\partial x_i} = \frac{y_k(x_i + \epsilon) - y_k(x_i - \epsilon)}{2\epsilon} + O(\epsilon^2). \tag{8.35}
+$$
+
+That takes $2D$ forward passes, $O(DW)$ in total.<Sidenote>The Jacobian can also be built by propagating *forwards*, carrying $\partial a_j/\partial x_i$ for one input $i$ through the network; that is the book's Exercise 8.5, and it is exactly forward-mode automatic differentiation, below. Forward gives one column per pass, backward one row per pass.</Sidenote>
+
+## The Hessian matrix
+
+### Second derivatives and their cost
+
+Backpropagation can also deliver second derivatives. Collect all $W$ weights and biases into one
+vector $\mathbf{w}$; the **Hessian** is the $W \times W$ matrix
+
+$$
+H_{ij} = \frac{\partial^2 E}{\partial w_i\,\partial w_j}, \qquad \text{elements of } \frac{\partial^2 E}{\partial w_{ji}\,\partial w_{lk}}. \tag{8.36, 8.37}
+$$
+
+It describes the curvature of the error surface (see [the Hessian post](/blog/hessian-matrix/)),
+and it is used by second-order optimizers, by Bayesian treatments of neural networks, and to
+decide how far each weight can be rounded when quantizing a large model.<Sidenote>Bishop and Bishop cite Bishop (2006) for optimization and Bayesian uses, MacKay (1992) for the Bayesian framework, and Shen et al. (2019) for Hessian-guided low-precision weights.</Sidenote>
+
+The difficulty is size. The Hessian has $W^2$ entries, so even an efficient extension of
+backpropagation, which exists, costs $O(W^2)$ per data point.<Sidenote>Bishop (1992). The book's Exercise 8.6 derives the exact Hessian of a two-layer network from the quantities $\delta_k$ and $M_{kk'} = \partial^2 E_n/\partial a_k \partial a_{k'}$.</Sidenote>
+For a 7-billion-parameter model that is $4.9 \times 10^{19}$ entries, about 98 exabytes at two
+bytes each. Inverting it costs $O(W^3)$. In practice we need either products with the Hessian
+(below) or approximations.
+
+The simplest approximation keeps only the diagonal. It needs $O(W)$ storage and its inverse is
+trivial, but computing it exactly still takes $O(W^2)$ (Ricotti et al., 1988), or $O(W)$ with
+further approximation (Becker and LeCun, 1989). Real Hessians usually have large off-diagonal
+entries, so the diagonal approximation must be used with care.
+
+### The outer product approximation
+
+A better approximation comes from the structure of sum-of-squares error. Take one output and
+
+$$
+E = \frac{1}{2}\sum_{n=1}^{N}(y_n - t_n)^2. \tag{8.38}
+$$
+
+Differentiate once, $\nabla E = \sum_n (y_n - t_n)\nabla y_n$, and again with the product rule:
+
+$$
+\mathbf{H} = \nabla\nabla E = \sum_{n=1}^{N}\nabla y_n(\nabla y_n)^\top + \sum_{n=1}^{N}(y_n - t_n)\nabla\nabla y_n. \tag{8.39}
+$$
+
+The first sum needs only first derivatives. The second is weighted by the residuals $y_n - t_n$.
+For a well-trained network the residuals are small, so the second sum is small. There is a
+subtler argument too: the function that minimizes sum-of-squares error is the conditional mean of
+the target, so the residual behaves like zero-mean noise, and if it is uncorrelated with
+$\nabla\nabla y_n$ the second sum averages out over $n$.<Sidenote>The book's Exercise 8.9 makes this exact in the infinite-data limit: at the optimum, $\partial^2 E/\partial w_r \partial w_s = \int (\partial y/\partial w_r)(\partial y/\partial w_s)\,p(\mathbf{x})\,d\mathbf{x}$.</Sidenote>
+Dropping it gives the **Levenberg–Marquardt** or **outer product approximation**:
+
+$$
+\mathbf{H} \simeq \sum_{n=1}^{N}\nabla a_n\,\nabla a_n^\top. \tag{8.40}
+$$
+
+The book writes $\nabla a_n$, the gradient of the output unit's pre-activation; with a linear
+output $y_n = a_n$, so this is the $\nabla y_n$ of (8.39). Each $\nabla a_n$ costs one backward
+pass, $O(W)$, and the outer products add up in $O(W^2)$. The approximation is also always
+**positive semi-definite** (a sum of outer products), which the true Hessian need not be.
+
+How good is it? The experiment below fits a 1–{hessianSetup.M}–1 tanh network ($W =
+10$) to {hessianSetup.N} noisy samples of $\sin(\pi x)$ by gradient descent, and at
+checkpoints compares the exact Hessian with (8.40) by the relative error
+$\|\mathbf{H} - \mathbf{H}_{\text{LM}}\|_F / \|\mathbf{H}\|_F$.<Sidenote>Exact Hessians from `torch.autograd.functional.hessian` in float64; $\nabla y_n$ from `torch.autograd.functional.jacobian`. At the last checkpoint, identity (8.39) holds to {sci(hessianFinal.err39)}. Learning rate {hessianSetup.lr}, torch seed 0.</Sidenote>
+
+<LineChart
+	x={() => hessianRecords.map((r) => r.step)}
+	series={[
+		{ name: "log₁₀ relative error of (8.40)", fn: (s) => Math.log10(hessianRecords.find((r) => r.step === s).rel) },
+		{ name: "log₁₀ training error E", fn: (s) => Math.log10(hessianRecords.find((r) => r.step === s).E) },
+	]}
+	title="Outer product approximation vs exact Hessian during training"
+	xLabel="gradient descent step"
+	yLabel="log₁₀ value"
+/>
+
+At initialization the approximation is off by {Math.round(first.rel * 100)}%; by step {last.step}
+the error is {(last.rel * 100).toFixed(2)}%. It tracks the training error, as (8.39) predicts:
+smaller residuals, smaller neglected term. The eigenvalues tell the same story.
+
+| step | $E$ | rel. error of (8.40) | smallest eigenvalue of $\mathbf{H}$ | smallest eigenvalue of $\mathbf{H}_{\text{LM}}$ |
+| ---: | ---: | ---: | ---: | ---: |
+| {first.step} | {first.E.toFixed(3)} | {first.rel.toFixed(3)} | {first.minEig.toFixed(3)} | {sci(first.minEigLM)} |
+| {hessianRecords[2].step} | {hessianRecords[2].E.toFixed(3)} | {hessianRecords[2].rel.toFixed(3)} | {hessianRecords[2].minEig.toFixed(3)} | {sci(hessianRecords[2].minEigLM)} |
+| {hessianRecords[5].step} | {hessianRecords[5].E.toFixed(3)} | {hessianRecords[5].rel.toFixed(4)} | {hessianRecords[5].minEig.toFixed(3)} | {sci(hessianRecords[5].minEigLM)} |
+| {last.step} | {last.E.toFixed(3)} | {last.rel.toFixed(5)} | {sci(last.minEig)} | {sci(last.minEigLM)} |
+
+Early on the true Hessian has a large negative eigenvalue ({first.minEig.toFixed(2)}): the error
+surface curves downward in some direction, and a Newton step would go the wrong way. The outer
+product approximation cannot see this; its eigenvalues are never negative (the values near
+$10^{-16}$ are rounding). That is a feature for optimization, since it always gives a descent
+direction, but it means (8.40) is only a faithful Hessian for a network that is already well
+trained.
+
+For a single logistic-sigmoid output with cross-entropy error, the same steps give a weighted
+version. There $\partial E_n/\partial a_n = y_n - t_n$ again, so
+$\nabla\nabla E = \sum_n y_n(1 - y_n)\nabla a_n\nabla a_n^\top + \sum_n (y_n - t_n)\nabla\nabla a_n$,
+where $y_n(1-y_n) = \sigma'(a_n)$ comes from differentiating $y_n$ once more. Dropping the second
+sum:
+
+$$
+\mathbf{H} \simeq \sum_{n=1}^{N} y_n(1 - y_n)\nabla a_n\nabla a_n^\top. \tag{8.41}
+$$
+
+Softmax outputs give the analogous matrix-weighted form. Because (8.40) adds one outer product per
+data point, its *inverse* can also be built in one pass over the data, updating with the
+Sherman–Morrison identity at each point.<Sidenote>Hassibi and Stork (1993); the book's Exercise 8.12. With $\mathbf{H}_{n+1} = \mathbf{H}_n + \mathbf{b}\mathbf{b}^\top$ and $\mathbf{b} = \nabla a_{n+1}$: $\mathbf{H}_{n+1}^{-1} = \mathbf{H}_n^{-1} - \frac{\mathbf{H}_n^{-1}\mathbf{b}\mathbf{b}^\top\mathbf{H}_n^{-1}}{1 + \mathbf{b}^\top\mathbf{H}_n^{-1}\mathbf{b}}$, starting from $\mathbf{H}_0 = \alpha\mathbf{I}$ with small $\alpha$.</Sidenote>
+
+Often we need neither the Hessian nor an approximation, only its product $\mathbf{H}\mathbf{v}$
+with a vector. That costs $O(W)$, and the cleanest way to see why is automatic differentiation.
+
+## Automatic differentiation
+
+### Four ways to get a gradient
+
+The book lists four ways to evaluate the derivatives of a network's error:
+
+| approach | how | accuracy | cost | weakness |
+| --- | --- | --- | --- | --- |
+| By hand | derive backprop equations, code them | machine precision | $O(W)$ | slow to derive, error-prone, two codes to keep in sync |
+| Numerical | finite differences (8.24), (8.25) | limited by $\epsilon$ and rounding | $O(W^2)$ | scales badly; useful for checking |
+| Symbolic | computer algebra applies the rules of calculus | machine precision | can blow up | expression swell; needs closed form, no loops or branches |
+| Automatic | augment the forward code with derivative variables | machine precision | $O(W)$ | needs the library's support (now standard) |
+
+Hand-derived backpropagation was the norm for years. The cost is human: every architecture change
+means re-deriving and re-coding the backward pass in step with the forward pass, which limits how
+quickly new architectures can be tried. Numerical differentiation we have seen. That leaves
+symbolic and automatic differentiation.
+
+### Symbolic differentiation and expression swell
+
+**Symbolic differentiation** has software apply the chain rule, product rule and so on to a
+formula, producing a formula for the derivative. It is exact and avoids human error, but the
+derivative of a formula can be much longer than the formula. Even the product rule duplicates:
+
+$$
+f(x) = u(x)v(x), \qquad f'(x) = u'(x)v(x) + u(x)v'(x). \tag{8.42, 8.43}
+$$
+
+Now $u$ and $v$ each appear twice. If they are products themselves, the duplication nests. This
+is **expression swell**.
+
+The book's example is a network with one input $x$, one hidden unit and one output,
+
+$$
+z = h(w_1 x + b_1), \qquad y = h(w_2 z + b_2), \tag{8.44, 8.45}
+$$
+
+where the activation $h$ is the **soft ReLU** (softplus), which the book writes as $\zeta$:
+
+$$
+\zeta(a) = \ln(1 + \exp(a)), \tag{8.46}
+$$
+
+so that
+
+$$
+y(x) = h\big(w_2\, h(w_1 x + b_1) + b_2\big). \tag{8.47}
+$$
+
+The symbolic derivative with respect to $w_1$ is
+
+$$
+\frac{\partial y}{\partial w_1} = \frac{w_2 x \exp\big(w_1 x + b_1 + b_2 + w_2 \ln[1 + e^{w_1 x + b_1}]\big)}{(1 + e^{w_1 x + b_1})\big(1 + \exp(b_2 + w_2\ln[1 + e^{w_1 x + b_1}])\big)}. \tag{8.48}
+$$
+
+The subexpression $w_1 x + b_1$ appears three times and $\ln[1 + e^{w_1x+b_1}]$ twice; a program
+evaluating the formula recomputes them. Backpropagation would instead reuse the stored
+pre-activations: since $\zeta'(a) = \sigma(a)$, the derivative is just
+$\sigma(a_2)\, w_2\, \sigma(a_1)\, x$.<Sidenote>Checked with sympy 1.14: `diff` of (8.47) and the expression (8.48) agree numerically ($-0.147720$ at $x = 0.7$, $w_1 = 1.3$, $w_2 = -0.8$, $b_1 = 0.2$, $b_2 = 0.5$). sympy's own derivative has 29 operations against 10 for $y$. This is the book's Exercise 8.13.</Sidenote>
+
+Swell grows with depth. The book's Exercise 8.14 uses the **logistic map**
+$L_{n+1}(x) = 4L_n(x)(1 - L_n(x))$, $L_1(x) = x$, which is like a deep network with one unit per
+layer. The chart counts the operations in the unsimplified formulas for $L_n$ and $L_n'$, and in
+an evaluation trace (defined next) that computes them.
+
+<LineChart
+	x={() => swell.map((r) => r.n)}
+	series={[
+		{ name: "formula for Lₙ", fn: (n) => Math.log10(swell[n - 1].f) },
+		{ name: "formula for Lₙ′", fn: (n) => Math.log10(swell[n - 1].df) },
+		{ name: "trace for Lₙ and Lₙ′ (autodiff)", fn: (n) => Math.log10(swell[n - 1].traceTangent) },
+	]}
+	title="Expression swell for the logistic map (Exercise 8.14)"
+	xLabel="n"
+	yLabel="log₁₀ operations"
+/>
+
+At $n = 8$ the derivative formula has {swell[7].df.toLocaleString("en-US")} operations, against
+{swell[7].f} for the function, and both roughly double or triple per step because each step uses
+$L_n$ twice. A program that computes $L_n$ step by step, carrying the derivative along, needs 6
+operations per step: {swell[7].traceTangent} in total.<Sidenote>Counts by sympy's `count_ops` on the unsimplified expression trees. The trace count is 3 operations for $v \leftarrow 4v(1-v)$ and 3 for $\dot v \leftarrow \dot v(4 - 8v)$ per step. The formula sizes depend on how the expression is written; the growth rate is the point.</Sidenote>
+Symbolic differentiation has a second limitation: it needs a closed-form expression, so it cannot
+handle loops, recursion, branches or function calls.
+
+### The idea of automatic differentiation
+
+**Automatic differentiation** (autodiff, or algorithmic differentiation) does not produce a formula
+for the derivative. It takes the *code* that computes a function and produces code that computes
+its derivatives, by augmenting each intermediate variable with a derivative variable. It is exact
+to machine precision, like symbolic differentiation, but it reuses intermediate values instead of
+duplicating them, and it handles any control flow, because it differentiates the operations that
+actually ran. It comes in two forms, **forward mode** and **reverse mode**.<Sidenote>Baydin et al. (2018) survey autodiff for machine learning. The field developed mostly outside machine learning; Griewank and Walther (2008) is the standard reference.</Sidenote>
+
+The book's running example has two inputs:
+
+$$
+f(x_1, x_2) = x_1 x_2 + \exp(x_1 x_2) - \sin(x_2). \tag{8.49}
+$$
+
+Written as code, it is a sequence of elementary operations, the **evaluation trace**. Each
+intermediate result is a **primal variable** $v_i$:
+
+$$
+\begin{aligned}
+v_1 &= x_1, & v_2 &= x_2, & v_3 &= v_1 v_2, & v_4 &= \sin(v_2),\\
+v_5 &= \exp(v_3), & v_6 &= v_3 - v_4, & v_7 &= v_5 + v_6. &&
+\end{aligned} \tag{8.50–8.56}
+$$
+
+Note that $x_1 x_2$ is computed once, as $v_3$, and used twice. The trace is a graph: $v_3$ has
+**parents** $v_1$ and $v_2$ (written $\mathrm{pa}(3)$) and **children** $v_5$ and $v_6$
+($\mathrm{ch}(3)$). The figures below draw it as in the book's Figures 8.4 and 8.5. All examples
+use $x_1 = 1$, $x_2 = 2$.
+
+### Forward mode
+
+Forward mode pairs each primal $v_i$ with a **tangent variable** $\dot v_i$, the derivative of
+$v_i$ with respect to one chosen input. For $\partial f/\partial x_1$, $\dot v_i = \partial v_i /
+\partial x_1$. The chain rule computes each tangent from its parents' tangents:
+
+$$
+\dot v_i = \frac{\partial v_i}{\partial x_1} = \sum_{j \in \mathrm{pa}(i)} \frac{\partial v_j}{\partial x_1}\frac{\partial v_i}{\partial v_j} = \sum_{j \in \mathrm{pa}(i)} \dot v_j\,\frac{\partial v_i}{\partial v_j}. \tag{8.57}
+$$
+
+Applied to each line of the trace, (8.57) gives the tangent trace:
+
+$$
+\begin{aligned}
+\dot v_1 &= 1, & \dot v_2 &= 0, & \dot v_3 &= v_1 \dot v_2 + \dot v_1 v_2, & \dot v_4 &= \dot v_2\cos(v_2),\\
+\dot v_5 &= \dot v_3 \exp(v_3), & \dot v_6 &= \dot v_3 - \dot v_4, & \dot v_7 &= \dot v_5 + \dot v_6. &&
+\end{aligned} \tag{8.58–8.64}
+$$
+
+The software writes these from the primal code, one rule per elementary operation, and runs both
+together: each step computes the pair $(v_i, \dot v_i)$, then both can be discarded once their
+children are done. The figure also includes the book's second output (Figure 8.5),
+
+$$
+f_2(x_1, x_2) = (x_1 x_2 - \sin(x_2))\exp(x_1 x_2) = v_5 v_6, \tag{8.65}
+$$
+
+which costs one more line, $v_8 = v_5 v_6$.
+
+<GraphSteps data={forwardModeSteps} title="Forward-mode autodiff of (8.49) and (8.65), seeded for ∂/∂x₁ (8.57)–(8.64)" colGap={175} nodeWidth={118} />
+
+The final tangent is $\dot v_7 = 16.778 = \partial f_1/\partial x_1$, which matches the closed
+form $x_2 + x_2 e^{x_1 x_2} = 2 + 2e^2$.<Sidenote>The book says the pass ends at $\dot v_5$, "which is the required derivative"; it should be $\dot v_7$, since $v_7 = f$. This is the book's Exercise 8.17, worked in the figure.</Sidenote>
+The same pass also gave $\partial f_2/\partial x_1 = 30.897$. But
+$\partial f_1/\partial x_2$ needs a *second* pass, seeded with $\dot{\mathbf{x}} = (0, 1)$.
+
+In general, for a function with $D$ inputs and $K$ outputs, the **Jacobian** is $K \times D$:
+
+$$
+\mathbf{J} = \begin{bmatrix} \frac{\partial f_1}{\partial x_1} & \cdots & \frac{\partial f_1}{\partial x_D} \\ \vdots & \ddots & \vdots \\ \frac{\partial f_K}{\partial x_1} & \cdots & \frac{\partial f_K}{\partial x_D} \end{bmatrix}. \tag{8.66}
+$$
+
+A forward pass seeded with $\dot{\mathbf{x}} = \mathbf{e}_i$ (the $i$th unit vector) produces column
+$i$, so the full Jacobian takes $D$ passes. Here, with two passes:
+
+$$
+\mathbf{J} = \begin{bmatrix} 16.778 & 8.805 \\ 30.897 & 18.523 \end{bmatrix}.
+$$
+
+Seeding with an arbitrary vector $\dot{\mathbf{x}} = \mathbf{r}$ gives the **Jacobian-vector
+product** $\mathbf{J}\mathbf{r}$ in one pass, because the tangent equations are linear in the seed
+and $\mathbf{r} = \sum_i r_i\mathbf{e}_i$:<Sidenote>This is the book's Exercise 8.18.</Sidenote>
+
+$$
+\mathbf{J}\mathbf{r} = \begin{bmatrix} \frac{\partial f_1}{\partial x_1} & \cdots & \frac{\partial f_1}{\partial x_D} \\ \vdots & \ddots & \vdots \\ \frac{\partial f_K}{\partial x_1} & \cdots & \frac{\partial f_K}{\partial x_D} \end{bmatrix}\begin{bmatrix} r_1 \\ \vdots \\ r_D \end{bmatrix}. \tag{8.67}
+$$
+
+With $\mathbf{r} = (1, -1)$ a single pass gives $(\dot v_7, \dot v_8) =
+(7.973, 12.373)$. Check the first entry from the matrix:
+$16.778 - 8.805 = 7.973$.
+
+Forward mode is efficient when there are few inputs and many outputs ($K \gg D$). Training is the
+opposite: one output, the error, and millions or billions of inputs, the weights. Forward mode
+would need one pass per weight, which is no better than finite differences.
+
+### Reverse mode
+
+Reverse mode turns the flow around. Each primal $v_i$ gets an **adjoint variable**, the derivative
+of the (single) output with respect to it:
+
+$$
+\bar v_i = \frac{\partial f}{\partial v_i}. \tag{8.68}
+$$
+
+Now the chain rule runs over a node's *children*, the variables it was used to compute:
+
+$$
+\bar v_i = \frac{\partial f}{\partial v_i} = \sum_{j \in \mathrm{ch}(i)} \frac{\partial f}{\partial v_j}\frac{\partial v_j}{\partial v_i} = \sum_{j \in \mathrm{ch}(i)} \bar v_j\,\frac{\partial v_j}{\partial v_i}. \tag{8.69}
+$$
+
+This is (8.12) again, with "units" replaced by any elementary operation: reverse mode is the
+generalization of backpropagation. For our trace it gives, starting at the output:
+
+$$
+\begin{aligned}
+\bar v_7 &= 1, & \bar v_6 &= \bar v_7, & \bar v_5 &= \bar v_7, & \bar v_4 &= -\bar v_6,\\
+\bar v_3 &= \bar v_5 v_5 + \bar v_6, & \bar v_2 &= \bar v_3 v_1 + \bar v_4\cos(v_2), & \bar v_1 &= \bar v_3 v_2. &&
+\end{aligned} \tag{8.70–8.76}
+$$
+
+The term $\bar v_5 v_5$ in $\bar v_3$ uses $\partial v_5/\partial v_3 = \exp(v_3) = v_5$, a value
+already stored. In the figure, each red edge label is one term of (8.69): the child's adjoint times
+the local derivative.
+
+<GraphSteps data={reverseModeSteps} title="Reverse-mode autodiff of (8.49): adjoints from the output back (8.69)–(8.76)" colGap={175} nodeWidth={118} />
+
+One backward pass gave both $\partial f/\partial x_1 = \bar v_1 = 16.778$ and
+$\partial f/\partial x_2 = \bar v_2 = 8.805$: the whole gradient, however many
+inputs there are. For a network's error, the adjoints of the weights are exactly the derivatives
+$\partial E/\partial w$. With several outputs, reverse mode needs one pass per output; each pass
+gives one *row* of $\mathbf{J}$, a **vector-Jacobian product** $\mathbf{u}^\top\mathbf{J}$ with
+$\mathbf{u}$ the seed.
+
+PyTorch exposes both modes directly. `torch.func.jvp` is forward mode and `torch.func.vjp` reverse
+mode; on our two-output function they return column 1 and row 1 of $\mathbf{J}$, and the
+Jacobian-vector product for $\mathbf{r} = (1, -1)$:
+
+```python
+import torch
+from torch.func import jvp, vjp
+
+def f(x):
+    x1, x2 = x
+    v3 = x1 * x2
+    return torch.stack([v3 + torch.exp(v3) - torch.sin(x2),          # f1 (8.49)
+                        (v3 - torch.sin(x2)) * torch.exp(v3)])       # f2 (8.65)
+
+x = torch.tensor([1.0, 2.0], dtype=torch.float64)
+e1 = torch.tensor([1.0, 0.0], dtype=torch.float64)
+
+_, col = jvp(f, (x,), (e1,))      # forward mode: column 1 of J
+_, pullback = vjp(f, x)
+(row,) = pullback(e1)             # reverse mode: row 1 of J
+_, Jr = jvp(f, (x,), (torch.tensor([1.0, -1.0], dtype=torch.float64),))
+print(col, row, Jr, sep="\n")
+# tensor([16.7781, 30.8966], dtype=torch.float64)
+# tensor([16.7781,  8.8052], dtype=torch.float64)
+# tensor([ 7.9729, 12.3734], dtype=torch.float64)
+```
+
+### Forward or reverse?
+
+| | forward mode | reverse mode |
+| --- | --- | --- |
+| carries | tangents $\dot v_i = \partial v_i/\partial x_j$ | adjoints $\bar v_i = \partial f/\partial v_i$ |
+| chain rule over | parents, (8.57) | children, (8.69) |
+| one pass gives | one column of $\mathbf{J}$, or $\mathbf{J}\mathbf{r}$ | one row of $\mathbf{J}$, or $\mathbf{u}^\top\mathbf{J}$ |
+| full $K \times D$ Jacobian | $D$ passes | $K$ passes |
+| best when | few inputs, many outputs | few outputs, many inputs (training) |
+| memory | discard values as you go | keep every primal for the backward pass |
+
+The memory row matters in practice. Reverse mode cannot start until the forward pass has finished,
+and it needs the stored primals ($v_1$, $v_2$, $v_5$ above; every layer's activations in a
+network). Activation memory is often what limits batch size, which is why frameworks offer to
+recompute some activations instead of storing them (see [AOTAutograd](/blog/aot-autograd/) for how
+PyTorch decides). Forward mode computes each tangent alongside its primal and is simpler to
+implement.
+
+Both modes are cheap. A single pass of either costs at most about 6 times one evaluation of the
+function, and typically 2 to 3 times (Griewank and Walther, 2008), consistent with the
+multiplication count earlier.
+
+### Hessian-vector products
+
+Combining the two modes gives the Hessian-vector product promised earlier (Pearlmutter, 1994).
+Reverse mode computes the gradient $\nabla f$ as a program. Running forward mode on *that* program,
+seeded with $\dot{\mathbf{w}} = \mathbf{v}$, gives the directional derivative of the gradient,
+
+$$
+\frac{d}{d\alpha}\nabla f(\mathbf{w} + \alpha\mathbf{v})\Big|_{\alpha=0} = \nabla^2 f\,\mathbf{v} = \mathbf{H}\mathbf{v},
+$$
+
+at a small constant times the cost of the gradient: $O(W)$, even though $\mathbf{H}$ has $W^2$
+entries. The book describes the mirror-image order (forward mode to get
+$\mathbf{v}^\top\nabla f$, then reverse mode to differentiate it); both orders give
+$\mathbf{H}\mathbf{v}$.<Sidenote>The book's text starts "from a vector $\mathbf{b}$" but then seeds with $\mathbf{v}$; they are the same vector. Forming the full Hessian by autodiff is possible too, at $O(W^2)$.</Sidenote>
+On the Hessian experiment's final network ($W = 10$) we compared three ways of computing
+$\mathbf{H}\mathbf{v}$ for a random $\mathbf{v}$: the full matrix times $\mathbf{v}$,
+forward-over-reverse with `torch.func.jvp(torch.func.grad(E), (w,), (v,))`, and central
+differences of the gradient, $(\nabla E(\mathbf{w} + \epsilon\mathbf{v}) - \nabla E(\mathbf{w} -
+\epsilon\mathbf{v}))/2\epsilon$ with $\epsilon = 10^{-5}$. Forward-over-reverse matched the full
+product to {sci(hessianFinal.errFwdRev)}, rounding level; central differences to
+{sci(hessianFinal.errFd)}, the accuracy the finite-difference chart predicts.
+
+## Summary
+
+- Each weight's derivative is local: $\partial E_n/\partial w_{ji} = \delta_j z_i$, the error at
+  the weight's output end times the activation at its input end (8.10).
+- Errors flow backwards through the same weights, transposed:
+  $\delta_j = h'(a_j)\sum_k w_{kj}\delta_k$ (8.13). One forward and one backward sweep give all $W$
+  derivatives in $O(W)$, against $O(W^2)$ for finite differences. Central differences remain the
+  tool for checking gradients.
+- The same recursion with a one-hot seed gives the Jacobian, one row per backward pass. The
+  Hessian has $W^2$ entries, so in practice we use the outer product approximation (8.40), good
+  only once the residuals are small, or Hessian-vector products in $O(W)$.
+- Automatic differentiation generalizes backpropagation to any program. Forward mode carries
+  tangents and gives one Jacobian column per pass; reverse mode carries adjoints, gives one row
+  per pass, and is what training uses, at the price of storing the forward pass.
+
+## References
+
+- C. M. Bishop and H. Bishop. [*Deep Learning: Foundations and Concepts*](https://doi.org/10.1007/978-3-031-45468-4_8), chapter 8, Springer, 2024.
+- D. E. Rumelhart, G. E. Hinton and R. J. Williams. [Learning representations by back-propagating errors](https://doi.org/10.1038/323533a0). *Nature* 323, 533–536, 1986.
+- A. G. Baydin, B. A. Pearlmutter, A. A. Radul and J. M. Siskind. [Automatic differentiation in machine learning: a survey](https://jmlr.org/papers/v18/17-468.html). *JMLR* 18(153), 2018.
+- A. Griewank and A. Walther. *Evaluating Derivatives: Principles and Techniques of Algorithmic Differentiation*, 2nd ed., SIAM, 2008.
+- B. A. Pearlmutter. [Fast exact multiplication by the Hessian](https://doi.org/10.1162/neco.1994.6.1.147). *Neural Computation* 6(1), 147–160, 1994.
+- B. Hassibi and D. G. Stork. Second order derivatives for network pruning: Optimal Brain Surgeon. *NeurIPS* 5, 1993.
+- PyTorch. [`torch.func` API](https://pytorch.org/docs/2.9/func.api.html): `jvp`, `vjp`, `grad`.

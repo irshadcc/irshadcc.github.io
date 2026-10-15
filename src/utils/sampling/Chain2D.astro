@@ -1,0 +1,206 @@
+---
+// MCMC on a correlated 2D Gaussian, one move at a time. `method` picks the sampler:
+//  - "metropolis": isotropic Gaussian proposal of standard deviation ρ, accepted with eq 14.27;
+//    accepted moves are green, rejected candidates red (as in the book's Figure 14.9).
+//  - "gibbs": alternate draws from p(z1 | z2) and p(z2 | z1) (eqs 14.42–14.44), with the
+//    over-relaxation α of eq 14.46 (α = 0 is plain Gibbs, α < 0 overshoots the conditional mean).
+//  - "langevin": unadjusted Langevin steps of eq 14.61 with step size η.
+// The left panel shows the 1σ and 2σ contours of the target, every visited state and the
+// most recent moves; the right panel traces the state's coordinate along the long axis of the
+// ellipse. Readouts: acceptance rate, sample standard deviations along both axes against the
+// truth, and the integrated autocorrelation time along the long axis (effective sample size).
+// Logic in sampling.ts (`runChain`).
+// Usage in .mdx:
+//   <Chain2D method="metropolis" param={0.2} />
+import Player from "./Player.astro";
+import "./sampling.css";
+
+interface Props {
+	method: "metropolis" | "gibbs" | "langevin";
+	/** ρ, α or η; defaults depend on the method. */
+	param?: number;
+	/** Standard deviations along the long and short axes, and the axis angle in degrees. */
+	sMax?: number;
+	sMin?: number;
+	angle?: number;
+	start?: [number, number];
+	seed?: number;
+	title?: string;
+	caption?: string;
+}
+
+const defaults = { metropolis: 0.2, gibbs: 0, langevin: 0.005 };
+const ranges = {
+	metropolis: { min: 0.02, max: 1.5, step: 0.01, label: "proposal sd ρ" },
+	gibbs: { min: -0.98, max: 0.9, step: 0.01, label: "over-relaxation α" },
+	langevin: { min: 0.0005, max: 0.075, step: 0.0005, label: "step size η" },
+};
+const {
+	method,
+	param,
+	sMax = 0.8,
+	sMin = 0.2,
+	angle = 45,
+	start = [0.2, 0.4],
+	seed = 4,
+	title,
+	caption,
+} = Astro.props;
+const value = param ?? defaults[method];
+const r = ranges[method];
+---
+
+<figure
+	class="smp-fig smp-chain"
+	data-method={method}
+	data-smax={sMax}
+	data-smin={sMin}
+	data-angle={angle}
+	data-start={JSON.stringify(start)}
+	data-seed={seed}
+>
+	{title && <div class="smp-title">{title}</div>}
+	<div class="smp-legend">
+		<span><i class="k-text"></i>1σ and 2σ contours</span>
+		{method === "metropolis" ? (
+			<>
+				<span><i class="k-q" style="border-color: var(--smp-ok)"></i>accepted move</span>
+				<span><i class="k-q" style="border-color: var(--smp-bad)"></i>rejected candidate</span>
+			</>
+		) : (
+			<span><i class="k-q" style="border-color: var(--smp-ok)"></i>move</span>
+		)}
+		<span><i class="dot k-dot-p"></i>visited states</span>
+	</div>
+	<svg class="smp-svg" viewBox="0 0 640 330" role="img" aria-label="Markov chain moves on a correlated Gaussian"></svg>
+	<div class="smp-controls">
+		<Player />
+		<button type="button" class="smp-btn" data-add="100">+100</button>
+		<button type="button" class="smp-btn" data-add="1000">+1000</button>
+		<label class="smp-slider">{r.label} = <strong class="v-param"></strong>
+			<input type="range" class="i-param" min={r.min} max={r.max} step={r.step} value={value} aria-label={r.label} />
+		</label>
+	</div>
+	<div class="smp-metrics">
+		<div><span>moves</span><strong class="m-n"></strong></div>
+		{method === "metropolis" && <div><span>acceptance rate</span><strong class="m-acc"></strong></div>}
+		<div><span class="l-long">sd along long axis</span><strong class="m-long"></strong></div>
+		<div><span class="l-short">sd along short axis</span><strong class="m-short"></strong></div>
+		<div><span>autocorrelation time τ (long axis)</span><strong class="m-tau"></strong></div>
+	</div>
+	<p class="smp-narration"></p>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import { type ChainMethod, type ChainMove, type Vec2, along, autocorrelationTime, gauss2, langevinStationaryVariance, runChain } from "./sampling";
+	import { axes, bindPlayer, el, fmt } from "./plot";
+
+	const MAX = 6000;
+
+	function attach(fig: HTMLElement) {
+		const svg = fig.querySelector("svg")!;
+		const say = fig.querySelector(".smp-narration")!;
+		const input = fig.querySelector<HTMLInputElement>(".i-param")!;
+		const method = fig.dataset.method as ChainMethod;
+		const g = gauss2([1.5, 1.5], Number(fig.dataset.smax), Number(fig.dataset.smin), Number(fig.dataset.angle));
+		const z0 = JSON.parse(fig.dataset.start!) as Vec2;
+		const seed = Number(fig.dataset.seed);
+		let moves: ChainMove[] = [];
+		// Start with some draws shown so the figure is not empty.
+		let n = 150;
+
+		const recompute = () => {
+			moves = runChain(method, g, z0, Number(input.value), MAX, seed);
+		};
+
+		function draw() {
+			const param = Number(input.value);
+			svg.replaceChildren();
+			const P = axes(svg, { x: 40, y: 10, w: 280, h: 280 }, [-0.5, 3.5], [-0.5, 3.5], { xLabel: "z₁", yLabel: "z₂", xTicks: 4, yTicks: 4 });
+			const [u, v] = g.axes;
+			for (const k of [1, 2]) {
+				const pts = Array.from({ length: 121 }, (_, i) => {
+					const t = (i / 120) * 2 * Math.PI;
+					const a = k * g.sd[0] * Math.cos(t);
+					const b = k * g.sd[1] * Math.sin(t);
+					return `${i ? "L" : "M"}${P.sx(g.mean[0] + a * u[0] + b * v[0]).toFixed(1)},${P.sy(g.mean[1] + a * u[1] + b * v[1]).toFixed(1)}`;
+				});
+				el("path", { d: pts.join(""), class: k === 1 ? "smp-text-line" : "smp-muted-line" }, svg);
+			}
+			const states: Vec2[] = [z0, ...moves.slice(0, n).map((m) => m.next)];
+			for (const s of states) el("circle", { cx: P.sx(s[0]), cy: P.sy(s[1]), r: 1.6, class: "smp-dot", opacity: 0.55 }, svg);
+			const recent = moves.slice(Math.max(0, n - 150), n);
+			for (const m of recent) {
+				el("line", { x1: P.sx(m.from[0]), y1: P.sy(m.from[1]), x2: P.sx(m.to[0]), y2: P.sy(m.to[1]), class: m.accept ? "smp-ok-line" : "smp-bad-line" }, svg);
+			}
+			const cur = states[states.length - 1];
+			el("circle", { cx: P.sx(cur[0]), cy: P.sy(cur[1]), r: 4.5, class: "smp-current" }, svg);
+
+			// Trace of the long-axis coordinate.
+			const tr = states.map((s) => along(g, s, u));
+			const span = Math.max(n, 100);
+			const T = axes(svg, { x: 372, y: 10, w: 250, h: 280 }, [0, span], [-3, 3], { xLabel: "move t", yLabel: "long-axis coordinate / σ_max", xTicks: 4, yTicks: 6 });
+			let d = "";
+			const stride = Math.max(1, Math.floor(tr.length / 600));
+			for (let i = 0; i < tr.length; i += stride) d += `${i ? "L" : "M"}${T.sx(i).toFixed(1)},${T.sy(Math.max(-3, Math.min(3, tr[i] / g.sd[0]))).toFixed(1)}`;
+			el("path", { d, class: "smp-p", style: "stroke-width: 1.2" }, svg);
+			for (const k of [-1, 1]) el("line", { x1: T.box.x, x2: T.box.x + T.box.w, y1: T.sy(k), y2: T.sy(k), class: "smp-muted-line" }, svg);
+
+			// Readouts, after dropping the first 10% of moves as burn-in.
+			const kept = states.slice(Math.floor(states.length / 10));
+			const sd = (w: Vec2) => {
+				const xs = kept.map((s) => along(g, s, w));
+				const m = xs.reduce((a, b) => a + b, 0) / xs.length;
+				return Math.sqrt(xs.reduce((a, b) => a + (b - m) ** 2, 0) / Math.max(1, xs.length - 1));
+			};
+			fig.querySelector(".v-param")!.textContent = method === "langevin" ? fmt(param, 4) : fmt(param, 2);
+			fig.querySelector(".m-n")!.textContent = String(n);
+			const acc = fig.querySelector(".m-acc");
+			if (acc) acc.textContent = n ? fmt(moves.slice(0, n).filter((m) => m.accept).length / n, 3) : "–";
+			const [tl, ts] = method === "langevin" ? g.sd.map((s) => Math.sqrt(langevinStationaryVariance(s * s, param))) : g.sd;
+			fig.querySelector(".l-long")!.textContent = `sd along long axis (${method === "langevin" ? "chain's limit" : "true"} ${fmt(tl, 3)})`;
+			fig.querySelector(".l-short")!.textContent = `sd along short axis (${method === "langevin" ? "chain's limit" : "true"} ${fmt(ts, 3)})`;
+			fig.querySelector(".m-long")!.textContent = n >= 20 ? fmt(sd(u), 3) : "–";
+			fig.querySelector(".m-short")!.textContent = n >= 20 ? fmt(sd(v), 3) : "–";
+			if (n >= 500) {
+				const tau = autocorrelationTime(kept.map((s) => along(g, s, u)));
+				fig.querySelector(".m-tau")!.textContent = `${fmt(tau, 1)} (ESS ${Math.round(kept.length / tau)})`;
+			} else fig.querySelector(".m-tau")!.textContent = "needs 500 moves";
+			if (n > 0) {
+				const m = moves[n - 1];
+				const pt = (z: Vec2) => `(${fmt(z[0])}, ${fmt(z[1])})`;
+				say.textContent =
+					method === "metropolis"
+						? `Move ${n}: from ${pt(m.from)} propose z★ = ${pt(m.to)}: ${m.accept ? "accepted" : "rejected, so the chain repeats its current state"}.`
+						: method === "gibbs"
+							? `Move ${n}: redraw z${m.coord === 0 ? "₁" : "₂"} from its conditional given z${m.coord === 0 ? "₂" : "₁"}: ${pt(m.from)} → ${pt(m.to)}.`
+							: `Move ${n}: z + η ∇ln p(z) + √(2η) ε: ${pt(m.from)} → ${pt(m.to)}.`;
+			} else say.textContent = `The chain starts at ${`(${z0[0]}, ${z0[1]})`}. Press play or step.`;
+		}
+
+		const step = (dir: 1 | -1) => {
+			n = Math.max(0, Math.min(MAX, n + dir));
+			draw();
+			return n < MAX;
+		};
+		bindPlayer(fig, step, () => {
+			n = 0;
+			draw();
+		}, 90);
+		fig.querySelectorAll<HTMLButtonElement>("[data-add]").forEach((b) =>
+			b.addEventListener("click", () => {
+				n = Math.min(MAX, n + Number(b.dataset.add));
+				draw();
+			}),
+		);
+		input.addEventListener("input", () => {
+			recompute();
+			draw();
+		});
+		recompute();
+		draw();
+	}
+
+	document.querySelectorAll<HTMLElement>(".smp-chain").forEach(attach);
+</script>

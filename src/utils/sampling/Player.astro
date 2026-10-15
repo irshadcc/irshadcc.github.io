@@ -1,0 +1,23 @@
+---
+// First / previous / play-pause / next buttons used by the step-through sampling figures.
+// Wire them with bindPlayer() from plot.ts. Styles are in sampling.css.
+// Usage in a component:
+//   <Player />
+import "./sampling.css";
+---
+
+<div class="smp-player">
+	<button type="button" data-act="first" aria-label="Restart">
+		<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 3v10M13 3 6 8l7 5z"></path></svg>
+	</button>
+	<button type="button" data-act="prev" aria-label="Previous step">
+		<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M11 3 4 8l7 5z"></path></svg>
+	</button>
+	<button type="button" data-act="play" class="play" aria-label="Play">
+		<svg class="i-play" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5v11L13.5 8z"></path></svg>
+		<svg class="i-pause" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 3h3v10H4zM9 3h3v10H9z"></path></svg>
+	</button>
+	<button type="button" data-act="next" aria-label="Next step">
+		<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 3l7 5-7 5z"></path></svg>
+	</button>
+</div>

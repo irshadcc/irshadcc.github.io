@@ -1,0 +1,148 @@
+---
+// Training a one-dimensional energy-based model by maximum likelihood (eqs 14.50–14.62).
+// The energy is E(x, w) = w₁x + w₂x² + w₃x³ + w₄x⁴, so ∇_w E = (x, x², x³, x⁴). The data are
+// 200 points from ½ N(−1.5, 0.5²) + ½ N(1.5, 0.5²). Each iteration moves 300 model samples with
+// Langevin steps (eq 14.61), then applies eq 14.57: w moves by the model-sample average of
+// ∇_w E minus the data average (each feature scaled by its data second moment). Top: the energy
+// (shifted to minimum 0) with data (orange) and model samples (purple) as rugs. Bottom: the
+// data density, the model density p(x | w) (normalized on a grid, only for display) and a grey
+// band where the model has more mass than the data, which is where training raises the energy.
+// A checkbox switches to contrastive divergence: chains restart at the data and run 10 steps.
+// The table lists the two expectations of eq 14.57 for each feature. Logic in sampling.ts.
+// Usage in .mdx:
+//   <EbmTraining iterations={600} />
+import Player from "./Player.astro";
+import { ebmData, ebmFitExact, ebmLogLik } from "./sampling";
+import "./sampling.css";
+
+interface Props {
+	iterations?: number;
+	title?: string;
+	caption?: string;
+}
+
+const { iterations = 600, title, caption } = Astro.props;
+const data = ebmData(7, 200);
+const wMle = ebmFitExact(data, [0, 0.5, 0, 0.01], 0.5, 1500);
+const llMle = ebmLogLik(wMle, data);
+---
+
+<figure class="smp-fig smp-ebm" data-iters={iterations} data-mle={JSON.stringify({ w: wMle, ll: llMle })}>
+	{title && <div class="smp-title">{title}</div>}
+	<div class="smp-legend">
+		<span><i class="k-text"></i>energy E(x, w)</span>
+		<span><i class="k-q"></i>data density p_D</span>
+		<span><i class="k-model"></i>model density p(x | w)</span>
+		<span><i class="dot k-dot-model"></i>model samples</span>
+		<span><i class="box k-shade"></i>model above data: energy pushed up</span>
+	</div>
+	<svg class="smp-svg" viewBox="0 0 640 420" role="img" aria-label="Energy-based model training"></svg>
+	<div class="smp-controls">
+		<Player />
+		<span class="smp-count"></span>
+		<label><input type="checkbox" class="i-cd" /> contrastive divergence (10 steps from the data)</label>
+	</div>
+	<div class="smp-metrics">
+		<div><span>w = (w₁, w₂, w₃, w₄)</span><strong class="m-w"></strong></div>
+		<div><span>mean log-likelihood</span><strong class="m-ll"></strong></div>
+		<div><span>maximum (exact fit)</span><strong class="m-mle"></strong></div>
+	</div>
+	<table class="smp-table">
+		<thead><tr><th>feature ∂E/∂wₖ</th><th>data average</th><th>model-sample average</th><th>gradient (model − data)</th></tr></thead>
+		<tbody></tbody>
+	</table>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import { type EbmState, ebmData, ebmDataDensity, ebmGrid, ebmLogLik, ebmStep, energy, meanFeatures, modelDensity, mulberry32, normalGenerator } from "./sampling";
+	import { axes, bars, bindPlayer, curve, el, fmt, histogram } from "./plot";
+
+	const PER_TICK = 5;
+	const X: [number, number] = [-4, 4];
+
+	function attach(fig: HTMLElement) {
+		const svg = fig.querySelector("svg")!;
+		const body = fig.querySelector("tbody")!;
+		const cd = fig.querySelector<HTMLInputElement>(".i-cd")!;
+		const total = Number(fig.dataset.iters);
+		const mle = JSON.parse(fig.dataset.mle!) as { w: number[]; ll: number };
+		const data = ebmData(7, 200);
+		const md = meanFeatures(data);
+		let history: EbmState[] = [];
+
+		function train() {
+			const rng = mulberry32(11);
+			const randn = normalGenerator(rng);
+			const opt = { lr: 0.3, eta: 0.01, langevinSteps: cd.checked ? 10 : 20, fromData: cd.checked };
+			let s: EbmState = { w: [0, 0.5, 0, 0.01], particles: Array.from({ length: 300 }, () => 1.4 * randn()), iter: 0 };
+			history = [s];
+			for (let t = 0; t < total; t++) {
+				s = ebmStep(s, data, opt, randn);
+				history.push(s);
+			}
+		}
+
+		let i = 0;
+		function draw() {
+			const s = history[i];
+			// The model samples used for the update that produced this w come from the next state.
+			const samples = history[Math.min(i + 1, total)].particles;
+			svg.replaceChildren();
+			const xs = ebmGrid.filter((x) => x >= X[0] && x <= X[1]);
+			const eMin = Math.min(...xs.map((x) => energy(s.w, x)));
+			const T = axes(svg, { x: 52, y: 10, w: 568, h: 170 }, X, [0, 8], { yLabel: "E(x, w) − min", yTicks: 4 });
+			el("path", { d: curve(T, (x) => energy(s.w, x) - eMin), class: "smp-text-line" }, svg);
+			for (const x of data) el("line", { x1: T.sx(x), x2: T.sx(x), y1: T.box.y + T.box.h, y2: T.box.y + T.box.h - 8, class: "smp-q" , style: "stroke-width: 1" }, svg);
+			for (const x of samples) if (x > X[0] && x < X[1]) el("circle", { cx: T.sx(x), cy: T.box.y + T.box.h - 14, r: 1.6, class: "smp-dot-model", opacity: 0.6 }, svg);
+
+			const pm = modelDensity(s.w, ebmGrid);
+			const pmAt = (x: number) => pm[Math.max(0, Math.min(pm.length - 1, Math.round((x + 6) / 0.01)))];
+			const B = axes(svg, { x: 52, y: 210, w: 568, h: 170 }, X, [0, 0.6], { xLabel: "x", yLabel: "density", yTicks: 3 });
+			// Grey band where the model density exceeds the data density.
+			const step = 0.02;
+			for (let x = X[0]; x < X[1]; x += step) {
+				const a = pmAt(x + step / 2);
+				const b = ebmDataDensity(x + step / 2);
+				if (a > b) el("rect", { x: B.sx(x), y: B.sy(Math.min(a, 0.6)), width: B.sx(x + step) - B.sx(x) + 0.3, height: B.sy(b) - B.sy(Math.min(a, 0.6)), class: "smp-shade" }, svg);
+			}
+			bars(svg, B, histogram(samples, X[0], X[1], 40), X[0], X[1], "smp-hist-model");
+			el("path", { d: curve(B, ebmDataDensity), class: "smp-q" }, svg);
+			el("path", { d: curve(B, pmAt, 400), class: "smp-model" }, svg);
+
+			fig.querySelector(".smp-count")!.textContent = `iteration ${i} of ${total}`;
+			fig.querySelector(".m-w")!.textContent = s.w.map((v) => fmt(v, 3)).join(", ");
+			fig.querySelector(".m-ll")!.textContent = fmt(ebmLogLik(s.w, data), 4);
+			fig.querySelector(".m-mle")!.textContent = `${fmt(mle.ll, 4)} at w = ${mle.w.map((v) => fmt(v, 2)).join(", ")}`;
+			const mm = meanFeatures(samples);
+			body.replaceChildren();
+			["x", "x²", "x³", "x⁴"].forEach((name, k) => {
+				const tr = document.createElement("tr");
+				for (const c of [name, fmt(md[k], 3), fmt(mm[k], 3), fmt(mm[k] - md[k], 3)]) {
+					const td = document.createElement("td");
+					td.textContent = c;
+					tr.append(td);
+				}
+				body.append(tr);
+			});
+		}
+
+		const step = (dir: 1 | -1) => {
+			i = Math.max(0, Math.min(total, i + dir * PER_TICK));
+			draw();
+			return i < total;
+		};
+		bindPlayer(fig, step, () => {
+			i = 0;
+			draw();
+		}, 80);
+		cd.addEventListener("change", () => {
+			train();
+			draw();
+		});
+		train();
+		draw();
+	}
+
+	document.querySelectorAll<HTMLElement>(".smp-ebm").forEach(attach);
+</script>

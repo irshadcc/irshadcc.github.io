@@ -1,0 +1,1177 @@
+---
+title: "Sampling: From Uniform Random Numbers to Langevin Dynamics"
+description: "A walk through the Sampling chapter of Bishop and Bishop's Deep Learning: Monte Carlo estimates, the transformation method, rejection and importance sampling, Markov chain Monte Carlo (Metropolis, Metropolis–Hastings, Gibbs, ancestral sampling) and Langevin sampling for energy-based models, with every equation worked on a small example and an interactive figure."
+date: 2026-10-15
+tags: [Machine learning, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import LineChart from "../../utils/charts/LineChart.astro";
+import InverseCdfSampler from "../../utils/sampling/InverseCdfSampler.astro";
+import BoxMullerMap from "../../utils/sampling/BoxMullerMap.astro";
+import RejectionSampler from "../../utils/sampling/RejectionSampler.astro";
+import AdaptiveRejectionSteps from "../../utils/sampling/AdaptiveRejectionSteps.astro";
+import ImportanceResampler from "../../utils/sampling/ImportanceResampler.astro";
+import MarkovChainSteps from "../../utils/sampling/MarkovChainSteps.astro";
+import Chain2D from "../../utils/sampling/Chain2D.astro";
+import BayesNetSampler from "../../utils/sampling/BayesNetSampler.astro";
+import EbmTraining from "../../utils/sampling/EbmTraining.astro";
+import { walkAt } from "../../utils/sampling/samplingFigures";
+
+## Background
+
+Every computer comes with a source of random numbers that are uniform on $(0, 1)$. Deep
+learning keeps asking for something else: a Gaussian to initialise weights, a token from a
+softmax, an image from a generative model, or the average of a loss over a distribution we can
+only evaluate pointwise. **Sampling**, also called **Monte Carlo sampling**, is the craft of
+turning uniform numbers into draws from the distribution $p(\mathbf{z})$ we actually want, or
+into averages under it.
+
+It matters because most quantities in probabilistic modelling are integrals that have no closed
+form: expectations, marginals, posterior predictions, and the gradient of the log-likelihood of
+an energy-based model. Sampling replaces each integral by an average over draws. The price is
+noise, and the art is in keeping that noise small, especially in high dimensions where the
+simplest methods fail exponentially fast.
+
+This post follows chapter 14 of Bishop and Bishop's *Deep Learning: Foundations and
+Concepts*<Sidenote>C. M. Bishop and H. Bishop, *Deep Learning: Foundations and Concepts*,
+Springer, 2024, chapter 14, pp. 429–458. Equation numbers such as (14.27) refer to the book.
+Every number in this post was computed by a script, using the same TypeScript code the figures
+run, and cross-checked with SciPy where an independent answer exists.</Sidenote> equation by
+equation, in order:
+
+1. **Monte Carlo expectations**: why an average of samples estimates an integral, and how its
+   error shrinks.
+2. **Standard distributions**: the transformation method, Box–Muller and the Cholesky trick.
+3. **Rejection sampling**, its adaptive version, and why it collapses in high dimensions.
+4. **Importance sampling** and sampling-importance-resampling.
+5. **Markov chain Monte Carlo**: Metropolis, the theory of Markov chains, Metropolis–Hastings,
+   Gibbs sampling and ancestral sampling.
+6. **Langevin sampling** and how it trains energy-based models.
+
+Importance sampling has [its own post](/blog/importance-sampling/), which this one links to
+rather than repeats.
+
+## Monte Carlo expectations
+
+### Expectations as averages
+
+Often we do not want samples for their own sake but the **expectation** of a function $f$ under
+a distribution $p$:
+
+$$
+\mathbb{E}[f] = \int f(\mathbf{z})\, p(\mathbf{z})\, \mathrm{d}\mathbf{z}. \tag{14.1}
+$$
+
+For discrete $\mathbf{z}$ the integral is a sum. The **Monte Carlo** idea is to draw $L$
+independent samples $\mathbf{z}^{(1)}, \dots, \mathbf{z}^{(L)}$ from $p$ and average:
+
+$$
+\hat f = \frac{1}{L}\sum_{l=1}^{L} f\big(\mathbf{z}^{(l)}\big). \tag{14.2}
+$$
+
+Each term has expectation $\mathbb{E}[f]$, so their average does too: $\hat f$ is an
+**unbiased estimator**, written
+
+$$
+\mathbb{E}[f(\mathbf{z})] \simeq \frac{1}{L}\sum_{l=1}^{L} f\big(\mathbf{z}^{(l)}\big), \tag{14.3}
+$$
+
+where $\simeq$ means "equal on average over the randomness of the samples".<Sidenote>Exercise
+14.1: $\mathbb{E}[\hat f] = \frac{1}{L}\sum_l \mathbb{E}[f(\mathbf{z}^{(l)})] = \frac{1}{L}
+\cdot L\, \mathbb{E}[f] = \mathbb{E}[f]$, by linearity of expectation.</Sidenote> Because the
+terms are independent, their variances add, and dividing by $L$ twice gives
+
+$$
+\operatorname{var}[\hat f] = \frac{1}{L}\, \mathbb{E}\big[(f - \mathbb{E}[f])^2\big]. \tag{14.4}
+$$
+
+<Sidenote>Exercise 14.2: $\operatorname{var}[\hat f] = \frac{1}{L^2}\sum_l
+\operatorname{var}[f(\mathbf{z}^{(l)})] = \frac{1}{L^2} \cdot L \operatorname{var}[f]$, since the
+covariances between independent terms are zero.</Sidenote>Two facts in (14.4) explain most of
+this chapter:
+
+- **The error shrinks like $1/\sqrt{L}$, whatever the dimension of $\mathbf{z}$.** A grid over
+  $\mathbf{z}$ needs exponentially many points in the dimension; Monte Carlo does not.
+- **The constant is the variance of $f$ under $p$.** If $f$ is large where $p$ is small, a few
+  rare samples carry the estimate, and $L$ must be large. And if the samples are not
+  independent (as in MCMC below), the **effective sample size** is smaller than $L$.
+
+### A worked example
+
+Take $p(z) = e^{-z}$ for $z \ge 0$ (the exponential distribution) and $f(z) = z^2$. Then
+$\mathbb{E}[f] = 2$ and $\operatorname{var}[f] = \mathbb{E}[z^4] - 4 = 24 - 4 = 20$, so by
+(14.4) an average of $L$ samples has variance $20/L$.
+
+Ten samples drawn with a fixed seed are $0.229, 0.378, 0.759, 2.194, 0.804, 1.160, 0.014,
+0.736, 0.261, 0.698$. Their squares average to $\hat f = 0.867$, well below 2. That is not a
+bug: with $L = 10$ the standard deviation of $\hat f$ is $\sqrt{2} \approx 1.41$, and one
+sample ($2.194^2 = 4.81$) supplies more than half the sum. Repeating the experiment 2000 times
+for each $L$ confirms both the mean and the variance:
+
+| samples $L$ | mean of $\hat f$ over 2000 runs | variance of $\hat f$ | (14.4): $20/L$ |
+| ---: | ---: | ---: | ---: |
+| 10 | 1.979 | 1.934 | 2.000 |
+| 100 | 2.008 | 0.206 | 0.200 |
+| 1000 | 1.997 | 0.0196 | 0.0200 |
+
+## Sampling from standard distributions
+
+### The transformation method
+
+Suppose $z$ is uniform on $(0, 1)$ and we set $y = g(z)$ for some increasing function $g$. A
+small interval $\mathrm{d}z$ maps to an interval $\mathrm{d}y$ holding the same probability, so
+the densities are related by
+
+$$
+p(y) = p(z) \left| \frac{\mathrm{d}z}{\mathrm{d}y} \right|, \tag{14.5}
+$$
+
+with $p(z) = 1$ here. We want to choose $g$ so that $p(y)$ is a target density. Integrating
+(14.5) from $-\infty$ to $y$ gives
+
+$$
+z = h(y) \equiv \int_{-\infty}^{y} p(\hat y)\, \mathrm{d}\hat y, \tag{14.6}
+$$
+
+the **cumulative distribution function** (CDF) of the target. So $y = h^{-1}(z)$: **push
+uniform numbers through the inverse CDF**.<Sidenote>Exercise 14.3: $P(y \le a) = P(h^{-1}(z)
+\le a) = P(z \le h(a)) = h(a)$, because $h$ is increasing and $z$ is uniform. A variable whose
+CDF is $h$ has density $h' = p$.</Sidenote> Geometrically, a uniform $z$ on the vertical axis
+hits the CDF where it is steep (where $p$ is large) for a wide range of $z$ values, so many
+draws land there.
+
+For the **exponential distribution**
+
+$$
+p(y) = \lambda \exp(-\lambda y), \qquad 0 \le y < \infty, \tag{14.7}
+$$
+
+the CDF is $h(y) = 1 - e^{-\lambda y}$, so $y = -\lambda^{-1}\ln(1 - z)$. Check one value with
+$\lambda = 1$: $z = 0.3$ gives $y = -\ln 0.7 = 0.357$, and indeed $h(0.357) = 1 - e^{-0.357} =
+0.3$. In the figure, follow the dashed guide from $z$ on the left axis across to the CDF and down
+to $y$; the histogram of the $y$ values fills in the target.
+
+<InverseCdfSampler
+	dist="exponential"
+	title="The transformation method: y = h⁻¹(z) with z uniform"
+	caption="Each draw z (orange dot on the left axis) is mapped across to the CDF h and down to y. Draws near z = 1 land in the long right tail; draws near 0 pile up where the density is largest. Switch the target to the Cauchy to see the heavy tails (some draws fall off the plot)."
+/>
+
+The **Cauchy distribution**
+
+$$
+p(y) = \frac{1}{\pi}\, \frac{1}{1 + y^2} \tag{14.8}
+$$
+
+has CDF $h(y) = \tfrac12 + \tfrac1\pi \arctan y$, so $y = \tan\big(\pi(z - \tfrac12)\big)$
+(Exercise 14.4). For example $z = 0.75$ gives $y = \tan(\pi/4) = 1$ and $z = 0.9$ gives $y =
+3.078$. The Cauchy has such heavy tails that it has no mean, which makes it a useful proposal
+later: it is hard to find a bell-shaped density it does not eventually cover.
+
+### Several variables and Box–Muller
+
+With several variables the derivative in (14.5) becomes the **Jacobian determinant** of the
+change of variables:
+
+$$
+p(y_1, \dots, y_M) = p(z_1, \dots, z_M) \left| \frac{\partial(z_1, \dots, z_M)}{\partial(y_1, \dots, y_M)} \right|. \tag{14.9}
+$$
+
+The Gaussian CDF has no closed-form inverse, so the transformation method does not apply
+directly. The **Box–Muller method** gets around this with two variables at once. Draw $z_1, z_2$
+uniformly on $(-1, 1)$ (by $z \to 2z - 1$) and discard the pair unless $r^2 = z_1^2 + z_2^2 \le
+1$. The kept pairs are uniform in the unit disc, with density $1/\pi$. Then set
+
+$$
+y_1 = z_1 \left( \frac{-2 \ln r^2}{r^2} \right)^{1/2}, \tag{14.10}
+$$
+
+$$
+y_2 = z_2 \left( \frac{-2 \ln r^2}{r^2} \right)^{1/2}. \tag{14.11}
+$$
+
+The map keeps the direction of $(z_1, z_2)$ and moves the radius $r$ to $\rho =
+\sqrt{-2\ln r^2}$. Applying (14.9) gives
+
+$$
+p(y_1, y_2) = p(z_1, z_2) \left| \frac{\partial(z_1, z_2)}{\partial(y_1, y_2)} \right| =
+\left[ \frac{1}{\sqrt{2\pi}} \exp(-y_1^2/2) \right] \left[ \frac{1}{\sqrt{2\pi}} \exp(-y_2^2/2) \right], \tag{14.12}
+$$
+
+so $y_1$ and $y_2$ are **independent standard Gaussians**.<Sidenote>Exercise 14.5, in polar
+coordinates. The angle $\theta$ is uniform and unchanged. The squared radius $r^2$ is uniform on
+$(0, 1)$, because the area inside radius $r$ is $\pi r^2$. The new squared radius is $\rho^2 =
+-2\ln r^2$, an exponential variable with rate $\tfrac12$ by the transformation method above. A
+uniform angle and $\rho^2 \sim \text{Exp}(1/2)$ is exactly the joint density
+$\frac{1}{2\pi}e^{-\rho^2/2}$ of two independent standard Gaussians.</Sidenote> Check one pair:
+$(z_1, z_2) = (0.3, -0.4)$ has $r^2 = 0.25$ and factor $\sqrt{-2\ln 0.25 / 0.25} = 3.330$, so
+$(y_1, y_2) = (0.999, -1.332)$. A numerical Jacobian at this point gives $p(z)/|\det J| =
+0.039789$, equal to the standard bivariate Gaussian density at $(0.999, -1.332)$.
+
+<BoxMullerMap
+	title="Box–Muller: uniform pairs in the disc become Gaussian pairs"
+	caption="Left: pairs outside the circle are discarded, so about π/4 = 78.5% are kept. Right: each kept pair keeps its direction, and its radius r becomes sqrt(−2 ln r²): points near the rim (r ≈ 1) go near the centre, points near the centre go far out. Hover a point to see its partner."
+/>
+
+To get a Gaussian with mean $\mu$ and variance $\sigma^2$, use $\sigma y + \mu$. For a
+**multivariate Gaussian** with mean $\boldsymbol\mu$ and covariance $\boldsymbol\Sigma$, factor
+$\boldsymbol\Sigma = \mathbf{L}\mathbf{L}^\top$ by the **Cholesky decomposition** ($\mathbf{L}$
+lower triangular) and set $\mathbf{y} = \boldsymbol\mu + \mathbf{L}\mathbf{z}$ with
+$\mathbf{z}$ a vector of independent standard Gaussians. Then $\mathbb{E}[\mathbf{y}] =
+\boldsymbol\mu$ and $\operatorname{cov}[\mathbf{y}] = \mathbf{L}\,\mathbb{E}[\mathbf{z}
+\mathbf{z}^\top]\,\mathbf{L}^\top = \mathbf{L}\mathbf{L}^\top = \boldsymbol\Sigma$ (Exercise
+14.6), and a linear map of a Gaussian is Gaussian. For example
+
+$$
+\boldsymbol\Sigma = \begin{pmatrix} 4 & 2 \\ 2 & 3 \end{pmatrix} = \begin{pmatrix} 2 & 0 \\ 1 & \sqrt2 \end{pmatrix} \begin{pmatrix} 2 & 1 \\ 0 & \sqrt2 \end{pmatrix},
+$$
+
+so the standard pair $\mathbf{z} = (1, -0.5)$ becomes $\mathbf{y} = \mathbf{L}\mathbf{z} = (2,\ 1 -
+0.707) = (2, 0.293)$ for $\boldsymbol\mu = \mathbf{0}$.
+
+The transformation method needs a CDF we can compute *and* invert. Few distributions allow that,
+so the rest of the chapter builds general tools on top of these simple ones.
+
+## Rejection sampling
+
+### The algorithm
+
+Suppose we can evaluate the target only up to a constant:
+
+$$
+p(\mathbf{z}) = \frac{1}{Z_p}\, \tilde p(\mathbf{z}), \tag{14.13}
+$$
+
+where $\tilde p$ is easy to compute and the **normalizing constant** $Z_p$ is unknown. This is
+the usual situation: a posterior is likelihood × prior divided by an intractable evidence.
+
+**Rejection sampling** uses a simpler **proposal distribution** $q(\mathbf{z})$ that we can sample
+from, and a constant $k$ large enough that the **comparison function** $kq(\mathbf{z})$ lies
+above $\tilde p(\mathbf{z})$ everywhere. One step:
+
+1. Draw $z_0$ from $q$.
+2. Draw $u_0$ uniformly on $[0, kq(z_0)]$. The pair $(z_0, u_0)$ is now uniform under the curve
+   $kq$.
+3. Keep $z_0$ if $u_0 \le \tilde p(z_0)$; otherwise reject it.
+
+The kept pairs are uniform under $\tilde p$, so their $z$ values are distributed as $p$. A
+proposal $z$ is accepted with probability $\tilde p(z)/kq(z)$, so the overall acceptance rate is
+
+$$
+p(\text{accept}) = \int \left\{ \frac{\tilde p(z)}{kq(z)} \right\} q(z)\, \mathrm{d}z = \frac{1}{k}\int \tilde p(z)\, \mathrm{d}z. \tag{14.14}
+$$
+
+It is the area under $\tilde p$ divided by the area under $kq$, so $k$ should be as small as
+possible while keeping $kq \ge \tilde p$.<Sidenote>Exercise 14.7: the density of an accepted $z$
+is $q(z) \cdot \tilde p(z)/kq(z)$ divided by the acceptance probability (14.14), which gives
+$\tilde p(z) / \int \tilde p = p(z)$. The $q$ and $k$ cancel; they only affect how often we
+succeed.</Sidenote>
+
+### Gamma samples from a Cauchy proposal
+
+The book's example is the **gamma distribution**
+
+$$
+\operatorname{Gam}(z \mid a, b) = \frac{b^a z^{a-1} \exp(-bz)}{\Gamma(a)}, \tag{14.15}
+$$
+
+which is bell-shaped for $a > 1$. A Cauchy is bell-shaped too and can be sampled by the
+transformation method. Shifting and scaling it, $z = b \tan y + c$ with $y$ uniform on
+$(-\pi/2, \pi/2)$, gives<Sidenote>Exercise 14.8. The book's wording says $y$ uniform on $[0, 1]$;
+the tangent must be applied to an angle uniform on $(-\pi/2, \pi/2)$, which is $\pi(u - \tfrac12)$
+for $u$ uniform on $(0, 1)$. Also note the book reuses the letter $b$: in (14.16) it is the
+Cauchy's scale, not the gamma's rate. Below, the scale is written $s$.</Sidenote>
+
+$$
+q(z) = \frac{k}{1 + (z - c)^2 / b^2}, \tag{14.16}
+$$
+
+where the constant $k$ in the numerator already folds in the comparison constant. The book
+suggests $c = a - 1$ (the gamma's mode) and squared scale $2a - 1$. The book does not say which
+$a$ it plots; here $a = 10$ and rate $1$, so $c = 9$ and $s = \sqrt{19} = 4.359$.
+
+With the normalized Cauchy $q(z) = 1/\big(\pi s(1 + (z - c)^2/s^2)\big)$ and $\tilde p$ the
+normalized gamma, the smallest valid constant is the largest ratio $\tilde p/q$. A grid search
+puts it at $z = 9$, the mode, with $k_{\min} = 1.8042$ (SciPy's optimiser agrees). By (14.14)
+the acceptance rate is $1/1.8042 = 0.554$. Three proposals show the acceptance probability
+$\tilde p/kq$ at work:
+
+| $z_0$ | $\tilde p(z_0)$ | $kq(z_0)$ | accept with probability |
+| ---: | ---: | ---: | ---: |
+| 5 | 0.03627 | 0.07152 | 0.507 |
+| 12 | 0.08736 | 0.08941 | 0.977 |
+| 20 | 0.00291 | 0.01788 | 0.163 |
+
+Running 100,000 proposals with the same code accepts 55.2% and gives a sample mean of 9.98,
+against the gamma mean $a/b = 10$.
+
+<RejectionSampler
+	preset="gamma"
+	a={10}
+	title="Rejection sampling Gam(z | 10, 1) with a Cauchy proposal (after Figure 14.5)"
+	caption="Green points fall under p̃ and are kept; red points fall in the grey region between p̃ and kq and are rejected. Proposals below z = 0 always fail, since p̃ is zero there. Drag k above k_min: the grey region grows and the acceptance rate falls as 1/k, while the kept samples still follow p̃."
+/>
+
+### Adaptive rejection sampling
+
+Finding a tight $kq$ by hand is hard. **Adaptive rejection sampling** (Gilks and Wild, 1992)
+builds the envelope from the target itself, provided $p$ is **log concave**, meaning $\ln p(z)$
+has a non-increasing derivative. A concave function lies below each of its tangent lines. So the
+tangents of $\ln \tilde p$ at a few grid points, cut where neighbours intersect, form a piecewise
+linear upper bound of $\ln \tilde p$. Exponentiating gives an envelope made of exponential
+pieces:
+
+$$
+q(z) = k_i \lambda_i \exp\{-\lambda_i (z - z_{i-1})\}, \qquad z_{i-1} < z \le z_i. \tag{14.17}
+$$
+
+Here $-\lambda_i$ is the slope of tangent $i$ and $z_{i-1}, z_i$ are the intersection points
+that bound its piece. Sampling from (14.17) is easy: pick piece $i$ with probability equal to its
+mass, then invert that piece's exponential CDF as in (14.7) (Exercise 14.10). If the sample is
+rejected, it becomes a new grid point, which adds a tangent exactly where the envelope was loose.
+
+**Worked example.** Take $\tilde p(z) = z^2 e^{-z}$ on $z > 0$ (an unnormalized Gam$(z \mid 3, 1)$,
+whose area is $\Gamma(3) = 2$), so $\ln \tilde p(z) = 2\ln z - z$ with derivative $2/z - 1$, which
+decreases: log concave. Start with grid points $1$ and $5$:
+
+- At $z = 1$: $\ln \tilde p = -1$, slope $+1$. At $z = 5$: $\ln\tilde p = 2\ln 5 - 5 = -1.781$,
+  slope $-0.6$.
+- The tangents $-1 + (z - 1)$ and $-1.781 - 0.6(z - 5)$ meet at $z_1 = 2.012$.
+- Piece 1, on $(0, 2.012]$, has mass $\int_0^{2.012} e^{z - 2}\, \mathrm{d}z = 0.877$. Piece 2,
+  on $(2.012, \infty)$, has mass $e^{0.0118}/0.6 = 1.686$. Total $2.563$.
+- The acceptance rate is $\int\tilde p / \int\text{envelope} = 2/2.563 = 0.780$. SciPy's
+  quadrature gives the same masses.
+
+In book notation, $\lambda_1 = -1$ (the first piece rises) and $\lambda_2 = 0.6$. Requiring
+continuity at each $z_i$ and total mass 1 (Exercise 14.9) gives $k_i = e^{u_i(z_{i-1})} /
+(\lambda_i M)$, where $u_i$ is tangent $i$ and $M$ the total mass. That is $k_1 = -0.053$ and
+$k_2 = 0.658$; the product $k_i\lambda_i$ is positive in both pieces. Step through the figure.
+The first rejection, at draw 9 ($z = 2.631$, right next to the kink of the first envelope),
+lowers the envelope mass to $2.199$ and raises the acceptance rate to $0.910$. After 60 draws
+there are 7 grid points, 55 draws were kept, and the acceptance rate is $0.958$.
+
+<AdaptiveRejectionSteps
+	grid={[1, 5]}
+	title="Adaptive rejection sampling of p̃(z) = z² e^(−z)"
+	caption="Top: ln p̃ (blue) and its tangent envelope (orange); orange dots mark where neighbouring tangents meet. Bottom: the same on the density scale; the grey gap is the rejection region. Each rejection adds a grid point and closes the gap near it."
+/>
+
+When $p$ is not log concave, each rejection step can be followed by a Metropolis–Hastings step
+(introduced below), which gives **adaptive rejection Metropolis sampling** (Gilks, Best and Tan,
+1995).
+
+### Why rejection fails in high dimensions
+
+Consider an artificial but revealing case: target $\mathcal{N}(\mathbf{0}, \sigma_p^2
+\mathbf{I})$ in $D$ dimensions, proposal $\mathcal{N}(\mathbf{0}, \sigma_q^2 \mathbf{I})$ with
+$\sigma_q > \sigma_p$. The ratio $p/q$ peaks at the origin, where it is $(\sigma_q/\sigma_p)^D$,
+so $k = (\sigma_q/\sigma_p)^D$. Both densities are normalized, so by (14.14) the acceptance rate
+is $1/k = (\sigma_p/\sigma_q)^D$: **it decays exponentially with dimension**.
+
+<RejectionSampler
+	preset="gaussian"
+	sigmaQ={1.5}
+	title="Gaussian target, wider Gaussian proposal, D = 1 (after Figure 14.7)"
+	caption="In one dimension a proposal 1.5 times wider accepts 1/1.5 = 66.7% of draws. The loss is the grey sliver on each side, but in D dimensions the same ratio is raised to the power D."
+/>
+
+Even a proposal only 1% wider than the target is hopeless in a thousand dimensions:
+
+<LineChart
+	x={() => Array.from({ length: 201 }, (_, i) => i * 5)}
+	series={[
+		{ name: "σq/σp = 1.01", fn: (d) => 1.01 ** -d },
+		{ name: "σq/σp = 1.05", fn: (d) => 1.05 ** -d },
+		{ name: "σq/σp = 1.5", fn: (d) => 1.5 ** -d },
+	]}
+	title="Acceptance rate (σp/σq)^D of rejection sampling a D-dimensional Gaussian"
+	xLabel="dimension D"
+	yLabel="acceptance rate"
+	height={260}
+/>
+
+| dimension $D$ | 1 | 10 | 100 | 1000 |
+| --- | ---: | ---: | ---: | ---: |
+| acceptance, $\sigma_q/\sigma_p = 1.01$ | 0.990 | 0.905 | 0.370 | $4.77 \times 10^{-5}$ |
+| acceptance, $\sigma_q/\sigma_p = 1.5$ | 0.667 | 0.0173 | $2.5 \times 10^{-18}$ | $8 \times 10^{-177}$ |
+
+At $D = 1000$ and 1% extra width, only one proposal in 20,959 is accepted, the book's "about
+1/20,000". Real targets are multimodal and sharply peaked, so rejection sampling is a tool for
+one or two dimensions, or a subroutine inside something bigger.
+
+## Importance sampling
+
+### Weighting instead of rejecting
+
+**Importance sampling** estimates expectations directly, without producing samples from $p$. A
+first idea is a grid:
+
+$$
+\mathbb{E}[f] \simeq \sum_{l=1}^{L} p\big(\mathbf{z}^{(l)}\big) f\big(\mathbf{z}^{(l)}\big), \tag{14.18}
+$$
+
+but the number of grid points grows exponentially with dimension, and most of them sit where
+$p$ is negligible. Instead, draw from a proposal $q$ that is easy to sample and correct for the
+mismatch:
+
+$$
+\mathbb{E}[f] = \int f(\mathbf{z}) \frac{p(\mathbf{z})}{q(\mathbf{z})} q(\mathbf{z})\, \mathrm{d}\mathbf{z} \simeq \frac{1}{L}\sum_{l=1}^{L} \frac{p(\mathbf{z}^{(l)})}{q(\mathbf{z}^{(l)})} f\big(\mathbf{z}^{(l)}\big). \tag{14.19}
+$$
+
+The ratios $r_l = p(\mathbf{z}^{(l)})/q(\mathbf{z}^{(l)})$ are the **importance weights**. A sample
+from a region that $q$ over-visits gets a small weight, one from a region $q$ under-visits gets a
+large weight, and no sample is thrown away. The [Importance Sampling](/blog/importance-sampling/)
+post works this through for a rare-event probability, where the best $q$ is far from $p$.
+
+### Unknown normalizing constants
+
+When $p = \tilde p/Z_p$ and $q = \tilde q/Z_q$ are both known only up to constants,
+
+$$
+\mathbb{E}[f] = \frac{Z_q}{Z_p} \int f(\mathbf{z}) \frac{\tilde p(\mathbf{z})}{\tilde q(\mathbf{z})} q(\mathbf{z})\, \mathrm{d}\mathbf{z} \simeq \frac{Z_q}{Z_p}\frac{1}{L}\sum_{l=1}^{L} \tilde r_l f\big(\mathbf{z}^{(l)}\big), \tag{14.20}
+$$
+
+with $\tilde r_l = \tilde p(\mathbf{z}^{(l)})/\tilde q(\mathbf{z}^{(l)})$. The same samples estimate the
+unknown ratio of constants:
+
+$$
+\frac{Z_p}{Z_q} = \frac{1}{Z_q}\int \tilde p(\mathbf{z})\, \mathrm{d}\mathbf{z} = \int \frac{\tilde p(\mathbf{z})}{\tilde q(\mathbf{z})} q(\mathbf{z})\, \mathrm{d}\mathbf{z} \simeq \frac{1}{L}\sum_{l=1}^{L} \tilde r_l. \tag{14.21}
+$$
+
+Dividing (14.20) by (14.21), the constants cancel and the estimate becomes a weighted average,
+
+$$
+\mathbb{E}[f] \simeq \sum_{l=1}^{L} w_l f\big(\mathbf{z}^{(l)}\big), \tag{14.22}
+$$
+
+$$
+w_l = \frac{\tilde r_l}{\sum_m \tilde r_m} = \frac{\tilde p(\mathbf{z}^{(l)}) / q(\mathbf{z}^{(l)})}{\sum_m \tilde p(\mathbf{z}^{(m)}) / q(\mathbf{z}^{(m)})}, \tag{14.23}
+$$
+
+with **self-normalized weights** $w_l \ge 0$ that sum to one. This estimator is slightly biased for
+finite $L$ (it is a ratio of two estimates), but consistent as $L \to \infty$.
+
+The danger is a $q$ that misses where $p f$ is large. Then a few weights dominate, the **effective
+sample size** $1/\sum_l w_l^2$ (equal to $L$ for equal weights, 1 for a single nonzero weight)
+collapses, and worse, if *no* sample lands in the important region, the weights can look fine
+while the answer is wrong. **The proposal must not be small where $p$ is significant.**
+
+### Sampling-importance-resampling
+
+**Sampling-importance-resampling** (SIR) turns weights into samples without needing the constant
+$k$ of rejection sampling. Draw $L$ samples from $q$, compute the weights (14.23), then draw $L$
+new samples from the discrete distribution on $\mathbf{z}^{(1)}, \dots, \mathbf{z}^{(L)}$ with
+probabilities $w_1, \dots, w_L$. In one dimension the resampled values have CDF
+
+$$
+p(z \le a) = \sum_{l:\, z^{(l)} \le a} w_l = \frac{\sum_l I(z^{(l)} \le a)\, \tilde p(z^{(l)})/q(z^{(l)})}{\sum_l \tilde p(z^{(l)})/q(z^{(l)})}, \tag{14.24}
+$$
+
+where $I(\cdot)$ is 1 when its argument is true and 0 otherwise. As $L \to \infty$ each sum
+becomes an integral against $q$, and $q$ cancels:
+
+$$
+p(z \le a) = \frac{\int I(z \le a) \{\tilde p(z)/q(z)\} q(z)\, \mathrm{d}z}{\int \{\tilde p(z)/q(z)\} q(z)\, \mathrm{d}z} = \frac{\int I(z \le a)\, \tilde p(z)\, \mathrm{d}z}{\int \tilde p(z)\, \mathrm{d}z} = \int I(z \le a)\, p(z)\, \mathrm{d}z, \tag{14.25}
+$$
+
+the CDF of $p$. For finite $L$ the resampled values are only approximately from $p$; if $q = p$
+all weights are $1/L$ and resampling changes nothing. Moments do not need the resampling step at
+all:
+
+$$
+\mathbb{E}[f(\mathbf{z})] = \frac{\int f(\mathbf{z}) [\tilde p(\mathbf{z})/q(\mathbf{z})] q(\mathbf{z})\, \mathrm{d}\mathbf{z}}{\int [\tilde p(\mathbf{z})/q(\mathbf{z})] q(\mathbf{z})\, \mathrm{d}\mathbf{z}} \simeq \sum_{l=1}^{L} w_l f(\mathbf{z}_l). \tag{14.26}
+$$
+
+**Worked example.** The target is two bumps, $\tilde p(z) = 3e^{-2(z+1)^2} + 2e^{-(z-2)^2/0.72}$:
+Gaussians of standard deviation $0.5$ at $-1$ and $0.6$ at $2$. Its constant is $Z_p =
+\sqrt{2\pi}(3 \cdot 0.5 + 2 \cdot 0.6) = 6.768$ and its mean is $(1.5 \cdot (-1) + 1.2 \cdot 2)/2.7
+= 1/3$. The proposal is $\mathcal{N}(0, \sigma_q^2)$ with $L = 200$:
+
+| proposal $\sigma_q$ | effective sample size | $\sum_l w_l z_l$ (true 0.333) | $Z_p$ by (14.21) (true 6.768) |
+| ---: | ---: | ---: | ---: |
+| 4 | 64.4 | 0.454 | 6.186 |
+| 2 | 111.0 | 0.368 | 7.060 |
+| 1 | 64.5 | 0.380 | 7.306 |
+| 0.5 | 35.1 | **−0.487** | **3.267** |
+
+With $\sigma_q = 2$ the proposal covers both bumps and the estimates are good. With $\sigma_q =
+0.5$ only one of the 200 samples lands beyond $z = 1.2$, so the right bump is essentially
+invisible: the mean comes out negative and $Z_p$ is half its true value. Yet the effective sample
+size, 35, does not look alarming. That is the book's warning in numbers: importance sampling can
+be **arbitrarily wrong with no diagnostic sign**.
+
+<ImportanceResampler
+	sigmaQ={2}
+	samples={200}
+	title="Importance weights and resampling for a two-bump target"
+	caption="Middle: each proposal sample is a stem whose height is its normalized weight w_l. Bottom: L values resampled with probabilities w_l follow the target. Shrink σq below about 0.7 and the right bump disappears from the resampled histogram, while the weights still look tame."
+/>
+
+## Markov chain Monte Carlo
+
+Rejection and importance sampling draw every proposal from the same fixed $q$, so $q$ must
+resemble $p$ globally, which is impossible in high dimensions. **Markov chain Monte Carlo**
+(MCMC) only asks $q$ to make a *local* move from the current state $\mathbf{z}^{(\tau)}$: the
+proposal is $q(\mathbf{z} \mid \mathbf{z}^{(\tau)})$, and the sequence of states forms a **Markov
+chain**. As before we only need $\tilde p$, not $Z_p$.
+
+### The Metropolis algorithm
+
+In the **Metropolis algorithm** (Metropolis et al., 1953) the proposal is **symmetric**,
+$q(\mathbf{z}_A \mid \mathbf{z}_B) = q(\mathbf{z}_B \mid \mathbf{z}_A)$; a Gaussian centred on the
+current state is the usual choice. A candidate $\mathbf{z}^\star$ is accepted with probability
+
+$$
+A(\mathbf{z}^\star, \mathbf{z}^{(\tau)}) = \min\left(1, \frac{\tilde p(\mathbf{z}^\star)}{\tilde p(\mathbf{z}^{(\tau)})}\right). \tag{14.27}
+$$
+
+Moves uphill (to higher $\tilde p$) are always accepted; moves downhill are accepted with
+probability equal to the density ratio, so the chain can still explore the tails. The ratio
+cancels $Z_p$. On rejection the chain **stays put and records the current state again**, unlike
+rejection sampling, which discards the draw. Those repeats are what make the chain spend the
+right amount of time in each region. Algorithm 14.1 in Python:
+
+```python
+import numpy as np
+
+def metropolis(log_p_tilde, z0, rho, T, rng):
+    z, chain, accepted = np.asarray(z0, float), [], 0
+    for _ in range(T):
+        z_star = z + rho * rng.standard_normal(z.shape)   # symmetric proposal
+        if np.log(rng.uniform()) < log_p_tilde(z_star) - log_p_tilde(z):
+            z, accepted = z_star, accepted + 1             # accept
+        chain.append(z)                                    # a rejection repeats z
+    return np.array(chain), accepted / T
+```
+
+Working in logs avoids overflow, and comparing $\ln u < \ln \tilde p(\mathbf{z}^\star) - \ln
+\tilde p(\mathbf{z})$ is the same test as $u < A$. Successive states are correlated, so to get
+nearly independent samples keep only every $M$-th state.
+
+The figure reproduces the book's Figure 14.9 setting: a correlated Gaussian centred at $(1.5,
+1.5)$ with standard deviation $\sigma_{\max} = 0.8$ along its long axis and $\sigma_{\min} = 0.2$
+across it (covariance entries $0.34$ on the diagonal, $0.30$ off it), and an isotropic proposal
+with $\rho = 0.2$. Starting from $(0.2, 0.4)$, 55 of the first 150 candidates are rejected (the
+book reports 43 of 150 for its own run).
+
+<Chain2D
+	method="metropolis"
+	param={0.2}
+	title="Metropolis on a correlated Gaussian (after Figure 14.9)"
+	caption="Green: accepted moves. Red: rejected candidates; the chain stays where it was. The trace on the right is the position along the long axis in units of σ_max: with ρ = 0.2 it wanders slowly, the random-walk behaviour the next section quantifies."
+/>
+
+### Random walks are slow
+
+Why does the chain crawl along the ellipse? Consider the simplest **random walk**, on the
+integers:
+
+$$
+p(z^{(\tau+1)} = z^{(\tau)}) = 0.5, \tag{14.28}
+$$
+
+$$
+p(z^{(\tau+1)} = z^{(\tau)} + 1) = 0.25, \tag{14.29}
+$$
+
+$$
+p(z^{(\tau+1)} = z^{(\tau)} - 1) = 0.25. \tag{14.30}
+$$
+
+Starting from $z^{(0)} = 0$, symmetry gives $\mathbb{E}[z^{(\tau)}] = 0$. Each step adds an
+increment $\delta$ with mean 0 and $\mathbb{E}[\delta^2] = \tfrac12$, independent of the current
+position, so $\mathbb{E}[(z^{(\tau)})^2] = \mathbb{E}[(z^{(\tau-1)})^2] + \tfrac12$ and by induction
+$\mathbb{E}[(z^{(\tau)})^2] = \tau/2$ (Exercise 14.11). Propagating the exact distribution of the
+walk confirms $\mathbb{E}[z^2] = 0.5, 1, 5, 50$ after $1, 2, 10, 100$ steps. **The typical
+distance travelled grows only as $\sqrt\tau$**: covering 14 states takes about 400 steps.
+
+<LineChart
+	x={() => Array.from({ length: 401 }, (_, i) => i)}
+	series={[
+		{ name: "+√(τ/2)", fn: (t) => Math.sqrt(t / 2) },
+		{ name: "−√(τ/2)", fn: (t) => -Math.sqrt(t / 2) },
+		{ name: "walk 1", fn: walkAt(0) },
+		{ name: "walk 2", fn: walkAt(1) },
+		{ name: "walk 3", fn: walkAt(2) },
+	]}
+	title="Three random walks of eqs 14.28–14.30 and the root-mean-square distance √(τ/2)"
+	xLabel="step τ"
+	yLabel="z"
+	height={280}
+/>
+
+A Metropolis chain with a small proposal behaves like this walk along the long axis of the
+target. **A central goal in designing MCMC methods is to avoid random-walk behaviour**, and the
+Langevin section below does it by following the gradient.
+
+### Markov chains, invariance and detailed balance
+
+When does a chain sample the right distribution? A **first-order Markov chain** is a sequence
+$\mathbf{z}^{(1)}, \dots, \mathbf{z}^{(M)}$ in which each state depends on the past only through
+the previous state:
+
+$$
+p(\mathbf{z}^{(m+1)} \mid \mathbf{z}^{(1)}, \dots, \mathbf{z}^{(m)}) = p(\mathbf{z}^{(m+1)} \mid \mathbf{z}^{(m)}). \tag{14.31}
+$$
+
+The chain is specified by an initial distribution and **transition probabilities**
+$T_m(\mathbf{z}^{(m)}, \mathbf{z}^{(m+1)}) \equiv p(\mathbf{z}^{(m+1)} \mid \mathbf{z}^{(m)})$; it is
+**homogeneous** if they do not depend on $m$. The marginal distribution moves forward by
+
+$$
+p(\mathbf{z}^{(m+1)}) = \int p(\mathbf{z}^{(m+1)} \mid \mathbf{z}^{(m)})\, p(\mathbf{z}^{(m)})\, \mathrm{d}\mathbf{z}^{(m)}. \tag{14.32}
+$$
+
+A distribution $p^\star$ is **invariant** (or **stationary**) if one step leaves it unchanged:
+
+$$
+p^\star(\mathbf{z}) = \int T(\mathbf{z}', \mathbf{z})\, p^\star(\mathbf{z}')\, \mathrm{d}\mathbf{z}'. \tag{14.33}
+$$
+
+A chain can have several invariant distributions; with $T$ the identity, every distribution is
+invariant. A simple **sufficient** condition for $p^\star$ to be invariant is **detailed
+balance**:
+
+$$
+p^\star(\mathbf{z})\, T(\mathbf{z}, \mathbf{z}') = p^\star(\mathbf{z}')\, T(\mathbf{z}', \mathbf{z}). \tag{14.34}
+$$
+
+It says the probability flow from $\mathbf{z}$ to $\mathbf{z}'$ equals the flow back. Integrating
+over $\mathbf{z}'$ shows invariance:
+
+$$
+\int p^\star(\mathbf{z}')\, T(\mathbf{z}', \mathbf{z})\, \mathrm{d}\mathbf{z}' = \int p^\star(\mathbf{z})\, T(\mathbf{z}, \mathbf{z}')\, \mathrm{d}\mathbf{z}' \tag{14.35}
+$$
+
+$$
+= p^\star(\mathbf{z}) \int p(\mathbf{z}' \mid \mathbf{z})\, \mathrm{d}\mathbf{z}' \tag{14.36}
+$$
+
+$$
+= p^\star(\mathbf{z}). \tag{14.37}
+$$
+
+A chain that satisfies detailed balance is called **reversible**. Invariance is not enough: we
+also need the chain to *reach* $p^\star$ from any starting distribution. That property is
+**ergodicity**, and the limit is then the **equilibrium distribution**, necessarily unique. A
+homogeneous chain is ergodic under weak conditions on $p^\star$ and $T$ (Neal, 1993).
+
+**Worked example.** Five states with $\tilde p = (1, 3, 6, 4, 2)$, so $p^\star = (1, 3, 6, 4, 2)/16$.
+The proposal moves one state left or right with probability $\tfrac12$ each (a proposal off the
+end is rejected), and (14.27) decides acceptance. From state 1, the move to 0 is downhill and
+accepted with probability $1/3$, so $T(1, 0) = \tfrac12 \cdot \tfrac13 = \tfrac16$; the move to
+2 is uphill, so $T(1, 2) = \tfrac12$; the rest, $T(1, 1) = \tfrac13$, is staying put. Detailed
+balance holds pair by pair because both flows equal $\tfrac12\min(p^\star_i, p^\star_j)$:
+
+| pair $(i, j)$ | $p^\star_i\, T(i, j)$ | $p^\star_j\, T(j, i)$ |
+| --- | ---: | ---: |
+| (0, 1) | $\tfrac{1}{16} \cdot \tfrac12 = 0.03125$ | $\tfrac{3}{16} \cdot \tfrac16 = 0.03125$ |
+| (1, 2) | 0.09375 | 0.09375 |
+| (2, 3) | 0.12500 | 0.12500 |
+| (3, 4) | 0.06250 | 0.06250 |
+
+Start with all mass on state 0 and apply (14.32) repeatedly. The total variation distance to
+$p^\star$ is $0.75$ after one step, $0.178$ after 5, $0.0385$ after 10 and $0.0017$ after 20; from
+then on each step multiplies it by $0.732$, the second-largest eigenvalue of $T$ (NumPy's `eig`
+gives $0.73178$). In the figure, watch the two arrows between each pair: at first far more mass
+flows right than left, and the flows equalise as the bars reach the outlines.
+
+<MarkovChainSteps
+	pTilde={[1, 3, 6, 4, 2]}
+	start={0}
+	steps={30}
+	title="A five-state Metropolis chain converging to p★ = (1, 3, 6, 4, 2) / 16"
+	caption="Bars: p(z^(m)) after m steps of eq 14.32. Outlines: the target. Arrow widths are the probability flows p(i)T(i, i±1); when they match in every pair the distribution has stopped changing (detailed balance). The table is the transition matrix built by the Metropolis rule."
+/>
+
+Practical samplers combine several **base transitions** $B_1, \dots, B_K$, either as a mixture
+
+$$
+T(\mathbf{z}', \mathbf{z}) = \sum_{k=1}^{K} \alpha_k B_k(\mathbf{z}', \mathbf{z}), \tag{14.38}
+$$
+
+with $\alpha_k > 0$ and $\sum_k \alpha_k = 1$, or by applying them in sequence:
+
+$$
+T(\mathbf{z}', \mathbf{z}) = \sum_{\mathbf{z}_1} \cdots \sum_{\mathbf{z}_{K-1}} B_1(\mathbf{z}', \mathbf{z}_1) \cdots B_{K-1}(\mathbf{z}_{K-2}, \mathbf{z}_{K-1})\, B_K(\mathbf{z}_{K-1}, \mathbf{z}). \tag{14.39}
+$$
+
+If $p^\star$ is invariant under every $B_k$, it is invariant under both. Detailed balance survives
+the mixture but not the sequence, unless the sequence is symmetrised as $B_1, \dots, B_K, B_K,
+\dots, B_1$. The typical use is a set of base transitions that each update only some of the
+variables, which is exactly Gibbs sampling below.<Sidenote>The book writes the sums in (14.39)
+up to $\mathbf{z}_{n-1}$; the indices should run to $\mathbf{z}_{K-1}$, matching the last
+factor.</Sidenote>
+
+### Metropolis–Hastings
+
+The **Metropolis–Hastings algorithm** (Hastings, 1970) allows an asymmetric proposal $q_k$. The
+acceptance probability gains a correction for the asymmetry:
+
+$$
+A_k(\mathbf{z}^\star, \mathbf{z}^{(\tau)}) = \min\left(1, \frac{\tilde p(\mathbf{z}^\star)\, q_k(\mathbf{z}^{(\tau)} \mid \mathbf{z}^\star)}{\tilde p(\mathbf{z}^{(\tau)})\, q_k(\mathbf{z}^\star \mid \mathbf{z}^{(\tau)})}\right). \tag{14.40}
+$$
+
+If $q_k$ is symmetric the $q$ terms cancel and (14.40) is (14.27). The index $k$ labels a set of
+available proposals; Algorithm 14.2 picks one per iteration. The extra factor rewards moves the
+proposal finds hard to reverse. To prove the chain samples $p$, check detailed balance (14.34)
+for the transition "propose $\mathbf{z}'$, then accept":
+
+$$
+\begin{aligned}
+p(\mathbf{z})\, q_k(\mathbf{z}' \mid \mathbf{z})\, A_k(\mathbf{z}', \mathbf{z}) &= \min\big(p(\mathbf{z}) q_k(\mathbf{z}' \mid \mathbf{z}),\ p(\mathbf{z}') q_k(\mathbf{z} \mid \mathbf{z}')\big) \\
+&= \min\big(p(\mathbf{z}') q_k(\mathbf{z} \mid \mathbf{z}'),\ p(\mathbf{z}) q_k(\mathbf{z}' \mid \mathbf{z})\big) \\
+&= p(\mathbf{z}')\, q_k(\mathbf{z} \mid \mathbf{z}')\, A_k(\mathbf{z}, \mathbf{z}').
+\end{aligned} \tag{14.41}
+$$
+
+The first line multiplies $p(\mathbf{z}) q_k(\mathbf{z}' \mid \mathbf{z})$ into both arguments of
+the min in (14.40); the expression is symmetric in $\mathbf{z}$ and $\mathbf{z}'$, so it equals
+the reverse flow. (Rejections only add mass to staying put, which trivially balances.)
+
+**Choosing the proposal scale.** With a Gaussian proposal of standard deviation $\rho$ there is
+a trade-off. Small $\rho$: almost every move is accepted, but the chain random-walks in tiny
+steps. Large $\rho$: most candidates land in low-probability regions and are rejected. The book's
+argument (Figure 14.10): to keep rejections low, $\rho$ should be of order $\sigma_{\min}$, and
+then crossing the long axis by a random walk takes of order $(\sigma_{\max}/\sigma_{\min})^2$
+steps, here $(0.8/0.2)^2 = 16$. It adds that in two dimensions the higher rejection rate of a
+larger $\rho$ is offset by the larger accepted steps. The measurements bear that out. For each
+$\rho$ we ran 100,000 moves on the Gaussian above, dropped the first 10% and measured the
+**integrated autocorrelation time** $\tau_{\text{int}} = 1 + 2\sum_k \rho_k$ of the long-axis
+coordinate ($\rho_k$ is the autocorrelation at lag $k$). One chain of $n$ moves is worth about
+$n/\tau_{\text{int}}$ independent samples.
+
+| proposal sd $\rho$ | acceptance rate | $\tau_{\text{int}}$ (moves) | effective samples per 1000 moves |
+| ---: | ---: | ---: | ---: |
+| 0.02 | 0.966 | 2885 | 0.35 |
+| 0.05 | 0.914 | 931 | 1.1 |
+| 0.1 | 0.832 | 306 | 3.3 |
+| 0.2 | 0.683 | 118 | 8.5 |
+| 0.4 | 0.462 | 44.7 | 22.4 |
+| 0.8 | 0.239 | 24.8 | 40.3 |
+| 1.2 | 0.141 | 24.7 | 40.4 |
+| 1.6 | 0.092 | 28.5 | 35.1 |
+
+A high acceptance rate is not the goal. The best $\rho$ here is around $0.8$–$1.2$, with only
+14–24% of moves accepted, and it mixes about 115 times faster than $\rho = 0.02$, which accepts
+97%. All rows agree with the true standard deviations ($0.8$ and $0.2$) to within sampling
+error. Drag the slider in the Metropolis figure above and watch the trace change from a slow
+drift to frequent jumps.
+
+### Gibbs sampling
+
+**Gibbs sampling** (Geman and Geman, 1984) updates one variable at a time by drawing it from its
+**conditional distribution** given all the others, $p(z_i \mid \mathbf{z}_{\setminus i})$, where
+$\mathbf{z}_{\setminus i}$ is $\mathbf{z}$ without $z_i$. With three variables, one sweep is
+
+$$
+z_1^{(\tau+1)} \sim p(z_1 \mid z_2^{(\tau)}, z_3^{(\tau)}), \tag{14.42}
+$$
+
+$$
+z_2^{(\tau+1)} \sim p(z_2 \mid z_1^{(\tau+1)}, z_3^{(\tau)}), \tag{14.43}
+$$
+
+$$
+z_3^{(\tau+1)} \sim p(z_3 \mid z_1^{(\tau+1)}, z_2^{(\tau+1)}), \tag{14.44}
+$$
+
+each update using the newest values of the others. Why it works: a step that redraws $z_i$
+leaves $\mathbf{z}_{\setminus i}$ alone, so the marginal $p(\mathbf{z}_{\setminus i})$ is
+unchanged, and it draws $z_i$ from the correct conditional. Marginal times conditional is the
+joint, so $p$ is invariant under every step. Ergodicity needs more: it is guaranteed if no
+conditional is zero anywhere, since then any state can reach any other in one sweep.<Sidenote>
+Exercise 14.13 asks about a target that is uniform on two squares touching only at a corner.
+Each axis-aligned move stays inside one square, so a chain started in one square never reaches
+the other: Gibbs is not ergodic there and would sample the wrong distribution.</Sidenote>
+
+Gibbs is a special case of Metropolis–Hastings. Take the proposal $q_k(\mathbf{z}^\star \mid
+\mathbf{z}) = p(z_k^\star \mid \mathbf{z}_{\setminus k})$, which leaves $\mathbf{z}^\star_{\setminus k}
+= \mathbf{z}_{\setminus k}$, and write $p(\mathbf{z}) = p(z_k \mid \mathbf{z}_{\setminus k})
+p(\mathbf{z}_{\setminus k})$. The ratio in (14.40) is then
+
+$$
+A(\mathbf{z}^\star, \mathbf{z}) = \frac{p(\mathbf{z}^\star)\, q_k(\mathbf{z} \mid \mathbf{z}^\star)}{p(\mathbf{z})\, q_k(\mathbf{z}^\star \mid \mathbf{z})} = \frac{p(z^\star_k \mid \mathbf{z}^\star_{\setminus k})\, p(\mathbf{z}^\star_{\setminus k})\, p(z_k \mid \mathbf{z}^\star_{\setminus k})}{p(z_k \mid \mathbf{z}_{\setminus k})\, p(\mathbf{z}_{\setminus k})\, p(z^\star_k \mid \mathbf{z}_{\setminus k})} = 1, \tag{14.45}
+$$
+
+because every starred "rest" equals the unstarred one. **Every Gibbs move is accepted.**
+
+For a Gaussian with precision matrix $\boldsymbol\Lambda = \boldsymbol\Sigma^{-1}$ the conditionals
+are Gaussian with mean $\mu_i - \Lambda_{ii}^{-1}\sum_{j \ne i}\Lambda_{ij}(z_j - \mu_j)$ and
+variance $1/\Lambda_{ii}$, which gives a ten-line sampler (Algorithm 14.3, with the
+over-relaxation parameter of the next section):
+
+```python
+def gibbs(mu, Lam, z0, T, rng, alpha=0.0):
+    z, chain = np.array(z0, float), []
+    for _ in range(T):
+        for i in range(len(z)):
+            rest = [j for j in range(len(z)) if j != i]
+            m = mu[i] - Lam[i, rest] @ (z[rest] - mu[rest]) / Lam[i, i]  # conditional mean
+            s = 1 / np.sqrt(Lam[i, i])                                     # conditional sd
+            z[i] = m + alpha * (z[i] - m) + s * np.sqrt(1 - alpha**2) * rng.standard_normal()
+        chain.append(z.copy())
+    return np.array(chain)
+```
+
+On the Gaussian above the conditional standard deviation is $l = 1/\sqrt{\Lambda_{11}} = 0.274$
+and the marginal one is $L = \sqrt{\Sigma_{11}} = 0.583$. Steps are of size $l$, so by the
+random-walk argument an independent sample takes of order $(L/l)^2 = 4.5$ sweeps (Figure
+14.11). For a bivariate Gaussian with correlation $r$ this can be made exact: each coordinate,
+sampled once per sweep, follows an autoregression with coefficient $r^2$, whose
+integrated autocorrelation time is $(1 + r^2)/(1 - r^2)$. Here $r = 0.882$, so $8.0$ sweeps,
+or $16.1$ single-coordinate updates. The simulation measures $17.8$ updates.
+
+<Chain2D
+	method="gibbs"
+	param={0}
+	title="Gibbs sampling: alternate draws of z₁ and z₂ from their conditionals (after Figure 14.11)"
+	caption="Every move is axis-aligned and accepted. Because the target is stretched along the diagonal, each conditional is narrow (width l) and the chain zig-zags slowly along the long axis. Drag α below 0 to over-relax."
+/>
+
+### Over-relaxation, blocking and graphs
+
+**Over-relaxation** (Adler, 1981) reduces the random walk when the conditionals are Gaussian with
+mean $\mu_i$ and variance $\sigma_i^2$. Instead of a fresh draw, set
+
+$$
+z_i' = \mu_i + \alpha_i (z_i - \mu_i) + \sigma_i (1 - \alpha_i^2)^{1/2} \nu, \tag{14.46}
+$$
+
+with $\nu$ a standard Gaussian and $-1 < \alpha_i < 1$. If $z_i$ has mean $\mu_i$ and variance
+$\sigma_i^2$, so does $z_i'$: its mean is $\mu_i$ and its variance is $\alpha_i^2\sigma_i^2 +
+\sigma_i^2(1 - \alpha_i^2) = \sigma_i^2$ (Exercise 14.14). So $p$ stays invariant. With $\alpha
+= 0$ this is plain Gibbs; with $\alpha < 0$ the new value lands on the *opposite* side of the
+conditional mean, so successive updates keep moving in the same direction instead of
+diffusing. On our Gaussian (100,000 updates each):
+
+| $\alpha$ | +0.5 | 0 (Gibbs) | −0.5 | −0.8 | −0.9 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| $\tau_{\text{int}}$ (updates) | 50.4 | 17.8 | 6.0 | 4.6 | 4.3 |
+
+At $\alpha = -0.9$ the chain mixes about four times faster than Gibbs. The idea also works on
+non-Gaussian targets that have Gaussian conditionals, such as $p(z, y) \propto \exp(-z^2y^2)$,
+and **ordered over-relaxation** (Neal, 1999) generalises it further.
+
+Gibbs needs conditionals that are easy to sample. In a directed graphical model the conditional
+of a node depends only on its **Markov blanket**: its parents, children and co-parents (Figure
+14.12). Many common choices of node conditionals make $p(z_i \mid \mathbf{z}_{\setminus i})$ log
+concave, so adaptive rejection sampling can draw from them. Finally, **blocking Gibbs** (Jensen,
+Kong and Kjaerulff, 1995) samples groups of variables jointly given the rest, a middle ground
+between one-at-a-time updates and (intractable) joint draws.
+
+### Ancestral sampling
+
+For a directed graph, sampling the joint distribution needs no Markov chain at all. The joint
+factorises as
+
+$$
+p(\mathbf{z}) = \prod_{i=1}^{M} p(\mathbf{z}_i \mid \mathrm{pa}(i)), \tag{14.47}
+$$
+
+where $\mathrm{pa}(i)$ are the parents of node $i$. **Ancestral sampling** visits the nodes in
+an order where parents come first, and draws each from its conditional given the parent values
+already sampled. One pass gives one exact, independent sample from the joint.
+
+With **evidence**, some nodes observed, the simplest extension is **logic sampling** (Henrion,
+1988): sample as before, and as soon as a sampled observed node disagrees with its observed
+value, discard the whole sample and start again. The kept samples come from the posterior,
+since this is joint sampling followed by conditioning, but the acceptance rate is the
+probability of the evidence, which shrinks fast as more nodes are observed.
+
+**Likelihood weighted sampling** (Fung and Chang, 1990; Shachter and Peot, 1990) clamps each
+observed node to its value instead of sampling it, and gives the sample the weight
+
+$$
+r(\mathbf{z}) = \prod_{\mathbf{z}_i \notin \mathbf{e}} \frac{p(\mathbf{z}_i \mid \mathrm{pa}(i))}{p(\mathbf{z}_i \mid \mathrm{pa}(i))} \prod_{\mathbf{z}_i \in \mathbf{e}} \frac{p(\mathbf{z}_i \mid \mathrm{pa}(i))}{1} = \prod_{\mathbf{z}_i \in \mathbf{e}} p(\mathbf{z}_i \mid \mathrm{pa}(i)). \tag{14.48}
+$$
+
+This is importance sampling: the target is the joint with the evidence fixed, and the proposal
+samples the unobserved nodes from their conditionals and sets observed nodes deterministically,
+so the ratio keeps only the evidence factors (Exercise 14.15).
+
+**Worked example.** The classic sprinkler network: Cloudy ($C$) is a parent of Sprinkler ($S$)
+and Rain ($R$), which are both parents of WetGrass ($W$), with $P(C) = 0.5$; $P(S \mid C) = 0.1$,
+$P(S \mid \lnot C) = 0.5$; $P(R \mid C) = 0.8$, $P(R \mid \lnot C) = 0.2$; and $P(W \mid S, R) =
+0.99$, $P(W \mid S, \lnot R) = P(W \mid \lnot S, R) = 0.9$, $P(W \mid \lnot S, \lnot R) = 0$.
+Enumerating the 16 states gives $P(W = 1) = 0.6471$ and $P(R = 1 \mid W = 1) = 0.7079$.
+
+The first sample with the figure's seed draws uniforms $0.288, 0.076, 0.580, 0.941$: $C = 1$
+($0.288 < 0.5$), then $S = 1$ ($0.076 < P(S \mid C) = 0.1$), $R = 1$ ($0.580 < 0.8$), and $W = 1$
+($0.941 < 0.99$). Logic sampling keeps it, since $W$ agrees with the evidence. Likelihood
+weighting never draws $W$; it gives the sample weight $P(W = 1 \mid S, R) = 0.99$. After 5000
+samples, logic sampling has kept 3276 (65.5%, close to $P(W = 1)$) and estimates $0.717$;
+likelihood weighting uses all 5000 with total weight $3263.6$ and estimates $0.711$. A sample with
+$S = R = 0$ gets weight $0$, the importance-sampling version of a rejection.
+
+<BayesNetSampler
+	method="weighting"
+	title="Sampling the sprinkler network: ancestral, logic sampling, likelihood weighting"
+	caption="Left: the network with the newest sample's values; the orange outline marks the evidence node. Right: the running estimate against the exact value. Switch methods to compare how many samples each one wastes."
+/>
+
+## Langevin sampling
+
+Metropolis–Hastings proposes moves in every direction and lets the acceptance test sort them out,
+which is a random walk. Training a network taught us a better habit: **follow the gradient**.
+MCMC methods that use $\nabla_{\mathbf{z}} \ln p(\mathbf{z})$ move preferentially toward high
+probability. **Hamiltonian Monte Carlo** (Duane et al., 1987) does this and keeps a Metropolis
+test; the book focuses instead on **Langevin sampling**, which drops the test and is widely used
+in deep learning, especially for energy-based models.
+
+### Energy-based models
+
+A generative model $p(\mathbf{x} \mid \mathbf{w})$ must integrate to one,
+
+$$
+\int p(\mathbf{x} \mid \mathbf{w})\, \mathrm{d}\mathbf{x} = 1, \tag{14.49}
+$$
+
+which restricts what a network can output.<Sidenote>The book prints (14.49) as $\int
+p(\mathbf{x} \mid \mathbf{w})\, p(\mathbf{x})\, \mathrm{d}\mathbf{x} = 1$; the extra
+$p(\mathbf{x})$ is a typo.</Sidenote> An **energy-based model** (LeCun et al., 2006) drops the
+constraint. Any real-valued **energy function** $E(\mathbf{x}, \mathbf{w})$, typically a network
+with scalar output, defines
+
+$$
+p(\mathbf{x} \mid \mathbf{w}) = \frac{1}{Z(\mathbf{w})} \exp\{-E(\mathbf{x}, \mathbf{w})\}, \tag{14.50}
+$$
+
+where low energy means high probability and the **partition function**
+
+$$
+Z(\mathbf{w}) = \int \exp\{-E(\mathbf{x}, \mathbf{w})\}\, \mathrm{d}\mathbf{x} \tag{14.51}
+$$
+
+makes it normalized (Exercise 14.16: integrate both sides of (14.50)). Every normalized model is an
+energy-based model with $E = -\ln p$, but the term is used when $Z$ is intractable. For a data set
+$\mathcal{D} = (\mathbf{x}_1, \dots, \mathbf{x}_N)$ of independent points, the log-likelihood is
+
+$$
+\ln p(\mathcal{D} \mid \mathbf{w}) = -\sum_{n=1}^{N} E(\mathbf{x}_n, \mathbf{w}) - N \ln Z(\mathbf{w}), \tag{14.52}
+$$
+
+(take the log of (14.50) and sum over $n$; Exercise 14.17), and $Z(\mathbf{w})$ is exactly the
+integral we cannot compute.
+
+### The likelihood gradient
+
+For one data point the gradient with respect to the parameters is
+
+$$
+\nabla_{\mathbf{w}} \ln p(\mathbf{x} \mid \mathbf{w}) = -\nabla_{\mathbf{w}} E(\mathbf{x}, \mathbf{w}) - \nabla_{\mathbf{w}} \ln Z(\mathbf{w}). \tag{14.53}
+$$
+
+Averaging over data from the unknown data distribution $p_{\mathcal{D}}$, and noting that the last
+term does not depend on $\mathbf{x}$,
+
+$$
+\mathbb{E}_{\mathbf{x} \sim p_{\mathcal{D}}}\big[\nabla_{\mathbf{w}} \ln p(\mathbf{x} \mid \mathbf{w})\big] = -\mathbb{E}_{\mathbf{x} \sim p_{\mathcal{D}}}\big[\nabla_{\mathbf{w}} E(\mathbf{x}, \mathbf{w})\big] - \nabla_{\mathbf{w}} \ln Z(\mathbf{w}). \tag{14.54}
+$$
+
+Differentiate (14.51): $\nabla_{\mathbf{w}} Z = -\int \nabla_{\mathbf{w}} E\, e^{-E}\, \mathrm{d}\mathbf{x}$,
+and dividing by $Z$ turns $e^{-E}/Z$ into the model density:
+
+$$
+-\nabla_{\mathbf{w}} \ln Z(\mathbf{w}) = \int \{\nabla_{\mathbf{w}} E(\mathbf{x}, \mathbf{w})\}\, p(\mathbf{x} \mid \mathbf{w})\, \mathrm{d}\mathbf{x}, \tag{14.55}
+$$
+
+an expectation under the **model distribution** $p_{\mathcal{M}}$:
+
+$$
+\int \{\nabla_{\mathbf{w}} E(\mathbf{x}, \mathbf{w})\}\, p(\mathbf{x} \mid \mathbf{w})\, \mathrm{d}\mathbf{x} = \mathbb{E}_{\mathbf{x} \sim \mathcal{M}}\big[\nabla_{\mathbf{w}} E(\mathbf{x}, \mathbf{w})\big]. \tag{14.56}
+$$
+
+Putting (14.54)–(14.56) together (Exercise 14.18):
+
+$$
+\nabla_{\mathbf{w}} \mathbb{E}_{\mathbf{x} \sim p_{\mathcal{D}}}\big[\ln p(\mathbf{x} \mid \mathbf{w})\big] = -\mathbb{E}_{\mathbf{x} \sim p_{\mathcal{D}}}\big[\nabla_{\mathbf{w}} E(\mathbf{x}, \mathbf{w})\big] + \mathbb{E}_{\mathbf{x} \sim p_{\mathcal{M}}(\mathbf{x})}\big[\nabla_{\mathbf{w}} E(\mathbf{x}, \mathbf{w})\big]. \tag{14.57}
+$$
+
+Read it as two forces on the energy surface (Figure 14.13). Gradient ascent with the first term
+**lowers the energy at data points**, raising their probability. The second term **raises the
+energy at points the model itself generates**, lowering their probability. Where the model puts
+more mass than the data, the second force wins and probability drains away; where the data are
+denser, the first wins. At the maximum the two expectations are equal.
+
+The first term is an average over the training set,
+
+$$
+\mathbb{E}_{\mathbf{x} \sim p_{\mathcal{D}}}\big[\nabla_{\mathbf{w}} E(\mathbf{x}, \mathbf{w})\big] \simeq \frac{1}{N}\sum_{n=1}^{N} \nabla_{\mathbf{w}} E(\mathbf{x}_n, \mathbf{w}), \tag{14.58}
+$$
+
+with each $\nabla_{\mathbf{w}} E$ from automatic differentiation. The second needs **samples from the
+model**, whose normalizing constant we do not know: an MCMC problem.
+
+### Langevin dynamics
+
+The **score function** is the gradient of the log density *with respect to the data*, not the
+parameters:
+
+$$
+\mathbf{s}(\mathbf{x}, \mathbf{w}) = \nabla_{\mathbf{x}} \ln p(\mathbf{x} \mid \mathbf{w}), \tag{14.59}
+$$
+
+and for an energy-based model the partition function drops out because it does not depend on
+$\mathbf{x}$:
+
+$$
+\mathbf{s}(\mathbf{x}, \mathbf{w}) = -\nabla_{\mathbf{x}} E(\mathbf{x}, \mathbf{w}). \tag{14.60}
+$$
+
+**Langevin sampling**, or **stochastic gradient Langevin dynamics** (Parisi, 1981; Welling and Teh,
+2011), starts from $\mathbf{x}^{(0)}$ drawn from some simple prior and iterates
+
+$$
+\mathbf{x}^{(\tau+1)} = \mathbf{x}^{(\tau)} + \eta \nabla_{\mathbf{x}} \ln p(\mathbf{x}^{(\tau)}, \mathbf{w}) + \sqrt{2\eta}\, \boldsymbol\epsilon^{(\tau)}, \qquad \tau \in 1, \dots, T, \tag{14.61}
+$$
+
+with $\boldsymbol\epsilon^{(\tau)} \sim \mathcal{N}(\mathbf{0}, \mathbf{I})$ independent and step size
+$\eta$: a gradient-ascent step on $\ln p$ plus Gaussian noise. The gradient pulls toward high
+density; the noise keeps the chain from collapsing onto the mode. The factor $\sqrt{2\eta}$ is
+what balances the two so that, as $\eta \to 0$ and $T \to \infty$, $\mathbf{x}^{(T)}$ is a sample
+from $p$.<Sidenote>The book's sentence after (14.61) says "the value of $\mathbf{z}^{(T)}$"; it means
+$\mathbf{x}^{(T)}$.</Sidenote> Algorithm 14.4:
+
+```python
+def langevin(score, x0, eta, T, rng):
+    x = np.array(x0, float)
+    for _ in range(T):
+        x = x + eta * score(x) + np.sqrt(2 * eta) * rng.standard_normal(x.shape)
+    return x
+```
+
+**There is no acceptance test, so a finite $\eta$ samples a slightly wrong distribution.** For a
+Gaussian we can compute how wrong. Along a principal axis with variance $s^2$ the score is
+$-x/s^2$, so (14.61) is $x' = (1 - \eta/s^2)x + \sqrt{2\eta}\,\epsilon$. Its stationary variance
+$v$ solves $v = (1 - \eta/s^2)^2 v + 2\eta$, which gives
+
+$$
+v = \frac{s^2}{1 - \eta/(2s^2)},
+$$
+
+too wide by a factor that grows with $\eta/s^2$, and the chain diverges if $\eta \ge 2s^2$. On our
+Gaussian the short axis has $s = 0.2$, so the limit is $\eta < 0.08$:
+
+| step size $\eta$ | 0.001 | 0.01 | 0.04 | 0.07 |
+| --- | ---: | ---: | ---: | ---: |
+| short-axis sd, formula (true 0.200) | 0.201 | 0.214 | 0.283 | 0.566 |
+| short-axis sd, 100,000 steps | 0.203 | 0.214 | 0.283 | 0.565 |
+| $\tau_{\text{int}}$ along the long axis (steps) | 792 | 130 | 32 | 17 |
+
+SciPy's discrete Lyapunov solver for the full 2D chain gives the same standard deviations. Small
+$\eta$ is accurate but slow; large $\eta$ is fast but biased. Adding a Metropolis–Hastings test to
+each Langevin step removes the bias (the Metropolis-adjusted Langevin algorithm), at the cost of
+some rejections.
+
+<Chain2D
+	method="langevin"
+	param={0.005}
+	title="Langevin dynamics on the same Gaussian"
+	caption="Each step follows the score (toward the centre line of the ellipse) and adds noise of size √(2η). The readouts compare the sample standard deviations with the chain's own limit from the formula above. Push η toward 0.075 and the short-axis spread blows up."
+/>
+
+### Training an energy-based model
+
+With (14.61) the model term of (14.57) becomes an average over $M$ Langevin samples
+$\mathbf{x}_1, \dots, \mathbf{x}_M$:
+
+$$
+\mathbb{E}_{\mathbf{x} \sim p_{\mathcal{M}}(\mathbf{x})}\big[\nabla_{\mathbf{w}} E(\mathbf{x}, \mathbf{w})\big] \simeq \frac{1}{M}\sum_{m=1}^{M} \nabla_{\mathbf{w}} E(\mathbf{x}_m, \mathbf{w}). \tag{14.62}
+$$
+
+Running a long chain from scratch for every gradient step is expensive. **Contrastive
+divergence** (Hinton, 2002) starts each chain at a training point and runs only a few steps. The
+samples stay close to the data, so the gradient shapes the energy only near the data manifold;
+that can be enough for discrimination but tends to give a poor generative model. A common
+alternative, not in the book, is **persistent** chains: keep the model samples from one training
+step to the next and run a few more Langevin steps each time, so the chains track the slowly
+changing model.
+
+**Worked example.** A one-dimensional energy-based model with a quartic energy
+
+$$
+E(x, \mathbf{w}) = w_1 x + w_2 x^2 + w_3 x^3 + w_4 x^4, \qquad \nabla_{\mathbf{w}} E = (x, x^2, x^3, x^4),
+$$
+
+trained on 200 points from an equal mixture of $\mathcal{N}(-1.5, 0.5^2)$ and $\mathcal{N}(1.5,
+0.5^2)$. Because $\nabla_{\mathbf{w}} E$ is the feature vector, (14.57) says the gradient is zero
+exactly when **the model's average of $x, x^2, x^3, x^4$ equals the data's**: maximum likelihood
+here is moment matching. The data averages are $(0.179, 2.525, 0.669, 8.742)$.
+
+- Start at $\mathbf{w} = (0, 0.5, 0, 0.01)$, nearly a Gaussian with standard deviation 1. Its
+  moments are $(0, 0.907, 0, 2.337)$ and its mean log-likelihood is $-2.243$.
+- Each iteration moves 300 persistent particles by 20 Langevin steps with $\eta = 0.01$, then
+  updates $w_k \leftarrow w_k + 0.3\,(\bar\phi_k^{\text{model}} - \bar\phi_k^{\text{data}}) /
+  \overline{\phi_k^2}^{\text{data}}$, where $\phi = (x, x^2, x^3, x^4)$ and the denominator, the
+  data's average of $\phi_k^2$, only rescales each coordinate's step.<Sidenote>The data averages of
+  $\phi_k^2 = x^2, x^4, x^6, x^8$ are $2.5, 8.7, 36.8, 179.5$. Without the rescaling, the $x^4$
+  coordinate would need a learning rate about 70 times smaller than the $x$ coordinate. The scaling changes the path, not the
+  fixed point, which is still where the two averages of (14.57) agree.</Sidenote>
+- The exact maximum, found by the same update with model moments computed on a grid, is
+  $\mathbf{w} = (-0.035, -1.237, -0.011, 0.208)$ with mean log-likelihood $-1.4615$. SciPy's
+  optimiser on the exact likelihood finds the same $\mathbf{w}$ and $-1.4614$. The negative $w_2$
+  and positive $w_4$ make a double well, with minima near $\pm 1.7$.
+- The Langevin-trained model reaches log-likelihood $-1.514$ after 100 iterations, $-1.474$ after
+  200 and $-1.466$ at iteration 400, with $\mathbf{w} = (-0.052, -1.134, -0.008, 0.199)$. Afterwards it
+  hovers near the optimum, jittering with the sampling noise in (14.62).
+- Contrastive divergence (chains restarted at the data, 10 steps) reaches only $-1.585$ after
+  600 iterations, with $w_1$ drifting to $0.33$: ten steps of size $0.01$ move a sample only about
+  $\sqrt{2 \cdot 0.1} \approx 0.45$, so the model never "sees" the mass it puts away from the data.
+
+<EbmTraining
+	iterations={600}
+	title="Training a 1D energy-based model with Langevin samples (after Figure 14.13)"
+	caption="Top: the energy with the data (orange ticks) and the model's Langevin samples (purple dots). Bottom: data density, model density and the grey regions where the model has more mass than the data, where (14.57) raises the energy. The table holds the two averages of (14.57) per feature; their difference is the gradient. Tick the box to compare contrastive divergence."
+/>
+
+The same machinery reappears in diffusion models, which learn the score (14.59) directly by
+**score matching** instead of through an energy, and then generate with Langevin-like updates.
+
+## Summary
+
+- **Monte Carlo** replaces an expectation by an average of samples; the error falls as
+  $1/\sqrt{L}$ in any dimension, scaled by the variance of $f$ and inflated when samples are
+  correlated.
+- **Exact samplers** (inverse CDF, Box–Muller, Cholesky, rejection) work for simple or
+  low-dimensional targets. Rejection and importance sampling depend on a global proposal close to
+  $p$, and their efficiency decays exponentially with dimension; importance sampling can fail
+  silently.
+- **MCMC** needs only local moves and the unnormalized $\tilde p$. Detailed balance makes $p$
+  invariant, ergodicity makes the chain reach it; Metropolis–Hastings and Gibbs both satisfy
+  detailed balance, and Gibbs is Metropolis–Hastings with acceptance 1.
+- **Random-walk behaviour** is the main cost of MCMC: distance grows as $\sqrt\tau$, so mixing
+  time grows with the squared ratio of the target's length scales. Tune proposals for
+  effective samples per step, not acceptance rate.
+- **Langevin sampling** uses the score $\nabla_{\mathbf{x}}\ln p = -\nabla_{\mathbf{x}}E$ to move
+  toward high probability, which makes it the sampler of choice for **energy-based models**,
+  whose likelihood gradient (14.57) is "data average minus model average" of $\nabla_{\mathbf{w}}E$.
+
+## References
+
+- C. M. Bishop and H. Bishop. *Deep Learning: Foundations and Concepts*. Springer, 2024. Chapter 14.
+- N. Metropolis, A. W. Rosenbluth, M. N. Rosenbluth, A. H. Teller and E. Teller. Equation of state
+  calculations by fast computing machines. *Journal of Chemical Physics* 21(6), 1953.
+- W. K. Hastings. Monte Carlo sampling methods using Markov chains and their applications.
+  *Biometrika* 57(1), 1970.
+- S. Geman and D. Geman. Stochastic relaxation, Gibbs distributions, and the Bayesian restoration
+  of images. *IEEE TPAMI* 6(6), 1984.
+- W. R. Gilks and P. Wild. Adaptive rejection sampling for Gibbs sampling. *Applied Statistics*
+  41(2), 1992.
+- R. M. Neal. *Probabilistic Inference Using Markov Chain Monte Carlo Methods*. Technical report
+  CRG-TR-93-1, University of Toronto, 1993.
+- S. L. Adler. Over-relaxation method for the Monte Carlo evaluation of the partition function for
+  multiquadratic actions. *Physical Review D* 23(12), 1981.
+- M. Henrion. Propagating uncertainty in Bayesian networks by probabilistic logic sampling.
+  *Uncertainty in Artificial Intelligence 2*, 1988.
+- R. Fung and K.-C. Chang. Weighing and integrating evidence for stochastic simulation in Bayesian
+  networks. *Uncertainty in Artificial Intelligence 5*, 1990.
+- Y. LeCun, S. Chopra, R. Hadsell, M. Ranzato and F. J. Huang. A tutorial on energy-based
+  learning. In *Predicting Structured Data*, MIT Press, 2006.
+- G. E. Hinton. Training products of experts by minimizing contrastive divergence. *Neural
+  Computation* 14(8), 2002.
+- M. Welling and Y. W. Teh. Bayesian learning via stochastic gradient Langevin dynamics. *ICML*, 2011.
+- Y. Song and D. P. Kingma. How to train your energy-based models. arXiv:2101.03288, 2021.
+- S. Russell and P. Norvig. *Artificial Intelligence: A Modern Approach*. The sprinkler network's
+  probabilities follow their example.

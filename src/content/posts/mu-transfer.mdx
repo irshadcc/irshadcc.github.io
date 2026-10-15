@@ -1,0 +1,1279 @@
+---
+title: "μTransfer: Tuning a Large Network by Tuning a Small One"
+description: "A guided reading of Tensor Programs V (Yang, Hu et al., 2022): why the best learning rate moves when a network gets wider, how the Maximal Update Parametrization (μP) pins it in place, and the infinite-width mathematics behind it, from the law of large numbers to the Dynamical Dichotomy theorem. Every derivation in the appendix is worked through, with experiments."
+date: 2026-10-15
+tags: [Machine learning, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import LineChart from "../../utils/charts/LineChart.astro";
+import AbcExplorer from "../../utils/training/AbcExplorer.astro";
+import { av, coord, limit, linear, lookup, sweepAdam, sweepSgd, toy, toyF } from "../../utils/training/muTransferFigures";
+
+export const log2 = (v) => Math.log2(v);
+export const widthSeries = (sweep, p) =>
+	Object.keys(sweep[p]).map((w) => ({ name: `width ${w}`, fn: lookup(sweep.log2lr, sweep[p][w]) }));
+
+## Background
+
+Every neural network comes with **hyperparameters** (HPs): numbers that training does not learn,
+such as the learning rate, the initialization scale and the learning-rate schedule. Bad values
+cost a lot. Training diverges, or it converges to a worse model. So people search for good
+values, usually by training the model many times. For a model with billions of parameters,
+one training run already costs millions of dollars, so a search is out of the question. The
+common workaround is to tune a small model and hope the values carry over to the large one.
+They often don't. GPT-3, for example, used a different learning rate for every model size.<Sidenote>Brown et al. (2020), Table 2.1: the learning rate falls from $6.0 \times 10^{-4}$ for the 125M model to $0.6 \times 10^{-4}$ for the 175B model, and each value was chosen separately.</Sidenote>
+
+The paper *Tensor Programs V: Tuning Large Neural Networks via Zero-Shot Hyperparameter
+Transfer* by Greg Yang, Edward Hu and colleagues at Microsoft and OpenAI (2022) shows that the
+hope fails because of how networks are **parametrized**: how their initialization and learning
+rates are scaled as the width changes. In the usual parametrization, the best learning rate
+drifts as a network gets wider. In the **Maximal Update Parametrization** (μP), it stays put.
+This turns a hope into a procedure, **μTransfer**: write the target model in μP, tune a narrow
+copy of it, and copy the tuned values to the wide model without touching it again. With it, the
+authors tuned a 6.7B-parameter GPT-3 by tuning a 40M-parameter proxy, for 7% of the cost of
+pretraining, and beat the published model.
+
+This post covers the paper in the following order:
+
+1. **The idea**, with a one-line example built on the central limit theorem.
+2. **The failure**: learning rates drift with width in the standard parametrization (SP). We
+   reproduce this on CIFAR-10.
+3. **μP**: the scaling rules in one table, and what changes in practice.
+4. **Why SP breaks**, worked through on a two-weight network.
+5. **The mathematics of Appendix J**: how large $Av$ is for the three kinds of matrices that
+   appear in training, the desiderata that single out μP, the derivation of every row of the
+   table, and Lemma J.1, which shows three tables describe the same network.
+6. **The infinite-width theory** of the predecessor paper, Tensor Programs IV: abc-parametrizations,
+   the stability theorem, the Dynamical Dichotomy (feature learning *or* kernel regime, never both),
+   why μP is the unique "maximal" parametrization, and an explicit infinite-width limit.
+7. **Practice**: which HPs transfer, the `mup` package, and the paper's results.
+
+Readers who know [the Hessian](/blog/hessian-matrix/) and [matrix calculus](/blog/matrix-calculus/)
+have more than enough background. The only probability we need is the law of large numbers and
+the central limit theorem, which we restate when we use them.
+
+## The idea: the right parametrization makes the optimum stable
+
+### A one-line example
+
+Section 2 of the paper starts from the **central limit theorem** (CLT). If $x_1, \dots, x_n$ are
+independent samples with mean 0 and variance 1, then
+
+$$
+\frac{1}{\sqrt n}(x_1 + \dots + x_n) \;\longrightarrow\; \mathcal N(0, 1) \qquad (n \to \infty).
+$$
+
+The factor $1/\sqrt n$ is the only scaling that gives a nontrivial limit. With $1/n$ the sum goes
+to 0 (this is the **law of large numbers**, LLN); with $1$ its variance grows like $n$.
+
+Now suppose we want to choose a number $c$ to minimize
+
+$$
+F_n(c) = \mathbb E_{x_1, \dots, x_n}\, f\big(c\,(x_1 + \dots + x_n)\big)
+$$
+
+for some bounded continuous $f$. Think of $x_1, \dots, x_n$ as the random initial weights of a
+width-$n$ network, $c$ as a hyperparameter such as the learning rate, and $f$ as the loss after
+training. Then $F_n$ is the expected loss over random initializations.
+
+Write $c = \alpha / \sqrt n$. By the CLT,
+
+$$
+G_n(\alpha) := F_n(\alpha/\sqrt n) = \mathbb E\, f\Big(\alpha \cdot \tfrac{x_1 + \dots + x_n}{\sqrt n}\Big)
+\;\longrightarrow\; G_\infty(\alpha) := \mathbb E\, f\big(\mathcal N(0, \alpha^2)\big).
+$$
+
+The function $G_n$ settles down to a fixed function of $\alpha$, so its minimizer $\alpha^*_n$
+settles down too. Once $n$ is large, the best $\alpha$ for width $n$ is close to the best
+$\alpha$ for any larger width $N$. We can tune at width $n$ and **copy $\alpha$**. Copying $c$
+instead would be wrong by a factor $\sqrt{N/n}$, since $c^*_N \approx c^*_n \sqrt{n/N}$. The
+paper calls $c = \alpha/\sqrt n$ the **correct parametrization** of this problem: the one in
+which the optimal hyperparameter does not move.
+
+Let's make it concrete. Take Rademacher $x_i$ ($+1$ or $-1$ with equal probability) and
+$f(y) = 1 - e^{-(y^2 - 1)^2}$, which is bounded and smallest at $|y| = 1$. The sum
+$S = x_1 + \dots + x_n$ equals $2K - n$ with $K \sim \text{Binomial}(n, 1/2)$, so $G_n$ can be
+computed exactly. The two charts below show the same functions in the two parametrizations.
+
+<LineChart
+	x={() => toy.alpha.filter((a) => a <= 2.5)}
+	series={["4", "16", "64", "256", "inf"].map((n) => ({
+		name: n === "inf" ? "n → ∞" : `n = ${n}`,
+		fn: lookup(toy.alpha, toy.G[n]),
+	}))}
+	title="Parametrized by α: G_n(α) converges, and so does its minimizer"
+	xLabel="α (c = α/√n)"
+	yLabel="G_n(α)"
+	height={280}
+/>
+
+<LineChart
+	x={() => toyF.c}
+	series={["4", "16", "64", "256"].map((n) => ({ name: `n = ${n}`, fn: lookup(toyF.c, toyF.F[n]) }))}
+	title="Parametrized by c: the minimizer of F_n(c) slides to 0 like 1/√n"
+	xLabel="c"
+	yLabel="F_n(c)"
+	height={280}
+/>
+
+In the first chart, look at where each curve bottoms out: the minimizer is $\alpha^* = 1$ for
+$n = 4$ (and for $n = 1$, not drawn), then $0.728$ at $n = 16$, $0.732$ at $n = 64$ and $0.733$ at $n = 256$; the
+limit is $\alpha^*_\infty = 0.7335$ (all from a script). In the second chart, the minimizer of
+$F_n(c)$ is $c^* = \alpha^*/\sqrt n$: $0.182$, $0.0915$ and $0.0458$ for $n = 16, 64, 256$. It
+halves every time $n$ quadruples. Check one value by hand: for $n = 4$ the sum $S/2$ takes the
+values $0, \pm 1, \pm 2$ with probabilities $6/16, 8/16, 2/16$, so
+
+$$
+G_4(1) = \tfrac{6}{16}(1 - e^{-1}) + \tfrac{8}{16}\cdot 0 + \tfrac{2}{16}(1 - e^{-9}) = 0.2370 + 0.1250 = 0.3620,
+$$
+
+which is what the script gives.
+
+### Every hyperparameter has to be parametrized
+
+Appendix C of the paper adds a warning. A real network has many HPs that interact. Model this as
+
+$$
+F_n(c_1, \dots, c_k) = \mathbb E\, f\big((c_1 + \dots + c_k)(x_1 + \dots + x_n)\big).
+$$
+
+The correct parametrization is $\alpha_i = c_i \sqrt n$ for *every* $i$. Suppose we reparametrize
+only $\alpha_1$ and leave $c_2, \dots, c_k$ fixed. The loss depends on
+$(\alpha_1 + \sqrt n\,(c_2 + \dots + c_k))$, so the best $\alpha_1$ is
+
+$$
+\alpha_1^* = \alpha^* - \sqrt n\,(c_2 + \dots + c_k),
+$$
+
+which still runs off to $-\infty$. With $\alpha^* = 0.7335$ and a single fixed $c_2 = 0.1$, the
+best $\alpha_1$ is $0.33$ at $n = 16$, $-0.87$ at $n = 256$ and $-5.67$ at $n = 4096$. **One
+wrongly scaled hyperparameter forces the correctly scaled ones to compensate**, so their optima
+drift too. This is why tuning only the learning rate in SP is not enough: SP also scales the
+initialization and the output layer wrongly.
+
+#### The formal vocabulary
+
+Appendix A pins down the words used above.
+
+- A **multiplier** is a fixed scalar $c$ inserted anywhere in the network ("multiply by $c$").
+  A **parameter multiplier** replaces a weight $W$ by $cW$. The $1/\sqrt{d_\text{head}}$ in
+  attention is a multiplier; it can also be read as a parameter multiplier on $W_q$, since
+  $\langle k, q\rangle/\sqrt{d} = \langle k, (W_q/\sqrt d)\,x\rangle$. A parameter multiplier is
+  *not* the same as a different initialization, because it also scales the gradient (we return
+  to this in Lemma J.1). After training it can be folded into the weight.
+- A **parametrization** is a rule for how to change HPs *when the width changes*, not a value
+  for any particular width. An **abc-parametrization** scales, for each weight tensor, (a) its
+  parameter multiplier, (b) its initialization and (c) its learning rate as powers of the width.
+  "Initialize with variance $1/\text{fan\_in}$" is, in this sense, the rule "halve the
+  variance when fan-in doubles".
+- A parametrization admits **zero-shot transfer** of a set of HPs $\mathcal H$ with respect to a
+  metric $\mathcal L$ if the optimal values of $\mathcal H$ converge as the width goes to
+  infinity. The paper uses the training loss as $\mathcal L$.
+
+## Hyperparameters don't transfer in the standard parametrization
+
+The **standard parametrization** (SP) is what PyTorch does by default. For a two-hidden-layer
+MLP with inputs $\xi \in \mathbb R^{d_\text{in}}$ and width $n$ it is (eq. 2 of the paper)
+
+$$
+f(\xi) = W^{3\top}\phi\big(W^{2\top}\phi(W^{1\top}\xi + b^1) + b^2\big), \quad
+W^1 \sim \mathcal N(0, \tfrac{1}{d_\text{in}}),\; W^{2}, W^3 \sim \mathcal N(0, \tfrac1n),\; b^1 = b^2 = 0,
+$$
+
+with one learning rate $\eta$ for every parameter. The variance $1/\text{fan\_in}$ (LeCun
+initialization) keeps every activation of order 1 *at initialization*. The trouble starts once
+training begins.
+
+We reran the paper's MLP experiment (its Fig. 3) on CIFAR-10: a two-hidden-layer ReLU MLP
+trained with cross-entropy, widths 128 to 4096, sweeping the learning rate on a $\log_2$ grid.
+To keep it to an hour on a laptop CPU we train for 1000 steps of batch 128 (2.6 epochs) instead
+of 20 epochs, use Adam (the paper's Fig. 3 uses SGD; our SGD run is further down), and report the
+training loss on 10,000 training images, averaged over 2 seeds.<Sidenote>Inputs are standardized per pixel. μP uses base width $n_0 = 128$, so at width 128 the SP and μP networks are identical, which is why the width-128 curves coincide in the two charts. A missing point means at least one seed diverged (NaN loss).</Sidenote>
+
+<LineChart
+	x={() => sweepAdam.log2lr}
+	series={widthSeries(sweepAdam, "sp")}
+	title="SP, Adam: training loss after 1000 steps"
+	xLabel="log₂ learning rate"
+	yLabel="training loss"
+	height={300}
+/>
+
+SWEEP_SP_TEXT
+
+## μP in one table
+
+#### The rules
+
+μP changes three things relative to SP: the initialization of the output layer, the learning
+rates of the input and output layers (and of all biases), and, in a Transformer, the attention
+scale. Table 3 of the paper lists the rules by the role of each weight. Here $\text{fan\_in}$ and
+$\text{fan\_out}$ are the input and output dimension of a weight, and a bias counts as an input
+weight with $\text{fan\_in} = 1$. SP's value is in brackets where it differs.
+
+| | Input weights and all biases | Output weights | Hidden weights |
+| --- | --- | --- | --- |
+| Init. variance | $1/\text{fan\_in}$ | $1/\text{fan\_in}^2$ $\;(1/\text{fan\_in})$ | $1/\text{fan\_in}$ |
+| SGD learning rate | $\text{fan\_out}$ $\;(1)$ | $1/\text{fan\_in}$ $\;(1)$ | $1$ |
+| Adam learning rate | $1$ | $1/\text{fan\_in}$ $\;(1)$ | $1/\text{fan\_in}$ $\;(1)$ |
+
+The three columns are really three *shapes*. An **input weight** maps a finite dimension
+(the 3072 pixels, the vocabulary) to a width; an **output weight** maps a width to a finite
+dimension (10 classes, the vocabulary); a **hidden weight** maps a width to a width. Appendix B
+calls parameters with two width dimensions **matrix-like**, those with one **vector-like** (input
+and output weights, biases, layernorm gains) and those with none **scalar-like**. Only the scaling
+with width matters: the table says "multiply the hidden Adam learning rate by $1/2$ when the
+width doubles", not "use $1/1024$ at width 1024".
+
+For the MLP above with SGD, μP is (eq. 3)
+
+$$
+W^1 \sim \mathcal N(0, \tfrac{1}{d_\text{in}}),\; W^2 \sim \mathcal N(0, \tfrac1n),\;
+\boxed{W^3 \sim \mathcal N(0, \tfrac{1}{n^2})},\qquad
+\boxed{\eta_{W^1} = \eta_{b^1} = \eta_{b^2} = \eta n},\; \eta_{W^2} = \eta,\; \boxed{\eta_{W^3} = \eta / n}.
+$$
+
+In practice we insert constants so that μP *equals* SP at some **base width** $n_0$. With
+$\tilde n = n / n_0$ (eq. 4):
+
+$$
+W^3 \sim \mathcal N(0, \tfrac{1}{n \tilde n}),\qquad \eta_{W^1} = \eta_{b^1} = \eta_{b^2} = \eta \tilde n,\quad \eta_{W^2} = \eta,\quad \eta_{W^3} = \eta/\tilde n.
+$$
+
+At $n = n_0$ every boxed factor is 1 and the network *is* the SP network. As $n$ grows, the two
+diverge. The Adam version used in our experiment follows the third row of the table:
+
+```python
+nt = n / n0  # width multiplier
+W1 = randn(n, d_in) / sqrt(d_in);  b1 = zeros(n); b2 = zeros(n)
+W2 = randn(n, n) / sqrt(n)
+W3 = randn(10, n) / sqrt(n * nt)          # SP: / sqrt(n)
+opt = Adam([
+    {"params": [W1, b1, b2], "lr": lr},   # input weights and biases: constant
+    {"params": [W2, W3], "lr": lr / nt},  # hidden and output: 1/width
+])
+```
+
+#### For a Transformer
+
+Definition 4.1 adds one rule: the attention logit is $q^\top k / d$ instead of $q^\top k/\sqrt d$,
+where $d = d_\text{head}$. We derive why below. Appendix B.1 walks through every Transformer
+parameter: word and position embeddings and layernorm weights are input weights (their fan-in,
+the vocabulary or context size or the constant 1, does not grow), $W_q, W_k, W_v, W_o$ and the MLP
+matrices are hidden weights, and the unembedding is an output weight. To match a standard
+Transformer at base head size $d_{\text{head},0}$, the logit is computed as
+
+$$
+\text{AttnLogit} = \alpha_\text{attn}\,\frac{\sqrt{d_{\text{head},0}}}{d_\text{head}}\, q^\top k,
+$$
+
+with a tunable multiplier $\alpha_\text{attn}$; the output logits get a tunable multiplier
+$\alpha_\text{output}$ in the same way.
+
+#### The same experiment in μP
+
+<LineChart
+	x={() => sweepAdam.log2lr}
+	series={widthSeries(sweepAdam, "mup")}
+	title="μP, Adam: training loss after 1000 steps"
+	xLabel="log₂ learning rate"
+	yLabel="training loss"
+	height={300}
+/>
+
+SWEEP_MUP_TEXT
+
+The paper sees the same with SGD (its Fig. 3) and with Transformers trained by Adam (its Fig. 1,
+widths 128 to 8192 on WikiText-2): in SP the best learning rate moves by an order of magnitude
+or more and wider models can be *worse*; in μP the optimum stays put and the curves stack, wider
+below narrower. Our SGD run on the same MLP (eq. 4, base width 128):
+
+<LineChart
+	x={() => sweepSgd.log2lr}
+	series={widthSeries(sweepSgd, "sp")}
+	title="SP, SGD: training loss after 1000 steps"
+	xLabel="log₂ learning rate"
+	yLabel="training loss"
+	height={280}
+/>
+
+<LineChart
+	x={() => sweepSgd.log2lr}
+	series={widthSeries(sweepSgd, "mup")}
+	title="μP, SGD: training loss after 1000 steps"
+	xLabel="log₂ learning rate"
+	yLabel="training loss"
+	height={280}
+/>
+
+SWEEP_SGD_TEXT
+
+## Why SP breaks: a network with two weight vectors
+
+#### One step of SGD
+
+Section 5 of the paper uses the smallest network that shows the problem: one hidden layer, no
+nonlinearity, scalar input and output,
+
+$$
+f(x) = V^\top U x, \qquad U, V \in \mathbb R^{n}.
+$$
+
+In SP, $U_\alpha \sim \mathcal N(0, 1)$ and $V_\alpha \sim \mathcal N(0, 1/n)$, so $f(x) = \Theta(|x|)$
+at initialization: $V^\top U$ is a sum of $n$ independent zero-mean terms of variance $1/n$, so it
+is roughly $\mathcal N(0, 1)$ by the CLT. Train with the loss $\tfrac12(f(x) - y)^2$. The gradients
+are $\partial L/\partial V = \chi U x$ and $\partial L/\partial U = \chi V x$ with $\chi = f(x) - y$.
+One SGD step with learning rate 1 gives
+
+$$
+V' = V + \theta U,\qquad U' = U + \theta V,\qquad \theta = -\chi x = \Theta(1).
+$$
+
+Multiply out the new output:
+
+$$
+f'(x) = V'^\top U' x = \big(V^\top U + \theta\, U^\top U + \theta\, V^\top V + \theta^2\, U^\top V\big)\,x.
+$$
+
+Now size each term. $U^\top U = \sum_\alpha U_\alpha^2$ is a sum of $n$ terms with mean 1, so by
+the LLN it is $\approx n$. The other three are $\Theta(1)$. **So $f'$ grows linearly with the
+width.** After one step, a wide enough SP network outputs garbage.
+
+The culprit is the update $\theta U$ to $V$. It is *aligned* with $U$, the vector $V$ multiplies.
+Before training, $V$ and $U$ are independent, so $V^\top U$ is a sum of random signs that
+cancel (CLT, $\sqrt n$ growth, tamed by $V$'s $1/\sqrt n$ scale). After one step, part of $V$ is
+a copy of $U$, so its products with $U$ no longer cancel (LLN, $n$ growth). This switch from CLT
+to LLN is the whole story of μP.
+
+#### The same step in μP
+
+The table gives $V_\alpha \sim \mathcal N(0, 1/n^2)$ (output weight), $U_\alpha \sim \mathcal N(0, 1)$,
+and learning rates $\eta_V = 1/n$, $\eta_U = n$. One step gives $V' = V + \theta U/n$ and
+$U' = U + \theta n V$, so
+
+$$
+f'(x) = \big(V^\top U + \theta n^{-1} U^\top U + \theta n V^\top V + \theta^2 U^\top V\big)\,x.
+$$
+
+Size each term again:
+
+| Term | Size | Why |
+| --- | ---: | --- |
+| $V^\top U$ | $\Theta(n^{-1/2})$ | CLT: $n$ terms of variance $1/n^2$ |
+| $\theta\, n^{-1} U^\top U$ | $\theta$ | LLN: $U^\top U \approx n$ |
+| $\theta\, n V^\top V$ | $\theta$ | LLN: $V^\top V \approx n \cdot n^{-2}$ |
+| $\theta^2 U^\top V$ | $\Theta(n^{-1/2})$ | CLT again |
+
+So $f'(x) \to 2\theta x$: the output changes by an amount that does not depend on the width. The
+initial output $V^\top U$ vanishes as $n \to \infty$, which is not a bug; we will see that every
+feature-learning parametrization has this property (Corollary 3.10 below).
+
+We simulated one step with $x = y = 1$ (so $\theta \approx 1$), averaging over 200 draws per width.
+The left chart shows $|f' - f|$, the change in the output; the right one shows the root mean
+square change of the hidden features $h = Ux$. A third parametrization, SP with the learning rate
+scaled down to $1/n$, is the obvious fix for the blow-up, so we include it.
+
+<LineChart
+	x={() => linear.widths.map(log2)}
+	series={[
+		{ name: "SP, LR 1", fn: lookup(linear.widths.map(log2), linear.sp.df.map(log2)) },
+		{ name: "SP, LR 1/n", fn: lookup(linear.widths.map(log2), linear.sp_small.df.map(log2)) },
+		{ name: "μP", fn: lookup(linear.widths.map(log2), linear.mup.df.map(log2)) },
+	]}
+	title="log₂ |change of the output| after one SGD step"
+	xLabel="log₂ width n"
+	yLabel="log₂ |f′ − f|"
+	height={260}
+/>
+
+<LineChart
+	x={() => linear.widths.map(log2)}
+	series={[
+		{ name: "SP, LR 1", fn: lookup(linear.widths.map(log2), linear.sp.dh.map(log2)) },
+		{ name: "SP, LR 1/n", fn: lookup(linear.widths.map(log2), linear.sp_small.dh.map(log2)) },
+		{ name: "μP", fn: lookup(linear.widths.map(log2), linear.mup.dh.map(log2)) },
+	]}
+	title="log₂ RMS change of the hidden features h = Ux after one SGD step"
+	xLabel="log₂ width n"
+	yLabel="log₂ RMS(h′ − h)"
+	height={260}
+/>
+
+Fitted slopes (from width 128 up) tell the story:
+
+| Parametrization | output change $\lvert f' - f\rvert$ | feature change $h' - h$ |
+| --- | ---: | ---: |
+| SP, LR 1 | $n^{1.02}$ (blows up: $17.8$ at $n=16$, $19{,}981$ at $n=16384$) | $n^{-0.48}$ |
+| SP, LR $1/n$ | $n^{0.00}$ ($\approx 1.2$) | $n^{-1.50}$ |
+| μP | $n^{0.00}$ ($\approx 2.00$) | $n^{0.00}$ ($\approx 1.00$) |
+
+Scaling the SP learning rate down to $1/n$ stops the blow-up, but now the hidden features move by
+$n^{-3/2}$, which is nothing in a wide network. The network still changes its output, but only
+through the last layer, as if the features were fixed random features. This is the **kernel
+regime**, and we will see that it also kills transfer. μP is the only one of the three in which
+both the output and the features move by a width-independent amount.
+
+#### Some layers learn too fast, others too slow
+
+Section 5 then shows the same imbalance in a Transformer trained with Adam (the paper's Fig. 5):
+in SP, the output logits and the attention logits change by an amount that grows with width after
+a single step, while the word embeddings change by a width-independent amount. If we shrink the
+global learning rate to tame the logits, the embeddings stop learning. No single learning rate is
+right for every layer. μP is designed so that every layer's activations move at the same,
+width-independent speed.
+
+Appendix D.1 turns this into a debugging tool, **coordinate checking**: train a few steps at many
+widths and plot the size of each activation's change. A correct μP implementation gives flat
+lines. Here is the check for our CIFAR MLP: Adam with learning rate $2^{-9}$, batch 128, the
+standard deviation of the change of the logits over 256 images, averaged over 3 seeds.
+
+<LineChart
+	x={() => coord.widths.map(log2)}
+	series={[1, 2, 3, 4].map((t) => ({
+		name: `SP, step ${t}`,
+		fn: lookup(coord.widths.map(log2), coord.widths.map((w) => Math.log2(coord.sp.logits[String(w)][t]))),
+	}))}
+	title="SP: log₂ std(logits_t − logits_0)"
+	xLabel="log₂ width n"
+	yLabel="log₂ std"
+	height={260}
+/>
+
+<LineChart
+	x={() => coord.widths.map(log2)}
+	series={[1, 2, 3, 4].map((t) => ({
+		name: `μP, step ${t}`,
+		fn: lookup(coord.widths.map(log2), coord.widths.map((w) => Math.log2(coord.mup.logits[String(w)][t]))),
+	}))}
+	title="μP: log₂ std(logits_t − logits_0)"
+	xLabel="log₂ width n"
+	yLabel="log₂ std"
+	height={260}
+/>
+
+COORD_TEXT
+
+## The mathematics behind μP
+
+Appendix J derives the table from three ingredients: a way to talk about the size of a vector,
+the sizes of $Av$ for the matrices that appear in training, and three desiderata. The arguments
+are heuristic; Tensor Programs IV makes them rigorous for SGD, and the paper defers the Adam
+version to a later paper.
+
+#### Sizes of vectors
+
+During training, each activation vector of a wide network has coordinates that look like
+independent samples from one distribution (this is a theorem of the Tensor Programs series).
+So we can describe a whole vector by the typical size of one coordinate.
+
+**Definition J.1.** A vector $v \in \mathbb R^n$ has **$\Theta(n^a)$-coordinates** if
+$\|v\|^2/n = \Theta(n^{2a})$ as $n \to \infty$. Similarly with $O$ and $\Omega$.
+
+So $\Theta(1)$-coordinates means each entry stays the same size as the network widens. For such
+a vector we can attach a random variable $Z^v$ (independent of $n$) that has the distribution of
+one coordinate. If $u$ and $v$ are correlated, so are $Z^u$ and $Z^v$, and
+
+$$
+\frac{u^\top v}{n} \;\longrightarrow\; \mathbb E\,[Z^u Z^v].
+$$
+
+The rule of thumb behind every calculation: a sum of $n$ terms that look like samples of $X$ has
+size
+
+$$
+\sum_{i=1}^n x_i \;=\;
+\begin{cases}
+\Theta(n) & \text{if } \mathbb E X \ne 0 \quad \text{(LLN)}\\
+\Theta(\sqrt n) & \text{if } \mathbb E X = 0 \quad \text{(CLT)}.
+\end{cases}
+$$
+
+### Three kinds of matrices
+
+The question of Appendix J.1 is: if $v$ has $\Theta(1)$-coordinates, how large are the
+coordinates of $Av$? The answer depends on what kind of matrix $A$ is, and on whether $v$ is
+correlated with it.
+
+**A Gaussian matrix** (a weight at initialization). Let $A_{\alpha\beta} \sim \mathcal N(0, 1)$.
+If $v$ is independent of $A$, then $(Av)_\alpha = \sum_\beta A_{\alpha\beta} v_\beta$ is a sum of
+$n$ zero-mean terms, so it is $\Theta(\sqrt n)$ by the CLT. To get $\Theta(1)$-coordinates we need
+entries of size $1/\sqrt n$: variance $1/n$, the usual $1/\text{fan\_in}$.
+
+The subtle case is when $v$ depends on $A$, which happens as soon as gradients flow back through
+$A^\top$. The paper's example takes $v = A^\top \mathbf 1$ with $A_{\alpha\beta} \sim \mathcal N(0, 1/n)$:
+
+$$
+(AA^\top \mathbf 1)_\alpha = \sum_{\beta,\gamma} A_{\alpha\beta}A_{\gamma\beta}
+= \underbrace{\sum_\beta A_{\alpha\beta}^2}_{\text{LLN:}\;\approx 1}
++ \underbrace{\sum_\beta \sum_{\gamma \ne \alpha} A_{\alpha\beta}A_{\gamma\beta}}_{\text{CLT:}\;\approx \mathcal N(0, 1)}.
+$$
+
+The first sum has $n$ terms of mean $1/n$. The second has $n$ independent inner sums, each with
+variance $(n-1)/n^2$, so their total has variance $\approx 1$. Every coordinate looks like
+$\mathcal N(1, 1)$: still $\Theta(1)$. The correlation added a deterministic mean but did not
+change the scaling. (Our simulation at $n = 4000$: mean $1.02$, variance $0.96$.) In general,
+for a Gaussian $A$, entries of size $1/\sqrt n$ are the unique scaling that keeps $Av$ at
+$\Theta(1)$, correlated or not; the proof of the general case is in Tensor Programs III.
+
+**A tensor product matrix** (an SGD update). A gradient step on a weight $W$ with input $x$ and
+backpropagated gradient $u$ adds the outer product $u x^\top$, and a batch adds a sum of them.
+Take
+
+$$
+A = \frac{1}{n}\, u v^\top = \frac{u \otimes v}{n}.
+$$
+
+Then $Ax = u\,\frac{v^\top x}{n}$, and when the next input $x$ is correlated with $v$ (it usually
+is: $x$ and $v$ are both activations of the same layer), $v^\top x/n \to \mathbb E[Z^v Z^x] \ne 0$
+by the LLN. So $Ax \approx c\, u$ with $c = \mathbb E[Z^v Z^x]$, which has $\Theta(1)$-coordinates
+distributed like $Z^u\,\mathbb E[Z^vZ^x]$. **Entries of size $1/n$, not $1/\sqrt n$, are right
+for an update**, because the sum is LLN-like. For a sum of $k$ outer products,
+$Z^{Ax} = \sum_i Z^{u_i}\,\mathbb E[Z^{v_i} Z^x]$.<Sidenote>Footnote 29 of the paper: if $x$ happens to be uncorrelated with $v$, then $v^\top x = \Theta(\sqrt n)$ and $Ax$ is only $\Theta(1/\sqrt n)$. This corner case doesn't come up in training.</Sidenote>
+
+**A nonlinear tensor product matrix** (an Adam update). Adam divides the gradient by the root of a
+running average of its square, coordinatewise. After $k$ steps with outer-product gradients
+$u^i \otimes v^i$, the update has entries
+
+$$
+A_{\alpha\beta} = \frac{\sum_i \gamma_i\, u^i_\alpha v^i_\beta}{\sqrt{\sum_i \omega_i\,(u^i_\alpha v^i_\beta)^2}}
+=: \psi(u^1_\alpha, \dots, u^k_\alpha, v^1_\beta, \dots, v^k_\beta),
+$$
+
+where $\gamma_i, \omega_i$ are the moving-average weights (ignoring $\epsilon$ and bias correction).
+A matrix whose $(\alpha, \beta)$ entry is a fixed function of $\alpha$-indexed and $\beta$-indexed
+vectors is a **nonlinear tensor product matrix**; the SGD case is $\psi = n^{-1}\sum_i u^i_\alpha v^i_\beta$.
+Note that the Adam entries are $\Theta(1)$ whatever the gradient's size: the normalization removes
+the scale. Suppose $\psi = n^{-1}\bar\psi$ with $\bar\psi$ independent of $n$ (a learning rate
+$1/n$). Then by the LLN
+
+$$
+\begin{aligned}
+(Ax)_\alpha &= \frac1n \sum_{\beta=1}^n \bar\psi(u^1_\alpha, \dots, u^k_\alpha, v^1_\beta, \dots, v^k_\beta)\, x_\beta \\
+&\approx \mathbb E\big[\bar\psi(u^1_\alpha, \dots, u^k_\alpha, Z^{v^1}, \dots, Z^{v^k})\, Z^x\big]
+=: \Psi(u^1_\alpha, \dots, u^k_\alpha).
+\end{aligned}
+$$
+
+So $Ax$ has $\Theta(1)$-coordinates distributed as $Z^{Ax} = \Psi(Z^{u^1}, \dots, Z^{u^k})$. With
+SGD's $\bar\psi = u_\alpha v_\beta$ this gives $\Psi(z) = z\,\mathbb E[Z^v Z^x]$, the previous
+result. Again entries $\Theta(1/n)$ are the unique right size, so **Adam's learning rate for a
+hidden weight must scale like $1/n$**.
+
+**A vector** (the readout layer). If $A \in \mathbb R^{1 \times n}$ is correlated with $v$, then
+$Av$ is one LLN sum, $\Theta(n)$. Entries must be $\Theta(1/n)$.
+
+Table 14 of the paper summarizes the three cases for entries of size $\Theta(1)$:
+
+| $A$ | Gaussian $n \times n$ | (nonlinear) tensor product $n \times n$ | vector $1 \times n$ |
+| --- | ---: | ---: | ---: |
+| Entry size of $Av$ | $\Theta(\sqrt n)$ | $\Theta(n)$ | $\Theta(n)$ |
+
+We checked each case numerically, with $\Theta(1)$ entries and $v$ correlated with $A$ where it
+matters: a Gaussian $A$ with independent $v$ and with $v = \text{relu}(A^\top \mathbf 1/\sqrt n)$;
+a tensor product $u w^\top$ with $x = \tanh(w) + w/2$; the one-step Adam update
+$\text{sign}(u_\alpha w_\beta)$ with $x = w$; and the vector $w^\top$ with the same $x$.
+
+<LineChart
+	x={() => av.widths.map(log2)}
+	series={[
+		{ name: "Gaussian, v independent", fn: lookup(av.widths.map(log2), av.rms.gaussian.map(log2)) },
+		{ name: "Gaussian, v correlated", fn: lookup(av.widths.map(log2), av.rms.gaussian_corr.map(log2)) },
+		{ name: "tensor product (SGD)", fn: lookup(av.widths.map(log2), av.rms.tensor.map(log2)) },
+		{ name: "sign tensor product (Adam)", fn: lookup(av.widths.map(log2), av.rms.adam.map(log2)) },
+		{ name: "vector", fn: lookup(av.widths.map(log2), av.rms.vector.map(log2)) },
+	]}
+	title="log₂ RMS entry of Av for A with Θ(1) entries"
+	xLabel="log₂ n"
+	yLabel="log₂ RMS (Av)"
+	height={300}
+/>
+
+The fitted slopes are $0.51$ and $0.50$ for the Gaussian cases and $0.98$, $0.99$, $0.98$ for the
+other three: exactly the $\sqrt n$ versus $n$ of Table 14. The constants match the LLN too. For
+the Adam case $(Sw)_\alpha = \text{sign}(u_\alpha)\sum_\beta |w_\beta| \approx n\,\mathbb E|Z| = 0.798\,n$,
+which predicts $6536$ at $n = 8192$; the simulation gives $6506$. For the Gaussian case, $\sqrt{8192} = 90.5$,
+and the simulation gives $90.5$.
+
+#### The desiderata
+
+Appendix J.2 asks three things of a parametrization, at any fixed time during training as
+$n \to \infty$:
+
+1. **Every (pre)activation vector has $\Theta(1)$-coordinates.** If they grew or shrank with $n$,
+   a wide network would leave the floating-point range (acute in fp16 and bf16), and a nonlinearity
+   such as tanh would be either linear ($o(1)$ inputs) or saturated ($\omega(1)$ inputs).
+2. **The output is $O(1)$**, for the same reasons applied to the loss. Combined with 3, it is
+   $\Theta(1)$ after training, though it may vanish at initialization.
+3. **Every parameter is updated as much as possible without causing divergence.** This is
+   **maximal feature learning**: each layer contributes to the limit. It also guarantees that each
+   layer's learning rate *matters* in the limit, so that it plays the same role at width 256 and at
+   width 8192. A layer frozen at initialization in the limit would have a learning rate that does
+   nothing at infinite width but something at finite width, and its optimum could not transfer.
+
+### Deriving the table, layer by layer
+
+Take every hidden width equal to $n$. Desideratum 1 says the input $x$ to each layer has
+$\Theta(1)$-coordinates. We need two facts about gradients first.
+
+*The backward signal has $\Theta(1/n)$-coordinates.* The gradient of the output with respect to
+the last hidden activation is $\partial f/\partial x^L = (W^{L+1})^\top$, whose entries we are
+about to make $\Theta(1/n)$. Backpropagating through a hidden layer multiplies by
+$(W^l)^\top$, a Gaussian matrix with $1/\sqrt n$ entries (plus an update), which preserves
+coordinate size, and by $\phi'$, which is $\Theta(1)$. So $\partial f/\partial h^l$ has
+$\Theta(1/n)$-coordinates for every layer.
+
+*A weight's gradient is an outer product.* For $h = Wx$, $\nabla_W f = (\partial f/\partial h)\,x^\top$.
+
+Now each column of the table:
+
+**Output weights** $W \in \mathbb R^{1 \times n}$ (or $d_\text{out} \times n$). The output $Wx$ is a
+vector case: after training $x$ is correlated with $W$, so we need $W$ to have $\Theta(1/n)$
+entries, both at initialization and in its updates. Initialization: variance $\Theta(1/n^2)$.
+The gradient is $\chi\,x^\top$ with $\Theta(1)$ entries, so the SGD learning rate is $\Theta(1/n)$.
+Adam's normalized update has $\Theta(1)$ entries, so Adam's learning rate is also $\Theta(1/n)$.
+
+**Hidden weights** $W \in \mathbb R^{n \times n}$. Initialization is a Gaussian matrix:
+entries $\Theta(1/\sqrt n)$, variance $1/n$. The update is a (nonlinear) tensor product and needs
+$\Theta(1/n)$ entries, so that $(W_0 + \Delta W)x$ stays $\Theta(1)$. For SGD the gradient
+$(\partial f/\partial h)x^\top$ already has $\Theta(1/n)\cdot\Theta(1) = \Theta(1/n)$ entries, so the
+learning rate is $\Theta(1)$. For Adam the update has $\Theta(1)$ entries, so the learning rate is
+$\Theta(1/n)$.
+
+**Input weights** $W \in \mathbb R^{n \times d}$, $d$ fixed. Here $W\xi$ sums over the *finite*
+dimension $d$, so there is no LLN or CLT growth and $W$ itself needs $\Theta(1)$ entries:
+initialization variance $\Theta(1)$, which is $1/\text{fan\_in}$ because $\text{fan\_in} = d$ is a
+constant. The update also needs $\Theta(1)$ entries. The gradient $(\partial f/\partial h)\xi^\top$ has
+$\Theta(1/n)$ entries, so SGD needs learning rate $\Theta(n)$; Adam's update is already $\Theta(1)$,
+so Adam's learning rate is $\Theta(1)$.
+
+**Biases** are input weights whose input is the constant 1, and follow the same column.
+
+This reproduces every entry of the table, and explains the differences from SP. SP initializes
+the output layer at $1/\sqrt n$ (CLT thinking, right only at initialization), and gives every layer
+the same learning rate, which is $n$ times too large for Adam's hidden and output weights and,
+for SGD, $n$ times too small for the input layer and $n$ times too large for the output layer.
+
+#### Attention: $1/d$ instead of $1/\sqrt d$
+
+The attention logit $q^\top k$ is a sum over $d = d_\text{head}$ coordinates. At initialization
+$q = W_q x$ and $k = W_k x$ are nearly independent with zero mean, so $q^\top k = \Theta(\sqrt d)$ by
+the CLT, which is why the original Transformer divides by $\sqrt d$. But training makes $q$ and $k$
+correlated: that is what it means for a head to learn to attend. Then $q^\top k = \Theta(d)$ by the
+LLN, and $q^\top k/\sqrt d$ grows like $\sqrt d$. Dividing by $d$ keeps the trained logit
+$\Theta(1)$ (this is also the "infinite dimension to finite dimension" rule for output weights,
+since an attention logit maps $\mathbb R^{d}$ to a scalar). Fig. 5 of the paper shows the attention
+logits of an SP Transformer blowing up with width after one Adam step, and staying flat in μP.
+
+The same argument covers growing the *number* of heads with $d_\text{head}$ fixed: viewing keys,
+queries and values across all heads, attention acts coordinatewise along the head dimension, like a
+nonlinearity, so the rules above apply unchanged.
+
+### Lemma J.1: one network, three tables
+
+The paper gives three equivalent tables: Table 3 above, Table 8 (used by the `mup` package) and
+Table 9 (the style of Tensor Programs IV). They are equivalent because of a symmetry.
+
+**Lemma J.1.** Consider a weight tensor $W$ that enters the network as $A\,W$ (multiplier $A$), is
+initialized as $W \sim \mathcal N(0, B^2)$, and is trained with learning rate $C$. Let $f_t(\xi)$ be
+the network's output after $t$ steps on any fixed sequence of batches. For every $\theta > 0$,
+$f_t(\xi)$ is unchanged for all $t$ and $\xi$ if we replace
+
+- with SGD: $A \to A\theta,\; B \to B/\theta,\; C \to C/\theta^2$;
+- with Adam: $A \to A\theta,\; B \to B/\theta,\; C \to C/\theta$.
+
+*Proof.* The network only ever sees the **effective weight** $\widetilde W = A W$. It suffices to
+show that the trajectory of $\widetilde W$ is unchanged.
+
+At initialization $\widetilde W_0 = A W_0 \sim \mathcal N(0, A^2 B^2)$, which depends only on the
+product $AB$, and $AB$ is invariant: $(A\theta)(B/\theta) = AB$. (Using the same random draw,
+$\widetilde W_0$ is literally the same matrix.)
+
+By the chain rule the gradient with respect to $W$ is $A$ times the gradient with respect to
+$\widetilde W$: writing $g_t = \nabla_{\widetilde W} L$, we have $\nabla_W L = A\,g_t$.
+
+*SGD.* $W_{t+1} = W_t - C A g_t$, so $\widetilde W_{t+1} = \widetilde W_t - C A^2 g_t$. The update
+depends only on $CA^2$, and $(C/\theta^2)(A\theta)^2 = CA^2$.
+
+*Adam.* The update is $W_{t+1} = W_t - C\, m_t/\sqrt{v_t}$, where $m_t$ and $v_t$ are moving averages
+of $\nabla_W L = A g_t$ and of its square. Scaling every gradient by $A > 0$ scales $m_t$ by $A$ and
+$\sqrt{v_t}$ by $A$, so $m_t/\sqrt{v_t}$ is the same as for the gradients $g_t$; call it $u_t$. Then
+$\widetilde W_{t+1} = \widetilde W_t - C A\, u_t$, which depends only on $CA$, and
+$(C/\theta)(A\theta) = CA$.
+
+In both cases $\widetilde W_0$ and every update of $\widetilde W$ are the same, and since $g_t$
+depends only on the effective weights, induction on $t$ shows the whole trajectory, and so
+$f_t$, is the same. $\blacksquare$
+
+Two remarks. The Adam case assumes $\epsilon$ is negligible; if not, $\epsilon$ must be scaled
+by $\theta$ too, since it is added to the gradient's scale. And the Lemma is why a parameter
+multiplier is not the same as an initialization: changing only $B$ (or only $A$) changes the
+trajectory.
+
+We checked the Lemma on a 3-input, width-64 ReLU network: scaling the hidden weight's
+$(A, B, C)$ with $\theta = 0.1$ and $\theta = 8$ changed the outputs over 20 steps by at most
+$2 \times 10^{-16}$ (SGD) and $2 \times 10^{-15}$ (Adam with $\epsilon \to \epsilon\theta$), in
+float64.
+
+*Deriving Table 8 from Table 3.* For an output weight, Table 3 has multiplier $A = 1$, init standard
+deviation $B = 1/\text{fan\_in}$, learning rate $C = \eta/\text{fan\_in}$. Apply the Lemma with
+$\theta = 1/\text{fan\_in}$: $A = 1/\text{fan\_in}$, $B = 1$, and $C = \eta\,\text{fan\_in}$ for SGD,
+$C = \eta$ for Adam. With $\theta = 1/\sqrt{\text{fan\_in}}$ instead: $A = 1/\sqrt{\text{fan\_in}}$,
+$B^2 = 1/\text{fan\_in}$, $C = \eta$ for SGD and $\eta/\sqrt{\text{fan\_in}}$ for Adam, which is
+Table 9. For an input weight (Table 3: $A = 1$, $B^2 = 1/\text{fan\_in}$ a constant, SGD
+$C = \eta\,\text{fan\_out}$, Adam $C = \eta$), $\theta = \sqrt{\text{fan\_out}}$ gives Table 9's
+multiplier $\sqrt{\text{fan\_out}}$, variance $1/\text{fan\_out}$, SGD learning rate $\eta$ and Adam
+learning rate $\eta/\sqrt{\text{fan\_out}}$. The resulting tables:
+
+| Table 8 (`mup` package) | Input weights and biases | Output weights | Hidden weights |
+| --- | --- | --- | --- |
+| Init. variance | $1/\text{fan\_in}$ | $1$ | $1/\text{fan\_in}$ |
+| Multiplier | $1$ | $1/\text{fan\_in}$ | $1$ |
+| SGD LR | $\text{fan\_out}$ | $\text{fan\_in}$ | $1$ |
+| Adam LR | $1$ | $1$ | $1/\text{fan\_in}$ |
+
+| Table 9 (Tensor Programs IV style) | Input weights and biases | Output weights | Hidden weights |
+| --- | --- | --- | --- |
+| Init. variance | $1/\text{fan\_out}$ | $1/\text{fan\_in}$ | $1/\text{fan\_in}$ |
+| Multiplier | $\sqrt{\text{fan\_out}}$ | $1/\sqrt{\text{fan\_in}}$ | $1$ |
+| SGD LR | $1$ | $1$ | $1$ |
+| Adam LR | $1/\sqrt{\text{fan\_out}}$ | $1/\sqrt{\text{fan\_in}}$ | $1/\text{fan\_in}$ |
+
+Table 8 has a practical advantage: every vector-like parameter (input weights, output weights,
+biases) gets the *same* init and Adam learning rate, so the input embedding and the output
+unembedding can be **tied** (share one matrix), as most language models do. Its output multiplier
+$1/\text{fan\_in}$ reads as a general rule: any weight that maps an infinite dimension to a finite
+one gets a $1/\text{fan\_in}$ multiplier, which covers both the output logits and the $1/d$ attention.
+
+#### Different widths in different layers
+
+So far all hidden widths were $n$. In a Transformer, $d_\text{model}$, $d_\text{ffn}$, $d_\text{head}$
+and $n_\text{head}$ can all play the role of width (Appendix E.2). The rule is to replace $n$ by
+**fan-in** for output and hidden weights (this preserves the forward pass) and by **fan-out** for
+input weights. With Adam, if every layer's width goes to infinity, this keeps the coordinate
+distribution of every activation the same whatever the ratios between widths, so one can tune with
+$d_\text{ffn} = d_\text{model}$ and transfer to $d_\text{ffn} = 4 d_\text{model}$ (the paper's Fig. 12
+varies $d_\text{ffn}/d_\text{model}$ from 0.5 to 16 and the best learning rate does not move). With
+SGD the ratios change gradient sizes layer by layer, so the scaling is more involved. A convolution
+with kernel $s_1 \times s_2$ is just $s_1 s_2 = \Theta(1)$ dense weights of shape
+$\text{fan\_out} \times \text{fan\_in}$, and follows the same rules.
+
+## The infinite-width theory: Tensor Programs IV
+
+The paper leans on its predecessor, *Feature Learning in Infinite-Width Neural Networks* (Yang and
+Hu, 2021, "Tensor Programs IV"), for the claim that μP is *the* right parametrization. Appendix J.3
+uses its main theorem. Here is that theory for an MLP trained with SGD.
+
+### abc-parametrizations
+
+Take an MLP with $L$ hidden layers of width $n$:
+
+$$
+h^1 = W^1\xi,\quad x^l = \phi(h^l),\quad h^{l+1} = W^{l+1}x^l\;(l < L),\quad f(\xi) = W^{L+1}x^L.
+$$
+
+An **abc-parametrization** is a set of numbers $\{a_l, b_l\}_{l=1}^{L+1} \cup \{c\}$ such that
+
+$$
+W^l = n^{-a_l}\, w^l,\qquad w^l_{\alpha\beta} \sim \mathcal N(0, n^{-2b_l}),\qquad
+\text{and SGD trains } w^l \text{ with learning rate } \eta\, n^{-c}.
+$$
+
+So $a_l$ is the parameter multiplier, $b_l$ the initialization and $c$ the learning rate, all as
+powers of the width. The effective weight $W^l$ has initial variance $n^{-2(a_l + b_l)}$ and, since
+its gradient with respect to $w^l$ carries a factor $n^{-a_l}$, its effective SGD learning rate is
+$\eta\, n^{-(2a_l + c)}$. Some named examples (Table 1 of Tensor Programs IV):
+
+| | $a_l$ | $b_l$ | $c$ |
+| --- | --- | --- | ---: |
+| SP | $0$ | $0$ for $l = 1$, $\tfrac12$ otherwise | $0$ or $1$ |
+| NTK parametrization (NTP) | $0$ for $l = 1$, $\tfrac12$ otherwise | $0$ | $0$ |
+| Mean field ($L = 1$) | $0$, then $1$ | $0$ | $-1$ |
+| μP | $-\tfrac12$, then $0$, then $\tfrac12$ (input, hidden, output) | $\tfrac12$ | $0$ |
+
+For μP the effective init variances are $n^0, n^{-1}, n^{-2}$ and the effective SGD learning rates
+$n^{1}, n^{0}, n^{-1}$ for input, hidden and output weights: exactly Table 3.
+
+**The symmetry.** Shifting $a_l \to a_l + \theta$, $b_l \to b_l - \theta$ for every layer and
+$c \to c - 2\theta$ changes nothing (eq. 5 of Tensor Programs IV). This is Lemma J.1 for SGD with
+$A = n^{-a}$, $B = n^{-b}$, $C = n^{-c}$. So abc-parametrizations really form equivalence classes,
+and below only quantities invariant under the shift appear: $a_l + b_l$, $2a_l + c$, and $r$.
+
+### Stability: Theorem 3.3
+
+A parametrization is **stable** if, as $n \to \infty$, the activations $h^l, x^l$ have
+$\Theta(1)$-coordinates at initialization, and all activations and the output stay $O(1)$
+throughout training. Define
+
+$$
+r := \min\big(a_{L+1} + b_{L+1},\; 2a_{L+1} + c\big) + c - 1 + \min_{l=1}^{L}\big[2a_l + \mathbb 1(l = 1)\big].
+$$
+
+Intuitively, $\Delta x^L_t$, the change in the last layer's features, has
+$\Theta(n^{-r})$-coordinates.
+
+**Theorem 3.3 (stability).** An abc-parametrization is stable if and only if
+
+1. $a_1 + b_1 = 0$; $a_l + b_l = \tfrac12$ for $2 \le l \le L$; $a_{L+1} + b_{L+1} \ge \tfrac12$
+   (activations $\Theta(1)$ and output $O(1)$ at initialization);
+2. $r \ge 0$ (features don't blow up during training);
+3. $2a_{L+1} + c \ge 1$ and $a_{L+1} + b_{L+1} + r \ge 1$ (the output doesn't blow up during training).
+
+Each condition is one of the size calculations we have already done.
+
+*Condition 1.* $h^1 = W^1\xi$ is a finite sum, so its coordinates have the size of $W^1$'s entries,
+$n^{-(a_1+b_1)}$; this must be $n^0$. For $l \ge 2$, $h^l = W^l x^{l-1}$ is a CLT sum of $n$ terms
+of size $n^{-(a_l + b_l)}$, giving $n^{1/2 - (a_l + b_l)}$; this must be $n^0$. The output is the
+same CLT sum but only needs to be $O(1)$, hence $\ge$.
+
+*Condition 2 (where $r$ comes from).* Consider one SGD step on a hidden layer $l$. The chain rule
+gives $\nabla_{w^l} f = n^{-a_l}\,\partial f/\partial h^l\, x^\top$, so the effective weight changes by
+$\delta W^l = -\eta\, n^{-c}\, n^{-2a_l}\,\chi\, (\partial f/\partial h^l)\, x^\top$. On the next forward
+pass it contributes
+
+$$
+\delta W^l\,\bar x = -\eta\, n^{1 - c - 2a_l}\,\chi\,\frac{x^\top \bar x}{n}\,\frac{\partial f}{\partial h^l},
+$$
+
+where $x^\top\bar x/n \to$ a nonzero constant by the LLN ($x$ and the new input $\bar x$ are
+correlated). The backward signal $\partial f/\partial h^l$ has the size of the last layer's weights,
+which is $n^{-(a_{L+1}+b_{L+1})}$ from initialization plus $n^{-(2a_{L+1}+c)}$ from its updates. So
+$\delta W^l \bar x$ has coordinates of size $n^{-r_l}$ with
+
+$$
+r_l = \min\big(a_{L+1} + b_{L+1},\; 2a_{L+1} + c\big) + c - 1 + 2a_l.
+$$
+
+For $l = 1$ the input is $\xi$ and $\xi^\top\bar\xi$ is a finite sum with no factor $n$, which adds
+$+1$: the $\mathbb 1(l = 1)$. A change in layer $l$ propagates forward, so the last layer's features
+change by the largest contribution, $n^{-\min_l r_l} = n^{-r}$. Stability needs $r \ge 0$.
+
+*Condition 3.* The output changes by $\Delta W^{L+1} x^L + W^{L+1}_0 \Delta x^L$ (plus a smaller cross
+term). The first: $\Delta W^{L+1} = -\eta n^{-c-2a_{L+1}}\chi\, x^\top$, so
+$\Delta W^{L+1}x^L = -\eta n^{-c-2a_{L+1}}\chi\, x^\top x$, an LLN sum of size
+$n^{1 - (2a_{L+1} + c)}$. The second: $W_0^{L+1}$ has entries $n^{-(a_{L+1}+b_{L+1})}$, $\Delta x^L$
+has entries $n^{-r}$, and they are correlated (the update of the features is driven by
+$W_0^{L+1}$ through backpropagation), so this is also an LLN sum, of size
+$n^{1 - (a_{L+1}+b_{L+1}) - r}$. Both must be $O(1)$. $\blacksquare$ (heuristically; the rigorous proof
+is Theorem H.6 of Tensor Programs IV.)
+
+Condition 3 is our two-weight example in general form. SP with a constant learning rate has
+$2a_{L+1} + c = 0$, so the output change grows like $n^{1}$, the slope $1.02$ we measured.
+
+### Nontrivial, feature learning or kernel: the Dynamical Dichotomy
+
+A stable parametrization can still be useless: the output might not move at all in the limit. It
+is **nontrivial** if it does.
+
+**Theorem 3.4.** A stable abc-parametrization is nontrivial if and only if
+$a_{L+1} + b_{L+1} + r = 1$ or $2a_{L+1} + c = 1$.
+
+That is, one of the two terms of condition 3 must sit exactly at $\Theta(1)$.
+
+A parametrization **admits feature learning** if $\Delta x^L_t(\xi)$ has $\Omega(1)$-coordinates for
+some training routine, time $t \ge 1$ and input $\xi$: the representation itself changes. It is in
+the **kernel regime** if there is a fixed kernel $K$ such that in the limit, for every training
+routine,
+
+$$
+f_{t+1}(\xi) = f_t(\xi) - \eta\, K(\xi, \xi_t)\, \mathcal L'(f_t(\xi_t), y_t),
+$$
+
+that is, training reduces to kernel gradient descent with a kernel fixed at initialization (the
+**neural tangent kernel**, NTK, in the case of NTP).
+
+**Theorem 3.6.** A nontrivial stable abc-parametrization admits feature learning iff $r = 0$
+(iff it evolves the feature kernel $x^\top x'/n$).
+
+**Theorem 3.8.** A nontrivial stable abc-parametrization is in the kernel regime iff $r > 0$.
+
+Since stability forces $r \ge 0$, one of the two always holds, and they cannot both hold:
+
+**Corollary 3.9 (Dynamical Dichotomy).** A nontrivial stable abc-parametrization either admits
+feature learning or is in the kernel regime, but not both.
+
+This is not obvious, because "kernel regime" is not *defined* as "no feature learning". The
+intuition: if $r > 0$ the features move by $n^{-r} \to 0$, so the output is a first-order Taylor
+expansion around initialization, linear in the gradient, which is kernel gradient descent. If
+$r = 0$ the features move by $\Theta(1)$ and pass through a nonlinearity, so the change of $f$ is no
+longer linear in the loss derivative and no kernel can describe it.<Sidenote>The theorems assume $\phi$ is tanh or a smooth approximation of relu (Assumption 3.1). For a linear network the dichotomy fails: a one-hidden-layer linear net where only the first layer is trained both learns features and is in the kernel regime.</Sidenote>
+
+**Corollary 3.10.** In any nontrivial stable feature-learning parametrization, $f_0(\xi) \to 0$.
+*Proof.* Feature learning means $r = 0$. Stability condition 3 then gives
+$a_{L+1} + b_{L+1} \ge 1$, so the CLT size of the initial output is
+$n^{1/2 - (a_{L+1} + b_{L+1})} \le n^{-1/2} \to 0$. $\blacksquare$
+
+This is the vanishing $V^\top U$ we saw in the two-weight example, and the reason for Appendix
+D.2's advice to initialize the output layer at zero: the limit has $f_0 = 0$, so a small proxy
+model gets closer to the limit if its $f_0$ is exactly 0.
+
+### Why μP is "maximal": Theorem 5.6
+
+**Proposition 5.3.** In a stable parametrization, hidden or input layer $l$ is **updated
+maximally** ($\Delta W^l_t x^{l-1}_t$ has $\Theta(1)$-coordinates) iff $r_l = 0$.
+
+**Proposition 5.5.** The output layer is updated maximally ($\Delta W^{L+1}_t x^L_t = \Theta(1)$)
+iff $2a_{L+1} + c = 1$, and initialized maximally ($W^{L+1}_0\Delta x^L_t = \Theta(1)$) iff
+$a_{L+1} + b_{L+1} + r = 1$.
+
+**Theorem 5.6.** In μP every $W^l$ is updated maximally and $W^{L+1}$ is also initialized
+maximally. μP is the unique stable abc-parametrization with this property.
+
+*Proof of uniqueness* (up to the symmetry). Use the symmetry to set $c = 0$. Output updated
+maximally: $2a_{L+1} = 1$, so $a_{L+1} = \tfrac12$. All $r_l = 0$ means $r = 0$, and output
+initialized maximally means $a_{L+1} + b_{L+1} = 1$, so $b_{L+1} = \tfrac12$. Then the min in $r_l$
+is $\min(1, 1) = 1$ and $r_l = 1 + 0 - 1 + 2a_l + \mathbb 1(l=1) = 2a_l + \mathbb 1(l=1)$. Setting
+$r_l = 0$ gives $a_1 = -\tfrac12$ and $a_l = 0$ for $2 \le l \le L$. Stability condition 1 then fixes
+$b_1 = \tfrac12$ and $b_l = \tfrac12$. That is μP. Conversely, plugging these values in gives
+$r_l = 0$ for all $l$, $2a_{L+1} + c = 1$ and $a_{L+1} + b_{L+1} + r = 1$. $\blacksquare$
+
+The explorer below computes all of this for any choice of exponents. Each row of the number line
+is one quantity from the stability theorem; its exponent $e$ means the quantity scales as $n^e$.
+Start from μP and note that every dot sits on the dashed zero line. Then click "SP, LR Θ(1)":
+the output change $\Delta W^{L+1}x^L$ jumps to $+1$ and the features to $+1$, so the network is
+unstable. Click "SP, LR Θ(1/n)": everything is stable but $\Delta x^L$ falls to $-\tfrac12$, the
+kernel regime. "NTP" lands in the same place. Try the symmetry buttons: the exponents change but
+no verdict does.
+
+<AbcExplorer preset="mup" />
+
+### What the infinite-width limit looks like
+
+The theory doesn't just classify; it computes the limit. For a one-hidden-layer μP network
+$f(\xi) = V\phi(U\xi)$ (Section 6.1 of Tensor Programs IV) the initial coordinates of $U$ and of
+$nV$ are independent standard Gaussians $Z^{U_0}, Z^{nV_0}$. Each SGD step updates *every*
+coordinate by the same deterministic formula applied to that coordinate's own random variables,
+so the whole width-$n$ network becomes, in the limit, a pair of random variables evolving in
+time:
+
+$$
+\mathring f_t(\xi) = \mathbb E\big[Z^{nV_t}\, \phi(\xi Z^{U_t})\big],\qquad
+\mathring\chi_t = \mathcal L'(\mathring f_t(\xi_t), y_t),
+$$
+
+$$
+Z^{nV_{t+1}} = Z^{nV_t} - \eta\mathring\chi_t\,\phi(\xi_t Z^{U_t}),\qquad
+Z^{U_{t+1}} = Z^{U_t} - \eta\mathring\chi_t\,\xi_t\, Z^{nV_t}\phi'(\xi_t Z^{U_t}).
+$$
+
+This is **Theorem 6.1**: $f_t(\xi) \to \mathring f_t(\xi)$ almost surely. The expectation comes from
+the LLN in $f = \frac1n\sum_\alpha (nV)_\alpha x_\alpha$, and the loss derivative becomes deterministic
+because $f$ does. Note $\mathring f_0 = \mathbb E[Z^{nV_0}]\,\mathbb E[\phi(\xi Z^{U_0})] = 0$, as Corollary 3.10
+requires.
+
+For a linear network ($\phi = \text{id}$) the random variables stay linear combinations of the
+two initial Gaussians: $Z^{nV_t} = A_t Z^{nV_0} + B_t Z^{U_0}$ and $Z^{U_t} = C_t Z^{nV_0} + D_t Z^{U_0}$.
+Since $\mathbb E[Z^{nV_0}Z^{U_0}] = 0$ and both have variance 1, the whole infinite network reduces to
+four numbers (**Corollary 6.2**):
+
+$$
+\mathring f_t(\xi) = (A_tC_t + B_tD_t)\,\xi,\quad
+(A,B)_{t+1} = (A,B)_t - \eta\mathring\chi_t\xi_t\,(C,D)_t,\quad
+(C,D)_{t+1} = (C,D)_t - \eta\mathring\chi_t\xi_t\,(A,B)_t,
+$$
+
+starting from $A_0 = D_0 = 1$, $B_0 = C_0 = 0$.
+
+A worked example. Train on alternating examples $(\xi, y) = (1, 2)$ and $(-1, -1)$ (no linear
+function fits both) with $\eta = 0.1$ and squared loss, so $\mathring\chi_t = \mathring f_t(\xi_t) - y_t$. At
+$t = 0$: $\mathring f_0 = 0$, $\mathring\chi_0 = 0 - 2 = -2$, so $\eta\mathring\chi_0\xi_0 = -0.2$ and
+$(A, B)_1 = (1, 0) + 0.2\,(0, 1) = (1, 0.2)$, $(C, D)_1 = (0, 1) + 0.2\,(1, 0) = (0.2, 1)$. Then
+$\mathring f_1(1) = 1 \cdot 0.2 + 0.2 \cdot 1 = 0.4$. The chart compares the limit with actual finite
+networks in μP (one random draw each, SGD with $\eta_U = \eta n$, $\eta_V = \eta/n$), evaluated at
+$\xi = 1$:
+
+<LineChart
+	x={() => Array.from({ length: limit.T + 1 }, (_, t) => t)}
+	series={[
+		{ name: "limit (Corollary 6.2)", fn: (t) => limit.fLimit[t] },
+		{ name: "width 16", fn: (t) => limit.fFinite["16"][t] },
+		{ name: "width 256", fn: (t) => limit.fFinite["256"][t] },
+		{ name: "width 4096", fn: (t) => limit.fFinite["4096"][t] },
+	]}
+	title="f_t(1) of a 1-hidden-layer linear μP network vs its infinite-width limit"
+	xLabel="SGD step t"
+	yLabel="f_t(1)"
+	height={280}
+/>
+
+The finite networks track the limit closely, and the gap shrinks like $1/\sqrt n$: averaged over
+100 draws, the largest deviation over 30 steps is $0.257$ at width 16, $0.123$ at 64, $0.058$ at
+256, $0.030$ at 1024, $0.016$ at 4096 and $0.0077$ at 16384, a fitted slope of $n^{-0.50}$. The
+limit is not a kernel method: $\mathring f_{t+1} - \mathring f_t$ is quadratic in $\eta$ because both layers
+move.
+
+### The rigorous machinery: Tensor Programs and the Master Theorem
+
+Every heuristic so far ("coordinates look iid", "replace $u^\top v/n$ by $\mathbb E[Z^uZ^v]$") is made
+rigorous by one theorem. Section 7 of Tensor Programs IV observes that the computation of SGD
+training, forward and backward passes included, uses only three instructions on width-$n$ vectors:
+
+- **MatMul**: multiply a vector by a Gaussian matrix $W$ or by its transpose, $Wx$ or $W^\top x$;
+- **Nonlin**: apply a function coordinatewise, $\phi(x^1, \dots, x^k; \theta_1, \dots, \theta_l)$, possibly
+  using earlier scalars $\theta_i$ (such as the loss derivative $\chi_t$);
+- **Moment**: average over coordinates to get a scalar, $\frac1n\sum_\alpha \phi(x^1_\alpha, \dots, x^k_\alpha)$
+  (such as the output $f = \frac1n\sum_\alpha (nV)_\alpha x_\alpha$).
+
+A sequence of such instructions is a **Tensor Program**. Each weight matrix starts with
+$W_{\alpha\beta} \sim \mathcal N(0, \sigma_W^2/n)$ and each initial vector with iid coordinates. The
+framework then assigns to every vector $h$ a random variable $Z^h$ and to every scalar $\theta$ a
+number $\mathring\theta$, by rules that mirror the instructions:
+
+- **ZNonlin**: $Z^{\phi(x^1, \dots, x^k; \theta)} = \phi(Z^{x^1}, \dots, Z^{x^k}; \mathring\theta)$.
+- **ZMoment**: $\mathring\theta = \mathbb E\, \phi(Z^{x^1}, \dots, Z^{x^k}; \mathring\theta_1, \dots)$.
+- **ZMatMul**: $Z^{Wx} = \hat Z^{Wx} + \dot Z^{Wx}$, a Gaussian part plus a correction.
+  - $\hat Z^{Wx}$ is a zero-mean Gaussian, jointly Gaussian over all vectors multiplied by the
+    same $W$, with $\text{Cov}(\hat Z^{Wx}, \hat Z^{Wy}) = \sigma_W^2\,\mathbb E[Z^xZ^y]$. This is the CLT.
+  - $\dot Z^{Wx}$ accounts for $x$ having been computed using $W^\top$. Write $Z^x$ as a function
+    of the Gaussians $\hat Z^{W^\top y_i}$ it was built from; then
+    $\dot Z^{Wx} = \sigma_W^2 \sum_i Z^{y_i}\, \mathbb E\big[\partial Z^x / \partial \hat Z^{W^\top y_i}\big]$.
+    This is the correlation effect.
+
+**Theorem 7.4 (Master Theorem).** Under mild regularity (pseudo-Lipschitz nonlinearities), for any
+vectors $h^1, \dots, h^k$ in the program and any pseudo-Lipschitz $\psi$,
+
+$$
+\frac1n \sum_{\alpha=1}^n \psi(h^1_\alpha, \dots, h^k_\alpha) \;\xrightarrow{\text{a.s.}}\; \mathbb E\,\psi(Z^{h^1}, \dots, Z^{h^k}),
+$$
+
+and every scalar $\theta$ converges almost surely to $\mathring\theta$.
+
+In words: the coordinates of all vectors in the program behave like iid copies of the
+$Z$'s, and all scalars, including the network output and the loss, become deterministic.
+Theorem 6.1 above is this theorem applied to the program of a one-hidden-layer network.
+
+The ZMatMul rule explains the $AA^\top\mathbf 1$ example of Appendix J exactly. With $\sigma_A^2 = 1$,
+let $x = A^\top\mathbf 1$; then $Z^x = \hat Z^{A^\top \mathbf 1}$ is a standard Gaussian (its variance is
+$\mathbb E[(Z^{\mathbf 1})^2] = 1$). For $Ax$: the Gaussian part $\hat Z^{Ax}$ has variance
+$\mathbb E[(Z^x)^2] = 1$, and the correction is
+$\dot Z^{Ax} = Z^{\mathbf 1}\,\mathbb E[\partial Z^x/\partial \hat Z^{A^\top\mathbf 1}] = 1 \cdot 1 = 1$. So
+$Z^{AA^\top\mathbf 1} = \mathcal N(0, 1) + 1$, the $\mathcal N(1, 1)$ we derived by hand and simulated.
+The $\hat Z$ part is the CLT term; the $\dot Z$ part is the LLN term.
+
+### Why no other parametrization can transfer
+
+Appendix J.3 now argues in two steps.
+
+**Kernel-regime parametrizations can't.** This covers NTP and SP with learning rate
+$\Theta(1/\text{width})$ (with a $\Theta(1)$ learning rate, SP is not even stable). Their limit
+does not learn features, and on tasks where features matter it performs trivially. Tensor
+Programs IV's Word2Vec experiment is the example: the NTK limit gives trivial embeddings, so HPs
+have no effect in the limit, while at finite width they do. The landscapes don't converge to
+anything useful, and "wider is better" fails.
+
+**Feature-learning parametrizations other than μP can't.** Any other feature-learning
+parametrization differs from μP only in that some layers are *not* updated maximally. In the limit
+those layers are frozen at initialization, so their learning rate has no effect at infinite width
+but does at finite width. The finite-width HP landscape cannot converge to the limit's landscape.
+
+So μP is the unique abc-parametrization in which every layer's learning rate plays the same role
+at every width, which is what transfer needs. The paper is careful to call this an argument, not a
+theorem: it explains why the optimum *can* converge, not how fast.
+
+## Which hyperparameters transfer
+
+Table 1 of the paper sorts HPs into three groups.
+
+| Transfer | Examples |
+| --- | --- |
+| **μTransferable** | optimization (learning rate, momentum, Adam $\beta$, LR schedule), initialization (per-layer init variance), parameter multipliers (output, attention, embedding) |
+| **Not μTransferable** | regularization: dropout, weight decay |
+| **Transferred across** | width; depth\*, batch size\*, training time\*, sequence length\* |
+
+\* validated empirically on Transformers only. Transfer across width is justified by the theory.
+
+Regularization doesn't transfer because how much to regularize depends on how large the model is
+*relative to the data*, and μP knows nothing about the data size. The paper therefore targets the
+training loss, which is the right target for large pretraining runs where overfitting is not the
+bottleneck. Fine-tuning on a small dataset is a case where μTransfer may not be enough.
+
+Transfer across depth, batch size, sequence length and training time is an empirical finding
+(Figs. 4 and 19): HPs transferred well once the proxy had at least width 256, depth 4, batch size
+32, sequence length 128 and 5000 steps. There are caveats. The optimal *initialization scale* does
+not transfer across depth, and depth transfer works only for **pre-layernorm** Transformers, not
+post-layernorm ones (which are much more sensitive to HPs in general).
+
+## μTransfer in practice
+
+#### The procedure
+
+Algorithm 1 of the paper is three lines:
+
+1. Parametrize the target model in μP.
+2. Tune a smaller version (in width and/or depth) of the target model.
+3. Copy the tuned hyperparameters to the target model.
+
+### The `mup` package
+
+The authors released [`mup`](https://github.com/microsoft/mup) for PyTorch (Appendix H). It
+implements Table 8 and is designed so that, at a chosen **base shape**, the model is bit-for-bit
+the SP model. There are two ways to choose the base: set it to the *target* model's shape (so the
+target trains exactly as it would in SP, and you tune shrunk copies), or set it to the small
+model you explored with (so its HPs carry over as you scale up). Usage:
+
+```python
+from mup import MuReadout, MuAdam, set_base_shapes
+
+class Model(nn.Module):
+    def __init__(self, width):
+        ...
+        self.readout = MuReadout(width, vocab_size)  # replaces the output nn.Linear
+
+model = Model(width=4096)
+base = Model(width=256)    # widths here define "1x"
+delta = Model(width=512)   # tells mup which dimensions grow with width
+set_base_shapes(model, base, delta=delta)  # attaches p.infshape to every parameter
+opt = MuAdam(model.parameters(), lr=3e-4)  # per-parameter-group LR scaling
+```
+
+`set_base_shapes` gives each parameter an `infshape` that records which dimensions are
+"infinite" (they differ between `base` and `delta`) and their base sizes. The optimizer then
+applies Table 8. From [`mup/optim.py`](https://github.com/microsoft/mup/blob/19814971934ef91dd546f88e913fc963e096d11c/mup/optim.py):
+
+```python
+# MuAdam: only matrix-like parameters (2 infinite dims) are rescaled
+for p in param_group['params']:
+    if p.infshape.ninf() == 2:
+        matrix_like_p[p.infshape.width_mult()]['params'].append(p)
+    ...
+for width_mult, group in matrix_like_p.items():
+    group['lr'] /= width_mult          # Adam LR 1/fan_in for hidden weights
+```
+
+where `width_mult()` is `fan_in / base_fan_in`. The output layer's $1/\text{fan\_in}$ multiplier lives
+in [`MuReadout.forward`](https://github.com/microsoft/mup/blob/19814971934ef91dd546f88e913fc963e096d11c/mup/layer.py),
+which computes `super().forward(self.output_mult * x / self.width_mult())`. `MuSGD` multiplies
+the learning rate of vector-like parameters by `width_mult` (Table 8's $\text{fan\_out}$ and
+$\text{fan\_in}$) and divides matrix-like ones by their fan-in/fan-out ratio. Attention has to be
+changed by hand; the README's example keeps compatibility with $1/\sqrt d$ at the common $d = 64$:
+
+```python
+# attention_scores = query @ key.T / d**0.5
+attention_scores = query @ key.T * 8 / d   # 8/d == 1/sqrt(d) at d = 64
+```
+
+#### Practical advice from Appendix D
+
+- **Coordinate check** every μP implementation (as above); the package's
+  `mup.coord_check.get_coord_data` records each activation's size over a few steps at many widths.
+- **Zero-initialize the output layer and the query projection.** The μP network at initialization
+  is approximately a Gaussian process with variance $\Theta(1/\text{width})$, which is $0$ in the
+  limit but not in a small proxy. Starting from exactly zero removes this mismatch
+  (`MuReadout(..., readout_zero_init=True)`). The same goes
+  for attention logits, which are $\Theta(1/\sqrt{d_\text{head}})$ at initialization; $W_q = 0$ makes
+  them exactly 0.
+- **Keep $d_\text{head}$ (in particular $d_k$) large in the proxy**, for example 32 or more. A small
+  $d_k$ makes the HP landscape noisy (Fig. 10).
+- **Prefer relu-like activations and Gaussian initialization.** A narrow network's preactivations
+  fluctuate more, and squashing functions such as tanh saturate more often in narrow networks than
+  in wide ones, which biases the landscape. Non-Gaussian initialization converges to the limit more
+  slowly.
+- **Optimizers** (Appendix B.3): AdamW, Adagrad and RMSProp follow the Adam column. Weight decay in
+  AdamW needs no scaling. Gradient clipping is fine with a width-independent threshold. Adam's
+  $\epsilon$ must scale like $1/\text{fan\_in}$ (added after the square root) if it is not negligible.
+  Optimizers that normalize the update to the weight's Frobenius norm (LARS, LAMB, Adafactor) give
+  hidden updates with $\Theta(1/\sqrt n)$ entries, between Adam's $\Theta(1)$ and the needed
+  $\Theta(1/n)$; the paper suggests this partly explains why T5 trained 220M to 11B models with one
+  set of HPs while GPT-3 had to lower its learning rate with size.
+
+#### Reverse μTransfer
+
+Appendix I turns the idea around. If a large SP model diverges with some HPs, transfer those HPs
+*down* to a small μP model (with the large model's width as base width) and the small model
+diverges too. The authors used this to debug a width-8192 Transformer that diverged mid-training:
+the width-256 copy diverged the same way, and its activations showed exploding attention logits.
+A separate 6B-parameter SP model that kept blowing up was reproduced on a 100M-parameter model and
+fixed by retuning it.
+
+## Results
+
+All experiments ran on V100 GPUs.
+
+**IWSLT14 De-En** (40M-parameter post-layernorm Transformer). Tuning learning rate, output
+multiplier and attention multiplier on a width-0.25x proxy (4M parameters) with 64 random samples,
+for the same total compute as 5 samples on the full model. Over 25 repeated searches:
+
+| Setup | #Samples | BLEU 25% | 50% | 75% | 100% |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| fairseq default | – | – | – | – | 35.40 |
+| Tuning on 1x | 5 | 33.62 | 35.00 | 35.35 | 35.45 |
+| Naive transfer from 0.25x (SP) | 64 | diverged | | | |
+| μTransfer from 0.25x | 64 | 35.27 | 35.33 | 35.45 | 35.53 |
+
+**BERT.** A single 13M-parameter proxy (10 layers, width 256) tuned with 256 random samples at a
+total cost of about one BERT-large pretraining, then transferred in both width and depth to
+BERT-base and BERT-large:
+
+| Model | Method | Speedup (model / total) | Test loss | MNLI (m/mm) | QQP |
+| --- | --- | ---: | ---: | ---: | ---: |
+| BERT-base | Megatron default | 1x / 1x | 1.995 | 84.2/84.2 | 90.6 |
+| BERT-base | μTransfer | 4x / 40x | 1.970 | 84.3/84.8 | 90.8 |
+| BERT-large | Megatron default | 1x / 1x | 1.731 | 86.3/86.2 | 90.9 |
+| BERT-large | μTransfer | 22x / 220x | 1.683 | 87.0/86.5 | 91.4 |
+
+Naive transfer in SP diverged for both.
+
+**GPT-3 6.7B.** The proxy shrank the width from 4096 to 256 (about 40M parameters, 168 times
+smaller), and random search tuned learning rate, init scale, attention and output temperatures,
+embedding and relative-position multipliers, at 7% of the pretraining cost. Selected results:
+
+| Task | Metric | 6.7B + μP | 6.7B re-run | 6.7B (GPT-3 paper) | 13B (GPT-3 paper) |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Validation loss | cross-entropy | 1.98 | 2.03 | – | – |
+| LAMBADA zero-shot | accuracy | 73.5 | 70.8 | 70.3 | 72.5 |
+| HellaSwag zero-shot | accuracy | 72.0 | 66.7 | 67.4 | 70.9 |
+| HellaSwag few-shot | accuracy | 72.4 | 66.4 | 67.3 | 71.3 |
+
+The paper is candid about two confounders: the re-run baseline accidentally used absolute rather
+than relative attention, and the μP model had to be trained in FP32 because of numerical
+divergences, while the baselines used FP16. LAMBADA few-shot is one place where μP is worse
+(74.7 vs 79.1).
+
+**Wider is better.** In μP, with HPs fixed, a wider model has lower training loss at every point in
+training (Fig. 7), checked on a 4-layer GPT-3 up to width 32,768 (Fig. 8). In SP this fails: with a
+large learning rate wider can be strictly worse. Checking "wider is better" early in training is
+another cheap test of a μP implementation.
+
+## An open puzzle
+
+Section 9 points out something strange. For μTransfer to be useful, the proxy width $N$ must be
+large enough that the HP *optimum* has converged, but small enough that the network *itself* has
+not converged to the infinite-width limit, or the large model would be pointless. Experiments show
+such $N$ exists. So the optimum is a "coarse" quantity that converges quickly with width, while the
+function and its loss are "fine" quantities that converge slowly. Why this should be so is not
+explained by the theory, and the authors leave it open, along with finite-width corrections to the
+small remaining drift of the optimum, a principled parametrization for depth, and the transfer of
+regularization HPs.
+
+## Summary
+
+- A **parametrization** is a rule for scaling initialization, multipliers and learning rates with
+  width. Hyperparameters transfer across width only if the HP landscape converges as width grows,
+  which depends on the parametrization, and *every* HP must be scaled correctly.
+- In SP, training makes weight updates **correlated** with the activations they multiply, so their
+  products grow by the **law of large numbers** ($\Theta(n)$), not the CLT ($\Theta(\sqrt n)$). Output
+  and attention logits blow up while input layers barely learn, so no single learning rate works.
+- **μP** fixes this: output weights $\Theta(1/n)$, hidden updates $\Theta(1/n)$, input updates
+  $\Theta(1)$, attention $1/d$. In Adam terms: hidden and output learning rates $\propto 1/\text{fan\_in}$,
+  output multiplier $1/\text{fan\_in}$, everything else constant.
+- By Tensor Programs IV, stable parametrizations either **learn features** ($r = 0$) or are in the
+  **kernel regime** ($r > 0$), never both; μP is the unique one where **every layer updates
+  maximally**, so every learning rate keeps its meaning at every width.
+- **μTransfer**: write the model in μP, tune a narrow (and shallower, shorter-trained) proxy, copy
+  the HPs. It worked from 13M to 350M (BERT) and 40M to 6.7B (GPT-3); regularization HPs do not
+  transfer.
+
+## References
+
+- G. Yang, E. J. Hu, I. Babuschkin, S. Sidor, X. Liu, D. Farhi, N. Ryder, J. Pachocki, W. Chen,
+  J. Gao. [Tensor Programs V: Tuning Large Neural Networks via Zero-Shot Hyperparameter
+  Transfer](https://arxiv.org/abs/2203.03466). arXiv:2203.03466v2, 2022. Section, table, figure
+  and equation numbers in this post refer to this version.
+- G. Yang, E. J. Hu. [Feature Learning in Infinite-Width Neural Networks (Tensor Programs
+  IV)](https://arxiv.org/abs/2011.14522). ICML 2021. Theorems 3.3–3.10, 5.6, 6.1 and Corollary 6.2.
+- G. Yang. [Tensor Programs III: Neural Matrix Laws](https://arxiv.org/abs/2009.10685). 2020. The
+  Gaussian matrix with correlated inputs.
+- Microsoft. [`mup` package](https://github.com/microsoft/mup/tree/19814971934ef91dd546f88e913fc963e096d11c),
+  commit `1981497`.
+- T. Brown et al. [Language Models are Few-Shot Learners](https://arxiv.org/abs/2005.14165). 2020.
+- A. Jacot, F. Gabriel, C. Hongler. [Neural Tangent Kernel](https://arxiv.org/abs/1806.07572). 2018.

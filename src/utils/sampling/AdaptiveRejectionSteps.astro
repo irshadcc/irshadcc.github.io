@@ -1,0 +1,140 @@
+---
+// Adaptive rejection sampling (eq 14.17, Gilks and Wild 1992) on the log-concave target
+// p̃(z) = z² e^(−z), i.e. an unnormalized Gam(z | 3, 1). Top: ln p̃(z) and the envelope made of
+// tangent lines at the grid points, cut where neighbours intersect. Bottom: p̃(z) and the
+// piecewise-exponential envelope exp(envelope). Each step draws z from the envelope and u
+// uniform; z is kept if u ≤ p̃(z) / envelope(z). A rejected z becomes a new grid point, so the
+// envelope tightens and the acceptance rate ∫p̃ / ∫envelope rises. The table lists each
+// piece's slope and mass. Logic in sampling.ts (`runArs`).
+// Usage in .mdx:
+//   <AdaptiveRejectionSteps grid={[1, 5]} />
+import Player from "./Player.astro";
+import "./sampling.css";
+
+interface Props {
+	/** Initial grid points (need a positive slope at the first and negative at the last). */
+	grid?: number[];
+	seed?: number;
+	steps?: number;
+	title?: string;
+	caption?: string;
+}
+
+const { grid = [1, 5], seed = 3, steps = 60, title, caption } = Astro.props;
+---
+
+<figure class="smp-fig smp-ars" data-grid={JSON.stringify(grid)} data-seed={seed} data-steps={steps}>
+	{title && <div class="smp-title">{title}</div>}
+	<div class="smp-legend">
+		<span><i class="k-p"></i>ln p̃(z), p̃(z)</span>
+		<span><i class="k-q"></i>envelope</span>
+		<span><i class="box k-shade"></i>gap (rejection region)</span>
+		<span><i class="dot k-ok"></i>kept</span>
+		<span><i class="dot k-bad"></i>rejected, becomes a grid point</span>
+	</div>
+	<svg class="smp-svg" viewBox="0 0 640 430" role="img" aria-label="Adaptive rejection sampling envelope"></svg>
+	<div class="smp-controls">
+		<Player />
+		<span class="smp-count"></span>
+	</div>
+	<div class="smp-metrics">
+		<div><span>grid points</span><strong class="m-grid"></strong></div>
+		<div><span>∫ envelope</span><strong class="m-mass"></strong></div>
+		<div><span>acceptance rate 2 / ∫ envelope</span><strong class="m-rate"></strong></div>
+		<div><span>kept so far</span><strong class="m-kept"></strong></div>
+	</div>
+	<p class="smp-narration"></p>
+	<table class="smp-table">
+		<thead><tr><th>piece</th><th>from</th><th>to</th><th>tangent at</th><th>slope −λᵢ</th><th>mass</th></tr></thead>
+		<tbody></tbody>
+	</table>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import { envelopeLog, mulberry32, runArs } from "./sampling";
+	import { area, axes, bindPlayer, curve, el, fmt } from "./plot";
+
+	const logp = (z: number) => (z > 0 ? 2 * Math.log(z) - z : Number.NEGATIVE_INFINITY);
+	const dlogp = (z: number) => 2 / z - 1;
+
+	function attach(fig: HTMLElement) {
+		const svg = fig.querySelector("svg")!;
+		const say = fig.querySelector(".smp-narration")!;
+		const body = fig.querySelector("tbody")!;
+		const total = Number(fig.dataset.steps);
+		const steps = runArs(logp, dlogp, JSON.parse(fig.dataset.grid!), 0, total, mulberry32(Number(fig.dataset.seed)));
+		// i = number of draws shown; the envelope shown is the one the next draw uses.
+		let i = 0;
+		const X: [number, number] = [0, 12];
+		const yTop = 1.08 * Math.max(...Array.from({ length: 600 }, (_, k) => Math.exp(envelopeLog(steps[0].env, 0.001 + (k * 12) / 600))));
+
+		function draw() {
+			// After draw i, show the envelope that produced it with that draw marked.
+			const shown = steps[Math.max(0, i - 1)];
+			const shownEnv = shown.env;
+			const grid = shown.grid;
+			svg.replaceChildren();
+			const T = axes(svg, { x: 52, y: 10, w: 568, h: 170 }, X, [-6, 1.5], { yLabel: "log scale" });
+			el("path", { d: curve(T, (z) => envelopeLog(shownEnv, z), 600, 0.001) , class: "smp-q" }, svg);
+			el("path", { d: curve(T, logp, 600, 0.001), class: "smp-p" }, svg);
+			for (const g of grid) {
+				el("line", { x1: T.sx(g), x2: T.sx(g), y1: T.box.y, y2: T.box.y + T.box.h, class: "smp-muted-line" }, svg);
+				el("circle", { cx: T.sx(g), cy: T.sy(logp(g)), r: 3.5, class: "smp-dot" }, svg);
+			}
+			for (const p of shownEnv.pieces.slice(0, -1)) {
+				el("circle", { cx: T.sx(p.hi), cy: T.sy(envelopeLog(shownEnv, p.hi)), r: 3, class: "smp-dot-q" }, svg);
+			}
+			const B = axes(svg, { x: 52, y: 210, w: 568, h: 180 }, X, [0, yTop], { xLabel: "z", yLabel: "p̃(z), envelope" });
+			const envF = (z: number) => Math.exp(envelopeLog(shownEnv, z));
+			el("path", { d: `${curve(B, envF, 600, 0.001)}L${B.sx(X[1])},${B.sy(0)}L${B.sx(0)},${B.sy(0)}Z`, class: "smp-shade" }, svg);
+			el("path", { d: area(B, (z) => Math.exp(logp(z)), 600, 0.001), class: "smp-p-area" }, svg);
+			el("path", { d: curve(B, envF, 600, 0.001), class: "smp-q" }, svg);
+			el("path", { d: curve(B, (z) => Math.exp(logp(z)), 600, 0.001), class: "smp-p" }, svg);
+			// Earlier draws as small marks on the axis, the newest as a point (z, u · envelope(z)).
+			for (let j = 0; j < i; j++) {
+				const s = steps[j];
+				if (j < i - 1) el("circle", { cx: B.sx(s.z), cy: B.sy(0) - 4, r: 2, class: s.accept ? "smp-ok" : "smp-bad" }, svg);
+			}
+			if (i > 0) {
+				const s = steps[i - 1];
+				const y = s.u * envF(s.z);
+				el("line", { x1: B.sx(s.z), x2: B.sx(s.z), y1: B.sy(0), y2: B.sy(envF(s.z)), class: "smp-guide" }, svg);
+				el("circle", { cx: B.sx(s.z), cy: B.sy(y), r: 5, class: s.accept ? "smp-ok" : "smp-bad" }, svg);
+				say.textContent = `Draw ${i}: z = ${fmt(s.z, 3)} from the envelope, u = ${fmt(s.u, 3)}, p̃(z) / envelope(z) = ${fmt(s.ratio, 3)}. ${s.accept ? "u ≤ ratio, so z is kept." : `u > ratio, so z is rejected and added to the grid; the next envelope has ${s.grid.length + 1} tangents.`}`;
+			} else say.textContent = `Start with tangents at z = ${grid.map((g) => fmt(g, 2)).join(" and ")}. Step to draw from the envelope.`;
+			const kept = steps.slice(0, i).filter((s) => s.accept).length;
+			// Metrics describe the envelope the next draw will use.
+			const next = steps[Math.min(i, total - 1)];
+			const nextEnv = next.env;
+			fig.querySelector(".m-grid")!.textContent = String(next.grid.length);
+			fig.querySelector(".m-mass")!.textContent = fmt(nextEnv.total, 3);
+			fig.querySelector(".m-rate")!.textContent = fmt(2 / nextEnv.total, 3);
+			fig.querySelector(".m-kept")!.textContent = `${kept} of ${i}`;
+			fig.querySelector(".smp-count")!.textContent = `draw ${i} of ${total}`;
+			body.replaceChildren();
+			shownEnv.pieces.forEach((p, k) => {
+				const tr = document.createElement("tr");
+				for (const c of [String(k + 1), fmt(p.lo, 3), Number.isFinite(p.hi) ? fmt(p.hi, 3) : "∞", fmt(p.x, 3), fmt(p.slope, 3), fmt(p.mass, 3)]) {
+					const td = document.createElement("td");
+					td.textContent = c;
+					tr.append(td);
+				}
+				body.append(tr);
+			});
+		}
+
+		const step = (dir: 1 | -1) => {
+			i = Math.max(0, Math.min(total, i + dir));
+			draw();
+			return i < total;
+		};
+		bindPlayer(fig, step, () => {
+			i = 0;
+			draw();
+		}, 700);
+		draw();
+	}
+
+	document.querySelectorAll<HTMLElement>(".smp-ars").forEach(attach);
+</script>

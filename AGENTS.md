@@ -142,8 +142,17 @@ Once a component is stable, it will be migrated to `/src/component`
 | `OverlapTimeline` | `src/utils/inference/OverlapTimeline.astro` | CPU/GPU timeline of a serving loop with and without overlapped scheduling |
 | `TokenStrip` | `src/utils/inference/TokenStrip.astro` | A prompt as token chips (text, id, kind), runs of repeated tokens, KV-block markers, switchable views |
 | `NegativeSamplingExplorer` | `src/utils/probability/NegativeSamplingExplorer.astro` | Rare-events data with uniform or optimal negative sampling: histogram of kept negatives, π(x), and naive / IPW / log-odds-corrected fits with a repeat-and-compare-to-theory button |
+| `AbcExplorer` | `src/utils/training/AbcExplorer.astro` | abc-parametrizations of an L-hidden-layer MLP (Tensor Programs IV): reader sets exponents a, b, c or picks SP / NTP / mean field / μP; shows each quantity's width-growth exponent on a number line, per-layer init variance and LR exponents, the Theorem 3.3 stability conditions and the verdict (unstable, trivial, kernel regime, feature learning), with the a+θ, b−θ, c−2θ symmetry buttons (logic in `abcParametrization.ts`) |
+| `PcaExplorer` | `src/utils/statistics/PcaExplorer.astro` | 2D PCA: turn a line through the mean with a slider and see projections, residuals, variance kept vs mean squared distance (and both against the angle), snap to PC1/PC2; `mode="scatter"` plots scores coloured by group (logic in `pca.ts`) |
 | `MinCutSteps` | `src/utils/compiler/MinCutSteps.astro` | Step-through max-flow / min-cut on a node-capacitated network (augmenting paths, saved nodes), as built by AOTAutograd's partitioner |
 | `JaxprSteps` | `src/utils/compiler/JaxprSteps.astro` | Step-through program transformation: source or jaxpr being read (top), jaxpr being written (bottom), table of tracers / primals / cotangents per step |
+| `InverseCdfSampler`, `BoxMullerMap` | `src/utils/sampling/` | Transformation method y = h⁻¹(z) step by step (exponential / Cauchy); Box–Muller disc-to-plane map with hover and pooled histogram |
+| `RejectionSampler`, `AdaptiveRejectionSteps` | `src/utils/sampling/` | Rejection sampling under k q(z) with a k slider (gamma/Cauchy or Gaussian preset); step-through adaptive rejection sampling with tangent envelope and piece table |
+| `ImportanceResampler` | `src/utils/sampling/` | Importance weights as stems, SIR resampled histogram, ESS, σq and L sliders |
+| `MarkovChainSteps` | `src/utils/sampling/` | Discrete Metropolis chain: marginal converging to p★, probability-flow arrows showing detailed balance, transition table |
+| `Chain2D` | `src/utils/sampling/` | Metropolis / Gibbs (with over-relaxation α) / Langevin on a correlated 2D Gaussian: moves, trace, acceptance, sd, autocorrelation time |
+| `BayesNetSampler` | `src/utils/sampling/` | Sprinkler network: ancestral, logic sampling, likelihood weighting with running estimate vs exact |
+| `EbmTraining` | `src/utils/sampling/` | 1D energy-based model trained with Langevin samples (persistent or contrastive divergence), energy, densities, the two expectations of the likelihood gradient |
 
 ### Building a new component
 

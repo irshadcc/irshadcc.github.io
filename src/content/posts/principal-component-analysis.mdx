@@ -1,0 +1,500 @@
+---
+title: "Principal Component Analysis, Worked by Hand"
+description: "PCA finds the directions along which data varies most, which are also the directions that lose the least when the data is squeezed into fewer dimensions. This post derives PCA from both views, works a ten-point example by hand, shows why libraries compute it with the SVD, and applies it to the Iris dataset."
+date: 2026-10-15
+tags: [Machine learning, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import PcaExplorer from "../../utils/statistics/PcaExplorer.astro";
+import { irisGroups, irisScores, irisSpecies } from "../../utils/statistics/pcaFigures";
+
+export const toy = [[1, 1], [2, 1], [3, 3], [5, 6], [6, 5], [7, 5], [8, 7], [9, 3], [9, 4], [10, 5]];
+
+## Background
+
+Most datasets have more columns than they need. A flower measured four ways, an image stored
+as 784 pixels or a user described by 500 features often varies along only a few directions;
+the other columns mostly repeat the same information. Plotting, clustering or fitting a model
+on all of them costs time, adds noise, and hides the structure.
+
+**Principal component analysis** (PCA) replaces the original columns with a few new ones.
+Each new column is a weighted sum of the old ones, and the weights are chosen so that the
+first new column keeps as much of the spread in the data as possible, the second keeps as
+much of what is left, and so on. Keeping the first two or three gives a compact summary you
+can plot or feed to a model.
+
+This post covers, in order:
+
+1. **The problem**: what "the best direction" means, in two equivalent ways (most variance,
+   least reconstruction error), with an interactive figure.
+2. **The solution**: why the answer is the eigenvectors of the covariance matrix.
+3. **A worked example** on ten points, done by hand and checked with scikit-learn.
+4. **PCA through the SVD**, which is how libraries actually compute it.
+5. **Choosing the number of components**, using the Iris dataset.
+6. **Practical considerations**: scaling, signs, outliers and the limits of a linear method.
+
+The post leans on two pieces of linear algebra covered elsewhere on this blog: the
+eigendecomposition and the SVD, both in [Matrix Decompositions](/blog/matrix-decompositions/).
+
+## The problem: one direction that keeps the most
+
+### Data, centring and covariance
+
+Store the data as an $n \times d$ matrix $X$: one row per **sample** (a flower, an image), one
+column per **feature** (a measurement). PCA looks at how the samples spread around their
+centre, so the first step is to subtract the **mean** $\mu = \frac{1}{n}\sum_i x_i$ from every
+row. The result is the **centred** data matrix $Z$, with rows $z_i = x_i - \mu$.
+
+The spread of the centred data is summarised by the **sample covariance matrix**
+
+$$
+C = \frac{1}{n-1} Z^\top Z, \qquad C_{jk} = \frac{1}{n-1}\sum_{i=1}^{n} z_{ij}\, z_{ik}.
+$$
+
+The diagonal entry $C_{jj}$ is the variance of feature $j$. The off-diagonal entry $C_{jk}$ is
+the covariance of features $j$ and $k$: positive when they tend to rise together. The sum of
+the diagonal, $\operatorname{tr}(C)$, is the **total variance** of the data.<Sidenote>Dividing
+by $n-1$ rather than $n$ gives an unbiased estimate of the population covariance.
+scikit-learn's `PCA` uses $n-1$ ("The variance estimation uses `n_samples - 1` degrees of
+freedom"), and so does this post. The choice scales every variance by the same factor, so it
+never changes the directions PCA finds.</Sidenote>
+
+### Projecting onto a direction
+
+Pick a **unit vector** $u$ ($\lVert u \rVert = 1$), a direction in feature space. Each centred
+point has a coordinate along it, its **score**
+
+$$
+s_i = z_i^\top u.
+$$
+
+The point $s_i u$ is the **projection** of $z_i$ onto the line through the origin along $u$:
+the closest point on that line. The scores have mean zero (the data is centred), and their
+variance is
+
+$$
+\operatorname{Var}(s) = \frac{1}{n-1}\sum_i (z_i^\top u)^2 = \frac{1}{n-1} u^\top Z^\top Z u = u^\top C u.
+$$
+
+So the covariance matrix answers "how spread out is the data along $u$?" for every direction
+at once.
+
+### Two ways to say "best"
+
+There are two natural goals for a single direction:
+
+- **Keep the most spread.** Choose $u$ so the scores vary as much as possible. Directions
+  where all the points have about the same coordinate tell us little about which point is
+  which.
+- **Lose the least.** Replace each point by its projection $s_i u$ and choose $u$ so the
+  points move as little as possible: minimise the **reconstruction error**
+  $\frac{1}{n-1}\sum_i \lVert z_i - s_i u \rVert^2$, the mean squared distance from the points to
+  the line.<Sidenote>This is not least-squares regression. Regression measures vertical
+  distances (errors in $y$ only) and treats the features unequally; PCA measures perpendicular
+  distances and treats all features alike.</Sidenote>
+
+These are the same goal. The projection $s_i u$ and the residual $z_i - s_i u$ are
+perpendicular, so by Pythagoras
+
+$$
+\lVert z_i \rVert^2 = s_i^2 + \lVert z_i - s_i u \rVert^2 .
+$$
+
+Sum over the points and divide by $n-1$. The left side is the total variance, which does not
+depend on $u$:
+
+$$
+\underbrace{\operatorname{tr}(C)}_{\text{fixed}}
+= \underbrace{u^\top C u}_{\text{variance kept}}
++ \underbrace{\tfrac{1}{n-1}\textstyle\sum_i \lVert z_i - s_i u \rVert^2}_{\text{reconstruction error}} .
+$$
+
+Every unit of variance the line keeps is a unit of error it avoids. Maximising one minimises
+the other.
+
+The figure below shows this on ten points. Drag the slider to turn the line about the mean
+(the black dot). Each point drops a dashed perpendicular onto the line; the open circles are
+the projections. Watch the three numbers under the plot: the blue variance and the orange mean
+squared distance trade off, while their sum stays at $14$. The lower panel plots both against
+the angle: the variance peaks at about $26.6°$ exactly where the distance bottoms out. That
+angle is the **first principal component**. "Snap to PC1" jumps there.
+
+<PcaExplorer
+	title="Turning a line through ten points"
+	points={toy}
+	angle={0}
+	caption="The ten points of the worked example below. Variance along the line (blue) plus mean squared distance to the line (orange) is always the total variance, 14. The variance is largest, 12, at θ ≈ 26.6° (PC1); there the distance is smallest, 2."
+/>
+
+## The solution: eigenvectors of the covariance matrix
+
+### The first component
+
+We want the unit vector that maximises $u^\top C u$. Because $C$ is symmetric, it has an
+eigendecomposition $C = V \Lambda V^\top$ with orthonormal eigenvectors $v_1, \dots, v_d$ (the
+columns of $V$) and real eigenvalues $\lambda_1 \ge \lambda_2 \ge \dots \ge \lambda_d$. They
+are also non-negative, since $u^\top C u$ is a variance.
+
+Write $u$ in the eigenvector basis, $u = \sum_j a_j v_j$. Since $u$ is a unit vector and the
+$v_j$ are orthonormal, $\sum_j a_j^2 = 1$. Then
+
+$$
+u^\top C u = \sum_j \lambda_j a_j^2 \;\le\; \lambda_1 \sum_j a_j^2 = \lambda_1 .
+$$
+
+The bound is reached by putting all the weight on the first eigenvector, $u = v_1$. So:
+
+- The **first principal component** (PC1) is the eigenvector $v_1$ of $C$ with the largest
+  eigenvalue.
+- The variance of the data along it is $\lambda_1$.
+
+The same result falls out of calculus: maximise $u^\top C u$ subject to $u^\top u = 1$ with a
+Lagrange multiplier $\lambda$. Setting the gradient of $u^\top C u - \lambda(u^\top u - 1)$ to
+zero gives $Cu = \lambda u$, and at any such $u$ the objective equals $\lambda$, so the best one
+has the largest eigenvalue.<Sidenote>The gradient of $u^\top C u$ is $2Cu$ for symmetric $C$;
+see [Matrix Calculus](/blog/matrix-calculus/) for the rules.</Sidenote>
+
+### More than one component
+
+To keep $k$ directions, ask for the second direction to capture the most variance among those
+perpendicular to the first, and so on. The same argument, restricted to the subspace
+orthogonal to $v_1$, picks $v_2$, then $v_3$. The **principal components** are the
+eigenvectors of $C$, sorted by eigenvalue.
+
+Collect the first $k$ of them as the columns of a $d \times k$ matrix $V_k$. Then PCA gives three
+things:
+
+| Name | Formula | Shape | Meaning |
+| --- | --- | --- | --- |
+| Scores | $S = Z V_k$ | $n \times k$ | the new, shorter description of each sample |
+| Reconstruction | $\hat X = S V_k^\top + \mu$ | $n \times d$ | each sample rebuilt from its $k$ scores |
+| Explained variance | $\lambda_1, \dots, \lambda_k$ | $k$ | variance of each score column |
+
+The scores are uncorrelated with each other: their covariance is
+$V_k^\top C V_k = \operatorname{diag}(\lambda_1, \dots, \lambda_k)$. And the reconstruction error
+is exactly what was thrown away,
+
+$$
+\frac{1}{n-1}\sum_i \lVert x_i - \hat x_i \rVert^2 = \lambda_{k+1} + \dots + \lambda_d .
+$$
+
+No other rank-$k$ linear approximation does better; this is the Eckart–Young theorem, which
+the next section ties to the SVD.
+
+The **explained variance ratio** of component $j$ is $\lambda_j / \operatorname{tr}(C)$, its
+share of the total variance. It is the number most people look at when deciding how many
+components to keep.
+
+## Worked example: ten points
+
+### Centre the data
+
+The ten points from the figure, with $d = 2$ features $x_1, x_2$:
+
+| $i$ | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
+| --- | -: | -: | -: | -: | -: | -: | -: | -: | -: | -: |
+| $x_1$ | 1 | 2 | 3 | 5 | 6 | 7 | 8 | 9 | 9 | 10 |
+| $x_2$ | 1 | 1 | 3 | 6 | 5 | 5 | 7 | 3 | 4 | 5 |
+| $z_1 = x_1 - 6$ | −5 | −4 | −3 | −1 | 0 | 1 | 2 | 3 | 3 | 4 |
+| $z_2 = x_2 - 4$ | −3 | −3 | −1 | 2 | 1 | 1 | 3 | −1 | 0 | 1 |
+
+The column sums are $60$ and $40$, so $\mu = (6, 4)$, and the centred rows $z_i$ are the last two
+lines of the table.
+
+### Covariance matrix
+
+Sum the products of the centred columns:
+
+$$
+\sum z_1^2 = 90, \qquad \sum z_2^2 = 36, \qquad \sum z_1 z_2 = 36,
+$$
+
+and divide by $n - 1 = 9$:
+
+$$
+C = \begin{pmatrix} 10 & 4 \\ 4 & 4 \end{pmatrix}.
+$$
+
+Feature $x_1$ varies more (variance $10$ against $4$), and the two rise together (covariance
+$+4$). The total variance is $\operatorname{tr}(C) = 14$.<Sidenote>Check one product sum by
+hand: $\sum z_1 z_2 = 15 + 12 + 3 - 2 + 0 + 1 + 6 - 3 + 0 + 4 = 36$.</Sidenote>
+
+### Eigenvalues and eigenvectors
+
+The eigenvalues solve $\det(C - \lambda I) = 0$:
+
+$$
+(10 - \lambda)(4 - \lambda) - 16 = \lambda^2 - 14\lambda + 24 = (\lambda - 12)(\lambda - 2) = 0,
+$$
+
+so $\lambda_1 = 12$ and $\lambda_2 = 2$. They add up to $14$, the total variance, as they must.
+
+For $\lambda_1 = 12$, the first row of $(C - 12 I)v = 0$ reads $-2a + 4b = 0$, so $b = a/2$.
+Normalising,
+
+$$
+v_1 = \tfrac{1}{\sqrt 5}(2, 1) \approx (0.894, 0.447), \qquad
+v_2 = \tfrac{1}{\sqrt 5}(-1, 2) \approx (-0.447, 0.894).
+$$
+
+PC1 points at an angle of $\arctan(1/2) \approx 26.57°$ above the $x_1$ axis, the peak in the
+figure. PC2 is perpendicular to it. PC1 alone explains $12/14 \approx 85.7\%$ of the variance.
+
+### Scores and reconstruction
+
+Each score is a dot product with $v_1$ or $v_2$. Multiplying by $\sqrt 5$ keeps the numbers whole:
+
+| $i$ | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
+| --- | -: | -: | -: | -: | -: | -: | -: | -: | -: | -: |
+| $\sqrt5\, s_{i1} = 2z_1 + z_2$ | −13 | −11 | −7 | 0 | 1 | 3 | 7 | 5 | 6 | 9 |
+| $\sqrt5\, s_{i2} = -z_1 + 2z_2$ | −1 | −2 | 1 | 5 | 2 | 1 | 4 | −5 | −3 | −2 |
+
+The squares of the first row add up to $540$, so the PC1 scores have variance
+$540 / 5 / 9 = 12 = \lambda_1$. The second row's squares add up to $90$, giving
+$90/5/9 = 2 = \lambda_2$. The products of the two rows add up to $0$: the scores are
+uncorrelated.
+
+Check one point by hand: point 8 is $x = (9, 3)$, so $z = (3, -1)$. Its PC1 score is
+$(2 \cdot 3 - 1)/\sqrt 5 = \sqrt 5 \approx 2.236$. Keeping only PC1, it is rebuilt as
+
+$$
+\hat x = \mu + s_1 v_1 = (6, 4) + \sqrt5 \cdot \tfrac{1}{\sqrt5}(2, 1) = (8, 5),
+$$
+
+which is off by $(1, -2)$, a squared error of $5$. In the figure, snap to PC1 and hover the point
+at $(9, 3)$: its dashed segment ties with the one from $(5, 6)$ as the longest of the ten (both
+have PC2 score $\pm\sqrt 5$). Over all ten points the squared
+errors add up to $18$, and $18 / 9 = 2 = \lambda_2$: the error of a one-component PCA is the
+discarded eigenvalue.
+
+The table compares a few lines through the mean; these are the numbers the figure shows at those
+angles.
+
+| Line angle | Variance kept | Mean squared distance | Sum |
+| --- | -: | -: | -: |
+| 0° (the $x_1$ axis) | 10 | 4 | 14 |
+| 26.57° (PC1) | 12 | 2 | 14 |
+| 45° | 11 | 3 | 14 |
+| 90° (the $x_2$ axis) | 4 | 10 | 14 |
+| 116.57° (PC2) | 2 | 12 | 14 |
+
+scikit-learn agrees: `PCA().fit(X)` on these points gives `components_` $= [[0.894, 0.447],
+[-0.447, 0.894]]$, `explained_variance_` $= [12, 2]$ and `explained_variance_ratio_`
+$= [0.857, 0.143]$.<Sidenote>Verified with scikit-learn 1.9.1 and NumPy 2.5.4. Every number in
+this post was computed by a script, not by hand.</Sidenote>
+
+## Computing PCA with the SVD
+
+### The connection
+
+The **singular value decomposition** (SVD) writes any $n \times d$ matrix as
+$Z = U \Sigma V^\top$, with orthonormal columns in $U$ and $V$ and non-negative **singular
+values** $\sigma_1 \ge \sigma_2 \ge \dots$ on the diagonal of $\Sigma$ (see
+[Matrix Decompositions](/blog/matrix-decompositions/)). Substitute it into the covariance:
+
+$$
+C = \frac{1}{n-1} Z^\top Z = \frac{1}{n-1} V \Sigma U^\top U \Sigma V^\top
+= V \, \frac{\Sigma^2}{n-1} \, V^\top .
+$$
+
+This is an eigendecomposition of $C$. So the SVD of the centred data hands over PCA directly:
+
+- the **right singular vectors** (columns of $V$, rows of `Vt`) are the principal components;
+- the eigenvalues are $\lambda_j = \sigma_j^2 / (n - 1)$;
+- the scores are $Z V = U \Sigma$, read off without another multiplication.
+
+In the example the singular values of $Z$ are $\sqrt{108} \approx 10.392$ and
+$\sqrt{18} \approx 4.243$, and $108/9 = 12$, $18/9 = 2$.
+
+```python
+import numpy as np
+
+X = np.array([[1, 1], [2, 1], [3, 3], [5, 6], [6, 5],
+              [7, 5], [8, 7], [9, 3], [9, 4], [10, 5]], dtype=float)
+Z = X - X.mean(axis=0)                      # centre: mean is (6, 4)
+U, S, Vt = np.linalg.svd(Z, full_matrices=False)
+
+print(Vt)                     # [[ 0.894  0.447]   rows are the principal components
+                              #  [-0.447  0.894]]
+print(S**2 / (len(X) - 1))    # [12.  2.]          explained variance
+print((U * S)[:, 0])          # PC1 scores; entry 7 (point 8) is 2.236 = sqrt(5)
+```
+
+The SVD also explains the optimality claim. The Eckart–Young theorem says the best rank-$k$
+approximation of $Z$ in squared error keeps the top $k$ singular triples, $U_k \Sigma_k V_k^\top$,
+which is exactly $Z V_k V_k^\top$: the PCA reconstruction.
+
+### Why libraries prefer the SVD
+
+Forming $Z^\top Z$ squares the **condition number** (the ratio $\sigma_1 / \sigma_d$), so small
+singular values that are still well determined in $Z$ can be lost to rounding in $Z^\top Z$.
+Running the SVD on $Z$ avoids that. The trade-off is cost: an SVD of an $n \times d$ matrix
+costs $O(n d \min(n, d))$, while forming the covariance costs $O(n d^2)$ and its
+eigendecomposition only $O(d^3)$, which is much cheaper when $n \gg d$.
+
+scikit-learn 1.9.1 picks between the two by shape when `svd_solver="auto"`
+([`_pca.py`](https://github.com/scikit-learn/scikit-learn/blob/f0668270731746c1b4517f0e9e2cd5b8c2ba3784/sklearn/decomposition/_pca.py#L524-L536)):
+
+```python
+if X.shape[1] <= 1_000 and X.shape[0] >= 10 * X.shape[1]:
+    self._fit_svd_solver = "covariance_eigh"
+# Small problem or n_components == 'mle', just call full PCA
+elif max(X.shape) <= 500 or n_components == "mle":
+    self._fit_svd_solver = "full"
+elif 1 <= n_components < 0.8 * min(X.shape):
+    self._fit_svd_solver = "randomized"
+# This is also the case of n_components in (0, 1)
+else:
+    self._fit_svd_solver = "full"
+```
+
+- **Tall and skinny** data (at most 1,000 features and at least 10 samples per feature) uses the
+  covariance matrix, whose docstring warns it "effectively doubles the condition number and is
+  therefore less numerical stable".
+- **Small** data (no side longer than 500) uses a full LAPACK SVD.
+- **Large** data where only a few components are wanted uses a **randomized SVD**, which
+  multiplies $Z$ by a few random vectors to find an approximate top subspace and only
+  decomposes that small piece (Halko, Martinsson and Tropp, 2011).
+
+The ten-point example falls in the "small" case and uses `"full"`. Iris, below, has 150 rows
+and 4 columns, so it uses `"covariance_eigh"`.
+
+### Signs are arbitrary
+
+If $v$ is an eigenvector, so is $-v$. The SVD has the same freedom: flip a column of $U$ and the
+matching row of $V^\top$ together and the product is unchanged. Different libraries, versions or
+even inputs can therefore return PCs with opposite signs, and the scores flip with them.
+scikit-learn removes the ambiguity with `svd_flip(U, Vt, u_based_decision=False)`, which flips
+each component so that its largest-magnitude entry is positive
+([`extmath.py`](https://github.com/scikit-learn/scikit-learn/blob/f0668270731746c1b4517f0e9e2cd5b8c2ba3784/sklearn/utils/extmath.py#L924)).
+That is why $v_1 = (0.894, 0.447)$ and not $(-0.894, -0.447)$. When comparing PCA results across
+tools, compare up to sign.
+
+## How many components to keep
+
+### Iris
+
+The **Iris** dataset (Fisher, 1936) has 150 flowers from three species, each measured four ways in
+centimetres: sepal length, sepal width, petal length and petal width. PCA on the four raw columns
+gives:
+
+| Component | Eigenvalue $\lambda_j$ | Explained ratio | Cumulative |
+| --- | -: | -: | -: |
+| PC1 | 4.228 | 92.5% | 92.5% |
+| PC2 | 0.243 | 5.3% | 97.8% |
+| PC3 | 0.078 | 1.7% | 99.5% |
+| PC4 | 0.024 | 0.5% | 100.0% |
+
+The first component alone carries 92.5% of the variance; the first two carry 97.8%. Plotting
+the flowers by their first two scores loses very little:
+
+<PcaExplorer
+	mode="scatter"
+	title="150 Iris flowers on their first two principal components"
+	points={irisScores}
+	groups={irisGroups}
+	groupNames={irisSpecies}
+	xLabel="PC1 score (cm)"
+	yLabel="PC2 score (cm)"
+	caption="Scores from scikit-learn's PCA(2) on the four raw measurements. Setosa separates cleanly along PC1; versicolor and virginica overlap a little."
+/>
+
+Notice what the plot shows and what it does not. PCA never saw the species labels; it only
+looked for spread. Here the direction of largest spread also separates setosa from the rest,
+because petal size differs a lot between species. That is a property of this dataset, not a
+promise of PCA (see the practical notes below).
+
+PC1's weights, its **loadings**, say what it measures. In the raw data PC1 is
+$(0.361, -0.085, 0.857, 0.358)$ on (sepal length, sepal width, petal length, petal width): mostly
+petal length, with some sepal length and petal width. A flower with a high PC1 score is a large
+flower with long petals.
+
+### Rules of thumb
+
+There is no single right $k$. Common choices:
+
+- **A variance threshold.** Keep the fewest components whose cumulative ratio passes, say, 95%.
+  For Iris that is $k = 2$. scikit-learn does this when `n_components` is a float between 0 and
+  1: `PCA(0.95)` on Iris keeps 2 components.
+- **The elbow.** Plot the eigenvalues in order (a **scree plot**) and stop where the curve
+  flattens. For Iris the drop from 4.23 to 0.24 is the elbow, suggesting $k = 1$.
+- **The downstream task.** If the scores feed a classifier, choose $k$ by validation accuracy, like
+  any other hyperparameter.
+- **Two or three for plotting**, whatever they explain; just report the percentage.
+
+## Practical considerations
+
+### Scale the features when units differ
+
+PCA maximises variance, and variance depends on units. In raw Iris, petal length has variance
+3.116 out of a total of 4.573, so it alone is 68% of the total and dominates PC1. Measuring it in
+millimetres would multiply its variance by 100 and make PC1 almost exactly "petal length".
+
+**Standardising** each column to mean 0 and variance 1 before PCA (equivalently, running PCA on
+the **correlation matrix**) gives every feature the same say. On standardised Iris the picture
+changes:
+
+| | PC1 | PC2 | PC3 | PC4 |
+| --- | -: | -: | -: | -: |
+| Raw (cm), explained ratio | 92.5% | 5.3% | 1.7% | 0.5% |
+| Standardised, explained ratio | 73.0% | 22.9% | 3.7% | 0.5% |
+
+The standardised PC1 is $(0.521, -0.269, 0.580, 0.565)$: three of the four measurements now count
+about equally. Standardise when the features have different units or arbitrary scales; keep raw
+units when they share one (pixel intensities, or Iris if centimetres are what you care about).
+`PCA(0.95)` keeps two components in both cases (97.8% raw, 95.8% standardised).
+
+### Other things to watch
+
+- **Always centre.** Without centring, the first "component" points at the mean instead of along
+  the spread. scikit-learn's `PCA` centres for you. Its `TruncatedSVD` does not ("Contrary to
+  PCA, this estimator does not center the data"), which keeps sparse inputs sparse but means it is
+  not PCA unless you centre first.
+- **Fit on training data only.** The mean, scale and components are learned parameters. Fit them on
+  the training set and apply the same `transform` to validation and test data.
+- **Outliers pull hard.** Variance squares distances, so one far-away point can swing PC1 towards
+  itself. Inspect the scores for extreme points, or use a robust variant.
+- **High variance is not the same as useful.** PCA ignores labels. If the signal that separates
+  two classes lies along a low-variance direction, PCA will rank it last and a small $k$ will
+  throw it away. Linear discriminant analysis (LDA) uses the labels instead.
+- **PCA is linear.** It finds flat subspaces. Data on a curved surface (a spiral, a circle) needs a
+  non-linear method such as kernel PCA, or a visualisation method such as t-SNE or UMAP.
+- **Whitening.** Dividing each score by $\sqrt{\lambda_j}$ (`whiten=True`) gives every component
+  unit variance. It helps some downstream models but amplifies the noise in the small
+  components.
+- **Interpreting loadings.** Each component mixes all the features, and the signs are arbitrary
+  (see above), so read loadings by their relative size and the pattern of signs within one
+  component, not by whether the whole vector comes out positive or negative.
+
+## Summary
+
+- PCA finds orthogonal directions, ordered so that each captures as much of the remaining
+  variance as possible.
+- Keeping the most variance and losing the least squared reconstruction error are the same
+  goal, because the two always add up to the total variance.
+- The directions are the eigenvectors of the covariance matrix, and the variance along each is
+  its eigenvalue; the error of keeping $k$ components is the sum of the eigenvalues left out.
+- In practice PCA is computed with the SVD of the centred data ($\lambda_j = \sigma_j^2/(n-1)$),
+  which is more accurate than forming the covariance matrix; component signs are arbitrary.
+- Centre always, standardise when units differ, and choose $k$ by explained variance or by the
+  task the scores feed.
+
+## References
+
+- K. Pearson, "On lines and planes of closest fit to systems of points in space", *Philosophical
+  Magazine*, 1901. The least-distance view of PCA.
+- H. Hotelling, "Analysis of a complex of statistical variables into principal components",
+  *Journal of Educational Psychology*, 1933. The maximum-variance view and the name.
+- C. Eckart and G. Young, "The approximation of one matrix by another of lower rank",
+  *Psychometrika*, 1936.
+- R. A. Fisher, "The use of multiple measurements in taxonomic problems", *Annals of Eugenics*,
+  1936. The Iris data, used here through scikit-learn's `load_iris()`.
+- N. Halko, P.-G. Martinsson and J. A. Tropp, "Finding structure with randomness: probabilistic
+  algorithms for constructing approximate matrix decompositions", *SIAM Review*, 2011.
+- I. T. Jolliffe and J. Cadima, "Principal component analysis: a review and recent
+  developments", *Philosophical Transactions of the Royal Society A*, 2016.
+- scikit-learn 1.9.1,
+  [`sklearn/decomposition/_pca.py`](https://github.com/scikit-learn/scikit-learn/blob/f0668270731746c1b4517f0e9e2cd5b8c2ba3784/sklearn/decomposition/_pca.py)
+  and
+  [`sklearn/utils/extmath.py`](https://github.com/scikit-learn/scikit-learn/blob/f0668270731746c1b4517f0e9e2cd5b8c2ba3784/sklearn/utils/extmath.py).

@@ -1,0 +1,136 @@
+---
+// Box–Muller in polar form (eqs 14.10–14.12). Left: uniform pairs (z1, z2) in the square
+// [−1, 1]²; pairs outside the unit circle are discarded (grey). Right: each kept pair mapped to
+// (y1, y2) = z · sqrt(−2 ln r² / r²), which keeps the direction and moves radius r to
+// sqrt(−2 ln r²). Bottom: histogram of all y1 and y2 against N(0, 1). The newest pair is joined
+// to its image; hover any kept point to see its pair. Step, play or add 200 pairs at a time.
+// Usage in .mdx:
+//   <BoxMullerMap />
+import Player from "./Player.astro";
+import "./sampling.css";
+
+interface Props {
+	seed?: number;
+	title?: string;
+	caption?: string;
+}
+
+const { seed = 5, title, caption } = Astro.props;
+---
+
+<figure class="smp-fig smp-bm" data-seed={seed}>
+	{title && <div class="smp-title">{title}</div>}
+	<div class="smp-legend">
+		<span><i class="dot k-dot-p"></i>kept pair and its image</span>
+		<span><i class="dot k-bad"></i>discarded (outside the circle)</span>
+		<span><i class="k-p"></i>N(0, 1)</span>
+	</div>
+	<svg class="smp-svg" viewBox="0 0 640 470" role="img" aria-label="Box–Muller mapping from the unit disc to the plane"></svg>
+	<div class="smp-controls">
+		<Player />
+		<button type="button" class="smp-btn" data-add="200">+200 pairs</button>
+	</div>
+	<div class="smp-metrics">
+		<div><span>pairs drawn</span><strong class="m-n"></strong></div>
+		<div><span>kept (π/4 ≈ 0.785)</span><strong class="m-keep"></strong></div>
+		<div><span>mean of y</span><strong class="m-mean"></strong></div>
+		<div><span>variance of y</span><strong class="m-var"></strong></div>
+	</div>
+	<p class="smp-narration"></p>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import { boxMuller, gaussianPdf, mulberry32 } from "./sampling";
+	import { axes, bars, bindPlayer, curve, el, fmt, histogram } from "./plot";
+
+	const MAX = 4000;
+
+	function attach(fig: HTMLElement) {
+		const svg = fig.querySelector("svg")!;
+		const say = fig.querySelector(".smp-narration")!;
+		const rng = mulberry32(Number(fig.dataset.seed));
+		const pairs = Array.from({ length: MAX }, () => {
+			const z: [number, number] = [2 * rng() - 1, 2 * rng() - 1];
+			return { z, y: boxMuller(z[0], z[1]) };
+		});
+		// Start with some draws shown so the figure is not empty.
+		let n = 300;
+		let hover = -1;
+
+		function describe(i: number) {
+			const { z, y } = pairs[i];
+			const r2 = z[0] ** 2 + z[1] ** 2;
+			if (!y) return `Pair ${i + 1}: (z1, z2) = (${fmt(z[0])}, ${fmt(z[1])}), r² = ${fmt(r2, 3)} > 1, so it is discarded.`;
+			return `Pair ${i + 1}: (z1, z2) = (${fmt(z[0])}, ${fmt(z[1])}), r² = ${fmt(r2, 3)}, factor sqrt(−2 ln r² / r²) = ${fmt(Math.sqrt((-2 * Math.log(r2)) / r2), 3)} → (y1, y2) = (${fmt(y[0])}, ${fmt(y[1])}).`;
+		}
+
+		function draw() {
+			svg.replaceChildren();
+			const L = axes(svg, { x: 40, y: 12, w: 250, h: 250 }, [-1, 1], [-1, 1], { xLabel: "z₁", yLabel: "z₂", xTicks: 4, yTicks: 4 });
+			const R = axes(svg, { x: 370, y: 12, w: 250, h: 250 }, [-3.5, 3.5], [-3.5, 3.5], { xLabel: "y₁", yLabel: "y₂", xTicks: 6, yTicks: 6 });
+			el("circle", { cx: L.sx(0), cy: L.sy(0), r: L.sx(1) - L.sx(0), class: "smp-muted-line" }, svg);
+			const shown = pairs.slice(0, n);
+			const ys: number[] = [];
+			shown.forEach((p, i) => {
+				const recent = i === n - 1 || i === hover;
+				const c = el("circle", { cx: L.sx(p.z[0]), cy: L.sy(p.z[1]), r: recent ? 4.5 : 2.2, class: p.y ? "smp-dot" : "smp-bad" }, svg);
+				if (!p.y) {
+					c.setAttribute("opacity", "0.6");
+					return;
+				}
+				ys.push(p.y[0], p.y[1]);
+				const d = el("circle", { cx: R.sx(p.y[0]), cy: R.sy(p.y[1]), r: recent ? 4.5 : 2.2, class: "smp-dot" }, svg);
+				if (recent) {
+					c.setAttribute("class", "smp-current");
+					d.setAttribute("class", "smp-current");
+				}
+				for (const t of [c, d]) {
+					t.addEventListener("mouseenter", () => {
+						hover = i;
+						draw();
+					});
+				}
+			});
+			const B = axes(svg, { x: 40, y: 310, w: 580, h: 120 }, [-4, 4], [0, 0.5], { xLabel: "y₁ and y₂ pooled", yTicks: 2 });
+			bars(svg, B, histogram(ys, -4, 4, 40), -4, 4, "smp-hist");
+			el("path", { d: curve(B, (x) => gaussianPdf(x)), class: "smp-p" }, svg);
+
+			const kept = shown.filter((p) => p.y).length;
+			const mean = ys.reduce((s, v) => s + v, 0) / Math.max(ys.length, 1);
+			const v = ys.reduce((s, x) => s + (x - mean) ** 2, 0) / Math.max(ys.length - 1, 1);
+			fig.querySelector(".m-n")!.textContent = String(n);
+			fig.querySelector(".m-keep")!.textContent = n ? fmt(kept / n, 3) : "–";
+			fig.querySelector(".m-mean")!.textContent = ys.length ? fmt(mean, 3) : "–";
+			fig.querySelector(".m-var")!.textContent = ys.length > 1 ? fmt(v, 3) : "–";
+			const focus = hover >= 0 && hover < n ? hover : n - 1;
+			say.textContent = focus >= 0 ? describe(focus) : "Press play or step to draw a pair uniformly from the square.";
+		}
+
+		const step = (dir: 1 | -1) => {
+			n = Math.max(0, Math.min(MAX, n + dir));
+			hover = -1;
+			draw();
+			return n < MAX && n < 150;
+		};
+		bindPlayer(fig, step, () => {
+			n = 0;
+			hover = -1;
+			draw();
+		}, 200);
+		fig.querySelector("[data-add]")!.addEventListener("click", () => {
+			n = Math.min(MAX, n + 200);
+			hover = -1;
+			draw();
+		});
+		svg.addEventListener("mouseleave", () => {
+			if (hover >= 0) {
+				hover = -1;
+				draw();
+			}
+		});
+		draw();
+	}
+
+	document.querySelectorAll<HTMLElement>(".smp-bm").forEach(attach);
+</script>

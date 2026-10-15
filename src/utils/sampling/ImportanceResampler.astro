@@ -1,0 +1,111 @@
+---
+// Importance sampling and sampling-importance-resampling (eqs 14.19–14.26). The target is the
+// unnormalized two-bump density p̃(z) = 3 exp(−2 (z + 1)²) + 2 exp(−(z − 2)² / 0.72), whose
+// normalizer is Z_p = 2.7 √(2π) ≈ 6.768 and mean is 1/3. The proposal is N(0, σq²).
+// Top: normalized target and proposal. Middle: the L proposal samples as stems whose height is
+// the normalized weight w_l. Bottom: histogram of L values resampled with probabilities w_l.
+// Sliders set σq and L; "New samples" re-draws. Readouts give the effective sample size, the
+// weighted estimate of E[z] (eq 14.22) and of Z_p (eq 14.21).
+// Usage in .mdx:
+//   <ImportanceResampler sigmaQ={2} samples={200} />
+import "./sampling.css";
+
+interface Props {
+	sigmaQ?: number;
+	samples?: number;
+	seed?: number;
+	title?: string;
+	caption?: string;
+}
+
+const { sigmaQ = 2, samples = 200, seed = 21, title, caption } = Astro.props;
+---
+
+<figure class="smp-fig smp-sir" data-sq={sigmaQ} data-l={samples} data-seed={seed}>
+	{title && <div class="smp-title">{title}</div>}
+	<div class="smp-legend">
+		<span><i class="k-p"></i>target p(z)</span>
+		<span><i class="k-qd"></i>proposal q(z)</span>
+		<span><i class="dot k-dot-p"></i>weight w_l of each sample</span>
+		<span><i class="box k-hist"></i>resampled values</span>
+	</div>
+	<svg class="smp-svg" viewBox="0 0 640 470" role="img" aria-label="Importance weights and resampling"></svg>
+	<div class="smp-controls">
+		<label class="smp-slider">σq = <strong class="v-sq"></strong>
+			<input type="range" class="i-sq" min="0.3" max="4" step="0.05" value={sigmaQ} aria-label="Proposal standard deviation" />
+		</label>
+		<label class="smp-slider">L = <strong class="v-l"></strong>
+			<input type="range" class="i-l" min="1" max="3.3" step="0.01" value={Math.log10(samples)} aria-label="Number of samples (log scale)" />
+		</label>
+		<button type="button" class="smp-btn" data-new>New samples</button>
+	</div>
+	<div class="smp-metrics">
+		<div><span>effective sample size 1/Σw²</span><strong class="m-ess"></strong></div>
+		<div><span>largest weight</span><strong class="m-max"></strong></div>
+		<div><span>Σ w_l z_l (true 0.333)</span><strong class="m-mean"></strong></div>
+		<div><span>Z_p ≈ (1/L) Σ p̃/q (true 6.768)</span><strong class="m-z"></strong></div>
+	</div>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import { effectiveSampleSize, gaussianPdf, importanceWeights, mulberry32, normalGenerator, resample } from "./sampling";
+	import { axes, bars, curve, el, fmt, histogram } from "./plot";
+
+	const pTilde = (z: number) => 3 * Math.exp(-2 * (z + 1) ** 2) + 2 * Math.exp(-((z - 2) ** 2) / 0.72);
+	const Zp = 2.7 * Math.sqrt(2 * Math.PI);
+	const X: [number, number] = [-5, 5];
+
+	function attach(fig: HTMLElement) {
+		const svg = fig.querySelector("svg")!;
+		const sqIn = fig.querySelector<HTMLInputElement>(".i-sq")!;
+		const lIn = fig.querySelector<HTMLInputElement>(".i-l")!;
+		let seed = Number(fig.dataset.seed);
+
+		function draw() {
+			const sq = Number(sqIn.value);
+			const L = Math.round(10 ** Number(lIn.value));
+			const rng = mulberry32(seed);
+			const randn = normalGenerator(rng);
+			// Standard normals drawn once per seed and scaled, so moving σq moves the same samples.
+			const zs = Array.from({ length: L }, () => sq * randn());
+			const q = (z: number) => gaussianPdf(z, 0, sq);
+			const w = importanceWeights(zs, pTilde, q);
+			const idx = resample(w, L, mulberry32(seed + 1));
+			const res = idx.map((i) => zs[i]);
+
+			svg.replaceChildren();
+			const T = axes(svg, { x: 52, y: 10, w: 568, h: 130 }, X, [0, 0.6], { yLabel: "density", yTicks: 3 });
+			el("path", { d: curve(T, (z) => pTilde(z) / Zp), class: "smp-p" }, svg);
+			el("path", { d: curve(T, q), class: "smp-q-dash" }, svg);
+			const wMax = Math.max(...w);
+			const M = axes(svg, { x: 52, y: 165, w: 568, h: 120 }, X, [0, Math.max(wMax * 1.1, 1e-6)], { yLabel: "weight w_l", yTicks: 3 });
+			zs.forEach((z, i) => {
+				if (z < X[0] || z > X[1]) return;
+				el("line", { x1: M.sx(z), x2: M.sx(z), y1: M.sy(0), y2: M.sy(w[i]), class: "smp-muted-line" }, svg);
+				el("circle", { cx: M.sx(z), cy: M.sy(w[i]), r: 2.2, class: "smp-dot" }, svg);
+			});
+			const B = axes(svg, { x: 52, y: 310, w: 568, h: 120 }, X, [0, 0.8], { xLabel: "z", yLabel: "density", yTicks: 4 });
+			bars(svg, B, histogram(res, X[0], X[1], 50), X[0], X[1], "smp-hist");
+			el("path", { d: curve(B, (z) => pTilde(z) / Zp), class: "smp-p" }, svg);
+
+			const ess = effectiveSampleSize(w);
+			fig.querySelector(".v-sq")!.textContent = fmt(sq, 2);
+			fig.querySelector(".v-l")!.textContent = String(L);
+			fig.querySelector(".m-ess")!.textContent = `${fmt(ess, 1)} of ${L}`;
+			fig.querySelector(".m-max")!.textContent = fmt(wMax, 3);
+			fig.querySelector(".m-mean")!.textContent = fmt(zs.reduce((s, z, i) => s + w[i] * z, 0), 3);
+			fig.querySelector(".m-z")!.textContent = fmt(zs.reduce((s, z) => s + pTilde(z) / q(z), 0) / L, 3);
+		}
+
+		sqIn.addEventListener("input", draw);
+		lIn.addEventListener("input", draw);
+		fig.querySelector("[data-new]")!.addEventListener("click", () => {
+			seed += 2;
+			draw();
+		});
+		draw();
+	}
+
+	document.querySelectorAll<HTMLElement>(".smp-sir").forEach(attach);
+</script>

@@ -1,0 +1,111 @@
+---
+// The transformation method of eqs 14.5–14.8. Top panel: the indefinite integral h(y) of the
+// target density, with the uniform draw z on the vertical axis; a guide runs across from z to
+// the curve and down to y = h⁻¹(z). Bottom panel: the histogram of all y drawn so far against
+// p(y). Step through draws one by one, add 100 at a time, or switch the target between the
+// exponential (λ = 1) and the Cauchy. The draws come from a fixed seed so the figure is
+// reproducible. Logic in sampling.ts (`transforms`).
+// Usage in .mdx:
+//   <InverseCdfSampler dist="exponential" />
+import Player from "./Player.astro";
+import "./sampling.css";
+
+interface Props {
+	dist?: "exponential" | "cauchy";
+	seed?: number;
+	title?: string;
+	caption?: string;
+}
+
+const { dist = "exponential", seed = 3, title, caption } = Astro.props;
+---
+
+<figure class="smp-fig smp-inv" data-dist={dist} data-seed={seed}>
+	{title && <div class="smp-title">{title}</div>}
+	<div class="smp-legend">
+		<span><i class="k-text"></i>h(y), the CDF</span>
+		<span><i class="k-p"></i>target p(y)</span>
+		<span><i class="box k-hist"></i>histogram of y = h⁻¹(z)</span>
+	</div>
+	<svg class="smp-svg" viewBox="0 0 640 400" role="img" aria-label="Uniform draws mapped through the inverse CDF"></svg>
+	<div class="smp-controls">
+		<Player />
+		<button type="button" class="smp-btn" data-add="100">+100 draws</button>
+		<label>target
+			<select class="smp-dist">
+				<option value="exponential" selected={dist === "exponential"}>exponential (λ = 1)</option>
+				<option value="cauchy" selected={dist === "cauchy"}>Cauchy</option>
+			</select>
+		</label>
+	</div>
+	<p class="smp-narration"></p>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import { mulberry32, transforms } from "./sampling";
+	import { axes, bars, bindPlayer, curve, el, fmt, histogram } from "./plot";
+
+	const MAX = 3000;
+
+	function attach(fig: HTMLElement) {
+		const svg = fig.querySelector("svg")!;
+		const say = fig.querySelector(".smp-narration")!;
+		const select = fig.querySelector<HTMLSelectElement>(".smp-dist")!;
+		const rng = mulberry32(Number(fig.dataset.seed));
+		const zs = Array.from({ length: MAX }, () => rng());
+		// Start with some draws shown so the figure is not empty.
+		let n = 200;
+
+		function draw() {
+			const t = transforms[select.value];
+			const ys = zs.slice(0, n).map(t.inv);
+			svg.replaceChildren();
+			const top = axes(svg, { x: 48, y: 12, w: 572, h: 150 }, t.range, [0, 1], { yLabel: "z = h(y)", yTicks: 2 });
+			const pmax = t.pdf(t.range[0] < 0 ? 0 : t.range[0]) * 1.25;
+			const bot = axes(svg, { x: 48, y: 190, w: 572, h: 170 }, t.range, [0, pmax], { xLabel: "y", yLabel: "density" });
+			const bins = 40;
+			bars(svg, bot, histogram(ys, t.range[0], t.range[1], bins), t.range[0], t.range[1], "smp-hist");
+			el("path", { d: curve(bot, t.pdf), class: "smp-p" }, svg);
+			el("path", { d: curve(top, t.cdf), class: "smp-text-line" }, svg);
+			// Ticks of every z on the left edge (most recent 60).
+			for (const z of zs.slice(Math.max(0, n - 60), n)) {
+				el("line", { x1: top.box.x - 6, x2: top.box.x, y1: top.sy(z), y2: top.sy(z), class: "smp-guide" }, svg);
+			}
+			if (n > 0) {
+				const z = zs[n - 1];
+				const y = t.inv(z);
+				const inView = y >= t.range[0] && y <= t.range[1];
+				const xEnd = inView ? top.sx(y) : top.sx(y < t.range[0] ? t.range[0] : t.range[1]);
+				el("path", { d: `M${top.box.x},${top.sy(z)}H${xEnd}${inView ? `V${bot.box.y + bot.box.h}` : ""}`, class: "smp-guide" }, svg);
+				el("circle", { cx: top.box.x, cy: top.sy(z), r: 4, class: "smp-dot-q" }, svg);
+				if (inView) {
+					el("circle", { cx: top.sx(y), cy: top.sy(z), r: 3.5, class: "smp-current" }, svg);
+					el("circle", { cx: top.sx(y), cy: bot.box.y + bot.box.h, r: 4, class: "smp-dot" }, svg);
+				}
+				const out = ys.filter((v) => v < t.range[0] || v > t.range[1]).length;
+				say.textContent = `Draw ${n}: z = ${fmt(z, 3)} → y = h⁻¹(z) = ${fmt(y, 3)}${inView ? "" : " (off the plot)"}. ${n} draws, ${out} outside the plotted range.`;
+			} else {
+				say.textContent = "Press play or step to draw z uniformly from (0, 1) and map it through h⁻¹.";
+			}
+		}
+
+		const step = (dir: 1 | -1) => {
+			n = Math.max(0, Math.min(MAX, n + dir));
+			draw();
+			return n < MAX && n < 200;
+		};
+		bindPlayer(fig, step, () => {
+			n = 0;
+			draw();
+		}, 150);
+		fig.querySelector("[data-add]")!.addEventListener("click", () => {
+			n = Math.min(MAX, n + 100);
+			draw();
+		});
+		select.addEventListener("change", draw);
+		draw();
+	}
+
+	document.querySelectorAll<HTMLElement>(".smp-inv").forEach(attach);
+</script>

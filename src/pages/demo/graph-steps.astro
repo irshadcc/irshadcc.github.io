@@ -1,0 +1,73 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import GraphSteps from "../../utils/autodiff/GraphSteps.astro";
+import {
+	deltaFlowSteps,
+	networkSteps,
+	reverseModeSteps,
+} from "../../utils/autodiff/backpropFigures";
+import type { GraphStepsData } from "../../utils/autodiff/graphSteps";
+
+// A hand-written example: y = sin(x) * x at x = 2, forward then one backward step, with an edge label.
+const tiny: GraphStepsData = {
+	nodes: [
+		{ id: "x", label: "x", sub: "input", col: 0, row: 0.5 },
+		{ id: "s", label: "s", sub: "sin x", col: 1, row: 0 },
+		{ id: "y", label: "y", sub: "s·x", col: 2, row: 0.5 },
+	],
+	edges: [
+		{ from: "x", to: "s" },
+		{ from: "s", to: "y" },
+		{ from: "x", to: "y" },
+	],
+	steps: [
+		{
+			label: "Forward",
+			note: "Forward: $s = \\sin 2 = 0.909$, $y = s\\,x = 1.819$.",
+			nodes: {
+				x: { lines: ["x = 2.000"], hi: "fwd" },
+				s: { lines: ["s = 0.909"], hi: "fwd" },
+				y: { lines: ["y = 1.819"], hi: "fwd" },
+			},
+			edges: {
+				"x>s": { hi: "fwd" },
+				"s>y": { hi: "fwd" },
+				"x>y": { hi: "fwd" },
+			},
+		},
+		{
+			label: "Backward",
+			note: "Backward: $\\bar x = \\bar s\\cos x + \\bar y\\,s = 2(-0.416) + 0.909 = 0.077$.",
+			nodes: {
+				x: { lines: ["x = 2.000", "x̄ = 0.077"], hi: "bwd" },
+				s: { lines: ["s = 0.909", "s̄ = 2.000"] },
+				y: { lines: ["y = 1.819", "ȳ = 1"] },
+			},
+			edges: {
+				"x>s": { hi: "bwd", label: "2×(−0.416)" },
+				"x>y": { hi: "bwd", label: "1×0.909" },
+			},
+			table: {
+				columns: ["variable", "value", "adjoint"],
+				rows: [
+					["x", "2.000", "0.077"],
+					["s", "0.909", "2.000"],
+					["y", "1.819", "1"],
+				],
+			},
+		},
+	],
+};
+---
+
+<Layout title="GraphSteps">
+	<h1>GraphSteps</h1>
+	<p>A hand-written three-node graph, with a table on the second step.</p>
+	<GraphSteps data={tiny} title="y = x sin x" colGap={170} />
+	<p>Figure 8.1 of Bishop & Bishop, symbolic.</p>
+	<GraphSteps data={deltaFlowSteps} title="Backpropagating δ through one unit" colGap={230} nodeWidth={130} />
+	<p>Backpropagation on a 2-3-2 network, starting on step 4.</p>
+	<GraphSteps data={networkSteps} step={4} title="Backpropagation on a 2-3-2 network" />
+	<p>Reverse-mode autodiff on an evaluation trace.</p>
+	<GraphSteps data={reverseModeSteps} title="Adjoints of f(x₁, x₂)" />
+</Layout>

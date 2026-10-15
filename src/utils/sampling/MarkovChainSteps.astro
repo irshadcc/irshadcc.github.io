@@ -1,0 +1,125 @@
+---
+// A Markov chain on a few discrete states, built by the Metropolis rule (eq 14.27) for an
+// unnormalized target p̃ with a proposal that moves one state left or right with probability
+// 1/2. Step m shows the marginal p(z^(m)) as bars against the target p★ (outline) after m
+// applications of eq 14.32, starting with all mass on one state. Between neighbouring states,
+// the upper arrow carries the probability flow p(z^(m) = i) T(i, i+1) and the lower arrow the
+// flow back p(z^(m) = i+1) T(i+1, i); at p★ the two are equal, which is detailed balance
+// (eq 14.34). The transition matrix is listed below. Logic in sampling.ts (`metropolisMatrix`).
+// Usage in .mdx:
+//   <MarkovChainSteps pTilde={[1, 3, 6, 4, 2]} start={0} steps={30} />
+import Player from "./Player.astro";
+import { metropolisMatrix } from "./sampling";
+import "./sampling.css";
+
+interface Props {
+	pTilde: number[];
+	start?: number;
+	steps?: number;
+	title?: string;
+	caption?: string;
+}
+
+const { pTilde, start = 0, steps = 30, title, caption } = Astro.props;
+const T = metropolisMatrix(pTilde);
+const f = (v: number) => (v === 0 ? "0" : v.toFixed(4));
+---
+
+<figure class="smp-fig smp-mc" data-p={JSON.stringify(pTilde)} data-start={start} data-steps={steps}>
+	{title && <div class="smp-title">{title}</div>}
+	<div class="smp-legend">
+		<span><i class="box k-hist"></i>p(z<sup>(m)</sup>)</span>
+		<span><i class="k-text"></i>target p★</span>
+		<span><i class="k-q"></i>flow right, p(i) T(i, i+1)</span>
+		<span><i class="k-p"></i>flow left, p(i+1) T(i+1, i)</span>
+	</div>
+	<svg class="smp-svg" viewBox="0 0 640 330" role="img" aria-label="Distribution of a Markov chain converging to its stationary distribution"></svg>
+	<div class="smp-controls">
+		<Player />
+		<span class="smp-count"></span>
+	</div>
+	<p class="smp-narration"></p>
+	<table class="smp-table">
+		<thead>
+			<tr><th>T(i, j)</th>{pTilde.map((_, j) => <th>j = {j}</th>)}<th>p̃(i)</th></tr>
+		</thead>
+		<tbody>
+			{T.map((row, i) => (
+				<tr><td>i = {i}</td>{row.map((v) => <td>{f(v)}</td>)}<td>{pTilde[i]}</td></tr>
+			))}
+		</tbody>
+	</table>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import { metropolisMatrix, propagate, totalVariation } from "./sampling";
+	import { bindPlayer, el, fmt } from "./plot";
+
+	function attach(fig: HTMLElement) {
+		const svg = fig.querySelector("svg")!;
+		const say = fig.querySelector(".smp-narration")!;
+		const pt = JSON.parse(fig.dataset.p!) as number[];
+		const total = Number(fig.dataset.steps);
+		const T = metropolisMatrix(pt);
+		const sum = pt.reduce((s, v) => s + v, 0);
+		const star = pt.map((v) => v / sum);
+		const dists: number[][] = [pt.map((_, i) => (i === Number(fig.dataset.start) ? 1 : 0))];
+		for (let m = 0; m < total; m++) dists.push(propagate(dists[m], T));
+		const n = pt.length;
+		const cx = (i: number) => 70 + (i * 500) / (n - 1);
+		let m = 0;
+
+		function draw() {
+			const p = dists[m];
+			svg.replaceChildren();
+			// Bars of p(z^(m)) and the target outline.
+			const base = 300;
+			const H = 170;
+			const top = Math.max(...star, ...p.map((v) => Math.min(v, 0.6))) * 1.1;
+			const sy = (v: number) => base - (Math.min(v, top) / top) * H;
+			el("line", { x1: 30, x2: 610, y1: base, y2: base, class: "smp-muted-line" }, svg);
+			p.forEach((v, i) => {
+				el("rect", { x: cx(i) - 28, y: sy(v), width: 56, height: base - sy(v), class: "smp-hist" }, svg);
+				el("path", { d: `M${cx(i) - 28},${sy(star[i])}h56`, class: "smp-text-line" }, svg);
+				el("text", { x: cx(i), y: sy(v) - 5, class: "smp-text", "text-anchor": "middle" }, svg, fmt(v, 3));
+				el("text", { x: cx(i), y: base + 16, class: "smp-tick", "text-anchor": "middle" }, svg, `z = ${i}  (p★ = ${fmt(star[i], 4)})`);
+			});
+			// States with flow arrows between neighbours.
+			const yS = 46;
+			for (let i = 0; i + 1 < n; i++) {
+				const right = p[i] * T[i][i + 1];
+				const left = p[i + 1] * T[i + 1][i];
+				const x0 = cx(i) + 22;
+				const x1 = cx(i + 1) - 22;
+				const w = (f: number) => 0.8 + 30 * f;
+				el("path", { d: `M${x0},${yS - 8}L${x1 - 6},${yS - 8}`, class: "smp-q", style: `stroke-width: ${w(right)}` }, svg);
+				el("path", { d: `M${x1 - 8},${yS - 13}L${x1},${yS - 8}L${x1 - 8},${yS - 3}`, class: "smp-q" }, svg);
+				el("path", { d: `M${x1},${yS + 8}L${x0 + 6},${yS + 8}`, class: "smp-p", style: `stroke-width: ${w(left)}` }, svg);
+				el("path", { d: `M${x0 + 8},${yS + 3}L${x0},${yS + 8}L${x0 + 8},${yS + 13}`, class: "smp-p" }, svg);
+				el("text", { x: (x0 + x1) / 2, y: yS - 18, class: "smp-note", "text-anchor": "middle" }, svg, fmt(right, 4));
+				el("text", { x: (x0 + x1) / 2, y: yS + 28, class: "smp-note", "text-anchor": "middle" }, svg, fmt(left, 4));
+			}
+			for (let i = 0; i < n; i++) {
+				el("circle", { cx: cx(i), cy: yS, r: 19, class: "smp-current" }, svg);
+				el("text", { x: cx(i), y: yS + 4, class: "smp-text", "text-anchor": "middle" }, svg, String(i));
+			}
+			const tv = totalVariation(p, star);
+			fig.querySelector(".smp-count")!.textContent = `m = ${m} of ${total}`;
+			say.textContent = `After ${m} step${m === 1 ? "" : "s"}: p(z^(${m})) = (${p.map((v) => fmt(v, 3)).join(", ")}), total variation distance to p★ = ${fmt(tv, 4)}.${tv < 1e-3 ? " The flows in each pair now (almost) match: detailed balance." : ""}`;
+		}
+
+		const step = (dir: 1 | -1) => {
+			m = Math.max(0, Math.min(total, m + dir));
+			draw();
+			return m < total;
+		};
+		bindPlayer(fig, step, () => {
+			m = 0;
+			draw();
+		}, 450);
+		draw();
+	}
+
+	document.querySelectorAll<HTMLElement>(".smp-mc").forEach(attach);
+</script>
