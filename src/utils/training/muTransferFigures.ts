@@ -17,7 +17,6 @@ export const av = data.av;
 export const linear = data.linear;
 export const limit = data.limit;
 export const sweepAdam: Sweep = data.sweepAdam;
-export const sweepSgd: Sweep = data.sweepSgd;
 export const coord = data.coord;
 
 /** A LineChart series function that looks y up at sampled x values (NaN, i.e. a gap, elsewhere). */
