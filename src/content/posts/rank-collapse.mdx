@@ -9,6 +9,9 @@ import Sidenote from "../../components/Sidenote.astro";
 import LineChart from "../../utils/charts/LineChart.astro";
 import RankCollapseSteps from "../../utils/neuralnetwork/RankCollapseSteps.astro";
 import { wideEffectiveRank } from "../../utils/neuralnetwork/rankCollapseWide";
+import ModuleGraph from "../../component/ModuleGraph/ModuleGraph.astro";
+import qwenProgram from "../../component/ModuleGraph/models/qwen3GuardStream4B.json";
+import qwenStats from "../../component/ModuleGraph/models/qwen3GuardStream4BStats.json";
 
 export const mix = [
 	[5 / 6, 1 / 6],
@@ -34,6 +37,11 @@ export const erankFromRatio = (r) => {
 
 export const depths = Array.from({ length: 129 }, (_, i) => i);
 
+export const qwenCollapsed = [
+	"model.model.layers",
+	...Array.from({ length: 36 }, (_, i) => `model.model.layers.${i}`),
+];
+
 ## Background
 
 A hidden layer may have 1,024 neurons and still carry only a handful of independent signals.
@@ -51,8 +59,9 @@ This post first defines rank and two softer measures of it. It then follows twel
 through a deep network whose only layer is a gentle, invertible mixing of two neurons, and
 watches the collapse happen one layer at a time. It repeats the experiment on 64-wide random
 networks to see which design choices (orthogonal weights, residual connections, batch
-normalisation) prevent it, and ends with how to measure collapse in a real model and when low
-rank is actually what you want.
+normalisation) prevent it, and ends with how to measure collapse in a real model, what the
+weight ranks of a trained 4-billion-parameter Qwen3 model look like, and when low rank is
+actually what you want.
 
 ## What collapses?
 
@@ -490,6 +499,100 @@ pair the profile with a measurement of the task:
 - **The task metric itself**: if two variants with different rank profiles reach the same
   validation accuracy, the lower rank is compression, not damage.
 
+## The weight ranks of a trained Qwen3 model
+
+The "cliff at one layer" check above starts from the weights. A layer whose weight matrix has
+lost rank has a **null space**: a set of input directions it maps to zero, which no later layer
+can recover. So a first question about a real model is: are any of its weight matrices rank
+deficient?
+
+This section answers that for **Qwen3Guard-Stream-4B**, a safety classifier built on the
+Qwen3-4B language model: 36 decoder layers of width 2,560, plus small classification heads on
+top. It has 406 parameter tensors and about 4.0 billion weights in all.
+
+### From an exported graph to ranks
+
+Two files describe the model.
+
+- **The graph** comes from `torch.export`, which traces one forward pass into a flat list of
+  ATen operations (`aten.linear`, `aten.mul`, ...). Each operation records the stack of modules
+  it ran in (`model.model.layers.3.self_attn.q_proj`), which is enough to rebuild the module tree.
+  The trace used a 2-token input, so the wires carry shapes such as $(1, 2, 2560)$.
+- **The parameter statistics** list, for every parameter, its shape, a 50-bin histogram of its
+  values, its moments and its numerical rank.
+
+The **numerical rank** is the number of singular values above a tolerance,
+$\sigma_i > \varepsilon \cdot \max(m, n) \cdot \sigma_1$, where $\varepsilon = 2^{-23}$ is the
+machine epsilon of float32 and $m \times n$ is the matrix shape. This is the default rule of
+`torch.linalg.matrix_rank`, applied after casting each bfloat16 weight to float32.<Sidenote>Both
+files were produced on a GPU with PyTorch 2.14 and the model's remote code. The graph is the
+`models/model.json` of the `.pt2` archive that `torch.export.save` writes; the copy in this
+repository drops each node's stack trace and rounds the statistics to five significant digits,
+nothing else. The `ModuleGraph` component reads both and renders at build time; nothing in this
+section was re-run here.</Sidenote>
+
+`ModuleGraph` turns the graph into nested boxes, one per module. The innermost modules (each
+`Linear`, each RMSNorm) become single cards, and operations that only reshape or cast a tensor
+(`view`, `transpose`, `to`) are skipped. The statistics are then attached to the card of the
+module that owns each weight.
+
+<ModuleGraph
+	program={qwenProgram}
+	parameterStats={qwenStats}
+	statsPrefix="model."
+	programOptions={{
+		outputNames: [
+			"risk_level_logits",
+			"category_logits",
+			"query_risk_level_logits",
+			"query_category_logits",
+		],
+	}}
+	collapsed={qwenCollapsed}
+	wide
+	title="Qwen3Guard-Stream-4B, rebuilt from its torch.export graph. Hover a box label for the rank of every weight inside it; + expands a box."
+/>
+
+Hover the `layers` card for a grid with one row per decoder layer and one column per weight
+matrix ($W_q, W_k, W_v, W_o$ and the three MLP projections). Press + on it, then on any layer, to
+see the layer's dataflow; hover a `Linear` card such as `q_proj` for its value histogram and rank.
+
+### What the ranks show
+
+Every one of the $36 \times 7 = 252$ projection matrices has full numerical rank, and so do the
+six matrices of the classification heads. Of the 259 matrices in the model, exactly one falls
+short:
+
+| Weight | Shape | Rank | Tolerance $\varepsilon \max(m,n)$ |
+| --- | ---: | ---: | ---: |
+| `q_proj` | 4,096 × 2,560 | 2,560 | $4.9 \times 10^{-4}$ |
+| `k_proj`, `v_proj` | 1,024 × 2,560 | 1,024 | $3.1 \times 10^{-4}$ |
+| `o_proj` | 2,560 × 4,096 | 2,560 | $4.9 \times 10^{-4}$ |
+| `gate_proj`, `up_proj` | 9,728 × 2,560 | 2,560 | $1.2 \times 10^{-3}$ |
+| `down_proj` | 2,560 × 9,728 | 2,560 | $1.2 \times 10^{-3}$ |
+| `embed_tokens` | 151,936 × 2,560 | **2,559** | $1.8 \times 10^{-2}$ |
+
+The embedding's shortfall says less than it seems. The tolerance grows with the longer side of
+the matrix: check it by hand, $151{,}936 \times 2^{-23} = 0.0181$, so a singular value counts
+only if it exceeds 1.8% of $\sigma_1$. For `q_proj` the bar is $4{,}096 \times 2^{-23} = 0.05\%$.
+All the rank tells us is that one direction of the embedding has a singular value below 1.8% of
+the largest. Whether that direction is truly unused needs the singular values themselves, which
+these statistics do not include.<Sidenote>The 147 remaining parameters are vectors (the scale of
+each RMSNorm), which have no rank. They show up in the grid's summary as "not ranked".</Sidenote>
+
+### Full rank is not the end of the story
+
+Full rank everywhere is what the earlier sections predict, and it is also why weight ranks
+cannot rule collapse out. The two-neuron network collapsed a batch to one direction although its
+weight matrix had full rank at every layer. Full-rank weights in Qwen3 likewise say nothing about
+how unevenly the product of 36 layers spreads a batch's variance.
+
+So the weight check answers a narrower question. It rules out the obvious failure, a layer
+with a null space, and points at the one matrix worth a closer look. To see whether the model's
+representations collapse, measure the rank profile of its activations, as in the previous
+section, or the effective and stable ranks of each weight from its full spectrum of singular
+values.
+
 ## Preventing rank collapse
 
 Every countermeasure attacks the cause found earlier. A deep network multiplies many layers
@@ -654,6 +757,9 @@ If the diagnosis shows harmful collapse in a model trained with strong weight de
   and batch normalisation puts a floor under it.
 - Diagnose with a rank profile: the effective rank of every layer on a fixed batch with many
   more rows than the width, checked against a linear probe or the task metric.
+- Weight ranks are a narrower check. In Qwen3Guard-Stream-4B, 258 of 259 weight matrices have
+  full numerical rank; the embedding misses by one under a tolerance of 1.8% of $\sigma_1$.
+  This rules out layers with a null space, not collapse of the activations.
 - Prevent it by keeping each layer close to an isometry (orthogonal initialisation, small
   residual branches, orthogonality penalties) or by re-equalising the spread (batch
   normalisation for per-feature scale, whitening or decorrelation losses for correlation).
@@ -691,3 +797,7 @@ If the diagnosis shows harmful collapse in a model trained with strong weight de
 12. T. Miyato, T. Kataoka, M. Koyama, and Y. Yoshida, ["Spectral Normalization for Generative
     Adversarial Networks"](https://arxiv.org/abs/1802.05957), ICLR 2018.
 13. T. Nait Saada, A. Naderi, and J. Tanner, ["Mind the Gap: a Spectral Analysis of Rank Collapse and Signal Propagation in Attention Layers"](https://arxiv.org/abs/2410.07799), 2024.
+14. Qwen Team, [Qwen3Guard-Stream-4B model card](https://huggingface.co/Qwen/Qwen3Guard-Stream-4B),
+    Hugging Face.
+15. PyTorch, [`torch.linalg.matrix_rank`](https://docs.pytorch.org/docs/stable/generated/torch.linalg.matrix_rank.html)
+    and [`torch.export`](https://docs.pytorch.org/docs/stable/export.html) documentation.

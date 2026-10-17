@@ -14,25 +14,54 @@
 // names, "" for the root) that start collapsed. The input is a nested JSON module
 // (moduleGraph.ts describes the format), lowered to a flat graph that moduleLayout.ts lays out
 // and moduleRender.ts draws, at build time and again in the browser after a toggle.
+// Instead of `spec`, `program` takes a torch.export program (the JSON graph of a .pt2 archive),
+// nested by module (exportedProgram.ts), and `parameterStats` fills its weights from a
+// { fqn: { rank, distribution } } file before lowering. Hovering a box label (or a collapsed
+// box's card) also tabulates the numerical rank of every weight inside it, per layer as a grid.
 // Self-contained: it uses no other component. The drawing shrinks to 75% at most, then scrolls.
 // Usage in .mdx:
 //   import spec from "../../component/ModuleGraph/megatronMoe.json";
 //   <ModuleGraph spec={spec} wide collapsed={["local_experts.1"]} />
+//   import program from "../../component/ModuleGraph/models/qwen3GuardStream4B.json";
+//   import stats from "../../component/ModuleGraph/models/qwen3GuardStream4BStats.json";
+//   <ModuleGraph program={program} parameterStats={stats} statsPrefix="model." collapsed={["model.model.layers"]} />
 import katex from "katex";
+import {
+	type ExportedProgram,
+	type FromExportOptions,
+	type ParameterStats,
+	fromExportedProgram,
+	withParameterStats,
+} from "./exportedProgram";
 import {
 	type ModuleSpec,
 	type TensorValue,
 	type WeightSpec,
 	collapse,
+	join,
 	lower,
 	moduleLabel,
 } from "./moduleGraph";
 import { layoutModule } from "./moduleLayout";
 import { renderSvg } from "./moduleRender";
-import { weightHtml, weightStats } from "./weightStats";
+import {
+	type NamedStats,
+	type WeightStats,
+	rankSummaryHtml,
+	weightHtml,
+	weightStats,
+} from "./weightStats";
 
 interface Props {
-	spec: ModuleSpec;
+	/** The module as nested JSON; or give `program`. */
+	spec?: ModuleSpec;
+	/** A torch.export program (models/model.json of a .pt2 archive), converted to a spec. */
+	program?: ExportedProgram;
+	programOptions?: FromExportOptions;
+	/** Per-parameter statistics by fully qualified name, stitched onto the weights. */
+	parameterStats?: Record<string, ParameterStats>;
+	/** Removed from a parameter's name before looking it up in `parameterStats`. */
+	statsPrefix?: string;
 	/** Extend into the margin-note column on wide screens. */
 	wide?: boolean;
 	title?: string;
@@ -40,8 +69,57 @@ interface Props {
 	collapsed?: string[];
 }
 
-const { spec, wide = false, title, collapsed = [] } = Astro.props;
+const {
+	program,
+	programOptions,
+	parameterStats,
+	statsPrefix = "",
+	wide = false,
+	title,
+	collapsed = [],
+} = Astro.props;
+const baseSpec =
+	Astro.props.spec ??
+	(program ? fromExportedProgram(program, programOptions) : undefined);
+if (!baseSpec) throw new Error("ModuleGraph: give `spec` or `program`");
+const spec = parameterStats
+	? withParameterStats(baseSpec, parameterStats, statsPrefix)
+	: baseSpec;
 const graph = lower(spec);
+// Every weight with its statistics, by dotted name (module path + parameter key), computed once.
+const allWeights: (NamedStats & { module: string })[] = [
+	...graph.nodes.flatMap((n) =>
+		Object.entries(n.weights ?? {}).map(([k, w]) => {
+			const owner = n.kind === "module" ? n.id : (n.module ?? "");
+			return { name: join(owner, k), module: owner, s: weightStats(w) };
+		}),
+	),
+	...Object.entries(graph.modules).flatMap(([id, m]) =>
+		Object.entries(m.weights ?? {}).map(([k, w]) => ({
+			name: join(id, k),
+			module: id,
+			s: weightStats(w),
+		})),
+	),
+];
+const statsByName = new Map<string, WeightStats>(
+	allWeights.map((w) => [w.name, w.s]),
+);
+/** The ranked weights under a module, named relative to it. */
+const weightsUnder = (id: string): NamedStats[] =>
+	allWeights
+		.filter(
+			(w) => id === "" || w.module === id || w.module.startsWith(`${id}.`),
+		)
+		.map((w) => ({ name: id ? w.name.slice(id.length + 1) : w.name, s: w.s }));
+const summaries = new Map<string, string>();
+for (const id of Object.keys(graph.modules)) {
+	const under = weightsUnder(id);
+	if (!under.some((w) => w.s.rank !== undefined)) continue;
+	summaries.set(id, rankSummaryHtml(under));
+	// An empty `weights` marks the box label as having a card.
+	graph.modules[id].weights ??= {};
+}
 for (const c of collapsed)
 	if (!(c in graph.modules))
 		throw new Error(
@@ -84,9 +162,11 @@ const usedSymbols = (ts: TensorValue[]) =>
 			ts.flatMap((t) => t.symbolic_shape?.match(/[A-Za-z_]\w*/g) ?? []),
 		),
 	].filter((w) => Object.hasOwn(symbols, w));
-const weightsHtml = (ws?: Record<string, WeightSpec>) =>
+const weightsHtml = (owner: string, ws?: Record<string, WeightSpec>) =>
 	Object.entries(ws ?? {})
-		.map(([k, w]) => weightHtml(k, weightStats(w)))
+		.map(([k, w]) =>
+			weightHtml(k, statsByName.get(join(owner, k)) ?? weightStats(w)),
+		)
 		.join("");
 const unique = <T extends { name: string }>(ts: T[]) =>
 	ts.filter((t, i) => ts.findIndex((u) => u.name === t.name) === i);
@@ -101,7 +181,10 @@ const nodeCards = graph.nodes.map((n) => {
 		ins,
 		outs,
 		syms: usedSymbols([...ins, ...outs]),
-		weights: weightsHtml(n.weights),
+		weights: weightsHtml(
+			n.kind === "module" ? n.id : (n.module ?? ""),
+			n.weights,
+		),
 	};
 });
 const boxCards = Object.entries(graph.modules)
@@ -109,7 +192,7 @@ const boxCards = Object.entries(graph.modules)
 	.map(([id, m]) => ({
 		id,
 		label: moduleLabel(id, m),
-		weights: weightsHtml(m.weights),
+		weights: weightsHtml(id, m.weights) + (summaries.get(id) ?? ""),
 	}));
 ---
 
@@ -977,6 +1060,36 @@ const boxCards = Object.entries(graph.modules)
 	}
 	.mg-card :global(.wt-warn) {
 		margin: 0.35rem 0 0;
+		color: var(--mg-x);
+		font-weight: 600;
+	}
+	.mg-card :global(.wt-summary .card-note) {
+		margin: 0.2rem 0 0;
+	}
+	.mg-card :global(.wt-grid) {
+		width: auto;
+		margin: 0.35rem 0 0;
+		border-collapse: collapse;
+		font-family: var(--mono);
+		font-size: 0.6rem;
+		line-height: 1.15;
+	}
+	.mg-card :global(.wt-grid th),
+	.mg-card :global(.wt-grid td) {
+		padding: 0 0.3rem;
+		border: 0;
+		text-align: center;
+		white-space: nowrap;
+	}
+	.mg-card :global(.wt-grid th) {
+		font-weight: 400;
+		color: var(--muted);
+	}
+	.mg-card :global(.wt-grid td.full) {
+		color: var(--mg-spark);
+	}
+	.mg-card :global(.wt-grid td.low),
+	.mg-card :global(.wt-stats tr.low td) {
 		color: var(--mg-x);
 		font-weight: 600;
 	}

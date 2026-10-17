@@ -3,6 +3,8 @@ import Layout from "../../layouts/Layout.astro";
 import ModuleGraph from "../../component/ModuleGraph/ModuleGraph.astro";
 import ffn from "../../component/ModuleGraph/ffnRankExample.json";
 import megatronMoe from "../../component/ModuleGraph/megatronMoe.json";
+import qwenProgram from "../../component/ModuleGraph/models/qwen3GuardStream4B.json";
+import qwenStats from "../../component/ModuleGraph/models/qwen3GuardStream4BStats.json";
 import type {
 	ModuleSpec,
 	WeightSpec,
@@ -159,4 +161,22 @@ const block: ModuleSpec = {
 	<h2>A Megatron-style MoE layer with expert parallelism</h2>
 	<p>One EP rank's forward pass, collectives in orange; values are rank 0's from an EP = 2 run.</p>
 	<ModuleGraph spec={megatronMoe as ModuleSpec} wide />
+
+	<h2>A whole model from torch.export, with parameter statistics</h2>
+	<p>
+		<code>program</code> takes the JSON graph of a <code>.pt2</code> archive (here
+		Qwen3Guard-Stream-4B) and nests its ATen ops by module; <code>parameterStats</code> attaches
+		each weight's histogram, moments and numerical rank. Hover the <code>layers</code> card for a
+		rank grid, one row per decoder layer; + expands a box.
+	</p>
+	<ModuleGraph
+		program={qwenProgram}
+		parameterStats={qwenStats}
+		statsPrefix="model."
+		collapsed={[
+			"model.model.layers",
+			...Array.from({ length: 36 }, (_, i) => `model.model.layers.${i}`),
+		]}
+		wide
+	/>
 </Layout>

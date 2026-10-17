@@ -33,6 +33,7 @@
 // { "total_tokens": "tokens on this rank: batch_size · seq_len" }; hover cards explain the names
 // their shapes use. Any op or module may list `weights`, its parameters (WeightSpec): hovering
 // its card (or a module box's label) shows their value histogram, singular values and ranks.
+// exportedProgram.ts builds a spec from a torch.export program and per-parameter statistics.
 //
 // The listing order of operations carries no meaning: an operation depends on what its inputs
 // reference, and nothing else. The optional `layout.order` lists child names left to right for
@@ -64,6 +65,8 @@ export interface TensorValue {
  * time; or give `singular_values` and/or `histogram` (e.g. from a large layer) without values.
  */
 export interface WeightSpec {
+	/** The parameter's fully qualified name, e.g. "model.layers.0.mlp.up_proj.weight". */
+	name?: string;
 	/** The parameter's shape, e.g. [out_features, in_features]. */
 	shape: number[];
 	/** The parameter as a matrix, one array per row; flatten a higher-rank weight to (shape[0], rest). */
@@ -74,6 +77,18 @@ export interface WeightSpec {
 	histogram?: { edges: number[]; counts: number[] };
 	/** Numerical rank counts σ > rank_tol · σ₁; default max(m, n) · ε of float32. */
 	rank_tol?: number;
+	/** The numerical rank, computed elsewhere (e.g. torch.linalg.matrix_rank), when no σ are given. */
+	rank?: number;
+	/** Moments of the values, when `values` is not given. */
+	moments?: {
+		count?: number;
+		mean: number;
+		std: number;
+		min?: number;
+		max?: number;
+	};
+	/** e.g. "bfloat16". */
+	dtype?: string;
 	note?: string;
 }
 

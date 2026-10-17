@@ -1,0 +1,1402 @@
+---
+title: "Inside Hugging Face Transformers: One API, Many Models, Many GPUs"
+description: "How the transformers library serves over 500 architectures through AutoModel, what from_pretrained does step by step from config.json to weights on the GPU, and how its native tensor, expert, pipeline and FSDP parallelism is wired in, read from the source."
+date: 2026-10-17
+tags: [DL Frameworks, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+
+## Background
+
+Most people meet Hugging Face Transformers as two lines of code:
+
+```python
+from transformers import AutoModelForCausalLM
+model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-2-7b-hf")
+```
+
+The same two lines load Llama, Qwen, Mixtral, BERT, Whisper or a vision-language model. Change
+the repository name and you get a different architecture, with a different module tree, different
+weight names on disk and sometimes a different tensor layout. Something has to turn a string into
+the right Python class, build a 7-billion-parameter model without running out of memory, and put
+every tensor from the checkpoint into the right place.
+
+This matters for anyone who builds on the library. Knowing how loading works explains why a model
+loads in seconds instead of minutes, why a "missing keys" warning appears, why `device_map="auto"`
+and tensor parallelism cannot be combined, and what you must write to add a new model. It also
+explains how a plain PyTorch `nn.Module` with no distributed code inside becomes a model sharded
+across 8 GPUs.
+
+This post reads the source at commit
+[`23292ca`](https://github.com/huggingface/transformers/tree/23292ca5b82012ee1a1fd620069fd5e659ecf1be)
+(version `5.21.0.dev0`, October 2026) and covers three parts, in order:
+
+1. **One API for many models**: the config and model registries behind `AutoModel`, the
+   one-file-per-model policy, and the plug-in points (attention backends, generic heads) that let
+   one model file serve many hardware setups.
+2. **Loading a model**: every step of `from_pretrained`, from resolving `config.json` to the
+   threaded loader that renames, converts and places each tensor.
+3. **Parallelism**: `device_map`, and the native `DistributedConfig` path for tensor (TP), expert
+   (EP), pipeline (PP) and fully sharded data parallelism (FSDP).
+
+Background on the parallelism schemes themselves is in
+[tensor parallelism](/blog/tensor-parallelism/), [ZeRO and FSDP](/blog/zero-and-fsdp/),
+[pipeline parallelism](/blog/pipeline-parallelism/) and [expert parallelism](/blog/expert-parallelism/).
+This post focuses on how Transformers implements them.
+
+## One API for many models
+
+### Three objects per model: config, model, mapping
+
+Every architecture in the library is described by three things:
+
+- a **config class** (`LlamaConfig`), a dataclass of hyperparameters with a unique string
+  `model_type = "llama"`;
+- one or more **model classes** (`LlamaModel`, `LlamaForCausalLM`, ...), plain `nn.Module`s
+  built from a config;
+- an entry in the **auto mappings**, which tie the `model_type` string to those class names.
+
+The checkpoint on the Hub carries a `config.json`, and that file names its `model_type`. That
+string is the only thing the library needs to pick the code. Here is the Llama config in full,
+minus the license header
+([`configuration_llama.py`](https://github.com/huggingface/transformers/blob/23292ca5b82012ee1a1fd620069fd5e659ecf1be/src/transformers/models/llama/configuration_llama.py)):
+
+```python
+@auto_docstring(checkpoint="meta-llama/Llama-2-7b-hf")
+@strict
+class LlamaConfig(PreTrainedConfig):
+    model_type = "llama"
+    keys_to_ignore_at_inference = ["past_key_values"]
+    # Default tensor parallel plan for base model `LlamaModel`
+    base_model_tp_plan = {
+        "layers.*.self_attn.q_proj": "colwise",
+        "layers.*.self_attn.k_proj": "colwise",
+        "layers.*.self_attn.v_proj": "colwise",
+        "layers.*.self_attn.o_proj": "rowwise",
+        "layers.*.mlp.gate_proj": "colwise",
+        "layers.*.mlp.up_proj": "colwise",
+        "layers.*.mlp.down_proj": "rowwise",
+    }
+    base_model_pp_plan = {
+        "embed_tokens": (["input_ids"], ["inputs_embeds"]),
+        "layers": (["hidden_states", "attention_mask"], ["hidden_states"]),
+        "norm": (["hidden_states"], ["hidden_states"]),
+    }
+
+    vocab_size: int = 32000
+    hidden_size: int = 4096
+    intermediate_size: int = 11008
+    num_hidden_layers: int = 32
+    num_attention_heads: int = 32
+    num_key_value_heads: int | None = None
+    hidden_act: str = "silu"
+    max_position_embeddings: int = 2048
+    ...
+
+    def __post_init__(self, **kwargs):
+        if self.head_dim is None:
+            self.head_dim = self.hidden_size // self.num_attention_heads
+        if self.num_key_value_heads is None:
+            self.num_key_value_heads = self.num_attention_heads
+        super().__post_init__(**kwargs)
+```
+
+Three things to notice. First, the config is a typed dataclass validated by `@strict` (from
+`huggingface_hub`), so `hidden_size="4096"` is rejected at load time rather than failing deep in
+a matmul. Second, `__post_init__` fills in derived defaults: a checkpoint that omits
+`num_key_value_heads` gets plain multi-head attention. Third, the config already carries the
+**parallel plans** (`base_model_tp_plan`, `base_model_pp_plan`). The model code never mentions
+GPUs; the plan is data that the distributed code reads later. We come back to this in the
+parallelism section.
+
+### The auto mappings and lazy imports
+
+The registry is a set of ordered dictionaries from `model_type` to class *name*. They are
+strings, not classes, so that `import transformers` does not import 500 model files. Excerpts from
+[`auto_mappings.py`](https://github.com/huggingface/transformers/blob/23292ca5b82012ee1a1fd620069fd5e659ecf1be/src/transformers/models/auto/auto_mappings.py)
+and
+[`modeling_auto.py`](https://github.com/huggingface/transformers/blob/23292ca5b82012ee1a1fd620069fd5e659ecf1be/src/transformers/models/auto/modeling_auto.py):
+
+```python
+CONFIG_MAPPING_NAMES = OrderedDict([
+    ...
+    ("llama", "LlamaConfig"),
+    ...
+])
+
+MODEL_FOR_CAUSAL_LM_MAPPING_NAMES = OrderedDict([
+    ...
+    ("llama", "LlamaForCausalLM"),
+    ...
+])
+
+MODEL_FOR_CAUSAL_LM_MAPPING = _LazyAutoMapping(CONFIG_MAPPING_NAMES, MODEL_FOR_CAUSAL_LM_MAPPING_NAMES)
+
+class AutoModelForCausalLM(_BaseAutoModelClass):
+    _model_mapping = MODEL_FOR_CAUSAL_LM_MAPPING
+```
+
+At this commit the sizes are:
+
+| Mapping | Entries |
+| --- | ---: |
+| `CONFIG_MAPPING_NAMES` (all `model_type`s, including sub-configs such as `aimv2_vision_model`) | 765 |
+| `MODEL_MAPPING_NAMES` (`AutoModel`, the bare backbone) | 574 |
+| `MODEL_FOR_CAUSAL_LM_MAPPING_NAMES` (`AutoModelForCausalLM`) | 182 |
+| `MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING_NAMES` | 126 |
+| `AutoModel*` classes built on `_BaseAutoModelClass` | 48 |
+
+These counts come from the source itself.<Sidenote>Counted with a regex over the two source files at commit `23292ca`. `auto_mappings.py` is generated by `utils/check_auto.py` from each config's `model_type`, so it is not edited by hand.</Sidenote>
+
+Each task (causal LM, sequence classification, image classification, speech-to-text...) has
+its own mapping and its own `AutoModelFor...` class. The class itself holds no logic beyond
+pointing at its mapping. All of the work is in two lazy containers.
+
+`_LazyConfigMapping` turns `"llama"` into the `LlamaConfig` class on first access by importing
+`transformers.models.llama`
+([`configuration_auto.py`](https://github.com/huggingface/transformers/blob/23292ca5b82012ee1a1fd620069fd5e659ecf1be/src/transformers/models/auto/configuration_auto.py)):
+
+```python
+class _LazyConfigMapping(OrderedDict[str, type[PreTrainedConfig]]):
+    def __getitem__(self, key: str) -> type[PreTrainedConfig]:
+        if key in self._extra_content:          # user-registered configs
+            return self._extra_content[key]
+        if key not in self._mapping:
+            raise KeyError(key)
+        value = self._mapping[key]              # "LlamaConfig"
+        module_name = model_type_to_module_name(key)   # "llama"
+        if module_name not in self._modules:
+            self._modules[module_name] = importlib.import_module(f".{module_name}", "transformers.models")
+        if hasattr(self._modules[module_name], value):
+            return getattr(self._modules[module_name], value)
+        ...
+```
+
+`_LazyAutoMapping` is keyed the other way round: by **config class**, returning the model class.
+It builds a reverse map from config class name to `model_type`, then imports the model module
+the same way
+([`auto_factory.py`](https://github.com/huggingface/transformers/blob/23292ca5b82012ee1a1fd620069fd5e659ecf1be/src/transformers/models/auto/auto_factory.py#L584)):
+
+```python
+class _LazyAutoMapping(OrderedDict[type[PreTrainedConfig], _LazyAutoMappingValue]):
+    def __init__(self, config_mapping, model_mapping) -> None:
+        self._config_mapping = config_mapping
+        self._reverse_config_mapping = {v: k for k, v in config_mapping.items()}
+        self._model_mapping = model_mapping
+        ...
+
+    def __getitem__(self, key: type[PreTrainedConfig]) -> _LazyAutoMappingValue:
+        if key in self._extra_content:
+            return self._extra_content[key]
+        model_type = self._reverse_config_mapping[key.__name__]   # LlamaConfig -> "llama"
+        if model_type in self._model_mapping:
+            model_name = self._model_mapping[model_type]          # "LlamaForCausalLM"
+            return self._load_attr_from_module(model_type, model_name)
+        ...
+```
+
+Both containers have a `register` method that writes into `_extra_content`. That is the public
+hook for adding your own architecture without editing the library:
+`AutoConfig.register("my_model", MyConfig)` and
+`AutoModelForCausalLM.register(MyConfig, MyModelForCausalLM)`.
+
+### How `AutoModelForCausalLM.from_pretrained` dispatches
+
+The auto class's `from_pretrained`
+([`auto_factory.py#L266`](https://github.com/huggingface/transformers/blob/23292ca5b82012ee1a1fd620069fd5e659ecf1be/src/transformers/models/auto/auto_factory.py#L266))
+does four things, then hands over to the concrete class. Abridged:
+
+```python
+@classmethod
+def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+    config = kwargs.pop("config", None)
+    ...
+    # 1. Pin the repository state once, so config, code and weights match.
+    hub_kwargs["revision"] = resolve_revision(pretrained_model_name_or_path, requested_revision, ...)
+
+    # 2. If the repo is a PEFT adapter, switch to its base model.
+    if is_peft_available():
+        maybe_adapter_path = find_adapter_config_file(pretrained_model_name_or_path, **adapter_kwargs)
+        if maybe_adapter_path is not None:
+            ...
+            pretrained_model_name_or_path = adapter_config["base_model_name_or_path"]
+
+    # 3. Load the config through AutoConfig, which reads config.json and model_type.
+    if not isinstance(config, PreTrainedConfig):
+        config, kwargs = AutoConfig.from_pretrained(
+            pretrained_model_name_or_path, return_unused_kwargs=True, **hub_kwargs, **kwargs
+        )
+
+    # 4. Pick the class: remote code from the Hub, or a class in the library.
+    has_remote_code = hasattr(config, "auto_map") and cls.__name__ in config.auto_map
+    has_local_code = type(config) in cls._model_mapping
+    ...
+    if has_remote_code and trust_remote_code and not explicit_local_code:
+        model_class = get_class_from_dynamic_module(class_ref, pretrained_model_name_or_path, ...)
+        ...
+        return model_class.from_pretrained(pretrained_model_name_or_path, *model_args, config=config, ...)
+    elif has_local_code:
+        model_class = _get_model_class(config, cls._model_mapping)
+        ...
+        return model_class.from_pretrained(pretrained_model_name_or_path, *model_args, config=config, ...)
+    raise ValueError(f"Unrecognized configuration class {config.__class__} for this kind of AutoModel: ...")
+```
+
+Step 3 is where `model_type` is read. `AutoConfig.from_pretrained` loads the JSON into a dict,
+looks up `CONFIG_MAPPING[config_dict["model_type"]]` and calls `config_class.from_dict(...)`.
+It also carries small compatibility rules, for example:
+
+```python
+# Apply heuristic: if model_type is mistral but layer_types is present, treat as ministral
+if config_dict["model_type"] == "mistral" and "layer_types" in config_dict:
+    config_dict["model_type"] = "ministral"
+```
+
+Step 4 has two routes. The **local** route uses the mapping. `_get_model_class` handles the case
+where one config maps to several classes, by checking the `architectures` list saved in
+`config.json`:
+
+```python
+def _get_model_class(config, model_mapping):
+    supported_models = model_mapping[type(config)]
+    if not isinstance(supported_models, (list, tuple)):
+        return supported_models
+    name_to_model = {model.__name__: model for model in supported_models}
+    architectures = getattr(config, "architectures", [])
+    for arch in architectures:
+        if arch in name_to_model:
+            return name_to_model[arch]
+    return supported_models[0]
+```
+
+The **remote** route is for models whose code lives in the Hub repository. Their `config.json`
+has an `auto_map` such as `{"AutoModelForCausalLM": "modeling_foo.FooForCausalLM"}`.
+`get_class_from_dynamic_module` downloads `modeling_foo.py` at the pinned revision, imports it and
+registers the class, but only when the user passed `trust_remote_code=True`, because this runs
+arbitrary Python from the internet.
+
+So "one API" means: one string in `config.json` selects a config class, and the
+`(config class, task)` pair selects a model class. Everything after that is ordinary
+`LlamaForCausalLM.from_pretrained`.
+
+### One file per model, and the modular converter
+
+Transformers deliberately does *not* build models from shared layers. Each architecture has a
+self-contained `modeling_<name>.py`: Llama's is 501 lines and contains its own `LlamaRMSNorm`,
+`LlamaRotaryEmbedding`, `LlamaMLP`, `LlamaAttention`, `LlamaDecoderLayer`, `LlamaModel` and
+heads. A reader can understand Llama from one file, and a change to Mistral cannot break Llama.
+
+The cost is duplication: Qwen2, for example, is mostly Llama with biases on Q, K and V and optional sliding-window layers. To avoid maintaining that by hand, 310 models at
+this commit have a `modular_<name>.py` that *inherits* from other models, and a converter
+generates the standalone `modeling_<name>.py` from it. The Qwen2 modular file
+([`modular_qwen2.py`](https://github.com/huggingface/transformers/blob/23292ca5b82012ee1a1fd620069fd5e659ecf1be/src/transformers/models/qwen2/modular_qwen2.py))
+states only the differences:
+
+```python
+from ..llama.modeling_llama import LlamaAttention, LlamaDecoderLayer, LlamaMLP, ...
+from ..mistral.modeling_mistral import MistralModel
+
+class Qwen2MLP(LlamaMLP):
+    def __init__(self, config):
+        super().__init__(config)
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        ...
+
+class Qwen2Attention(LlamaAttention):
+    def __init__(self, config: Qwen2Config, layer_idx: int):
+        ...
+        super().__init__(config, layer_idx)
+        self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=True)
+        ...
+        self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
+
+class Qwen2DecoderLayer(LlamaDecoderLayer):
+    pass
+```
+
+The generated `modeling_qwen2.py` starts with a banner: *"This file was automatically generated
+from src/transformers/models/qwen2/modular_qwen2.py. Do NOT edit this file manually"*, and CI
+checks that the two agree. Users only ever import the flat file, so they see no inheritance.
+
+### Contracts that make the files interchangeable
+
+If each model is its own file, why do `generate()`, `Trainer`, quantization and tensor
+parallelism work on all of them? Because every model file follows a few contracts that the
+shared code relies on. Llama's
+([`modeling_llama.py`](https://github.com/huggingface/transformers/blob/23292ca5b82012ee1a1fd620069fd5e659ecf1be/src/transformers/models/llama/modeling_llama.py))
+shows all of them.
+
+**1. A shared base class with declarative flags.** `LlamaPreTrainedModel` subclasses
+`PreTrainedModel` and declares capabilities as class attributes instead of code:
+
+```python
+class LlamaPreTrainedModel(PreTrainedModel):
+    config: LlamaConfig
+    base_model_prefix = "model"
+    supports_gradient_checkpointing = True
+    _no_split_modules = ["LlamaDecoderLayer"]
+    _skip_keys_device_placement = ["past_key_values"]
+    _supports_flash_attn = True
+    _supports_sdpa = True
+    _supports_flex_attn = True
+    _can_compile_fullgraph = True
+    _supports_attention_backend = True
+    _can_record_outputs = {
+        "hidden_states": LlamaDecoderLayer,
+        "attentions": LlamaAttention,
+    }
+```
+
+`base_model_prefix = "model"` tells the loader that `LlamaForCausalLM.model` is the backbone, so
+a checkpoint saved from the bare `LlamaModel` (keys `layers.0...`) loads into the causal-LM class
+(keys `model.layers.0...`) and vice versa. `_no_split_modules` tells `device_map="auto"` never to
+split one decoder layer across two GPUs. `_can_record_outputs` lets a decorator collect hidden
+states and attention maps through hooks, so `forward` does not need `if output_hidden_states:`
+branches.
+
+**2. A pluggable attention function.** The attention module computes Q, K, V and applies RoPE
+itself, but the actual attention kernel is looked up by name:
+
+```python
+attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+    self.config._attn_implementation, eager_attention_forward
+)
+attn_output, attn_weights = attention_interface(
+    self, query_states, key_states, value_states, attention_mask,
+    dropout=0.0 if not self.training else self.attention_dropout,
+    scaling=self.scaling,
+    **kwargs,
+)
+```
+
+`ALL_ATTENTION_FUNCTIONS` is an `AttentionInterface`, a dictionary with a class-wide default
+mapping and per-instance overrides
+([`modeling_utils.py#L5121`](https://github.com/huggingface/transformers/blob/23292ca5b82012ee1a1fd620069fd5e659ecf1be/src/transformers/modeling_utils.py#L5121)):
+
+```python
+class AttentionInterface(GeneralInterface):
+    _global_mapping = {
+        "flash_attention_4": flash_attention_forward,
+        "flash_attention_3": flash_attention_forward,
+        "flash_attention_2": flash_attention_forward,
+        "flex_attention": flex_attention_forward,
+        "sdpa": sdpa_attention_forward,
+        "paged|eager": eager_paged_attention_forward,
+    }
+```
+
+All backends share one signature: `(module, query, key, value, attention_mask, **kwargs)`, with
+`query` shaped `(batch, heads, seq, head_dim)`. The model file keeps only the reference
+`eager_attention_forward` (a matmul, a softmax and a second matmul). Passing
+`attn_implementation="flash_attention_2"` to `from_pretrained` sets
+`config._attn_implementation`, and every attention layer in every model switches kernel
+without a code change. A user can add a kernel with `AttentionInterface.register("mine", fn)`.
+The same registry pattern (`GeneralInterface`) is reused for the tensor-parallel styles later.
+
+**3. A uniform cache API.** The layer calls
+`past_key_values.update(key_states, value_states, self.layer_idx)` and gets back the full keys
+and values. Whether that cache is a growing `DynamicCache`, a preallocated `StaticCache` for
+`torch.compile`, or a paged cache is invisible to the model.
+
+**4. Generic task heads.** Many heads are not written per model at all:
+
+```python
+class LlamaForSequenceClassification(GenericForSequenceClassification, LlamaPreTrainedModel): ...
+```
+
+`GenericForSequenceClassification` builds the backbone with `AutoModel.from_config(config)` and
+adds a linear `score` layer
+([`modeling_layers.py`](https://github.com/huggingface/transformers/blob/23292ca5b82012ee1a1fd620069fd5e659ecf1be/src/transformers/modeling_layers.py)):
+
+```python
+class GenericForSequenceClassification:
+    base_model_prefix = "model"
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.num_labels = config.num_labels
+        setattr(self, self.base_model_prefix, AutoModel.from_config(config))
+        self.score = nn.Linear(config.get_text_config().hidden_size, self.num_labels, bias=False)
+        self.post_init()
+```
+
+The head finds each sequence's last non-padding token and classifies it. Any decoder whose
+backbone takes `input_ids` and returns `last_hidden_state` gets classification, token
+classification and question answering for one line each.
+
+**5. Typed outputs.** Every `forward` returns a dataclass such as `CausalLMOutputWithPast`
+(`loss`, `logits`, `past_key_values`, `hidden_states`, `attentions`). `generate()` and `Trainer`
+read `outputs.logits` and `outputs.loss` by name and never need to know which model produced them.
+
+**6. `GenerationMixin`.** `LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin)` inherits the
+whole decoding stack (greedy, sampling, beam search, assisted decoding). The model only has to
+accept `past_key_values` and return logits.
+
+Put together: the Auto classes pick a file, and the contracts let generic code drive whatever
+the file contains.
+
+## Loading a model
+
+### The big picture
+
+`PreTrainedModel.from_pretrained`
+([`modeling_utils.py#L3823`](https://github.com/huggingface/transformers/blob/23292ca5b82012ee1a1fd620069fd5e659ecf1be/src/transformers/modeling_utils.py#L3823))
+is about 400 lines without its docstring. Stripped to its spine, it runs these steps:
+
+| # | Step | Function |
+| ---: | --- | --- |
+| 1 | Pin the Hub revision; set up the distributed mesh if asked | `resolve_revision`, `prepare_distribute_model` |
+| 2 | Load the config | `config_class.from_pretrained` |
+| 3 | Pick a quantizer from `quantization_config` | `get_hf_quantizer` |
+| 4 | Find and download the weight files | `_get_resolved_checkpoint_files` |
+| 5 | Decide the dtype | `_get_dtype` |
+| 6 | Build the model on the `meta` device | `cls(config)` inside `get_init_context` |
+| 7 | Find the checkpoint-to-model conversion rules | `get_model_conversion_mapping` |
+| 8 | Shard the empty model (TP / EP / PP / FSDP) | `maybe_distribute_model` |
+| 9 | Compute a `device_map` | `_get_device_map` |
+| 10 | Read, convert and place every tensor | `_load_pretrained_model` → `convert_and_load_state_dict_in_model` |
+| 11 | Initialise missing weights, tie embeddings, report | `_finalize_model_loading` |
+| 12 | `eval()`, generation config, accelerate hooks, adapters | |
+
+The rest of this section walks through the steps that do real work.
+
+### Steps 1–5: config, files and dtype
+
+`from_pretrained` pops every option it knows from `kwargs` (`dtype`, `device_map`,
+`quantization_config`, `distributed_config`, `attn_implementation`, ...). What is left over is
+passed to `config_class.from_pretrained`, so `from_pretrained(..., num_labels=3)` overrides a
+config field.
+
+**Weight files.** `_get_resolved_checkpoint_files` looks for, in order, `model.safetensors`, the
+sharded index `model.safetensors.index.json`, and the legacy `pytorch_model.bin` files. Big
+checkpoints are split into shards (`model-00001-of-00002.safetensors`) and the index maps each
+tensor name to its shard. The function downloads every shard into the Hugging Face cache and
+returns the local paths plus the index metadata.
+
+**dtype.** At this version the default is `dtype="auto"`:
+
+```python
+if torch_dtype is not None:
+    dtype = dtype if dtype is not None else torch_dtype
+if dtype is None:
+    dtype = "auto"
+```
+
+`_get_dtype` resolves `"auto"` to `config.dtype` (what the model was saved in, usually
+`bfloat16`). If the config has none, it reads the dtype of the first floating-point tensor in
+the checkpoint. A 7B model saved in bf16 is therefore loaded in bf16, not silently upcast to
+fp32 and doubled in size.<Sidenote>Older v4 releases defaulted to `torch.float32` unless you passed `torch_dtype="auto"`. `torch_dtype` is still accepted as an alias.</Sidenote>
+
+### Step 6: building the model without memory
+
+A naive `LlamaForCausalLM(config)` would allocate 6.74 billion parameters and fill them with
+random numbers, only to overwrite them with the checkpoint a moment later. For Llama-2-7B that is
+13.5 GB of bf16 (6,738,415,616 parameters × 2 bytes) of wasted allocation and initialisation.
+Transformers avoids both with context managers
+([`get_init_context`](https://github.com/huggingface/transformers/blob/23292ca5b82012ee1a1fd620069fd5e659ecf1be/src/transformers/modeling_utils.py#L3733)):
+
+```python
+def get_init_context(cls, dtype, is_quantized, _is_ds_init_called, allow_all_kernels):
+    init_contexts = [local_torch_dtype(dtype, cls.__name__), init.no_tie_weights(), apply_patches()]
+    ...
+    if is_deepspeed_zero3_enabled():
+        ...
+        init_contexts.extend([init.no_init_weights(), deepspeed.zero.Init(...), set_zero3_state()])
+    else:
+        init_contexts.extend([torch.device("meta"), init.meta_device_safe_creation_ops()])
+    return init_contexts
+```
+
+and then
+
+```python
+with ContextManagers(model_init_context):
+    model = cls(config, *model_args, **model_kwargs)
+    ...
+    if hf_quantizer is not None:  # replace module with quantized modules (does not touch weights)
+        hf_quantizer.preprocess_model(model=model, ...)
+```
+
+- `local_torch_dtype` calls `torch.set_default_dtype(dtype)` for the duration, so every
+  `nn.Linear` is created in bf16.
+- `torch.device("meta")` used as a context manager makes every tensor created inside it a
+  **meta tensor**: it has a shape, a dtype and a stride but no storage. Building the full
+  32-layer module tree costs almost no memory and no time.
+- Under DeepSpeed ZeRO-3, `deepspeed.zero.Init` is used instead, which partitions each parameter
+  across ranks as soon as it is created.
+
+The model's `__init__` ends with `self.post_init()`. That method collects class-level metadata
+from the whole module tree onto the top model: the parallel plans (`init_parallel_plans`), tied
+weight keys, `_no_split_modules`, keys to ignore. It then calls `init_weights()`, but parameters
+on the meta device have nothing to initialise.
+
+If a quantization config is present (bitsandbytes, GPTQ, FP8...), `preprocess_model` swaps
+`nn.Linear` modules for quantized ones *before* any weight is read, so the loader later fills
+quantized modules directly.
+
+### Step 7: weight conversion rules
+
+The tensor names in a checkpoint do not always match the module tree. Two common reasons:
+
+- **History.** The original Mixtral checkpoint stores experts as `block_sparse_moe.experts.3.w1.weight`,
+  one tensor per expert.
+- **Performance.** The current `MixtralExperts` module stores *all* experts in two 3-D
+  parameters so that a grouped GEMM can run them at once:
+
+```python
+class MixtralExperts(nn.Module):
+    """Collection of expert weights stored as 3D tensors."""
+    def __init__(self, config: MixtralConfig):
+        super().__init__()
+        self.num_experts = config.num_local_experts
+        ...
+        self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
+        self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
+```
+
+Rather than rewrite every checkpoint on the Hub, the library describes the mapping as data in
+[`conversion_mapping.py`](https://github.com/huggingface/transformers/blob/23292ca5b82012ee1a1fd620069fd5e659ecf1be/src/transformers/conversion_mapping.py#L1131)
+and applies it while loading:
+
+```python
+"mixtral": [
+    WeightRenaming(".block_sparse_moe.", ".mlp."),
+    WeightConverter(
+        source_patterns=[".experts.*.w1.weight", ".experts.*.w3.weight"],
+        target_patterns=".experts.gate_up_proj",
+        operations=[MergeModulelist(dim=0), Concatenate(dim=1)],
+    ),
+    WeightConverter(
+        source_patterns=[".experts.*.w2.weight"],
+        target_patterns=".experts.down_proj",
+        operations=[MergeModulelist(dim=0)],
+    ),
+],
+```
+
+A `WeightRenaming` is a regex rename. A `WeightConverter` collects all tensors matching its
+source patterns and runs a chain of `ConversionOps` on them. Other models reuse a family's rules:
+the same file maps `"qwen3_moe"`, `"deepseek_v3"`, `"olmoe"` and about twenty more to the
+`"qwen2_moe"` rules.
+
+Worked through for Mixtral-8x7B (8 experts, `intermediate_size` 14336, `hidden_size` 4096), for
+one layer:
+
+| Stage | Tensors | Shape |
+| --- | --- | --- |
+| Checkpoint | `w1` of experts 0…7 | 8 × (14336, 4096) |
+| Checkpoint | `w3` of experts 0…7 | 8 × (14336, 4096) |
+| After `MergeModulelist(dim=0)` | stacked `w1`, stacked `w3` | 2 × (8, 14336, 4096) |
+| After `Concatenate(dim=1)` | `mlp.experts.gate_up_proj` | (8, 28672, 4096) |
+| `w2` after `MergeModulelist(dim=0)` | `mlp.experts.down_proj` | (8, 4096, 14336) |
+
+The final shapes are exactly the `(num_experts, 2 * intermediate, hidden)` and
+`(num_experts, hidden, intermediate)` parameters declared in `MixtralExperts`. Gate is rows
+0–14335 and up is rows 14336–28671 of the middle dimension, which matters for tensor parallelism
+below. Each op also has a `reverse_op` (`Concatenate` reverses to `Chunk`), so `save_pretrained`
+can write the checkpoint back in its original layout.
+
+### Step 10: the loader
+
+`_load_pretrained_model` opens every safetensors shard but does not read it:
+
+```python
+file_pointer = safe_open(file, framework="pt", device=device, backend=backend)  # mmap on Linux
+all_pointer.add(file_pointer)
+for k in file_pointer.keys():
+    merged_state_dict[k] = file_pointer.get_slice(k)  # don't materialize yet
+```
+
+`get_slice` returns a lazy handle. The safetensors format stores a JSON header of names, shapes,
+dtypes and byte offsets, followed by raw data, so a handle can later read any sub-range of a
+tensor straight from the memory-mapped file. This is what makes shard-on-read for tensor
+parallelism possible.
+
+The handles go to `convert_and_load_state_dict_in_model`
+([`core_model_loading.py#L1546`](https://github.com/huggingface/transformers/blob/23292ca5b82012ee1a1fd620069fd5e659ecf1be/src/transformers/core_model_loading.py#L1546)).
+It runs two passes. The first pass loops over checkpoint keys in natural order (`layers.2`
+before `layers.10`) and, for each key, does four things:
+
+```python
+for original_key, tensor in state_dict:
+    # 1. Rename the key according to all renaming and weight conversion patterns.
+    renamed_key, source_pattern = rename_source_key(
+        original_key, renamings, converters, base_model_prefix, meta_model_state_dict
+    )
+    ...
+    # 2. finally, collect the tensor into the proper converter
+    if renamed_key in meta_model_state_dict:
+        empty_param = meta_model_state_dict.get(renamed_key)
+        if source_pattern is not None:
+            new_converter = deepcopy(pattern_to_converter[source_pattern])
+            mapping = param_name_to_load.setdefault(renamed_key, new_converter)
+        else:
+            mapping = param_name_to_load.setdefault(renamed_key, WeightRenaming(original_key, renamed_key))
+            source_pattern = original_key
+
+        # 3. Handle dtype casting
+        ...
+        _dtype = dtype
+        if dtype_plan != {} and dtype_policy_alt.search(renamed_key):
+            ...  # _keep_in_fp32_modules
+        ...
+
+        # 4. Handle DTensor sharding or device_map placement
+        param_device = get_device(device_map, renamed_key, valid_torch_device=True)
+        sharding_op = None
+        if is_dtensor(empty_param):
+            sharding_op = DtensorShardOperation(empty_param)
+        ...
+        future_or_tensor = spawn_materialize(
+            thread_pool, tensor, param_device, _dtype, sharding_op=sharding_op, tensor_idx=tensor_idx,
+        )
+        mapping.add_tensor(renamed_key, original_key, source_pattern, future_or_tensor)
+    elif source_pattern is not None:
+        ...  # every target key of the converter is "unexpected"
+    else:
+        _add_unmatched_checkpoint_key(renamed_key, model, loading_info)
+```
+
+Line by line:
+
+1. **Rename.** Apply the conversion rules, and add or strip `base_model_prefix` (`model.`) so
+   that backbone-only and head checkpoints both match.
+2. **Group.** Each target parameter gets one `WeightConverter` (or a trivial `WeightRenaming`).
+   For Mixtral, all 16 `w1`/`w3` tensors of a layer land in the same converter.
+3. **Pick a dtype.** Normally the global dtype. Modules listed in `_keep_in_fp32_modules` (for
+   example a router whose softmax is unstable in fp16) stay in fp32.
+4. **Schedule the read.** `spawn_materialize` submits a job to a thread pool. The job either
+   slices this rank's shard (`sharding_op.shard_tensor`) or reads the whole tensor and moves it to
+   its device and dtype:
+
+```python
+def _materialize_copy(tensor, device=None, dtype=None):
+    # This slicing is what actually loads the tensor from the safetensors slice object
+    tensor = tensor[...]
+    if dtype is not None or device is not None:
+        tensor = tensor.to(device=device, dtype=dtype)
+    return tensor
+```
+
+The pool has `GLOBAL_WORKERS = min(4, os.cpu_count() or 4)` threads. The source comment
+explains why only four: reading files is I/O-bound, and *"using 16 can sometimes lead to taking
+TWICE as much time"*. The pool is turned off (jobs become deferred callables) when offloading to
+disk or quantizing on the fly, so that full-precision tensors cannot pile up in memory faster
+than they are consumed.
+
+Keys that do not match anything are recorded as **unexpected**. Model parameters that no key
+filled stay in `missing_keys`, which started as the full set of model keys.
+
+The second pass runs each converter, waits on its futures, and writes the results into the model:
+
+```python
+for first_param_name, mapping in tqdm(param_name_to_load.items(), desc="Loading weights"):
+    realized_value = mapping.convert(first_param_name, model=model, config=model.config,
+                                     hf_quantizer=hf_quantizer, loading_info=loading_info)
+    for target_name, param in realized_value.items():
+        ...
+        if param_device == "disk" and ...:
+            disk_offload_index = offload_and_maybe_resave_param(...)
+        else:
+            set_param_for_module(model, target_name, param, loading_info, hf_quantizer)
+```
+
+`WeightConverter.convert` calls `materialize_tensors()` (resolving the futures), applies each op
+in order, then the quantization op if the quantizer needs one. `set_param_for_module` replaces
+the meta parameter with the real one:
+
+```python
+def set_param_for_module(model, target_name, param_value, loading_info, hf_quantizer):
+    module_path, _, param_name = target_name.rpartition(".")
+    module_obj = model.get_submodule(module_path) if module_path else model
+    ...
+    ref = getattr(module_obj, param_name)
+    ...
+    loading_info.missing_keys.discard(target_name)
+    expected_shape = ref._local_tensor.shape if is_dtensor(ref) else ref.shape
+    if ref is not None and param_value.shape != expected_shape and hf_quantizer is None:
+        loading_info.mismatched_keys.add((target_name, param_value.shape, expected_shape))
+    else:
+        if is_dtensor(ref):
+            ...
+            dtensor_param = _dtensor_from_local_like(local_param, ref)
+            param_value = torch.nn.Parameter(dtensor_param, ...)
+        # super important otherwise _init_weight will re-init the param
+        param_value._is_hf_initialized = True
+        setattr(module_obj, param_name, param_value)
+```
+
+Two details matter here. If the meta parameter is a **DTensor** (because the model was sharded
+in step 8), the loaded local shard is wrapped back into a DTensor with the same mesh and
+placements. And every loaded parameter is flagged `_is_hf_initialized`, which the next step uses.
+
+### Step 11: finishing
+
+`_finalize_model_loading` handles everything the checkpoint did not provide:
+
+```python
+model.mark_tied_weights_as_initialized(loading_info)
+model._move_missing_keys_from_meta_to_device(loading_info.missing_and_mismatched(), ...)
+model._initialize_missing_keys(load_config.is_quantized)
+model.tie_weights(missing_keys=loading_info.missing_keys, recompute_mapping=False)
+model._adjust_missing_and_unexpected_keys(loading_info)
+...
+log_state_dict_report(...)
+```
+
+Parameters still on the meta device get real storage, and only those *without*
+`_is_hf_initialized` are passed to the model's `_init_weights`. This is the common case of
+fine-tuning: load `bert-base-uncased` into `BertForSequenceClassification` and only the new
+classifier is randomly initialised. Then input and output embeddings are tied if the config says
+so (`_tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}`), and the familiar
+report of missing, unexpected and mismatched keys is logged.
+
+Finally `from_pretrained` calls `model.eval()` (dropout off), loads `generation_config.json`,
+installs accelerate hooks if the model spans several devices, and loads a PEFT adapter if the
+repository was one.
+
+## Parallelism
+
+Transformers offers two different ways to spread a model over several GPUs. They solve different
+problems and cannot be combined.
+
+| | `device_map` | `distributed_config` |
+| --- | --- | --- |
+| Process model | One Python process sees all GPUs | One process per GPU, launched with `torchrun` |
+| What is split | Whole modules (layer 0–15 on GPU 0, 16–31 on GPU 1) | Individual weight matrices (TP, EP), layers (PP) or parameters (FSDP) |
+| GPUs busy at once | One, the others wait | All |
+| Built on | Accelerate hooks | `torch.distributed` `DeviceMesh` and `DTensor` |
+| Typical use | Fit a big model for inference on one box | Fast inference and training |
+
+Passing both is an error.<Sidenote>`prepare_distribute_model` raises `"Tensor parallelism and device_map are mutually exclusive."` when both are given with `tp_size > 1`.</Sidenote>
+
+### `device_map`: whole layers on different devices
+
+`device_map="auto"` computes a placement with Accelerate
+([`integrations/accelerate.py`](https://github.com/huggingface/transformers/blob/23292ca5b82012ee1a1fd620069fd5e659ecf1be/src/transformers/integrations/accelerate.py)):
+
+```python
+def _get_device_map(model, device_map, max_memory, hf_quantizer):
+    if isinstance(device_map, str):
+        no_split_modules = model._no_split_modules
+        ...
+        if device_map != "sequential":
+            inferred_max_memory = get_balanced_memory(
+                model, max_memory=max_memory, no_split_module_classes=no_split_modules, ...
+                low_zero=(device_map == "balanced_low_0"),
+            )
+        else:
+            inferred_max_memory = get_max_memory(max_memory)
+        ...
+        device_map = infer_auto_device_map(
+            model, max_memory=inferred_max_memory, no_split_module_classes=no_split_modules, ...
+        )
+    return device_map
+```
+
+Because the model is still on the meta device, Accelerate can measure every module's size
+without allocating it. `"auto"` balances the layers across the GPUs, then spills to CPU RAM and
+then disk (`"sequential"` fills GPU 0 before GPU 1), never splitting a module listed in
+`_no_split_modules` (`LlamaDecoderLayer`). The result is a dictionary such as
+`{"model.embed_tokens": 0, "model.layers.0": 0, ..., "model.layers.20": 1, ..., "lm_head": 1}`.
+
+The loader reads that map in step 4 above (`get_device(device_map, renamed_key)`), so each
+tensor goes straight from the file to its final GPU. Before loading, `caching_allocator_warmup`
+allocates one large block per device so that the CUDA caching allocator does not have to grow
+thousands of times.
+
+After loading, if the map names more than one device, `accelerate_dispatch` calls Accelerate's
+`dispatch_model`. That attaches a hook to each module that moves its inputs to the module's
+device before `forward`. Tensors that were mapped to `"cpu"` or `"disk"` are loaded to the GPU
+just in time for their layer. This is **naive model parallelism**: correct and simple, but at any
+moment only one GPU computes.
+
+### `DistributedConfig`: one process per GPU
+
+The native path is configured with a dataclass
+([`distributed/configuration_utils.py`](https://github.com/huggingface/transformers/blob/23292ca5b82012ee1a1fd620069fd5e659ecf1be/src/transformers/distributed/configuration_utils.py)):
+
+```python
+@dataclass
+class DistributedConfig:
+    tp_size: int | None = None
+    tp_plan: dict[str, str] | Literal["auto"] | None = None
+    enable_sequence_parallel: bool = False
+    enable_expert_parallel: bool = False
+    fsdp_size: int | None = None
+    fsdp_cpu_offload: bool = False
+    fsdp_mixed_precision: bool = False
+    pp_size: int | None = None
+    ep_size: int | None = None
+    ep_plan: dict[str, str] | None = None
+```
+
+and used like this, from a script started with `torchrun --nproc-per-node 4 script.py`:
+
+```python
+import torch
+from transformers import AutoModelForCausalLM, DistributedConfig
+
+model = AutoModelForCausalLM.from_pretrained(
+    "meta-llama/Llama-2-7b-hf",
+    dtype=torch.bfloat16,
+    distributed_config=DistributedConfig(tp_size=4),
+)
+```
+
+`__post_init__` fills the sizes. If only `tp_plan` is given, `tp_size` becomes
+`WORLD_SIZE // (fsdp_size * pp_size)`. Unset sizes default to 1. It also rejects invalid
+layouts, for example `ep_size` must be a multiple of `tp_size`, and FSDP cannot yet be combined
+with PP.
+
+**The mesh.** `prepare_distribute_model` (step 1 of `from_pretrained`) calls
+`initialize_distributed_mesh`, which starts the process group if needed, binds this process to
+`cuda:LOCAL_RANK`, and builds *two* views of the same ranks
+([`distributed/utils.py#L283`](https://github.com/huggingface/transformers/blob/23292ca5b82012ee1a1fd620069fd5e659ecf1be/src/transformers/distributed/utils.py#L283)):
+
+```python
+dense_mesh = torch.distributed.init_device_mesh(
+    device_type, (pp_size, fsdp_size, tp_size), mesh_dim_names=("pp", "fsdp", "tp"),
+)
+expert_mesh = torch.distributed.init_device_mesh(
+    device_type, (pp_size, efsdp_size, ep_size), mesh_dim_names=("pp", "efsdp", "ep"),
+)
+return device_map, TransformersDeviceMesh(dense_mesh, expert_mesh)
+```
+
+A **device mesh** arranges the world's ranks in an n-dimensional grid. Slicing it along one named
+axis gives the process groups for that kind of parallelism: `mesh["tp"]` is the group of ranks
+that together hold one copy of each weight matrix. The dense mesh is used for attention, dense
+MLPs and embeddings. The expert mesh exists because experts are sharded differently from dense
+layers; we return to it under expert parallelism.
+
+**Applying the plans.** After the model is built on the meta device (step 6) and before any
+weight is read, `maybe_distribute_model`
+([`distributed/mixin.py#L194`](https://github.com/huggingface/transformers/blob/23292ca5b82012ee1a1fd620069fd5e659ecf1be/src/transformers/distributed/mixin.py#L194))
+transforms the empty model:
+
+```python
+tp_plan, ep_plan = resolve_parallel_plans(model, distributed_config)
+distributed_config._validate_resolved_ep_plan(ep_plan)
+
+if distributed_config.pp_size > 1:
+    model = apply_pipeline_parallelism(model, mesh_manager.get_mesh("pp"))
+
+if tp_plan:
+    model = apply_tensor_parallelism(model, mesh_manager.get_mesh("tp"), tp_plan)
+
+if ep_plan:
+    ...
+    elif "ep_dispatch_experts" in ep_plan.values():
+        model = apply_expert_parallelism(model, ep_mesh, tp_mesh, ep_plan)
+
+if distributed_config.fsdp_size > 1:
+    model = apply_fully_sharded_data_parallelism(model, mesh_manager)
+```
+
+The order is: PP removes layers this rank does not own, TP and EP turn the remaining meta
+parameters into sharded DTensors and wrap `forward`, and FSDP wraps the result. Only then does
+the loader run, and because the parameters are already DTensors it reads only this rank's slice
+from disk.
+
+Where do the plans come from? `init_parallel_plans`, called from `post_init`, merges the head
+class's own `_tp_plan` with the config's `base_model_tp_plan`, and prefixes the plans of
+children. For `LlamaForCausalLM` the result is:
+
+```python
+{
+    "lm_head": "colwise_gather_output",                  # from LlamaForCausalLM._tp_plan
+    "model.layers.*.self_attn.q_proj": "colwise",        # from LlamaConfig.base_model_tp_plan,
+    "model.layers.*.self_attn.k_proj": "colwise",        #   prefixed with "model." by the
+    "model.layers.*.self_attn.v_proj": "colwise",        #   child loop in init_parallel_plans
+    "model.layers.*.self_attn.o_proj": "rowwise",
+    "model.layers.*.mlp.gate_proj": "colwise",
+    "model.layers.*.mlp.up_proj": "colwise",
+    "model.layers.*.mlp.down_proj": "rowwise",
+}
+```
+
+`DistributedConfig(tp_plan={...})` can override single entries; `resolve_parallel_plans` merges
+the override and rejects keys that match no module.
+
+### Tensor parallelism
+
+**Tensor parallelism** splits each weight matrix across the ranks of the TP group, so every rank
+does a fraction of every matmul. The plan's strings are names in a registry of styles, built on
+the same `GeneralInterface` as attention
+([`distributed/tensor_parallel.py#L943`](https://github.com/huggingface/transformers/blob/23292ca5b82012ee1a1fd620069fd5e659ecf1be/src/transformers/distributed/tensor_parallel.py#L943)):
+
+```python
+class ParallelInterface(GeneralInterface):
+    _global_mapping = {
+        "embedding_rowwise": RowwiseParallel(input_layouts=Replicate(), output_layouts=Replicate()),
+        "colwise_gather_output": ColwiseParallel(input_layouts=Replicate(), output_layouts=Replicate()),
+        "colwise": ColwiseParallel(input_layouts=Replicate(), output_layouts=Shard(-1)),
+        "rowwise": RowwiseParallel(input_layouts=Shard(-1), output_layouts=Replicate()),
+        "packed_colwise": PackedColwiseParallel(),
+        "packed_rowwise": PackedRowwiseParallel(),
+        "grouped_gemm": MoEParamShard(Shard(0), shards_expert_dim=True),
+        "ep_dispatch_experts": EpDispatchExpertsParallel(),
+        "moe_tp_experts": MoeExpertsParallel(),
+        "replicated_with_grad_allreduce": ReplicatedWithGradAllReduce(),
+        "all_reduce": AllReduceParallel(),
+        "replicate": TensorParallelLayer(),
+        ...
+    }
+```
+
+Every style subclasses `TensorParallelLayer`, which has two jobs: shard parameters, and wrap
+`forward`:
+
+```python
+class TensorParallelLayer:
+    def shard_param(self, module, param, mesh):
+        """Wrap ONE parameter as a DTensor placeholder. Default: no-op."""
+
+    def transform_inputs_pre_forward(self, module, args, kwargs, mesh):
+        return args, kwargs
+
+    def transform_output_post_forward(self, module, output, mesh):
+        return output
+
+    def install_forward(self, module, mesh):
+        original_forward = module.forward
+
+        def tp_forward(*args, **kwargs):
+            args, kwargs = self.transform_inputs_pre_forward(module, args, kwargs, mesh)
+            with self.context_around_forward(module, mesh):
+                output = original_forward(*args, **kwargs)
+            return self.transform_output_post_forward(module, output, mesh)
+
+        module.forward = tp_forward
+        return module
+```
+
+`apply_tensor_parallelism` walks the module tree, matches each parameter and module name
+against the plan (after replacing layer numbers with `*`), and calls these two methods:
+
+```python
+def apply_tensor_parallelism(model, tp_mesh, tp_plan=None):
+    ...
+    for name, module in model.named_modules():
+        for p_name, _ in list(module.named_parameters(recurse=False)):
+            full = f"{name}.{p_name}" if name else p_name
+            style_name = _get_parameter_plan(parameter_name=full, plan=tp_plan, is_weight=True)
+            if style_name is not None and style_name in ALL_PARALLEL_STYLES:
+                style = ALL_PARALLEL_STYLES[style_name]
+                style.validate_param(module, p_name, tp_mesh, parameter_name=full)
+                style.shard_param(module, p_name, tp_mesh)
+
+        style_name = _get_parameter_plan(parameter_name=name, plan=tp_plan, is_weight=False)
+        if style_name is not None and style_name in ALL_PARALLEL_STYLES:
+            ...
+            ALL_PARALLEL_STYLES[style_name].install_forward(module, tp_mesh)
+        module._is_hooked = True
+    return model
+```
+
+Note that the model's own code (`LlamaAttention.forward`) is never edited. Sharding is applied
+from outside, by replacing parameters and wrapping methods.
+
+#### Column-wise and row-wise
+
+An `nn.Linear` stores its weight as `(out_features, in_features)` and computes $y = x W^\top$.
+
+**Column-wise** (`colwise`) splits the *output* features. The weight is sharded on dim 0
+(`Shard(meta.ndim - 2)`, which is dim 1 for 3-D expert weights). Each rank needs the whole
+input and produces a slice of the output:
+
+```python
+class ColwiseParallel(TensorParallelLayer):
+    def shard_param(self, module, param, mesh):
+        meta = module._parameters.get(param)
+        ...
+        placement = Shard(1) if isinstance(module, torch.nn.Embedding) else Shard(meta.ndim - 2)
+        module._parameters[param] = torch.nn.Parameter(
+            distribute_tensor(meta, mesh, [placement], src_data_rank=None),
+            requires_grad=meta.requires_grad,
+        )
+```
+
+`distribute_tensor` on a meta tensor builds only DTensor metadata: global shape, mesh,
+placement. No data moves.
+
+**Row-wise** (`rowwise`) splits the *input* features: the weight is `Shard(-1)` and the bias is
+replicated. Each rank multiplies its slice of the input by its slice of the weight, producing a
+**partial sum** of the full output. The partial sums are added with an all-reduce:
+
+```python
+class RowwiseParallel(TensorParallelLayer):
+    def shard_param(self, module, param, mesh):
+        ...
+        placement = Replicate() if param == "bias" else Shard(-1)
+        ...
+
+    def transform_output_post_forward(self, module, output, mesh):
+        use_local_inference_path = (
+            isinstance(module, torch.nn.Linear)
+            and not isinstance(output, DTensor)
+            and isinstance(self.output_layouts, Replicate)
+            and not output.requires_grad
+        )
+        if use_local_inference_path:
+            process_group = mesh.get_group() if mesh.ndim == 1 else mesh.get_group("tp")
+            dist.all_reduce(output, group=process_group)
+            if (bias := module._parameters.get("bias")) is not None:
+                output = output + (bias.to_local() if isinstance(bias, DTensor) else bias)
+        else:
+            if not isinstance(output, DTensor):
+                output = DTensor.from_local(output, mesh, [Partial()], run_check=False)
+            if output.placements != (self.output_layouts,):
+                output = output.redistribute(placements=[self.output_layouts])
+            ...
+        return output
+```
+
+`context_around_forward` hides the bias during the local matmul and adds it once after the
+all-reduce. Otherwise it would be added `tp_size` times.
+
+There are two code paths. With gradients off (inference), plain local tensors and one explicit
+`dist.all_reduce` are used, avoiding DTensor overhead. With gradients on (training), the output is
+wrapped as a `Partial` DTensor and `redistribute` to `Replicate` performs the all-reduce, so
+autograd knows how to send gradients back.
+
+Pairing a column-wise layer with a row-wise layer is the classic Megatron pattern: the
+column-wise output is already split the way the row-wise input wants it, so a block needs only
+one all-reduce. A toy check with 2 ranks, $x = (1, 2, 3, 4)$ and two 4×4 weights
+(computed with a script):
+
+| | Rank 0 | Rank 1 | Sum |
+| --- | --- | --- | --- |
+| $W_1$ rows owned | 0, 1 | 2, 3 | |
+| $h_\text{local} = W_1 x$ | (7, 6) | (3, 7) | full $h$ = (7, 6, 3, 7) |
+| $W_2$ columns owned | 0, 1 | 2, 3 | |
+| partial $y$ | (19, 6, 14, 13) | (7, 3, 10, 10) | (26, 9, 24, 23) |
+
+The all-reduced sum (26, 9, 24, 23) equals $W_2 W_1 x$ computed on one device. Check one entry:
+$y_0 = 19 + 7 = 26$, and directly $y_0 = 1 \cdot 7 + 2 \cdot 6 + 0 \cdot 3 + 1 \cdot 7 = 26$.<Sidenote>$W_1$ = `[[1,0,2,0],[0,1,0,1],[1,1,0,0],[0,0,1,1]]`, $W_2$ = `[[1,2,0,1],[0,1,1,0],[2,0,1,1],[1,1,1,1]]`, both stored as (out, in).</Sidenote>
+
+#### Llama-2-7B at TP = 4
+
+Applying Llama's plan with 4 ranks gives these local shapes on every rank (computed with
+DTensor's chunking rule, $\lceil n / 4 \rceil$ rows per rank):
+
+| Parameter | Style | Full shape | Local shape | Rank 1 owns |
+| --- | --- | --- | --- | --- |
+| `q_proj.weight` | colwise | (4096, 4096) | (1024, 4096) | rows 1024–2047 |
+| `k_proj.weight` | colwise | (4096, 4096) | (1024, 4096) | rows 1024–2047 |
+| `v_proj.weight` | colwise | (4096, 4096) | (1024, 4096) | rows 1024–2047 |
+| `o_proj.weight` | rowwise | (4096, 4096) | (4096, 1024) | columns 1024–2047 |
+| `gate_proj.weight` | colwise | (11008, 4096) | (2752, 4096) | rows 2752–5503 |
+| `up_proj.weight` | colwise | (11008, 4096) | (2752, 4096) | rows 2752–5503 |
+| `down_proj.weight` | rowwise | (4096, 11008) | (4096, 2752) | columns 2752–5503 |
+
+Each rank stores exactly a quarter of the 202,375,168 linear weights in a decoder layer.
+
+Now follow one attention block on rank 1. `q_proj` produces 1024 features, which is 8 heads of
+128. `colwise` keeps its output as `Shard(-1)`, a plain local tensor of shape
+`(batch, seq, 1024)`. `LlamaAttention.forward` then does
+
+```python
+hidden_shape = (*input_shape, -1, self.head_dim)
+query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+```
+
+and the `-1` resolves to 8 heads. The unmodified attention code runs on heads 8–15 only. The
+attention output, `(batch, seq, 1024)`, is exactly the slice that the row-wise `o_proj` expects,
+and its all-reduce restores the full `(batch, seq, 4096)` hidden state. The MLP repeats the
+pattern: `gate_proj` and `up_proj` produce 2752 local features each, the SiLU-and-multiply is
+element-wise and needs no communication, and `down_proj` all-reduces. So each decoder layer costs
+**two all-reduces** of the hidden state in the forward pass.
+
+`lm_head` uses `colwise_gather_output`: it splits the 32,000-row vocabulary, then all-gathers the
+logits so every rank returns the full `(batch, seq, 32000)` tensor and `generate()` works
+unchanged.
+
+#### Packed weights and strided shards
+
+The fused `gate_up_proj` of Mixtral's experts breaks plain column-wise sharding. Its middle
+dimension is `[gate rows | up rows]`. A contiguous split across 2 ranks of a toy 8-row version
+would give rank 0 rows 0–3 (all of gate) and rank 1 rows 4–7 (all of up), and the expert's
+`gate, up = ....chunk(2, dim=-1)` would then pair the wrong halves.
+
+`packed_colwise` uses a **strided shard** instead:
+
+```python
+class PackedColwiseParallel(TensorParallelLayer):
+    def shard_param(self, module, param, mesh):
+        ...
+        shard_dim = self._packed_output_shard_dim(meta.ndim)
+        if meta.ndim == 1:
+            placement = Shard(shard_dim)
+        else:
+            placement = _StridedShard(dim=shard_dim, split_factor=self.split_factor)  # split_factor=2
+        ...
+```
+
+`_StridedShard(dim, split_factor=2)` first cuts the dimension into 2 groups (gate, up), then
+shards each group contiguously, and concatenates this rank's pieces. Computed with a
+re-implementation of the loader's `_compute_strided_slice`:
+
+| Size, TP | Rank | Rows owned |
+| --- | ---: | --- |
+| 8 rows, TP = 2 | 0 | 0–1 and 4–5 |
+| 8 rows, TP = 2 | 1 | 2–3 and 6–7 |
+| 28672 rows (Mixtral), TP = 4 | 0 | 0–3583 and 14336–17919 |
+| 28672 rows (Mixtral), TP = 4 | 1 | 3584–7167 and 17920–21503 |
+| 28672 rows (Mixtral), TP = 4 | 2 | 7168–10751 and 21504–25087 |
+| 28672 rows (Mixtral), TP = 4 | 3 | 10752–14335 and 25088–28671 |
+
+Each rank holds a matching quarter of gate and a quarter of up, so `chunk(2)` on the local
+output still separates gate from up correctly.
+
+#### Shard on read
+
+The loader's `DtensorShardOperation` turns these placements into byte ranges
+([`distributed/sharding_utils.py#L46`](https://github.com/huggingface/transformers/blob/23292ca5b82012ee1a1fd620069fd5e659ecf1be/src/transformers/distributed/sharding_utils.py#L46)).
+For every sharded dimension it computes the intervals this rank owns, then indexes the
+safetensors slice with them:
+
+```python
+# prepare the slices to fetch on disk for each tensor dimension.
+intervals_by_dim = [[(0, size)] for size in source_shape]
+for dim_idx, planned_ops in enumerate(planned_ops_by_dim):
+    intervals = intervals_by_dim[dim_idx]
+    for placement, rank, world_size in planned_ops:
+        if placement.is_shard():
+            intervals = self._compute_contiguous_slice(intervals, rank, world_size)
+        else:
+            intervals = self._compute_strided_slice(intervals, rank, world_size, placement.split_factor)
+    intervals_by_dim[dim_idx] = intervals
+...
+if has_strided_shard:
+    return self._slice_and_cat(source, intervals_by_dim, device, dtype)
+else:
+    ...
+    return source[tuple(slice_parts)].to(device=device, dtype=dtype)
+```
+
+Because `source` is a lazy safetensors slice over a memory-mapped file, `source[1024:2048, :]`
+reads only those rows. With TP = 4 each rank reads about a quarter of each sharded weight from
+disk, and never holds the full tensor in memory.
+
+For checkpoints with one tensor per expert, the operation receives `tensor_idx`, the expert's
+index, and returns `None` when this rank does not own that expert. `MergeModulelist` then stacks
+only the experts that were kept. So the conversion ops of step 7 and the sharding cooperate.
+
+### Expert parallelism
+
+**Expert parallelism** gives each rank whole experts instead of slices of every expert. Mixtral's
+config declares a separate plan:
+
+```python
+base_model_ep_plan = {
+    "layers.*.mlp.experts.gate_up_proj": "grouped_gemm",
+    "layers.*.mlp.experts.down_proj": "grouped_gemm",
+    "layers.*.mlp.experts": "ep_dispatch_experts",
+}
+```
+
+`grouped_gemm` shards the 3-D expert weights on dim 0, the expert dimension, so with
+`ep_size = 4` and 8 experts each rank holds 2 experts. `resolve_parallel_plans` drops TP rules for
+any module the EP plan names, so experts are sharded once.
+
+`ep_dispatch_experts` wraps the experts' `forward` with an all-to-all exchange
+(`EpDispatchExpertsParallel`, [`tensor_parallel.py#L768`](https://github.com/huggingface/transformers/blob/23292ca5b82012ee1a1fd620069fd5e659ecf1be/src/transformers/distributed/tensor_parallel.py#L768)):
+
+```python
+def ep_forward(hidden_states, top_k_index, top_k_weights):
+    num_tokens = hidden_states.size(0)
+    (hidden_states, top_k_index, top_k_weights), _ = self.transform_inputs_pre_forward(
+        module, (hidden_states, top_k_index, top_k_weights), {}, ep_mesh, tp_mesh=tp_mesh
+    )
+    with self.context_around_forward(module, ep_mesh):
+        tokens, expert_ids, order, send_sizes, recv_sizes = self._dispatch_tokens(
+            hidden_states, top_k_index, module.num_experts, ep_group, ep_size
+        )
+        tokens = wait_tensor(tokens)
+        expert_output = self._run_local_experts(experts_forward, tokens, expert_ids)
+        output = self._combine_tokens(
+            expert_output, top_k_weights, order, send_sizes, recv_sizes, ep_group
+        ).to(hidden_states.dtype)
+    return self.transform_output_post_forward(module, output, ep_mesh, tp_mesh=tp_mesh, num_tokens=num_tokens)
+```
+
+`_dispatch_tokens` sorts the `(token, expert)` pairs by expert id. Because each rank owns a
+contiguous range of experts, sorting also groups them by destination rank. It exchanges the
+per-expert counts with one small `all_to_all_single`, then sends the token vectors with a second
+one. Each rank runs its local experts on what it received, with top-1 routing and unit weights.
+`_combine_tokens` sends results back with the reverse all-to-all, undoes the sort, and applies
+the router weights.
+
+When TP is also on, all ranks of a TP group hold the same batch. If they all dispatched it, each
+token would be computed `tp_size` times. `transform_inputs_pre_forward` therefore slices the batch
+across the TP group first (`Replicate → Shard(0)`, a local chunk with no communication), and
+`transform_output_post_forward` all-gathers the rows afterwards.
+
+**Why a second mesh.** Dense weights are laid out on `(pp, fsdp, tp)`, experts on
+`(pp, efsdp, ep)`, over the same ranks, so $\text{fsdp} \times \text{tp} = \text{efsdp} \times
+\text{ep}$. **efsdp** is the number of copies of each expert group, which FSDP then shards. It is
+not chosen; it follows from the other sizes:
+
+| fsdp | tp | ep | World | efsdp = fsdp × tp / ep |
+| ---: | ---: | ---: | ---: | ---: |
+| 4 | 2 | 4 | 8 | 2 |
+| 8 | 1 | 8 | 8 | 1 |
+| 8 | 2 | 8 | 16 | 2 |
+
+The first row is the example in the `EpDispatchExpertsParallel` docstring. The code comments
+suggest keeping `ep` at the node width (8) so that the all-to-all never leaves NVLink, and letting
+efsdp absorb the extra nodes.
+
+### Pipeline parallelism
+
+**Pipeline parallelism** gives each rank a contiguous range of layers. The implementation is
+explicitly a first version (its docstring says *"Naive even split of `base_model.layers` across
+PP ranks"*)
+([`distributed/pipeline_parallel.py`](https://github.com/huggingface/transformers/blob/23292ca5b82012ee1a1fd620069fd5e659ecf1be/src/transformers/distributed/pipeline_parallel.py)):
+
+```python
+def layer_range_for_rank(self, rank: int, num_layers: int) -> tuple[int, int]:
+    layers_per_rank = num_layers // self.pp_size
+    start_layer = rank * layers_per_rank
+    end_layer = num_layers if rank == self.pp_size - 1 else start_layer + layers_per_rank
+    return start_layer, end_layer
+```
+
+With 32 layers, `pp_size = 3` gives ranks the layer ranges `[0, 10)`, `[10, 20)`, `[20, 32)`; the
+last rank takes the remainder. `pp_size = 4` gives four ranges of 8.
+
+`apply_pipeline_parallelism` runs on the meta model and replaces every module this rank does not
+own with a `PipelineIdentityLayer`, an `nn.Identity` that returns its first argument:
+
+```python
+if not keep_embed_tokens:
+    base_model.embed_tokens = PipelineIdentityLayer()
+for layer_idx in range(num_layers):
+    if layer_idx < start_layer or layer_idx >= end_layer:
+        layers[layer_idx] = PipelineIdentityLayer()
+if not stage.pp_is_last_stage:
+    base_model.norm = PipelineIdentityLayer()
+    model.lm_head = PipelineIdentityLayer()
+```
+
+The removed layers have no parameters, so the loader reports their checkpoint keys as
+skipped and never reads them. Each rank loads only its third of the model.
+
+The model's `forward` is wrapped in `pipeline_parallel_naive_forward`. A non-first stage receives
+the previous stage's hidden states with a point-to-point `irecv` and feeds them in as
+`inputs_embeds`. A non-last stage runs the backbone and sends `last_hidden_state` on. The last
+stage computes logits and broadcasts them to every rank so that `generate()` works without
+changes. There are no micro-batches yet, so only one stage computes at a time; a `TODO` in the
+code notes that GPipe and 1F1B schedules are planned. The value today is memory: a model too large
+for one GPU's memory, run with real `torch.distributed` processes.
+
+### Fully sharded data parallelism
+
+**FSDP** shards every parameter across the data-parallel ranks and all-gathers a layer's
+weights just before that layer runs. Transformers uses PyTorch's FSDP2 `fully_shard` and decides
+*where* to apply it from a plan. The default plan on every config is:
+
+```python
+base_model_fsdp_plan = {
+    "embed_tokens": "free_full_weight",
+    "layers.*": "free_full_weight",
+    "norm": "keep_full_weight",
+}
+```
+
+and `LlamaForCausalLM` adds `_fsdp_plan = {"lm_head": "keep_full_weight"}`.
+`apply_fully_sharded_data_parallelism` turns that into calls
+([`distributed/fsdp.py#L188`](https://github.com/huggingface/transformers/blob/23292ca5b82012ee1a1fd620069fd5e659ecf1be/src/transformers/distributed/fsdp.py#L188)):
+
+```python
+reshard_targets, no_reshard_targets = expand_fsdp_plan(model, adapted_fsdp_plan)
+...
+for module_name, module in reshard_targets:
+    fully_shard(module, mesh=fsdp_mesh, reshard_after_forward=True, **fsdp_policy_kwargs)
+
+if is_norm_and_head_pair(no_reshard_targets, model):
+    ...
+    fully_shard(modules, mesh=fsdp_mesh, reshard_after_forward=False, **fsdp_policy_kwargs)
+...
+fully_shard(model, mesh=fsdp_mesh, **fsdp_policy_kwargs)
+```
+
+- `free_full_weight` means `reshard_after_forward=True`: free the gathered weights after the
+  layer's forward and gather them again in backward. This saves memory.
+- `keep_full_weight` means `reshard_after_forward=False`: keep them gathered. The final norm and
+  `lm_head` run last in forward and first in backward, so freeing them would cause an immediate
+  re-gather. They are grouped into one `fully_shard` unit for the same reason.
+- With tied embeddings, `_resolve_tied_embed_lm_head_plan` removes one of the two entries so the
+  shared weight is wrapped once.
+
+Each decoder layer becomes one FSDP unit, so at most one layer's full weights (plus the kept
+tail) exist on a GPU at a time. When experts are dispatched with EP, they are wrapped on the
+`efsdp` mesh instead, with the gradient divide factor set to `fsdp_size` so that expert gradients
+are averaged over the same number of batches as dense ones.
+
+Because all of this happens before loading, FSDP and TP compose: a parameter on a 2-D
+`(fsdp, tp)` mesh carries two placements, for example `[Shard(0), Shard(0)]`, and the loader's
+`_compute_contiguous_slice` works out the intersection so each rank reads only its sub-block.
+
+### Data parallelism and training
+
+Plain **data parallelism** (DDP) needs nothing from the model, so Transformers leaves it to
+`Trainer`, which builds an Accelerate `Accelerator` and wraps the model in PyTorch's
+`DistributedDataParallel`. When the model was loaded with `tp_size > 1`, `Trainer` reads its
+`tp_size` and `fsdp_size` and creates a matching Accelerate `ParallelismConfig(tp_size=...,
+dp_shard_size=...)`, so data loading and gradient synchronisation agree with how the weights are
+sharded.
+
+### Saving
+
+`save_pretrained` reverses the process. For a TP model, `gather_state_dict_for_save` calls
+`DTensor.full_tensor()` on every parameter (a collective, so every rank must call it), and rank 0
+writes the files. For FSDP models, `gather_full_state_dict` does the same. The recorded weight
+conversions are reversed (`Concatenate` becomes `Chunk`), so a Mixtral saved from the fused layout
+is written back with one tensor per expert. For very large models,
+`save_pretrained(..., distributed_checkpoint=True)` writes per-rank files with PyTorch Distributed
+Checkpoint instead of gathering.
+
+## Summary
+
+- **A string selects the code.** `config.json`'s `model_type` picks a config class through a
+  lazy registry, and the `(config class, AutoModelFor...)` pair picks a model class. Remote code
+  is a second route, gated by `trust_remote_code`.
+- **Models are independent files tied together by contracts**: a common `PreTrainedModel` base
+  with declarative flags, a named attention backend, a uniform cache, typed outputs and generic
+  heads. `modular_*.py` removes the duplication without giving up one-file readability.
+- **`from_pretrained` builds first and fills later.** The model is created on the meta device,
+  then a threaded loader renames, converts (`WeightConverter`), shards and places each tensor
+  read lazily from memory-mapped safetensors. Only parameters the checkpoint did not provide are
+  initialised.
+- **Parallel plans are data on the config.** `base_model_tp_plan`, `base_model_ep_plan`,
+  `base_model_pp_plan` and `base_model_fsdp_plan` name a style per module. `DistributedConfig`
+  applies them to the empty model by turning parameters into DTensors and wrapping `forward`, and
+  the model code never changes.
+- **Because sharding happens before loading, each rank reads only its shard from disk.**
+  `device_map` is the other, simpler option: whole layers on different devices in one process,
+  with only one GPU busy at a time.
+
+## References
+
+- Hugging Face Transformers source at commit
+  [`23292ca`](https://github.com/huggingface/transformers/tree/23292ca5b82012ee1a1fd620069fd5e659ecf1be),
+  in particular
+  [`models/auto/auto_factory.py`](https://github.com/huggingface/transformers/blob/23292ca5b82012ee1a1fd620069fd5e659ecf1be/src/transformers/models/auto/auto_factory.py),
+  [`modeling_utils.py`](https://github.com/huggingface/transformers/blob/23292ca5b82012ee1a1fd620069fd5e659ecf1be/src/transformers/modeling_utils.py),
+  [`core_model_loading.py`](https://github.com/huggingface/transformers/blob/23292ca5b82012ee1a1fd620069fd5e659ecf1be/src/transformers/core_model_loading.py),
+  [`conversion_mapping.py`](https://github.com/huggingface/transformers/blob/23292ca5b82012ee1a1fd620069fd5e659ecf1be/src/transformers/conversion_mapping.py)
+  and the
+  [`distributed/`](https://github.com/huggingface/transformers/tree/23292ca5b82012ee1a1fd620069fd5e659ecf1be/src/transformers/distributed)
+  package.
+- Transformers documentation:
+  [tensor parallelism](https://github.com/huggingface/transformers/blob/23292ca5b82012ee1a1fd620069fd5e659ecf1be/docs/source/en/tensor_parallelism.md),
+  [expert parallelism](https://github.com/huggingface/transformers/blob/23292ca5b82012ee1a1fd620069fd5e659ecf1be/docs/source/en/expert_parallelism.md),
+  [FSDP](https://github.com/huggingface/transformers/blob/23292ca5b82012ee1a1fd620069fd5e659ecf1be/docs/source/en/fsdp.md).
+- PyTorch, [DTensor](https://pytorch.org/docs/stable/distributed.tensor.html) and
+  [FSDP2 `fully_shard`](https://pytorch.org/docs/stable/distributed.fsdp.fully_shard.html).
+- Shoeybi et al., [Megatron-LM: Training Multi-Billion Parameter Language Models Using Model
+  Parallelism](https://arxiv.org/abs/1909.08053), 2019, for the column-then-row pattern.

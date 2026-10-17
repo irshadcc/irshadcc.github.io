@@ -4,7 +4,9 @@
 //   - effective rank (Roy & Vetterli, 2007): exp of the entropy of σᵢ / Σσⱼ, between 1 (one
 //     direction carries everything) and min(m, n) (all σ equal);
 //   - stable rank: ‖W‖²_F / σ₁² = Σσᵢ² / σ₁², at most the rank and insensitive to tiny σ.
-// Pure: it runs at build time.
+// A spec without values or singular values (a large layer's statistics) may give the numerical
+// rank, the moments and a histogram directly. rankSummaryHtml tabulates the ranks of every
+// parameter under a module, as a grid when they repeat per layer. Pure: it runs at build time.
 import type { WeightSpec } from "./moduleGraph";
 
 /** Machine epsilon of float32, the usual dtype of a weight. */
@@ -29,6 +31,7 @@ export interface WeightStats {
 	rank?: number;
 	effectiveRank?: number;
 	stableRank?: number;
+	dtype?: string;
 	note?: string;
 }
 
@@ -90,7 +93,16 @@ export function weightStats(w: WeightSpec): WeightStats {
 		? [w.values.length, w.values[0].length]
 		: [w.shape[0] ?? 1, w.shape.slice(1).reduce((p, d) => p * d, 1)];
 	const tol = w.rank_tol ?? Math.max(m, n) * EPS32;
-	const out: WeightStats = { shape: w.shape, m, n, sv: [], tol, note: w.note };
+	const out: WeightStats = {
+		shape: w.shape,
+		m,
+		n,
+		sv: [],
+		tol,
+		dtype: w.dtype,
+		note: w.note,
+	};
+	if (w.moments) Object.assign(out, w.moments);
 	if (w.values?.length) {
 		if (w.values.some((r) => r.length !== n))
 			throw new Error(
@@ -127,6 +139,8 @@ export function weightStats(w: WeightSpec): WeightStats {
 		out.stableRank = sv.reduce((s, v) => s + v * v, 0) / (sv[0] * sv[0]);
 	} else if (sv.length) {
 		out.rank = 0;
+	} else if (w.rank !== undefined && w.shape.length >= 2) {
+		out.rank = w.rank;
 	}
 	return out;
 }
@@ -146,10 +160,29 @@ const esc = (t: string) =>
 const PLOT = { w: 168, h: 54, label: 11 };
 /** At most this many singular values are drawn, the largest. */
 export const MAX_SV_BARS = 48;
+/** A histogram with more bins is drawn with neighbouring bins merged, keeping its edges exact. */
+export const MAX_HIST_BARS = 25;
+
+/** The histogram with every k neighbouring bins summed, so that at most `max` remain. */
+export function mergeBins(
+	h: { edges: number[]; counts: number[] },
+	max = MAX_HIST_BARS,
+): { edges: number[]; counts: number[] } {
+	const k = Math.ceil(h.counts.length / max);
+	if (k <= 1) return h;
+	const counts: number[] = [];
+	const edges = [h.edges[0]];
+	for (let i = 0; i < h.counts.length; i += k) {
+		counts.push(h.counts.slice(i, i + k).reduce((a, b) => a + b, 0));
+		edges.push(h.edges[Math.min(i + k, h.counts.length)]);
+	}
+	return { edges, counts };
+}
 
 /** Bars of a histogram, with the range under it and a tick at zero when 0 is inside it. */
-function histogramSvg(h: { edges: number[]; counts: number[] }): string {
+function histogramSvg(full: { edges: number[]; counts: number[] }): string {
 	const { w, h: ht, label } = PLOT;
+	const h = mergeBins(full);
 	const top = Math.max(1, ...h.counts);
 	const bw = w / h.counts.length;
 	const [lo, hi] = [h.edges[0], h.edges[h.edges.length - 1]];
@@ -186,7 +219,7 @@ export function weightHtml(name: string, s: WeightStats): string {
 	const full = Math.min(s.m, s.n);
 	const plots = [
 		s.histogram
-			? `<figure>${histogramSvg(s.histogram)}<figcaption>values${s.count ? ` (${s.count})` : ""}</figcaption></figure>`
+			? `<figure>${histogramSvg(s.histogram)}<figcaption>values${s.count ? ` (${s.count.toLocaleString("en-US")})` : ""}</figcaption></figure>`
 			: "",
 		s.sv.length
 			? `<figure>${spectrumSvg(s.sv, s.tol)}<figcaption>singular values σᵢ / σ₁${s.sv.length > MAX_SV_BARS ? `, first ${MAX_SV_BARS} of ${s.sv.length}` : ""}</figcaption></figure>`
@@ -219,5 +252,115 @@ export function weightHtml(name: string, s: WeightStats): string {
 		s.rank !== undefined && s.rank < full
 			? `<p class="wt-warn">Rank-deficient: ${s.rank} of ${full} singular values above ${fmt(s.tol)} σ₁.</p>`
 			: "";
-	return `<div class="wt"><p class="wt-head"><code>${esc(name)}</code> <span>(${s.shape.join(", ")})</span></p>${plots ? `<div class="wt-plots">${plots}</div>` : ""}${rows.length ? `<table class="wt-stats"><tbody>${rows.join("")}</tbody></table>` : ""}${warn}${s.note ? `<p class="card-note">${esc(s.note)}</p>` : ""}</div>`;
+	return `<div class="wt"><p class="wt-head"><code>${esc(name)}</code> <span>(${s.shape.join(", ")})${s.dtype ? ` ${esc(s.dtype)}` : ""}</span></p>${plots ? `<div class="wt-plots">${plots}</div>` : ""}${rows.length ? `<table class="wt-stats"><tbody>${rows.join("")}</tbody></table>` : ""}${warn}${s.note ? `<p class="card-note">${esc(s.note)}</p>` : ""}</div>`;
+}
+
+/** A parameter under a module: its name relative to the module, and its statistics. */
+export interface NamedStats {
+	name: string;
+	s: WeightStats;
+}
+
+/** Rank as a fraction of min(m, n), or undefined for a parameter without a rank (a vector). */
+const fullness = (s: WeightStats) =>
+	s.rank === undefined ? undefined : s.rank / Math.min(s.m, s.n);
+
+/**
+ * The parameters of a repeated block (anything under "<prefix>.<number>.") as one grid per
+ * prefix, a row per index and a column per parameter, when at least two indices share it;
+ * returns the grids and the parameters left over.
+ */
+export function rankGrids(entries: NamedStats[]) {
+	const groups = new Map<
+		string,
+		{ rows: Map<string, Map<string, WeightStats>>; cols: string[] }
+	>();
+	const rest: NamedStats[] = [];
+	for (const e of entries) {
+		const m = /^(.*?)(?:^|\.)(\d+)\.(.+)$/.exec(e.name);
+		if (!m || e.s.rank === undefined) {
+			rest.push(e);
+			continue;
+		}
+		const [, prefix, index, col] = m;
+		let g = groups.get(prefix);
+		if (!g) {
+			g = { rows: new Map(), cols: [] };
+			groups.set(prefix, g);
+		}
+		if (!g.cols.includes(col)) g.cols.push(col);
+		let row = g.rows.get(index);
+		if (!row) {
+			row = new Map();
+			g.rows.set(index, row);
+		}
+		row.set(col, e.s);
+	}
+	const grids = [];
+	for (const [prefix, g] of groups) {
+		if (g.rows.size < 2) {
+			for (const [index, row] of g.rows)
+				for (const [col, s] of row)
+					rest.push({
+						name: `${prefix ? `${prefix}.` : ""}${index}.${col}`,
+						s,
+					});
+			continue;
+		}
+		grids.push({ prefix, cols: g.cols, rows: [...g.rows] });
+	}
+	return { grids, rest };
+}
+
+/** Column titles: the last module name ("q_proj" for "self_attn.q_proj.weight") when unique. */
+function shortNames(cols: string[]): string[] {
+	const short = cols.map((c) => {
+		const parts = c.split(".");
+		if (parts.length > 1 && parts[parts.length - 1] === "weight") parts.pop();
+		return parts[parts.length - 1];
+	});
+	return short.map((s, i) =>
+		short.indexOf(s) === short.lastIndexOf(s) ? s : cols[i],
+	);
+}
+
+/**
+ * Every parameter's rank under a module: repeated blocks as grids (each cell rank / min(m, n),
+ * tinted when below full), the others as rows with a meter. Parameters without a rank (norm
+ * scales and biases) are counted, not listed.
+ */
+export function rankSummaryHtml(entries: NamedStats[]): string {
+	const withRank = entries.filter((e) => e.s.rank !== undefined);
+	if (!withRank.length) return "";
+	const { grids, rest } = rankGrids(withRank);
+	const deficient = withRank.filter((e) => (fullness(e.s) ?? 1) < 1);
+	const cell = (name: string, s: WeightStats | undefined) => {
+		if (!s || s.rank === undefined) return "<td></td>";
+		const full = Math.min(s.m, s.n);
+		const f = s.rank / full;
+		return `<td class="${f < 1 ? "low" : "full"}" title="${esc(name)} (${s.shape.join(", ")}): rank ${s.rank} / ${full}">${s.rank === full ? "✓" : s.rank}</td>`;
+	};
+	const gridHtml = grids
+		.map((g) => {
+			const titles = shortNames(g.cols);
+			const head = `<tr><th>${esc(g.prefix ? `${g.prefix}.` : "")}N</th>${titles.map((t) => `<th>${esc(t)}</th>`).join("")}</tr>`;
+			const body = g.rows
+				.map(
+					([index, row]) =>
+						`<tr><th>${index}</th>${g.cols.map((c) => cell(`${g.prefix ? `${g.prefix}.` : ""}${index}.${c}`, row.get(c))).join("")}</tr>`,
+				)
+				.join("");
+			return `<table class="wt-grid"><tbody>${head}${body}</tbody></table>`;
+		})
+		.join("");
+	const rows = rest
+		.map(({ name, s }) => {
+			const full = Math.min(s.m, s.n);
+			const r = s.rank ?? 0;
+			return `<tr${r < full ? ' class="low"' : ""}><th><code>${esc(name)}</code></th><td>${r} / ${full}</td><td><span class="wt-meter"><span style="width:${((100 * r) / full).toFixed(1)}%"></span></span></td></tr>`;
+		})
+		.join("");
+	const unranked = entries.length - withRank.length;
+	const summary = `${withRank.length} matrices, ${deficient.length ? `${deficient.length} below full rank` : "all full rank"}${unranked ? `; ${unranked} vectors (norm scales) not ranked` : ""}. ✓ = rank min(m, n).`;
+	return `<div class="wt wt-summary"><p class="wt-head">Numerical rank of every weight</p><p class="card-note">${esc(summary)}</p>${gridHtml}${rows ? `<table class="wt-stats"><tbody>${rows}</tbody></table>` : ""}</div>`;
 }
