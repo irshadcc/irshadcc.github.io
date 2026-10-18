@@ -1,0 +1,1376 @@
+---
+title: "Higher-Order Operators in PyTorch"
+description: "A higher-order operator takes functions as arguments, which lets torch.compile and torch.export keep control flow such as torch.cond inside one graph. This post reads the HigherOrderOperator class and torch.cond's kernels line by line, follows a cond call through eager, autograd and tracing, and builds a working higher-order operator from scratch."
+date: 2026-10-18
+tags: [DL Frameworks, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import BoxDiagram from "../../utils/payments/BoxDiagram.astro";
+import SequenceSteps from "../../utils/payments/SequenceSteps.astro";
+import CodeStages from "../../utils/compiler/CodeStages.astro";
+import {
+	hopTableNodes,
+	hopTableEdges,
+	eagerParticipants,
+	eagerMessages,
+	traceParticipants,
+	traceMessages,
+	captureStages,
+	captureTags,
+	invokeStages,
+	invokeTags,
+} from "../../utils/compiler/hopFigures";
+
+## Background
+
+Every ordinary PyTorch operator, such as `aten::add` or `aten::mm`, takes tensors and numbers
+and returns tensors. Its signature is written down in a **schema**, and the
+[dispatcher](/blog/pytorch-dispatcher/) uses the schema to pick a kernel. A graph capture tool
+such as `torch.export` records a program as a list of these operators in an
+[FX graph](/blog/torch-fx-graph/).
+
+Some parts of a program do not fit that mould. A Python `if` on a tensor's value, a `while`
+loop, a `scan` over a sequence, activation checkpointing or the score function of
+FlexAttention all take *a piece of code* as input, not just tensors. A tracer that only knows
+tensor operators has two bad choices: run the Python code and record whatever path it took
+(which bakes in one branch), or give up and split the graph. A **higher-order operator** (HOP)
+is the third choice: an operator whose arguments include functions. Tracing turns those
+functions into subgraphs, and the HOP appears in the outer graph as a single node that
+points at them, so the control flow survives capture.
+
+This post reads the code that makes this work, in PyTorch 2.14.1
+(commit [`5c488690`](https://github.com/pytorch/pytorch/tree/5c4886908584029761b579af026dcfb627c84070)).
+It covers, in order:
+
+1. **Why an ordinary operator is not enough**, with the error `torch.export` raises on a
+   Python `if`.
+2. **The `HigherOrderOperator` class** in `torch/_ops.py`: its registration tables, how a call
+   computes a dispatch key and how `dispatch` turns that key into a Python function.
+3. **`torch.cond`**, the simplest real HOP, kernel by kernel: the eager kernel, autograd,
+   tracing, fake tensors, functionalization and `vmap`.
+4. **How Dynamo captures a HOP**, including how a closure variable becomes an explicit input.
+5. **Writing a HOP from scratch**, tested in eager mode, with autograd, `make_fx`, AOTAutograd
+   and `torch.export`.
+
+Every output shown below was produced by running the code on the CPU build of
+PyTorch 2.14.1.
+
+## Why an ordinary operator is not enough
+
+Start with a model that branches on data:
+
+```python
+class M(torch.nn.Module):
+    def forward(self, x):
+        if x.sum() > 0:
+            return x.cos()
+        return x.sin()
+
+torch.export.export(M(), (torch.tensor([0.0, 1.0, 2.0]),))
+```
+
+`torch.export` traces with fake tensors, which have shapes but no values. When Python asks
+`bool(x.sum() > 0)`, the tracer has nothing to answer with. It creates an **unbacked symbol**
+`u0` for the unknown value and then fails:
+
+```text
+GuardOnDataDependentSymNode: Could not guard on data-dependent expression Eq(u0, 1)
+```
+
+`torch.compile` does not fail, but it cannot keep the `if` either. It breaks the graph at the
+branch: on this input Dynamo produced **two** graphs, one that computes `x.sum() > 0` and one
+for the branch that was taken, with Python running the `if` between them.
+
+Could the branch be a custom operator? No: an operator's schema can only hold tensors,
+numbers, strings, devices and lists of these. Declaring one with a function argument is
+rejected when the schema is inferred:
+
+```text
+ValueError: infer_schema(func): Parameter fn has unsupported type typing.Callable.
+```
+
+A HOP sidesteps the schema. It is a Python object with its own small dispatcher, and it takes
+arguments of any type. `torch.cond` is the HOP for the `if`:
+
+```python
+torch.cond(x.sum() > 0, lambda x: x.cos(), lambda x: x.sin(), (x,))
+```
+
+With it, `torch.export` succeeds and `torch.compile` produces **one** graph. PyTorch 2.14.1
+registers 45 HOPs under `torch.ops.higher_order`. The ones a reader is most likely to meet:
+
+| HOP | What the function arguments are |
+| --- | --- |
+| `cond` | the two branches of an `if` |
+| `while_loop`, `scan`, `map_impl`, `associative_scan` | a loop body (and condition) |
+| `flex_attention` | the `score_mod` and `mask_mod` functions |
+| `tag_activation_checkpoint` | a region to recompute in the backward |
+| `invoke_subgraph` | a repeated block (one transformer layer) compiled once |
+| `auto_functionalized_v2` | a mutating custom op, wrapped to look functional |
+| `triton_kernel_wrapper_mutation` | a user-written Triton kernel |
+| `with_effects` | an op with side effects, ordered by a token |
+
+The rest of the post uses `cond` to read the machinery, then builds a HOP of its own.
+
+## The running example
+
+Two branches and one input, small enough to check by hand:
+
+```python
+from torch._higher_order_ops.cond import cond_op
+
+def t(x): return (x.cos(),)
+def f(x): return (x.sin(),)
+
+p = torch.tensor(True)
+x = torch.tensor([0.0, 1.0, 2.0])
+cond_op(p, t, f, (x,))      # (tensor([ 1.0000,  0.5403, -0.4161]),)
+```
+
+`cond_op` is the operator object itself; `torch.cond` is a user-facing wrapper around it,
+read [below](#the-public-torchcond-function). The branches return one-element tuples because
+the operator works on flat lists of outputs; `torch.cond` does that flattening for the user.<Sidenote>Calling `cond_op` directly with a branch that returns a bare tensor runs forward but fails in backward with `TypeError: object of type 'bool' has no len()`, inside AOTAutograd's joint function, which expects a sequence of outputs.</Sidenote>
+Check one entry: $\cos(2) = -0.4161$, the last element.
+
+## The HigherOrderOperator class
+
+All HOPs subclass `HigherOrderOperator` in
+[`torch/_ops.py`](https://github.com/pytorch/pytorch/blob/5c4886908584029761b579af026dcfb627c84070/torch/_ops.py#L282).
+It mirrors the C++ dispatcher in Python: kernels are registered per dispatch key, a call
+computes a key set from its tensor arguments, and the highest-priority key picks the kernel.
+The difference is that every kernel is a Python function, so it can accept and call other
+Python functions.
+
+### OperatorBase: three tables
+
+`HigherOrderOperator` inherits from `OperatorBase`, which it shares with `OpOverload`, the
+Python handle on a C++ operator such as `torch.ops.aten.add.Tensor`. The constructor creates
+the tables that kernels are registered into (comments trimmed):
+
+```python
+class OperatorBase:
+    def __init__(self):
+        self._dispatch_cache: dict[DispatchKey, DispatchKey | Callable[..., Any]] = {}
+        self.py_kernels: dict[DispatchKey, Callable[..., Any]] = {}
+        self.python_key_table: dict[
+            type[TorchDispatchMode | torch.Tensor], Callable[..., Any]
+        ] = {}
+        self.functorch_table = {}
+```
+
+- `_dispatch_cache` remembers, for each dispatch key already seen, which kernel it resolved
+  to. Resolving a key walks a list of fallbacks (read [below](#resolve_key)); the cache does
+  it once per key.
+- `py_kernels` maps a **dispatch key** to a kernel. These keys are the same enum the C++
+  dispatcher uses: `CPU`, `AutogradCPU`, or **alias keys** such as `Autograd` and
+  `CompositeExplicitAutograd` that stand for a whole family of keys.
+- `python_key_table` maps a **mode or tensor subclass type** to a kernel. A **dispatch mode**
+  (`TorchDispatchMode`) is an object pushed on a stack that intercepts every operator call;
+  `make_fx` uses `ProxyTorchDispatchMode` to record calls into a graph, and `FakeTensorMode`
+  runs them on fake tensors. All modes share one dispatch key, `Python`, so this table says
+  which mode-specific kernel to run once dispatch has reached `Python`.
+- `functorch_table` maps a **functorch transform** (`TransformType.Vmap`, `Grad`,
+  `Functionalize`, ...) to a kernel. The comment in the source notes it is only used by HOPs.
+
+Here is what `cond.py` puts in each table, read back from `cond_op` after import. The
+unlabelled arrow into `py_kernels` is the `resolve_key` path. Click a box for the function it
+holds and when it runs.
+
+<BoxDiagram
+	nodes={hopTableNodes}
+	edges={hopTableEdges}
+	grid={{ cellW: 190, cellH: 46, gapX: 70, gapY: 60 }}
+	selected="dispatch"
+	title="cond_op's registration tables, as filled in by torch/_higher_order_ops/cond.py"
+/>
+
+`py_kernels` has three keys (`Autograd`, `CompositeExplicitAutograd`, `Functionalize`), the
+mode table three types (`ProxyTorchDispatchMode`, `FakeTensorMode`, `FunctionalTensorMode`)
+and the functorch table two transforms (`Vmap`, `Functionalize`). Functionalization appears
+in all three tables because one decorator registers it three times, as the
+[functionalization section](#functionalization) shows.
+
+### py_impl: registering a kernel
+
+Kernels are added with the `py_impl` decorator. `OperatorBase.py_impl` sorts the key into
+the right table:
+
+```python
+def py_impl(self, k):
+    def inner(fn):
+        if inspect.isclass(k) and (
+            issubclass(k, TorchDispatchMode) or issubclass(k, torch.Tensor)
+        ):
+            if k in self.python_key_table:
+                raise AssertionError(f"{k} already registered in python_key_table")
+            self.python_key_table[k] = fn
+            self._dispatch_cache.clear()
+            return fn
+
+        if isinstance(k, TransformType):
+            if k in self.functorch_table:
+                raise AssertionError(f"{k} already registered in functorch_table")
+            self.functorch_table[k] = fn
+            return fn
+
+        if not isinstance(k, DispatchKey):
+            raise AssertionError(f"expected DispatchKey, got {type(k)}")
+        if k == DispatchKey.Python:
+            raise AssertionError(
+                "Please register a mode for the DispatchKey.Python key instead."
+            )
+
+        if k in self.py_kernels:
+            raise RuntimeError(
+                f"Trying to override a python impl for {k} on operator {self.name()}"
+            )
+        self.py_kernels[k] = fn
+        self._dispatch_cache.clear()
+        return fn
+
+    return inner
+```
+
+Line by line:
+
+- `def inner(fn)`: `py_impl(k)` returns a decorator, so it reads as `@cond_op.py_impl(key)`
+  above a function. The function is returned unchanged, so it can still be called directly.
+- The first `if`: `k` is a class that is a dispatch mode or a tensor subclass. It goes in
+  `python_key_table`. Registering twice is an error, because silently replacing a kernel
+  would make behaviour depend on import order.
+- `self._dispatch_cache.clear()`: any cached resolution may now be stale, so the whole cache
+  is dropped. This happens at import time, so it costs nothing at run time.
+- `isinstance(k, TransformType)`: functorch transforms go in `functorch_table`. No cache to
+  clear, because functorch dispatch never goes through the cache.
+- What is left must be a `DispatchKey`. The bare `Python` key is rejected: since all modes
+  share it, a kernel for `Python` would not know which mode it was serving. Register the mode
+  class instead.
+- Otherwise the kernel goes in `py_kernels`, again refusing to overwrite.
+
+`HigherOrderOperator` overrides `py_impl` to add one step before calling the version above:
+
+```python
+def py_impl(self, k):
+    if isinstance(k, DispatchKey) and not self.non_fallthrough_keys.has(k):
+        self.non_fallthrough_keys = self.non_fallthrough_keys.add(k)
+    return super().py_impl(k)
+```
+
+`non_fallthrough_keys` is the set of keys this operator will stop at. Registering a kernel
+for a key means the operator must stop there, so the key is added back if it had been
+removed. The next section explains which keys start out removed.
+
+### HigherOrderOperator.__init__
+
+```python
+_higher_order_ops: dict[str, "HigherOrderOperator"] = {}
+
+_HIGHER_ORDER_OP_DEFAULT_FALLTHROUGH_DISPATCH_KEYS = [
+    DispatchKey.PythonDispatcher,
+    DispatchKey.PythonTLSSnapshot,
+    DispatchKey.ADInplaceOrView,
+    DispatchKey.BackendSelect,
+    DispatchKey.AutocastCPU,
+    DispatchKey.AutocastCUDA,
+    DispatchKey.AutocastXPU,
+]
+
+class HigherOrderOperator(OperatorBase, abc.ABC):
+    def __init__(
+        self, name, *, cacheable=False, supports_training_input_mutation=False
+    ):
+        super().__init__()
+        if type(self) is HigherOrderOperator:
+            raise RuntimeError(
+                "Direct instantiation of HigherOrderOperator is not allowed. Please subclass it."
+            )
+        self._name = name
+        self.__name__ = name
+        _higher_order_ops[name] = self
+        self._ns = "higher_order"
+        self.__module__ = "torch.ops.higher_order"
+        self._cacheable = cacheable
+        self._supports_training_input_mutation = supports_training_input_mutation
+
+        self.non_fallthrough_keys = torch._C._dispatch_keyset_full()
+
+        for dispatch_key in _HIGHER_ORDER_OP_DEFAULT_FALLTHROUGH_DISPATCH_KEYS:
+            self.fallthrough(dispatch_key)
+```
+
+Line by line:
+
+- `class HigherOrderOperator(OperatorBase, abc.ABC)` and the `type(self) is
+  HigherOrderOperator` check: the class is abstract (its `__call__` is marked
+  `@abc.abstractmethod`), and the runtime check makes the intent explicit. Every HOP is its
+  own subclass, such as `CondOp`.
+- `_higher_order_ops[name] = self`: a module-level registry by name. This is what makes
+  `torch.ops.higher_order.cond` work: the `higher_order` namespace looks the name up here.
+  Creating a second HOP with the same name replaces the first in the registry.
+- `self.__name__` and `self.__module__`: set so the object prints and pickles like a function
+  in the module `torch.ops.higher_order`. FX uses these when it writes
+  `torch.ops.higher_order.cond(...)` into generated code.
+- `cacheable`: whether a graph containing this HOP may be stored in the compiled-graph cache.
+  It defaults to `False`, so each HOP opts in explicitly.
+- `supports_training_input_mutation`: whether the HOP may mutate its inputs while gradients
+  are being computed. The autograd wrapper below checks it.
+- `non_fallthrough_keys = _dispatch_keyset_full()`: start with every key. A key that is *not*
+  in this set is a **fallthrough**: dispatch skips over it as if the operator had no business
+  there.
+- The `for` loop removes seven keys. They are layers that make sense for a single tensor
+  operator but not for a HOP. `ADInplaceOrView` handles version counters for in-place ops and
+  views; `BackendSelect` picks a backend for factory functions; the `Autocast*` keys cast
+  arguments to lower precision. A HOP has none of those jobs itself: the operators *inside*
+  its subgraphs will meet these keys when they run.
+
+`fallthrough` is one line:
+
+```python
+def fallthrough(self, dispatch_key):
+    self.non_fallthrough_keys = self.non_fallthrough_keys.remove(dispatch_key)
+```
+
+`DispatchKeySet` is immutable, so `remove` returns a new set and the attribute is
+reassigned.
+
+### __call__: computing the dispatch key
+
+```python
+@abc.abstractmethod
+def __call__(self, /, *args, **kwargs):
+    flat_args = _to_flat_tuple(args, kwargs)
+    if torch.overrides.has_torch_function(flat_args):
+        return torch.overrides.handle_torch_function(
+            self, flat_args, *args, **kwargs
+        )
+    del flat_args
+
+    dispatch_key_set = _compute_keyset(args, kwargs, self.non_fallthrough_keys)
+    return self.dispatch(dispatch_key_set.highestPriorityTypeId(), *args, **kwargs)
+```
+
+- `/` makes everything before it positional-only. It lets a HOP have an argument named
+  `self` in `kwargs` without clashing with the method's own `self`.
+- `_to_flat_tuple` calls `pytree.arg_tree_leaves`, which flattens nested tuples, lists and
+  dicts into one list of leaves. For the running example the leaves are
+  `[p, t, f, x]`: the operand tuple `(x,)` has been opened up.
+- `has_torch_function` checks for `__torch_function__` overrides: a tensor subclass that
+  defines it, or an active `TorchFunctionMode`. If there is one, it gets the call first, with
+  the HOP itself as the function. This is the same first step every `torch.*` function takes.
+- `del flat_args`: drop the reference so the list does not keep tensors alive during a
+  possibly long dispatch.
+- `_compute_keyset` builds the key set, and `highestPriorityTypeId()` picks the highest key in
+  it. The method is abstract only to force subclasses to define `__call__` (for a typed
+  signature); subclasses do their own checks and then call `super().__call__`.
+
+`_compute_keyset` is a Python copy of the C++ key extraction in
+`DispatchKeyExtractor.h`:
+
+```python
+def _compute_keyset(args, kwargs, non_fallthrough_keys):
+    tensors = _get_tensors(args, kwargs)
+    return key_extractor(tensors, non_fallthrough_keys)
+
+def _get_tensors(args, kwargs):
+    flat_all = _to_flat_tuple(args, kwargs)
+    tensor_args = [t for t in flat_all if isinstance(t, torch.Tensor)]
+    return tuple(tensor_args)
+
+def key_extractor(tensors, key_mask):
+    key_set = torch._C._dispatch_tls_local_include_set()
+    for tensor in tensors:
+        key_set = key_set | torch._C._dispatch_keys(tensor)
+    key_set = key_set - torch._C._dispatch_tls_local_exclude_set()
+    key_set = key_set & key_mask
+    return key_set
+```
+
+`key_extractor` does four things, in this order:
+
+1. Start from the thread-local **include set**: keys that are on for every call on this thread.
+   Entering a dispatch mode, for example, adds `Python` here.
+2. Union in every tensor argument's keys. The functions `t` and `f` are not tensors and add
+   nothing.
+3. Remove the thread-local **exclude set**. Code that wants to skip a layer, such as
+   autograd re-calling the operator "below" itself, adds keys here.
+4. Intersect with `key_mask`, which is `non_fallthrough_keys`: drop the fallthroughs.
+
+Work it through for the running example with no mode active. Both `p` and `x` are CPU tensors,
+and `torch._C._dispatch_keys(x)` prints
+
+```text
+DispatchKeySet(CPU, ADInplaceOrView, AutogradCPU, AutocastCPU)
+```
+
+The include and exclude sets are empty. The mask removes `ADInplaceOrView` and `AutocastCPU`,
+leaving `{CPU, AutogradCPU}`. `AutogradCPU` has the higher priority, so the call is
+`self.dispatch(DispatchKey.AutogradCPU, p, t, f, (x,))`. Note that this is the key even
+when nothing requires grad: tensors always carry their autograd key, and the autograd kernel
+decides at run time whether it has anything to do.
+
+### dispatch: from a key to a kernel
+
+`dispatch` is the core of the class. It has five exits, tried in order. The first two:
+
+```python
+def dispatch(self, /, dispatch_key, *args, **kwargs):
+    from torch.utils._python_dispatch import _get_current_dispatch_mode
+
+    if dispatch_key in self._dispatch_cache:
+        kernel = self._dispatch_cache[dispatch_key]
+        if isinstance(kernel, DispatchKey):
+            raise AssertionError(f"unexpected DispatchKey in cache: {kernel}")
+        return kernel(*args, **kwargs)
+
+    if dispatch_key == DispatchKey.FuncTorchDynamicLayerFrontMode:
+        return dispatch_functorch(self, args, kwargs)
+```
+
+- **Cache hit.** If this key was resolved before, call the cached kernel at once. For
+  `OpOverload` the cache may hold a `DispatchKey` (meaning "call the C++ kernel registered
+  at that key"); a HOP has no C++ kernels, so a key here would be a bug.
+- **Functorch.** `FuncTorchDynamicLayerFrontMode` is the key functorch transforms
+  (`vmap`, `grad`, `functionalize`) put in the include set while they are active.
+  [`dispatch_functorch`](https://github.com/pytorch/pytorch/blob/5c4886908584029761b579af026dcfb627c84070/torch/_functorch/pyfunctorch.py#L328)
+  finds the innermost active transform (its **interpreter**) and calls
+  `interpreter.process(op, args, kwargs)`, which looks up `op.functorch_table` for that
+  transform's type.
+
+The third exit handles the `Python` key, that is, modes and tensor subclasses:
+
+```python
+    if dispatch_key == DispatchKey.Python:
+        overloaded_args = self._get_overloaded_args(args, kwargs)
+
+        # Step 1: dispatch on any user TorchDispatchModes
+        from torch.utils._python_dispatch import _pop_mode_temporarily
+
+        curr_mode = _get_current_dispatch_mode()
+        if curr_mode is not None:
+            if type(curr_mode) in self.python_key_table:
+                handler = self.python_key_table[type(curr_mode)]
+                with _pop_mode_temporarily() as mode:
+                    result = handler(mode, *args, **kwargs)
+            else:
+                if curr_mode.supports_higher_order_operators:
+                    with _pop_mode_temporarily() as mode:
+                        return curr_mode.__torch_dispatch__(self, [], args, kwargs)
+                else:
+                    raise NotImplementedError(...)
+            if result is not NotImplemented:
+                return result
+
+        # Step 2: dispatch on any subclasses
+        for arg in overloaded_args:
+            subclass_type = type(arg)
+            if (
+                subclass_type.__torch_dispatch__
+                is torch._C._disabled_torch_dispatch_impl
+            ):
+                continue
+            if subclass_type is torch._subclasses.fake_tensor.FakeTensor:
+                subclass_type = torch._subclasses.fake_tensor.FakeTensorMode
+                handler = self.python_key_table[subclass_type]
+                result = handler(arg.fake_mode, *args, **kwargs)
+                return result
+
+            if subclass_type in self.python_key_table:
+                handler = self.python_key_table[subclass_type]
+                result = handler(*args, **kwargs)
+            else:
+                raise NotImplementedError(...)
+            if result is not NotImplemented:
+                return result
+
+        raise TypeError(...)
+```
+
+- `_get_overloaded_args` collects the tensor arguments (looking one level into lists and
+  tuples) whose key set contains `Python`: these are tensor subclasses that implement
+  `__torch_dispatch__`.
+- **Step 1, modes.** `_get_current_dispatch_mode()` returns the top of the mode stack. If the
+  HOP registered a kernel for that mode's type, run it. `_pop_mode_temporarily()` removes the
+  mode from the stack while the kernel runs, so that operators the kernel calls go to the
+  *next* mode down (or to the real kernels), not back into this one. Without the pop, a
+  tracing kernel that calls `cond_op` again would recurse forever. The kernel receives the
+  mode as its first argument: the "natural" calling convention `(mode, *args, **kwargs)`.
+- If the HOP has no kernel for this mode, a mode can still opt in to seeing every HOP by
+  setting `supports_higher_order_operators = True`; its `__torch_dispatch__` then receives the
+  HOP as `func`. Otherwise the error message says exactly that.
+- A kernel may return `NotImplemented` to decline; dispatch then moves on to subclasses.
+- **Step 2, subclasses.** For each tensor subclass argument, skip those whose
+  `__torch_dispatch__` is disabled. `FakeTensor` gets special treatment: a fake tensor can
+  turn up without its `FakeTensorMode` on the stack (the comment in the source mentions mixing
+  fake and real weights while lowering a model), so the `FakeTensorMode` kernel is called
+  with the tensor's own `fake_mode`. Other subclasses must have registered a kernel by type.
+- If every handler declined, raise a `TypeError` naming the mode and input types.
+
+The fourth exit is for `PreDispatch`, a key used by `torch.export` to trace *above* autograd.
+It has its own small mode stack:
+
+```python
+    functionality_key = torch._C._to_functionality_key(dispatch_key)
+    if functionality_key == DispatchKey.PreDispatch:
+        from torch.utils._python_dispatch import _pop_mode_temporarily
+        if (
+            _len_torch_dispatch_stack_pre_dispatch() > 0
+        ) and not torch._C._dispatch_tls_is_dispatch_key_excluded(
+            DispatchKey.Python
+        ):
+            curr_mode = _get_current_dispatch_mode_pre_dispatch()
+            # ... assertions that curr_mode exists and has a kernel ...
+            handler = self.python_key_table[type(curr_mode)]
+            with _pop_mode_temporarily(functionality_key) as mode:
+                return handler(mode, *args, **kwargs)
+```
+
+This is Step 1 again, but against the pre-dispatch stack, which holds a
+`ProxyTorchDispatchMode` and a `FunctionalTensorMode` (and, in tests, a `SchemaCheckMode`). The check on the exclude set respects
+`no_dispatch()` blocks, which exclude `Python` to turn modes off.
+
+The last exit covers every other key:
+
+```python
+    final_key = resolve_key(self, dispatch_key)
+
+    if final_key not in self.py_kernels:
+        raise NotImplementedError(
+            f"could not find kernel for HigherOrderOperator {self._name} "
+            f"at dispatch key {final_key} (resolved from {dispatch_key})"
+        )
+
+    if dispatch_key != DispatchKey.PreDispatch:
+        self._dispatch_cache[dispatch_key] = self.py_kernels[final_key]
+    kernel = self.py_kernels[final_key]
+    if isinstance(kernel, DispatchKey):
+        raise AssertionError(f"unexpected DispatchKey in py_kernels: {kernel}")
+    return kernel(*args, **kwargs)
+```
+
+- `resolve_key` maps a concrete key such as `AutogradCPU` to the key a kernel was registered
+  under, such as the alias `Autograd`.
+- `resolve_key` may return a key with a C++ **backend fallback** (a kernel that serves every
+  operator at that key). A HOP has no C++ side, so if the resolved key has no Python kernel,
+  the error tells the author to register one by hand.
+- The resolved kernel is cached under the *original* key, so the next call with
+  `AutogradCPU` hits the cache at the top of `dispatch`. `PreDispatch` is not cached because
+  its behaviour depends on which modes are active.
+
+After one eager call of the running example, the cache holds exactly two entries:
+
+```text
+{'DispatchKey.AutogradCPU': 'maybe_run_autograd', 'DispatchKey.CPU': 'cond_op_dense'}
+```
+
+#### resolve_key
+
+`resolve_key` is a Python copy of the C++ function `computeDispatchTableEntryWithDebug`: the
+rules that decide which registration fills a slot of the dispatch table (the
+[dispatcher post](/blog/pytorch-dispatcher/) covers the C++ version). It returns the first
+match from this list:
+
+| Order | Rule | Example for cond |
+| ---: | --- | --- |
+| 1 | a kernel registered for the key itself | none |
+| 2.1 | `CompositeExplicitAutogradNonFunctional`, if the key is a backend key | none |
+| 2.2 | `CompositeExplicitAutograd`, if the key is a backend key | `CPU` → `cond_op_dense` |
+| 2.3 | `CompositeImplicitAutograd` (and its nested-tensor variant), if no backend kernel exists | none |
+| 2.4 | `Autograd`, if the key is an autograd key | `AutogradCPU` → `maybe_run_autograd` |
+| 2.5 | `FuncTorchBatchedDecomposition`, for batching keys | none |
+| last | the key itself, if C++ has a backend fallback for it | error for a HOP |
+
+So cond needs only two kernels for real execution: `CompositeExplicitAutograd` covers `CPU`,
+`CUDA` and every other backend, and `Autograd` covers every `Autograd<backend>` key.
+
+## Inside torch.cond
+
+[`torch/_higher_order_ops/cond.py`](https://github.com/pytorch/pytorch/blob/5c4886908584029761b579af026dcfb627c84070/torch/_higher_order_ops/cond.py)
+defines the operator, a public wrapper and one kernel per entry in the tables above.
+
+### CondOp
+
+```python
+class CondOp(HigherOrderOperator):
+    def __init__(self):
+        super().__init__("cond")
+
+    def __call__(self, pred, true_fn, false_fn, operands):
+        validate_subgraph_args_types(operands)
+        return super().__call__(pred, true_fn, false_fn, operands)
+
+cond_op = CondOp()
+```
+
+- `super().__init__("cond")` registers the instance as `torch.ops.higher_order.cond`.
+- `__call__` gives the operator a fixed signature. `validate_subgraph_args_types` asserts that
+  every operand is a `torch.Tensor`, an `int` or a `torch.SymInt`: by the time `cond_op` is
+  called, `torch.cond` or Dynamo has already flattened the user's operands.
+- `cond_op = CondOp()`: one instance per process, created at import. All kernels below are
+  registered on it.
+
+`CondOp` also defines `gen_schema`, which traces both branches and builds a
+`FunctionSchema` for *this particular call*, marking an operand as mutated if either branch
+writes to it. A HOP has no fixed schema (the branches differ per call), so passes that need
+to know about mutation ask for one per call site.
+
+### The public torch.cond function
+
+`torch.cond` is a plain function decorated with `@exposed_in("torch")`. After the docstring:
+
+```python
+    if torch.compiler.is_dynamo_compiling():
+        return cond_op(pred, true_fn, false_fn, operands)
+
+    if isinstance(pred, (bool, int, float)):
+        if torch.compiler.is_exporting():
+            warnings.warn("Pred is a Python constant. ...", UserWarning, stacklevel=2)
+        if pred:
+            return true_fn(*operands)
+        else:
+            return false_fn(*operands)
+
+    def _validate_input(pred, true_fn, false_fn, operands):
+        ...  # pred is bool/Tensor/SymBool with one element, branches callable,
+             # operands a (nested) tuple/list of tensors
+
+    _validate_input(pred, true_fn, false_fn, operands)
+
+    if not torch._dynamo.is_dynamo_supported():
+        raise RuntimeError("torch.cond requires dynamo support.")
+
+    def _cond_op_wrapper(*args, **kwargs):
+        return cond_op(*args, **kwargs)
+
+    from torch._higher_order_ops.utils import _hop_compile_and_call
+
+    return _hop_compile_and_call(_cond_op_wrapper, (pred, true_fn, false_fn, operands))
+```
+
+- **Under Dynamo**, `torch.cond` returns `cond_op(...)` directly. Dynamo never executes this
+  line: it recognises the call and handles it with its own tracing logic, read
+  [later](#how-dynamo-captures-a-hop).
+- **A Python constant predicate** needs no operator at all: run the chosen branch. During
+  export this means only one branch is captured, hence the warning.
+- `_validate_input` turns user mistakes into readable errors before any tracing starts.
+- **Eager with a tensor predicate** is the surprising case: `torch.cond` *compiles* the call,
+  with `fullgraph=True` and the `eager` backend, through `_hop_compile_and_call`. Dynamo is
+  the component that knows how to flatten nested operands and outputs, lift closures and
+  check that both branches match. Reusing it in eager mode means eager and compiled
+  `torch.cond` accept and reject exactly the same programs. `_cond_op_wrapper` exists because
+  Dynamo needs a function with a `__code__` object to start from, and `cond_op` is an object.
+
+### The dense kernel
+
+The kernel that actually computes something is the shortest:
+
+```python
+@cond_op.py_impl(DispatchKey.CompositeExplicitAutograd)
+def cond_op_dense(pred, true_fn, false_fn, operands):
+    if not all(isinstance(o, (torch.Tensor, int)) for o in operands):
+        raise AssertionError(...)
+    mode = _get_current_dispatch_mode()
+    if mode is not None:
+        raise AssertionError("Mode should never be enabled for CPU/CUDA key")
+    if pred:
+        return true_fn(*operands)
+    else:
+        return false_fn(*operands)
+```
+
+- Registered at `CompositeExplicitAutograd`, so `resolve_key` sends every backend key here.
+- The mode assertion checks an invariant: if a mode were active, the `Python` key would have
+  had higher priority and the mode's kernel would have run instead.
+- `if pred:` calls `bool()` on a one-element tensor, which reads its value (and on CUDA,
+  waits for the GPU). Only one branch runs, so eager `cond` costs no more than an `if`.
+
+### The autograd kernel
+
+Autograd is registered with `py_autograd_impl` rather than `py_impl`:
+
+```python
+def py_autograd_impl(self, fn):
+    def maybe_run_autograd(*args, **kwargs):
+        if not torch.is_grad_enabled() or pytree.tree_all_only(
+            torch.Tensor,
+            lambda t: not t.requires_grad,
+            (*args, kwargs),
+        ):
+            with torch._C._AutoDispatchBelowAutograd():
+                return self(*args, **kwargs)
+
+        from torch._higher_order_ops.utils import _has_gen_schema
+
+        if not self._supports_training_input_mutation and _has_gen_schema(self):
+            schema = self.gen_schema(*args, **kwargs)
+            if any(arg.is_write for arg in schema.arguments):
+                raise RuntimeError(...)
+
+        return fn(*args, **kwargs)
+
+    self.py_impl(DispatchKey.Autograd)(maybe_run_autograd)
+    return fn
+```
+
+- `maybe_run_autograd` wraps the HOP's autograd kernel `fn` with the check every autograd
+  kernel needs: if grad mode is off, or no tensor requires grad, there is nothing to record.
+- In that case `_AutoDispatchBelowAutograd()` adds the autograd keys to the thread's exclude
+  set, and `self(*args, **kwargs)` calls the operator again. `key_extractor` removes the
+  autograd key, so the call lands on the next key down (`CPU` in eager mode, `Python` under a
+  mode).
+- Otherwise, if the HOP can produce a schema and does not allow input mutation in training,
+  it builds the schema and refuses calls whose branches write to an input.
+- `self.py_impl(DispatchKey.Autograd)(maybe_run_autograd)` registers the *wrapper* at the
+  `Autograd` alias, which covers `AutogradCPU`, `AutogradCUDA` and the rest.
+
+cond's own autograd kernel is a `torch.autograd.Function`:
+
+```python
+@cond_op.py_autograd_impl
+def cond_autograd(pred, true_fn, false_fn, operands):
+    return CondAutogradOp.apply(pred, true_fn, false_fn, *operands)
+```
+
+`*operands` unpacks the tuple because `autograd.Function.apply` only tracks tensors passed
+directly as arguments, not tensors inside a tuple. The forward:
+
+```python
+class CondAutogradOp(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, pred, true_fn, false_fn, *operands):
+        ctx._pred = pred
+        ctx._true_bw_fn = create_bw_fn(true_fn, operands)
+        ctx._false_bw_fn = create_bw_fn(false_fn, operands)
+        ctx._fw_include_key_set = torch._C._dispatch_tls_local_include_set()
+        ctx._fw_exclude_key_set = torch._C._dispatch_tls_local_exclude_set()
+        save_values_for_backward(ctx, operands)
+
+        with torch._C._AutoDispatchBelowAutograd():
+            return cond_op(pred, true_fn, false_fn, operands)
+```
+
+- `ctx._pred = pred`: the backward must take the same branch as the forward, so it keeps the
+  predicate.
+- `create_bw_fn(fn, operands)` returns a function `bw(*operands, *grad_outputs)` that returns
+  one gradient per operand. It is built with AOTAutograd's `create_joint`, which runs `fn`
+  and then `torch.autograd.grad`; nothing is traced yet. Gradients that come out as `None`
+  are replaced by `zeros_like(operand)`, so every backward graph has the same number of
+  outputs.
+- The two key sets record which modes and keys were on during forward, so the backward
+  graphs can be traced under the same conditions even though backward runs later, possibly on
+  another thread.
+- `save_values_for_backward` splits operands into tensors (saved with `ctx.save_for_backward`,
+  which checks they are not modified in place before backward) and non-tensors (stored on
+  `ctx`), remembering each one's position.
+- The forward calls `cond_op` once more below autograd. This re-entry is the general pattern:
+  each kernel handles one concern (here, recording a backward node) and passes the call on.
+
+The backward:
+
+```python
+    @staticmethod
+    def backward(ctx, *flat_grads):
+        operands = saved_values(ctx)
+        args = operands + flat_grads
+        true_wrapped, grads_tensor_masks = create_fn_remove_none(ctx._true_bw_fn)
+        true_bw_gm = materialize_as_graph(
+            true_wrapped, args,
+            ctx._fw_include_key_set, ctx._fw_exclude_key_set,
+            force_enable_grad=True,
+        )
+        false_wrapped, _ = create_fn_remove_none(ctx._false_bw_fn)
+        false_bw_gm = materialize_as_graph(
+            false_wrapped, args,
+            ctx._fw_include_key_set, ctx._fw_exclude_key_set,
+            force_enable_grad=True,
+        )
+        grads = cond_op(ctx._pred, true_bw_gm, false_bw_gm, args)
+        return None, None, None, *fill_none_with_masks(grads, grads_tensor_masks)
+```
+
+- `saved_values(ctx)` puts tensors and non-tensors back in their original order.
+- `args = operands + flat_grads`: the backward functions take the forward inputs followed by
+  one gradient per forward output.
+- `create_fn_remove_none` wraps a backward function so it returns only tensors, and fills
+  `grads_tensor_masks` with `True` where a tensor was returned. A graph cannot return a mix of
+  tensors and `None` cleanly, so the `None`s are stripped here and restored at the end.
+- `materialize_as_graph` traces each backward function into an FX `GraphModule` with
+  `make_fx`, on fake tensors if a fake mode is active. The comment in the source gives the
+  reason for tracing here instead of passing plain functions: Dynamo cannot trace through the
+  joint function when the user compiles `torch.autograd.grad`.
+- `force_enable_grad=True` matters: the autograd engine runs `backward` with grad mode *off*,
+  and `create_joint` calls `torch.autograd.grad` inside the traced function. With grad mode
+  off, the forward ops inside it record nothing and every gradient comes out as zeros. The
+  [custom HOP section](#the-autograd-kernel-1) shows this failure.
+- `cond_op(ctx._pred, true_bw_gm, false_bw_gm, args)`: **the backward of cond is a cond**. The
+  same predicate selects between the two backward graphs, so a compiled backward keeps the
+  branch too.
+- `return None, None, None, ...`: no gradient for `pred`, `true_fn` and `false_fn`, then one per
+  operand.
+
+Step through the whole call for the running example with `x.requires_grad_()`. The dispatch
+keys shown are the ones a logging wrapper around `dispatch` printed.
+
+<SequenceSteps
+	participants={eagerParticipants}
+	messages={eagerMessages}
+	colWidth={128}
+	title="cond_op(p, t, f, (x,)) in eager mode, x requires grad"
+/>
+
+Check the gradient by hand. The true branch is $y_i = \cos x_i$, the loss is
+$\sum_i y_i$, so $\partial L / \partial x_i = -\sin x_i$. For $x = (0, 1, 2)$ that is
+$(-0, -0.8415, -0.9093)$, which is what `x.grad` holds.
+
+### The tracing kernel
+
+When a `ProxyTorchDispatchMode` is active (inside `make_fx`, `torch.export` or
+AOTAutograd), dispatch reaches `python_key_table[ProxyTorchDispatchMode]`:
+
+```python
+@cond_op.py_impl(ProxyTorchDispatchMode)
+def inner(mode, pred, true_fn, false_fn, operands):
+    return trace_cond(mode, cond_op, pred, true_fn, false_fn, operands)
+```
+
+`trace_cond` is where the branches become subgraphs:
+
+```python
+def trace_cond(proxy_mode, func_overload, pred, true_fn, false_fn, operands):
+    if not isinstance(operands, (list, tuple)):
+        raise AssertionError(...)
+
+    true_graph = reenter_make_fx(true_fn)(*operands)
+    false_graph = reenter_make_fx(false_fn)(*operands)
+
+    true_outs = []
+    false_outs = []
+    for node in true_graph.graph.nodes:
+        if node.op == "output":
+            true_outs.extend(node.args)
+    for node in false_graph.graph.nodes:
+        if node.op == "output":
+            false_outs.extend(node.args)
+
+    flat_true_outs = pytree.arg_tree_leaves(*true_outs)
+    flat_false_outs = pytree.arg_tree_leaves(*false_outs)
+    if len(flat_true_outs) != len(flat_false_outs):
+        raise torch._dynamo.exc.CondOpArgsMismatchError(...)
+
+    i, true_name = unique_graph_id(proxy_mode, prefix="true_graph")
+    false_name = f"false_graph_{i}"
+    if hasattr(proxy_mode.tracer.root, false_name):
+        raise AssertionError(...)
+
+    proxy_mode.tracer.root.register_module(true_name, true_graph)
+    proxy_mode.tracer.root.register_module(false_name, false_graph)
+
+    args = (pred, true_graph, false_graph, operands)
+    proxy_args = pytree.tree_map(proxy_mode.tracer.unwrap_proxy, args)
+    out_proxy = proxy_mode.tracer.create_proxy(
+        "call_function", func_overload, proxy_args, {}
+    )
+
+    out = func_overload(pred, true_graph, false_graph, operands)
+
+    return track_tensor_tree(out, out_proxy, constant=None, tracer=proxy_mode.tracer)
+```
+
+- `reenter_make_fx(true_fn)(*operands)` traces a branch while the outer trace is still in
+  progress. It calls `_CURRENT_MAKE_FX_TRACER.trace_subgraph`, which makes a **sub-tracer**
+  that shares the outer tracer's fake mode and symbolic-shape environment, so a size symbol
+  `s0` means the same thing inside the branch as outside. The result is a `GraphModule`.
+- Both branches are traced. The predicate is a proxy (or a fake tensor) here; its value is
+  unknown, which is the whole point.
+- The two loops read each graph's `output` node to count outputs. A branch that returns two
+  tensors when the other returns one cannot be one operator, so this raises
+  `CondOpArgsMismatchError`.
+- `unique_graph_id` tries `true_graph_0`, `true_graph_1`, ... until the root module has no
+  attribute by that name. The false graph reuses the number, so a pair always matches.
+- `register_module` attaches both graphs to the root module. The outer graph then refers to
+  them with `get_attr` nodes, which is why the code shows `true_graph_0 = self.true_graph_0`.
+- `unwrap_proxy` replaces each tensor in the arguments with the proxy that tracks it (the
+  graph node that produced it). Graph modules and Python values pass through unchanged.
+- `create_proxy("call_function", func_overload, ...)` adds the `cond` node. `func_overload`
+  is `cond_op`, and FX prints it as `torch.ops.higher_order.cond` because of the
+  `__module__` and `__name__` set in `__init__`.
+- `func_overload(pred, true_graph, false_graph, operands)` calls the operator again, now on
+  the traced graphs. The proxy mode was popped by `dispatch`, so this reaches the next layer:
+  the fake kernel under fake tracing, or `cond_op_dense` under real tracing. Its output gives
+  the tracer the values and metadata (shape, dtype, stride) of the result.
+- `track_tensor_tree` pairs each output tensor with a proxy for it, so later operations on the
+  output are recorded as users of the `cond` node.
+
+Step through it under `make_fx` with real tensors:
+
+<SequenceSteps
+	participants={traceParticipants}
+	messages={traceMessages}
+	colWidth={130}
+	title="make_fx tracing cond_op(p, t, f, (x,))"
+/>
+
+The resulting graph is the last tab of the [capture figure](#how-dynamo-captures-a-hop):
+the outer `forward` holds one `cond` node and two `get_attr`s, and the two submodules hold
+`aten.cos` and `aten.sin`.
+
+### The fake tensor kernel
+
+Under `FakeTensorMode` there are no values, so the predicate is unknown and the output must be
+a fake tensor that is correct *whichever* branch runs:
+
+```python
+@cond_op.py_impl(FakeTensorMode)
+def cond_fake_tensor_mode(mode, pred, true_fn, false_fn, operands):
+    ignore_fresh_unbacked = contextlib.nullcontext()
+    if mode.shape_env:
+        ignore_fresh_unbacked = mode.shape_env.ignore_fresh_unbacked_symbols()
+
+    with mode, ignore_fresh_unbacked:
+        flat_true_outs, true_out_spec = pytree.tree_flatten(true_fn(*operands))
+        flat_false_outs, false_out_spec = pytree.tree_flatten(false_fn(*operands))
+        if true_out_spec != false_out_spec:
+            raise RuntimeError(...)
+
+    merged_outs = []
+    for true_out, false_out in zip(flat_true_outs, flat_false_outs):
+        merged_outs.append(_merge_output(true_out, false_out, mode))
+    return pytree.tree_unflatten(merged_outs, true_out_spec)
+```
+
+- `ignore_fresh_unbacked_symbols()`: running a branch that calls `.item()` or `nonzero()`
+  creates new unbacked symbols. Here the branches have already been traced into graphs, and
+  the comment in the source explains the old symbol bindings are reused, so new ones are not
+  tracked.
+- `with mode`: the mode was popped by `dispatch`; it is pushed back so the branches' ops run
+  on fake tensors.
+- Both branches run, and their output trees must have the same structure (`TreeSpec`).
+- `_merge_output` combines each pair of outputs into one fake tensor.
+
+`_merge_output` first checks that `dtype`, `device`, `layout`, number of dimensions and a few
+flags match: a branch cannot change those. Sizes may differ. For each dimension where the two
+branches agree, the merged size is that size; where they disagree, it is a fresh unbacked
+symbol bounded by both:
+
+```python
+    for s0, s1 in zip(a.size(), b.size()):
+        if (
+            not _has_unbacked_symbols(s0)
+            and not _has_unbacked_symbols(s1)
+            and SymIntEqByExpr(s0) == SymIntEqByExpr(s1)
+        ):
+            merged_size.append(s0)
+        else:
+            new_size = mode.shape_env.create_unbacked_symint()
+            mode.shape_env.constrain_symbol_range(new_size.node.expr, *min_max(s0, s1))
+            merged_size.append(new_size)
+```
+
+Then it computes strides for the merged sizes. It visits the strides in increasing order and
+expresses each one as the product of the smaller dimensions' merged sizes, which works for
+any dense layout. If the two branches order their strides differently, or one returns a
+non-dense slice, it raises an error suggesting `.contiguous()`. Finally
+`torch.empty_strided(merged_size, merged_stride, ...)` under the mode makes the fake result.
+
+An example with different sizes, traced with `tracing_mode="symbolic"` and an input of
+length 5:
+
+```python
+def tt(x): return (x[:2].clone(),)   # size 2
+def ff(x): return (x.clone(),)       # size s57, the symbolic length of x
+```
+
+The output of `cond` is typed `f32[u0]`. The shape environment gives `s57` the range
+$[2, \infty)$, so $u_0 \in [\min(2, 2), \max(2, \infty)] = [2, \infty)$: code after the
+`cond` knows the length is at least 2, and nothing else.
+
+### Functionalization
+
+**Functionalization** rewrites a program so that no operator mutates its inputs or returns a
+view; compilers such as Inductor need this. A HOP is functionalized by
+`py_functionalize_impl`, which registers one function under three keys, one per
+functionalization implementation (C++ key, Python mode, functorch transform):
+
+```python
+def py_functionalize_impl(self, fn):
+    def functionalize_dk_fn(*args, **kwargs):
+        return fn(CppFunctionalizeAPI(), *args, **kwargs)
+
+    def functionalize_dispatch_mode_fn(mode, *args, **kwargs):
+        if has_user_subclass((args, kwargs), allowed_subclasses=(FakeTensor, FunctionalTensor)):
+            return NotImplemented
+        return fn(PythonFunctionalizeAPI(mode), *args, **kwargs)
+
+    def functionalize_functorch_fn(interpreter, *args, **kwargs):
+        return fn(FunctorchFunctionalizeAPI(interpreter), *args, **kwargs)
+
+    self.py_impl(DispatchKey.Functionalize)(functionalize_dk_fn)
+    self.py_impl(FunctionalTensorMode)(functionalize_dispatch_mode_fn)
+    self.py_impl(TransformType.Functionalize)(functionalize_functorch_fn)
+    return fn
+```
+
+Each wrapper builds a `ctx` object with the same methods (`unwrap_tensors`, `wrap_tensors`,
+`functionalize`, `redispatch_to_next`), so the HOP writes its rule once. The mode version
+returns `NotImplemented` for user tensor subclasses, so `dispatch` goes on to the subclass's
+own handler. cond's rule:
+
+```python
+@cond_op.py_functionalize_impl
+def cond_func(ctx, pred, true_fn, false_fn, inputs):
+    hop_instance = HopInstance.create(cond_op, pred, true_fn, false_fn, inputs)
+    if can_auto_functionalize(hop_instance) and hasattr(ctx, "mode"):
+        return do_auto_functionalize_v2(ctx.mode, hop_instance, ...)
+
+    unwrapped_inputs = ctx.unwrap_tensors(inputs)
+    unwrapped_pred = ctx.unwrap_tensors(pred)
+    with ctx.redispatch_to_next():
+        functional_true = ctx.functionalize(_maybe_run_with_interpreter(true_fn))
+        functional_false = ctx.functionalize(_maybe_run_with_interpreter(false_fn))
+        pre_dispatch = hasattr(ctx, "mode") and ctx.mode.pre_dispatch
+        for branch, branch_name in [(true_fn, "cond_true"), (false_fn, "cond_false")]:
+            _check_alias_and_mutation(branch, unwrapped_inputs, branch_name, pre_dispatch)
+        cond_return = cond_op(unwrapped_pred, functional_true, functional_false, unwrapped_inputs)
+        return ctx.wrap_tensors(cond_return)
+```
+
+- If a branch mutates an input (allowed in inference) and the Python mode is in use, the call
+  is handed to `auto_functionalized_v2`, another HOP, which turns "mutate `x`" into "return a
+  new `x`" plus a copy back at the end of the graph.
+- Otherwise: `unwrap_tensors` takes the plain tensors out of their functional wrappers.
+- `redispatch_to_next()` turns functionalization off for the calls inside the block, so the
+  `cond_op` call below reaches the next layer instead of coming back here.
+- `ctx.functionalize(branch)` wraps each branch so that, when it runs, its own ops are
+  functionalized.
+- `_check_alias_and_mutation` traces each branch and raises if it mutates an input or returns
+  an alias of one, which this path cannot represent.
+- The `cond_op` call runs with the functionalized branches, and `wrap_tensors` wraps the
+  outputs back up for the caller.
+
+### vmap
+
+`torch.vmap` runs a function over a batch dimension. For cond the interesting case is a
+predicate that differs per example:
+
+```python
+@cond_op.py_impl(torch._C._functorch.TransformType.Vmap)
+def cond_batch_rule(interpreter, pred, true_fn, false_fn, inputs):
+    # ... assert inputs is a list/tuple of tensors ...
+    pred_is_batched = isinstance(pred, torch.Tensor) and is_batchedtensor(pred)
+    pred_ = get_unwrapped(pred) if pred_is_batched else pred
+
+    tensors, in_dims = zip(*[
+        (get_unwrapped(t), maybe_get_bdim(t)) if is_batchedtensor(t) else (t, None)
+        for t in inputs
+    ])
+
+    if pred_is_batched:
+        tensors = (pred_,) + tensors
+        in_dims = (0,) + in_dims
+
+        def fn(p, *args):
+            t = true_fn(*args)
+            f = false_fn(*args)
+            return torch.where(p, t[0], f[0])
+
+        with interpreter.lower():
+            result = torch.vmap(fn, in_dims=in_dims)(*tensors)
+    else:
+        true_fn = torch.vmap(true_fn, in_dims=in_dims)
+        false_fn = torch.vmap(false_fn, in_dims=in_dims)
+        with interpreter.lower():
+            result = cond_op(pred, true_fn, false_fn, tensors)
+
+    if not isinstance(result, tuple):
+        result = (result,)
+    lvl = interpreter.level()
+    return tuple(_add_batch_dim(r, 0, lvl) for r in result)
+```
+
+- Inside `vmap`, tensors are `BatchedTensor` wrappers. `get_unwrapped` takes out the
+  underlying tensor (with the batch dimension) and `maybe_get_bdim` says which dimension is
+  the batch.
+- **Batched predicate**: each example may take a different branch, so cond cannot pick one.
+  It runs *both* branches and selects per example with `torch.where`. Note `t[0]` and `f[0]`:
+  only the first output is kept, so this path assumes one output.
+- **Unbatched predicate**: every example takes the same branch, so the branches are vmapped
+  and cond is called once.
+- `interpreter.lower()` runs the inner code at the next functorch level down, so the
+  transform does not see its own calls again.
+- `_add_batch_dim(r, 0, lvl)` re-wraps each result as batched along dimension 0.
+
+A worked case, vmapping `lambda x: cond_op(x.sum() > 0, t, f, (x,))` over three rows:
+
+| Row | Sum | Branch | Result |
+| --- | ---: | --- | --- |
+| `[1, 2]` | 3 | `cos` | `[0.5403, -0.4161]` |
+| `[-1, -2]` | -3 | `sin` | `[-0.8415, -0.9093]` |
+| `[3, -4]` | -1 | `sin` | `[0.1411, 0.7568]` |
+
+The output matched `torch.where(xs.sum(1, keepdim=True) > 0, xs.cos(), xs.sin())` exactly.
+Check one entry: $\sin(-4) = 0.7568$.
+
+## How Dynamo captures a HOP
+
+Dynamo does not call a HOP's kernels while tracing user code. It reads Python bytecode and
+builds a graph of torch calls, and when it meets a HOP it hands it to a dedicated
+`VariableTracker` subclass. `TorchHigherOrderOperatorVariable.make` looks the HOP's name up in
+a table: `cond` maps to
+[`CondHigherOrderVariable`](https://github.com/pytorch/pytorch/blob/5c4886908584029761b579af026dcfb627c84070/torch/_dynamo/variables/higher_order_ops.py#L2372).
+A HOP with no entry (and not a `BaseHOP`, below) is unsupported.
+
+`CondHigherOrderVariable._call_function` in outline:
+
+1. Normalise the arguments into exactly four positionals and validate them: the predicate is
+   a constant, tensor or symbolic bool; the operands are a list or tuple of tensors,
+   constants and symbolic ints. A constant predicate inlines one branch, with the same warning
+   as eager.
+2. **Speculate** each branch. `speculate_subgraph` traces the branch function into a fresh FX
+   graph, in a sub-tracer, and records every outside value the branch reads, such as
+   `self.w` from a closure: these are its **lifted free variables**. Dynamo's comment states
+   the strategy: checkpoint the state, trace the true branch, roll back, trace the false
+   branch. Side effects inside a branch (mutating a Python list, say) are not allowed,
+   because Dynamo could not replay them for only one branch.
+3. Check that both branches return the same pytree structure.
+4. `_merge_graph_inputs` builds one input list for both subgraphs: inputs both use, then
+   inputs only the true branch uses, then only the false branch. Each subgraph gets the full
+   list, so both have the same signature.
+5. `install_subgraph` adds the graphs as `cond_true_0` and `cond_false_0`, and one `cond` node
+   is created with the lifted variables appended to the operands.
+
+The figure shows one module captured four ways. The true branch reads `self.w` through a
+closure; follow the highlighted lines to see it become an explicit operand.
+
+<CodeStages
+	stages={captureStages}
+	tags={captureTags}
+	step={1}
+	title="One torch.cond, captured by Dynamo, torch.export and make_fx"
+/>
+
+In the Dynamo tab, the operands grew from `(x,)` to `(l_x_, l_self_parameters_w_)`, and the
+false branch's signature names the parameter `..._true_branch` although it ignores it: that is
+step 4 giving both graphs the same inputs. On $x = (0, 1, 2)$, the sum is $3 > 0$, so the
+result is $x \odot w = (0, 2, 6)$, which the compiled module returned.
+
+## Writing a HOP from scratch
+
+To see which parts are required, build a minimal HOP, `invoke_once(body_fn, operands)`, whose
+meaning is simply `body_fn(*operands)`. It is useful as a marker: the body stays a separate
+subgraph in every captured graph. The code below is complete; every helper it imports is the
+one cond uses.
+
+### Defining the operator
+
+```python
+import torch
+import torch.utils._pytree as pytree
+from torch._C import DispatchKey
+from torch._ops import HigherOrderOperator
+from torch._higher_order_ops.utils import (
+    create_bw_fn, materialize_as_graph, reenter_make_fx,
+    save_values_for_backward, saved_values, unique_graph_id,
+)
+from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.fx.experimental.proxy_tensor import ProxyTorchDispatchMode, track_tensor_tree
+
+
+class InvokeOnce(HigherOrderOperator):
+    def __init__(self):
+        super().__init__("invoke_once")
+
+    def __call__(self, body_fn, operands):
+        return super().__call__(body_fn, operands)
+
+
+invoke_once = InvokeOnce()
+```
+
+After this, `torch.ops.higher_order.invoke_once is invoke_once` is `True`. Calling it would
+fail, because every table is empty. The kernels fill them.
+
+### The dense and fake kernels
+
+```python
+@invoke_once.py_impl(DispatchKey.CompositeExplicitAutograd)
+def invoke_once_dense(body_fn, operands):
+    return body_fn(*operands)
+
+
+@invoke_once.py_impl(FakeTensorMode)
+def invoke_once_fake(mode, body_fn, operands):
+    with mode:
+        return body_fn(*operands)
+```
+
+- The dense kernel is the HOP's meaning, and serves every backend through `resolve_key`.
+- The fake kernel receives the mode first (the Python-key convention) and must re-enter it:
+  `dispatch` popped it, and without `with mode` the body would run on real tensors, or fail on
+  fake ones. Unlike cond there is only one body, so there is nothing to merge.
+
+### The tracing kernel
+
+```python
+@invoke_once.py_impl(ProxyTorchDispatchMode)
+def invoke_once_proxy(mode, body_fn, operands):
+    body_graph = reenter_make_fx(body_fn)(*operands)
+    _, name = unique_graph_id(mode, prefix="body_graph")
+    mode.tracer.root.register_module(name, body_graph)
+    args = (body_graph, operands)
+    proxy_args = pytree.tree_map(mode.tracer.unwrap_proxy, args)
+    out_proxy = mode.tracer.create_proxy("call_function", invoke_once, proxy_args, {})
+    out = invoke_once(body_graph, operands)
+    return track_tensor_tree(out, out_proxy, constant=None, tracer=mode.tracer)
+```
+
+This is `trace_cond` with one branch. Line by line: trace the body into a subgraph; find a
+free name `body_graph_N`; attach the subgraph to the root module; swap tensors for their
+proxies; add the `invoke_once` node; run the HOP once more (on the subgraph, with the proxy
+mode popped) to get example outputs; link those outputs to the node.
+
+### The functionalization kernel
+
+```python
+@invoke_once.py_functionalize_impl
+def invoke_once_functionalize(ctx, body_fn, operands):
+    unwrapped = ctx.unwrap_tensors(operands)
+    with ctx.redispatch_to_next():
+        out = invoke_once(ctx.functionalize(body_fn), unwrapped)
+    return ctx.wrap_tensors(out)
+```
+
+This is cond's rule without the mutation checks and the auto-functionalize path: unwrap,
+functionalize the body, call the HOP one layer down, wrap the outputs. It is needed for
+`torch.export` and AOTAutograd, which both functionalize. A body that mutates its inputs
+would need the checks too.
+
+### The autograd kernel
+
+```python
+class InvokeOnceAutogradOp(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, body_fn, *operands):
+        ctx._bw_fn = create_bw_fn(body_fn, operands)
+        save_values_for_backward(ctx, operands)
+        with torch._C._AutoDispatchBelowAutograd():
+            return invoke_once(body_fn, operands)
+
+    @staticmethod
+    def backward(ctx, *grads):
+        operands = saved_values(ctx)
+        bw_graph = materialize_as_graph(
+            ctx._bw_fn, operands + grads, force_enable_grad=True
+        )
+        return None, *invoke_once(bw_graph, operands + grads)
+
+
+@invoke_once.py_autograd_impl
+def invoke_once_autograd(body_fn, operands):
+    return InvokeOnceAutogradOp.apply(body_fn, *operands)
+```
+
+The same structure as `CondAutogradOp`, with one body and no predicate. The backward traces
+the joint function and runs it through `invoke_once` too, so a compiled backward also keeps
+the body as a subgraph. It skips cond's `create_fn_remove_none` step, which is safe because
+`create_bw_fn` already replaces `None` gradients with zeros.
+
+`force_enable_grad=True` is not optional. The first version of this kernel left it out, and
+the gradients came back as all zeros: the backward runs with grad mode off, so the forward ops
+inside the joint function recorded nothing for `torch.autograd.grad` to differentiate. The
+traced backward graph was just two `zeros_like` calls.
+
+### Testing it
+
+Use a small body, a matrix multiply and a ReLU:
+
+```python
+def body(x, w):
+    return (torch.relu(x @ w),)
+
+x = torch.tensor([[1.0, -2.0], [3.0, 0.5]])
+w = torch.tensor([[1.0, 0.0], [1.0, 1.0]], requires_grad=True)
+y, = invoke_once(body, (x, w))
+y.sum().backward()
+```
+
+By hand: $xw = \begin{pmatrix} -1 & -2 \\ 3.5 & 0.5 \end{pmatrix}$, so
+$y = \mathrm{relu}(xw) = \begin{pmatrix} 0 & 0 \\ 3.5 & 0.5 \end{pmatrix}$. The gradient of
+$\sum y$ with respect to $w$ is $x^\top M$, where $M$ is 1 where $xw > 0$:
+
+$$
+\frac{\partial L}{\partial w}
+= \begin{pmatrix} 1 & 3 \\ -2 & 0.5 \end{pmatrix}
+  \begin{pmatrix} 0 & 0 \\ 1 & 1 \end{pmatrix}
+= \begin{pmatrix} 3 & 3 \\ 0.5 & 0.5 \end{pmatrix}.
+$$
+
+`w.grad` matched this, and matched the gradient of `torch.relu(x @ w).sum()` computed without
+the HOP. Under `make_fx` (real and fake) and AOTAutograd's `aot_function`, the HOP produced
+these graphs:
+
+<CodeStages
+	stages={invokeStages}
+	tags={invokeTags}
+	step={0}
+	title="invoke_once traced by make_fx and by AOTAutograd"
+/>
+
+In the backward tab, `threshold_backward(arg2_1, detach_1, 0)` is the ReLU mask $M$ applied
+to the incoming gradient, and `mm(t(arg0_1), ...)` is the $x^\top M$ above.
+
+`torch.export.export(..., strict=False)` also worked, giving
+`invoke_once(body_graph_0, (x, p_w))` with the parameter as an input. Non-strict export
+traces with `make_fx` and never runs Dynamo.
+
+### What does not work: Dynamo
+
+`torch.compile` on the same function fails:
+
+```text
+Unsupported: unsupported HigherOrderOperator
+  Explanation: Unable to create higher order operator variable for invoke_once.
+```
+
+Dynamo needs a `VariableTracker` for each HOP, and that table lives inside PyTorch. The
+in-tree shortcut is
+[`BaseHOP`](https://github.com/pytorch/pytorch/blob/5c4886908584029761b579af026dcfb627c84070/torch/_higher_order_ops/base_hop.py#L26),
+a base class for HOPs shaped like `hop(subgraph, *operands, **kwargs)` that registers all the
+kernels above and is understood by Dynamo through `BaseHOPVariable`. Its docstring is explicit
+that it is not for use outside PyTorch: "don't subclass BaseHOP out of tree!". For code outside
+PyTorch, a HOP like `invoke_once` works with `make_fx`, AOTAutograd and non-strict export; for
+`torch.compile`, prefer an existing HOP or a custom operator.
+
+## Summary
+
+- A higher-order operator is an operator whose arguments include functions. Tracing turns
+  those functions into subgraphs, so control flow such as `torch.cond` stays a single node in
+  the captured graph instead of breaking it or baking in one branch.
+- `HigherOrderOperator` is a small Python dispatcher. It keeps three tables (dispatch keys,
+  modes and subclasses, functorch transforms), computes a key set from the tensor arguments,
+  masks out fallthrough keys and routes the highest key to a kernel, caching the result.
+- Each kernel handles one concern and calls the HOP again one layer down: autograd records a
+  backward and re-enters below autograd; the proxy kernel traces subgraphs, adds the node and
+  re-enters without the mode; functionalization unwraps and re-enters without itself.
+- cond's backward is itself a cond over two traced backward graphs, its fake kernel merges both
+  branches' outputs with unbacked sizes where they differ, and its vmap rule becomes
+  `torch.where` when the predicate is batched.
+- A HOP of your own needs at least the dense, fake, proxy, functionalize and autograd kernels;
+  it then works with `make_fx`, AOTAutograd and non-strict export, but not `torch.compile`,
+  whose support for a HOP lives inside Dynamo.
+
+## References
+
+- PyTorch source at commit `5c488690` (v2.14.1):
+  [`torch/_ops.py`](https://github.com/pytorch/pytorch/blob/5c4886908584029761b579af026dcfb627c84070/torch/_ops.py#L282)
+  (`HigherOrderOperator`),
+  [`torch/_higher_order_ops/cond.py`](https://github.com/pytorch/pytorch/blob/5c4886908584029761b579af026dcfb627c84070/torch/_higher_order_ops/cond.py),
+  [`torch/_higher_order_ops/utils.py`](https://github.com/pytorch/pytorch/blob/5c4886908584029761b579af026dcfb627c84070/torch/_higher_order_ops/utils.py)
+  (`reenter_make_fx`, `create_bw_fn`, `materialize_as_graph`),
+  [`torch/_dynamo/variables/higher_order_ops.py`](https://github.com/pytorch/pytorch/blob/5c4886908584029761b579af026dcfb627c84070/torch/_dynamo/variables/higher_order_ops.py#L2372)
+  (`CondHigherOrderVariable`),
+  [`torch/_functorch/pyfunctorch.py`](https://github.com/pytorch/pytorch/blob/5c4886908584029761b579af026dcfb627c84070/torch/_functorch/pyfunctorch.py#L328)
+  (`dispatch_functorch`).
+- [torch.cond documentation](https://docs.pytorch.org/docs/stable/cond.html).
+- Related posts: [The PyTorch Dispatcher](/blog/pytorch-dispatcher/),
+  [Torch FX Graphs and Symbolic Shapes](/blog/torch-fx-graph/),
+  [Inside AOTAutograd](/blog/aot-autograd/).
