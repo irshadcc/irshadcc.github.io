@@ -1,0 +1,233 @@
+---
+// A 1-D Triton #ttg.blocked layout drawn as a grid of the tensor's elements (32 per row), coloured
+// by warp, alternate lanes shaded. Hover or tap an element to pick the thread that holds it: its
+// elements are outlined, and the panel gives its warp and lane, the load vector width with the
+// numbers that limit it, and the ld.global instructions it issues for x. Controls: BLOCK_SIZE,
+// num_warps, before / after TritonGPUCoalesce, n_elements (elements at or past it are masked off)
+// and whether x_ptr is 16-byte aligned. Logic in blockedLayout.ts.
+// Usage in .mdx:
+//   <BlockedLayout block={1024} warps={4} n={1000} thread={122} />
+import {
+	type BlockedConfig,
+	coalescedSizePerThread,
+	drawGrid,
+	layoutString,
+} from "./blockedLayout";
+
+interface Props {
+	block?: 128 | 256 | 512 | 1024;
+	warps?: 1 | 2 | 4 | 8;
+	/** n_elements; elements at or past it are masked off. */
+	n?: number;
+	/** Thread selected on load. */
+	thread?: number;
+	/** Show the layout before TritonGPUCoalesce (sizePerThread = 1). */
+	before?: boolean;
+	title?: string;
+}
+
+const {
+	block = 1024,
+	warps = 4,
+	n = 1000,
+	thread = 0,
+	before = false,
+	title,
+} = Astro.props;
+const cfg: BlockedConfig = {
+	block,
+	sizePerThread: before ? 1 : coalescedSizePerThread(block, warps, 32),
+	threadsPerWarp: 32,
+	warps,
+	elementBits: 32,
+};
+const svg = drawGrid(cfg, n);
+---
+
+<figure class="blay" data-thread={thread}>
+	{title && <figcaption class="blay-title">{title}</figcaption>}
+	<div class="blay-controls">
+		<label
+			>BLOCK_SIZE
+			<select name="block">
+				{[128, 256, 512, 1024].map((b) => <option value={b} selected={b === block}>{b}</option>)}
+			</select>
+		</label>
+		<label
+			>num_warps
+			<select name="warps">
+				{[1, 2, 4, 8].map((w) => <option value={w} selected={w === warps}>{w}</option>)}
+			</select>
+		</label>
+		<label
+			>layout
+			<select name="stage">
+				<option value="before" selected={before}>before Coalesce</option>
+				<option value="after" selected={!before}>after Coalesce</option>
+			</select>
+		</label>
+		<label
+			>n_elements
+			<input name="n" type="number" min="1" max="4096" value={n} />
+		</label>
+		<label class="blay-check"><input name="aligned" type="checkbox" checked /> x_ptr 16-byte aligned</label>
+	</div>
+	<p class="blay-layout"><code>{layoutString(cfg)}</code></p>
+	<div class="blay-canvas" set:html={svg} />
+	<div class="blay-legend" aria-hidden="true"></div>
+	<div class="blay-panel" aria-live="polite"></div>
+</figure>
+
+<script>
+	import {
+		type BlockedConfig,
+		coalescedSizePerThread,
+		drawGrid,
+		layoutString,
+		ptxLines,
+		threadAccesses,
+		threadInfo,
+		vectorWidth,
+	} from "./blockedLayout";
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".blay")) {
+		const q = <T extends Element>(s: string) => fig.querySelector<T>(s);
+		const canvas = q<HTMLElement>(".blay-canvas");
+		const panel = q<HTMLElement>(".blay-panel");
+		const legend = q<HTMLElement>(".blay-legend");
+		const layout = q<HTMLElement>(".blay-layout code");
+		let sel = Number(fig.dataset.thread ?? 0);
+		let cfg: BlockedConfig;
+		let n = 1000;
+		let aligned = true;
+
+		const read = () => {
+			const block = Number(q<HTMLSelectElement>("[name=block]")?.value ?? 1024);
+			const warps = Number(q<HTMLSelectElement>("[name=warps]")?.value ?? 4);
+			const before = q<HTMLSelectElement>("[name=stage]")?.value === "before";
+			n = Math.max(1, Math.floor(Number(q<HTMLInputElement>("[name=n]")?.value ?? 1000)) || 1);
+			aligned = q<HTMLInputElement>("[name=aligned]")?.checked ?? true;
+			cfg = {
+				block,
+				sizePerThread: before ? 1 : coalescedSizePerThread(block, warps, 32),
+				threadsPerWarp: 32,
+				warps,
+				elementBits: 32,
+			};
+			sel = Math.min(sel, cfg.warps * 32 - 1);
+		};
+
+		const pick = (t: number) => {
+			sel = t;
+			const info = threadInfo(cfg, t);
+			const mine = new Set<number>();
+			for (const g of info.groups) for (let v = 0; v < g.size; v++) mine.add(g.start + v);
+			for (const r of fig.querySelectorAll<SVGRectElement>(".blay-canvas rect"))
+				r.classList.toggle("sel", (r.dataset.t ?? "").split(" ").includes(String(t)));
+			const vx = vectorWidth(cfg, n, aligned);
+			const vy = vectorWidth(cfg, n, true);
+			const lx = threadAccesses(cfg, t, vx.vec, n).length;
+			const ly = threadAccesses(cfg, t, vy.vec, n).length;
+			const ls = ly;
+			const ranges = info.groups
+				.map((g) => (g.size > 1 ? `${g.start}–${g.start + g.size - 1}` : `${g.start}`))
+				.join(", ");
+			const dup = cfg.sizePerThread * cfg.threadsPerWarp * cfg.warps > cfg.block;
+			const ptx = ptxLines(cfg, t, vx.vec, n)
+				.map((l) => l.replace(/&/g, "&amp;").replace(/</g, "&lt;"))
+				.join("\n");
+			if (panel)
+				panel.innerHTML =
+					`<p><strong>Thread ${t}</strong> = warp ${info.warp}, lane ${info.lane}. ` +
+					`It holds elements ${ranges} (${mine.size} registers per tensor).` +
+					(dup ? ` The layout tile (${cfg.sizePerThread * cfg.threadsPerWarp * cfg.warps}) is larger than BLOCK_SIZE, so every element is held by several threads.` : "") +
+					`</p><p class="blay-formula">vec(x) = min(128 / 32 = ${vx.maxVec}, contiguity = min(sizePerThread ${cfg.sizePerThread}, x alignment ${aligned ? 4 : 1}) = ${vx.contiguity}, mask alignment = gcd(${cfg.block}, ${n % 16 === 0 ? 16 : 1}) = ${vx.maskAlignment}) = <strong>${vx.vec}</strong></p>` +
+					`<p>Per thread: ${lx} load${lx > 1 ? "s" : ""} of x, ${ly} of y (vec ${vy.vec}), ${ls} store${ls > 1 ? "s" : ""}. Loads of x:</p><pre>${ptx}</pre>`;
+		};
+
+		const render = () => {
+			read();
+			if (canvas) canvas.innerHTML = drawGrid(cfg, n);
+			if (layout) layout.textContent = layoutString(cfg);
+			if (legend)
+				legend.innerHTML = Array.from(
+					{ length: cfg.warps },
+					(_, w) => `<span><i class="w${w % 8}"></i>warp ${w}</span>`,
+				).join("") + `<span><i class="off"></i>masked (≥ n)</span>`;
+			pick(sel);
+		};
+
+		fig.addEventListener("input", render);
+		canvas?.addEventListener("pointerover", (e) => {
+			const r = (e.target as Element).closest("rect");
+			if (r?.getAttribute("data-t")) pick(Number(r.getAttribute("data-t")?.split(" ")[0]));
+		});
+		canvas?.addEventListener("click", (e) => {
+			const r = (e.target as Element).closest("rect");
+			if (r?.getAttribute("data-t")) pick(Number(r.getAttribute("data-t")?.split(" ")[0]));
+		});
+		render();
+	}
+</script>
+
+<style>
+	.blay {
+		--w0: #2f6fb0;
+		--w1: #b8742a;
+		--w2: #2f8a5b;
+		--w3: #b33b5e;
+		--w4: #7a62b8;
+		--w5: #5f7380;
+		--w6: #9a8420;
+		--w7: #24868a;
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+	}
+	@media (prefers-color-scheme: dark) {
+		.blay {
+			--w0: #6fa6dc;
+			--w1: #e0a35e;
+			--w2: #63bf8d;
+			--w3: #e07597;
+			--w4: #a993e6;
+			--w5: #93a7b3;
+			--w6: #d2bb52;
+			--w7: #5cc2c6;
+		}
+	}
+	.blay-title { text-align: center; font-size: 0.9rem; font-weight: 600; margin-bottom: 0.4rem; }
+	.blay-controls { display: flex; flex-wrap: wrap; gap: 0.4rem 1rem; align-items: center; font-size: 0.78rem; color: var(--muted); margin-bottom: 0.4rem; }
+	.blay-controls label { display: inline-flex; gap: 0.35rem; align-items: center; }
+	.blay-controls select, .blay-controls input[type="number"] { font: 0.78rem var(--mono); color: var(--text); background: var(--bg); border: 1px solid var(--faint); border-radius: 6px; padding: 0.1rem 0.3rem; }
+	.blay-controls input[type="number"] { width: 5.5rem; }
+	.blay-layout { margin: 0 0 0.4rem; font-size: 0.72rem; overflow-x: auto; white-space: nowrap; }
+	.blay-canvas { overflow-x: auto; padding: 0.6rem; border: 1px solid var(--faint); border-radius: 10px; background: var(--surface); }
+	.blay-canvas :global(svg) { display: block; max-width: none; margin: 0 auto; }
+	.blay-canvas :global(.blay-axis) { font: 0.55rem var(--mono); fill: var(--muted); text-anchor: middle; }
+	.blay-canvas :global(.blay-row) { text-anchor: end; }
+	.blay-canvas :global(rect) { cursor: pointer; stroke: none; }
+	.blay-canvas :global(rect.w0), .blay-legend :global(i.w0) { fill: color-mix(in oklch, var(--w0) 55%, var(--bg)); background: color-mix(in oklch, var(--w0) 55%, var(--bg)); }
+	.blay-canvas :global(rect.w1), .blay-legend :global(i.w1) { fill: color-mix(in oklch, var(--w1) 55%, var(--bg)); background: color-mix(in oklch, var(--w1) 55%, var(--bg)); }
+	.blay-canvas :global(rect.w2), .blay-legend :global(i.w2) { fill: color-mix(in oklch, var(--w2) 55%, var(--bg)); background: color-mix(in oklch, var(--w2) 55%, var(--bg)); }
+	.blay-canvas :global(rect.w3), .blay-legend :global(i.w3) { fill: color-mix(in oklch, var(--w3) 55%, var(--bg)); background: color-mix(in oklch, var(--w3) 55%, var(--bg)); }
+	.blay-canvas :global(rect.w4), .blay-legend :global(i.w4) { fill: color-mix(in oklch, var(--w4) 55%, var(--bg)); background: color-mix(in oklch, var(--w4) 55%, var(--bg)); }
+	.blay-canvas :global(rect.w5), .blay-legend :global(i.w5) { fill: color-mix(in oklch, var(--w5) 55%, var(--bg)); background: color-mix(in oklch, var(--w5) 55%, var(--bg)); }
+	.blay-canvas :global(rect.w6), .blay-legend :global(i.w6) { fill: color-mix(in oklch, var(--w6) 55%, var(--bg)); background: color-mix(in oklch, var(--w6) 55%, var(--bg)); }
+	.blay-canvas :global(rect.w7), .blay-legend :global(i.w7) { fill: color-mix(in oklch, var(--w7) 55%, var(--bg)); background: color-mix(in oklch, var(--w7) 55%, var(--bg)); }
+	.blay-canvas :global(rect.odd) { fill-opacity: 0.6; }
+	@media (prefers-color-scheme: dark) {
+		.blay-canvas :global(rect.odd) {
+			fill-opacity: 0.78;
+		}
+	}
+	.blay-canvas :global(rect.off) { fill-opacity: 0.18; }
+	.blay-canvas :global(rect.sel) { stroke: var(--text); stroke-width: 2; }
+	.blay-legend { display: flex; flex-wrap: wrap; gap: 0.3rem 0.9rem; justify-content: center; margin: 0.45rem 0 0; font-size: 0.72rem; color: var(--muted); }
+	.blay-legend :global(span) { display: inline-flex; align-items: center; gap: 0.3rem; }
+	.blay-legend :global(i) { display: inline-block; width: 0.75rem; height: 0.75rem; border-radius: 2px; }
+	.blay-legend :global(i.off) { background: color-mix(in oklch, var(--muted) 20%, var(--bg)); }
+	.blay-panel { margin-top: 0.5rem; font-size: 0.8rem; }
+	.blay-panel :global(p) { margin: 0.3rem 0; }
+	.blay-panel :global(.blay-formula) { padding: 0.4rem 0.7rem; border-left: 3px solid var(--accent); background: var(--surface); font: 0.74rem var(--mono); overflow-x: auto; }
+	.blay-panel :global(pre) { margin: 0.3rem 0 0; padding: 0.5rem 0.7rem; background: var(--surface); border-radius: 6px; font: 0.72rem/1.45 var(--mono); overflow-x: auto; max-height: 14rem; }
+</style>

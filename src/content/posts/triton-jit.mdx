@@ -1,0 +1,746 @@
+---
+title: "How Triton's JIT Turns Python into GPU Machine Code"
+description: "What happens between add_kernel[grid](...) and a running GPU kernel: the JITFunction and its binder, specialization and the two caches, the Python AST frontend, TTIR, layouts in TTGIR, the pass pipeline, LLVM IR, PTX, ptxas and the CUDA launch. Every listing is real Triton 3.8.0 output from an RTX 5070 Ti."
+date: 2026-10-18
+tags: [Compilers, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import MarginNote from "../../components/MarginNote.astro";
+import BoxDiagram from "../../utils/payments/BoxDiagram.astro";
+import SequenceSteps from "../../utils/payments/SequenceSteps.astro";
+import CodeStages from "../../utils/compiler/CodeStages.astro";
+import TritonPasses from "../../utils/compiler/TritonPasses.astro";
+import BlockedLayout from "../../utils/gpu/BlockedLayout.astro";
+import { addStages, addTags, maskStages } from "../../utils/compiler/tritonJitData";
+import { addPasses, mm120Passes, mm90Passes } from "../../utils/compiler/tritonJitPasses";
+import { JIT_PASS_INFO } from "../../utils/compiler/tritonJitPassInfo";
+import {
+	jitNodes,
+	jitEdges,
+	launchParticipants,
+	launchMessages,
+} from "../../utils/compiler/tritonJitFigures";
+
+## Background
+
+A Triton kernel looks like an ordinary Python function with a decorator on top. You call it
+with square brackets and a grid, pass it PyTorch tensors, and a moment later the GPU has done the
+work. In between, though, nothing runs as Python. The function body is never executed by the
+interpreter. Triton reads its source, compiles it through five intermediate languages into NVIDIA
+machine code, loads that code into the CUDA driver and launches it.
+
+Knowing what happens in between explains a lot of behaviour that otherwise looks arbitrary. Why
+the first call takes a quarter of a second and later calls take microseconds. Why changing
+`n_elements` from 98432 to 98433 compiles a second kernel. Why `tl.arange` insists on a power of
+two. Why a load becomes one 16-byte instruction in one call and four 4-byte instructions in
+another. And where to look when a kernel is slower than it should be.
+
+This post follows one kernel, the vector add from Triton's tutorials, all the way down. It covers,
+in order:
+
+1. **The running example** and the same kernel at every stage, from Python to SASS.
+2. **The runtime path**: what `@triton.jit` returns, how a launch binds and specializes its
+   arguments, and the two caches that make later calls cheap.
+3. **The compiler**: the Python AST frontend and TTIR, layouts and TTGIR, the pass pipeline, and
+   the lowering to LLVM IR, PTX and a CUBIN.
+4. **The launch**: how the CUBIN is loaded and how the CUDA driver is called.
+5. **How to inspect every stage yourself.**
+
+The MLIR concepts behind TTIR and TTGIR (operations, dialects, passes) are covered in
+[MLIR, One Lowering at a Time](/blog/mlir/), and what LLVM does with the IR Triton hands it is in
+[Inside LLVM: IR, TableGen and the NVPTX Backend](/blog/llvm-nvptx-backend/). This post links to
+them rather than repeating them.
+
+Everything below was produced with Triton 3.8.0 (the version PyTorch 2.14.1 ships with), on a
+GeForce RTX 5070 Ti, compute capability 12.0 (`sm_120`).<Sidenote>Source links point at the
+`v3.8.0` tag, commit [`c01b6774`](https://github.com/triton-lang/triton/tree/c01b6774b1865984607d89d89d3a10833de92037).
+I checked that the installed wheel's Python package and its CUDA driver files are identical to that commit. The matmul
+for `sm_90` near the end was compiled but not run: I had no Hopper GPU.</Sidenote> Every listing
+is real output, with location and debug information stripped.
+
+## The running example
+
+Here is the kernel and the function that launches it, as in the
+[vector-add tutorial](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/python/tutorials/01-vector-add.py#L30):
+
+```python
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def add_kernel(x_ptr, y_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    x = tl.load(x_ptr + offsets, mask=mask)
+    y = tl.load(y_ptr + offsets, mask=mask)
+    output = x + y
+    tl.store(output_ptr + offsets, output, mask=mask)
+
+
+def add(x, y):
+    output = torch.empty_like(x)
+    n_elements = output.numel()
+    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+    add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=1024)
+    return output
+```
+
+A Triton kernel is written from the point of view of a **program instance**: one copy of the
+kernel that handles one block of the data. Here each program instance adds `BLOCK_SIZE = 1024`
+consecutive elements. `tl.program_id(0)` says which block, `tl.arange(0, 1024)` is a tensor of
+1024 offsets, and `tl.load` reads 1024 values at once. There are no threads in the source.
+
+The **grid** says how many program instances to run. With `n_elements = 98432`, the tutorial's
+size, the grid is $\lceil 98432 / 1024 \rceil = 97$ instances. The last one, `pid = 96`, starts at
+$96 \times 1024 = 98304$, so only its first $98432 - 98304 = 128$ offsets are in range. The
+**mask** `offsets < n_elements` switches the other 896 off: masked lanes neither read nor write.
+
+On the GPU, each program instance becomes one CUDA **thread block** (also called a CTA, cooperative
+thread array) of `32 × num_warps` threads. With the default `num_warps = 4` that is 128 threads
+sharing 1024 elements, so each thread handles 8 of them. Which 8 is the compiler's choice, and an
+important one; it is the subject of the [layouts section](#ttir-to-ttgir-giving-every-element-a-thread).
+
+### One kernel, seven listings
+
+The figure shows the kernel at every stage Triton produces, from the Python source down to the
+SASS machine code inside the binary. Each colour follows one line of the Python through all of
+them: step through the stages and watch, for example, `mask = offsets < n_elements` (third colour)
+go from one `arith.cmpi` on a tensor of 1024 values to two `setp.lt.s32` instructions per thread.
+Hover a legend entry to dim everything else.
+
+<CodeStages stages={addStages} tags={addTags} step={0} maxLines={26} title="add_kernel at every stage (BLOCK_SIZE = 1024, num_warps = 4, sm_120)" />
+
+Three things change on the way down. The **unit of work** goes from a program instance holding
+tensors (TTIR) to one thread holding registers (LLVM IR and below). The **abstraction** goes from
+Triton operations (`tt.load`) through generic compiler IR to NVIDIA's virtual ISA (PTX) and its
+real one (SASS). And **decisions get made**: which thread owns which element, how wide each load
+is, which registers hold what. The rest of the post is about who makes those decisions and when.
+
+## The runtime: from decorator to launch
+
+Before any compiling happens, Triton's runtime has to decide whether it needs to compile at all.
+That logic lives in [`python/triton/runtime/jit.py`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/python/triton/runtime/jit.py).
+The diagram shows the parts of the whole journey; click a box to read what it does.
+
+<BoxDiagram nodes={jitNodes} edges={jitEdges} selected="bind" title="From @triton.jit to a running kernel" />
+
+The top row is Python, in the runtime. The middle row is the compiler, which only runs on a cache
+miss. The bottom row is the CUBIN and the CUDA driver.
+
+### What `@triton.jit` returns
+
+[`triton.jit`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/python/triton/runtime/jit.py#L935)
+runs once, when Python defines `add_kernel`, and returns a `JITFunction` that wraps the original
+function. The constructor reads the source with `inspect.getsourcelines` (which is why a kernel must live in a
+file, not be typed into a REPL), records the signature and
+which parameters are annotated `tl.constexpr`, and creates an empty per-device cache. That is all:
+**decoration compiles nothing**, because the compiler needs to know the argument types, and those
+only exist at the first call.
+
+The original function is never meant to run as Python. Calling it directly fails:
+
+```python
+add_kernel(x, y, out, n, BLOCK_SIZE=1024)
+# RuntimeError: Cannot call @triton.jit'd outside of the scope of a kernel
+```
+
+The square brackets are ordinary Python indexing. `KernelInterface.__getitem__` returns a lambda
+that remembers the grid and forwards the call:
+
+```python
+def __getitem__(self, grid):
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+```
+
+So `add_kernel[grid](x, y, out, n, BLOCK_SIZE=1024)` is `add_kernel.run(x, y, out, n,
+BLOCK_SIZE=1024, grid=grid, warmup=False)`. Everything below starts in
+[`JITFunction.run`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/python/triton/runtime/jit.py#L726).
+
+### Binding and specialization
+
+`run` first asks the driver for the current device and stream, then calls a **binder**: a small
+function generated with `exec` from the kernel's signature the first time the kernel is used on
+a device
+([`create_function_from_signature`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/python/triton/runtime/jit.py#L396)).
+Generating it, rather than calling `inspect.Signature.bind` on every launch, is a deliberate
+choice: a comment in the code notes that binding is a large part of launch overhead.
+
+For each argument the binder calls `native_specialize_impl`, written in C++
+([`specialize.cc`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/python/src/specialize.cc#L264)).
+It returns two things per argument: a **type** and a **specialization hint**.
+
+- A tensor becomes a pointer type from its dtype, `*fp32` here. Its hint is `"D"` if
+  `data_ptr() % 16 == 0`, that is, if the pointer is 16-byte aligned.
+- An integer becomes `i32` if it fits in 32 bits, otherwise `i64`. Its hint is `"D"` if the value
+  is divisible by 16.
+- An integer equal to **1** becomes a compile-time constant. Strides of 1 are common, and a
+  constant stride lets the compiler see that addresses are contiguous.
+- Parameters annotated `tl.constexpr` are passed through as constants.
+
+The hint `"D"` turns into the MLIR attribute `tt.divisibility = 16` on the kernel argument (in
+[`BaseBackend.parse_attr`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/python/triton/backends/compiler.py#L75)).
+You can see it on all four runtime arguments in the TTIR listing above. It is a promise to the
+compiler, and the compiled kernel is only valid for arguments that keep it.
+
+The list of types and hints, plus the options (`num_warps`, `num_stages` and so on), is the
+**specialization key**. Two calls share a compiled kernel only if their keys match. Here is what
+happened when I called the kernel with different arguments in one process, in order (D means the
+argument has the divisible-by-16 hint; the last column counts compiled kernels in the cache):
+
+| Call | `n_elements` type | Hints (x, y, out, n) | Constants | `num_warps` | Kernels |
+| --- | --- | --- | --- | ---: | ---: |
+| `n = 98432` | `i32` | D D D D | `BLOCK_SIZE=1024` | 4 | 1 |
+| `n = 98432` again | `i32` | D D D D | `BLOCK_SIZE=1024` | 4 | 1 |
+| `n = 4096` | `i32` | D D D D | `BLOCK_SIZE=1024` | 4 | 1 |
+| `n = 98433` | `i32` | D D D – | `BLOCK_SIZE=1024` | 4 | 2 |
+| `n = 1000` | `i32` | D D D – | `BLOCK_SIZE=1024` | 4 | 2 |
+| `n = 1` | constant | D D D – | `n_elements=1, BLOCK_SIZE=1024` | 4 | 3 |
+| `x = base[1:98433]` | `i32` | – D D D | `BLOCK_SIZE=1024` | 4 | 4 |
+| `BLOCK_SIZE = 512` | `i32` | D D D D | `BLOCK_SIZE=512` | 4 | 5 |
+| `num_warps = 8` | `i32` | D D D D | `BLOCK_SIZE=1024` | 8 | 6 |
+
+Changing `n` from 98432 to 4096 reuses the kernel: both are divisible by 16, and the value itself
+is a runtime argument. Changing it to 98433 compiles a new kernel, and 1000 then reuses that
+second one. Slicing `x` one element in makes its pointer 4 bytes off a 16-byte boundary, which
+costs another compile. Why the compiler cares about all this is the subject of the
+[coalescing section](#coalescing-and-the-mask); the short answer is that it decides how wide the
+memory instructions can be.
+
+If an argument varies a lot and its hint does not help, `@triton.jit(do_not_specialize=["n_elements"])`
+turns the hint off for it (and `do_not_specialize_on_alignment` turns off only the pointer
+alignment check), so every value maps to one kernel.
+
+### `constexpr` is compile-time Python
+
+`BLOCK_SIZE: tl.constexpr` is different in kind from `n_elements`. A **constexpr** is not passed to
+the GPU at all. Its value is substituted while the compiler builds the IR, so it can decide shapes
+(`tl.arange(0, BLOCK_SIZE)` needs a fixed size), unroll loops and remove branches. In the TTIR
+listing, `BLOCK_SIZE` has disappeared from the argument list and `1024` appears as
+`arith.constant 1024`.
+
+Because constexprs are known while compiling, plain Python control flow on them is evaluated by
+the compiler, not compiled. The frontend's
+[`visit_If`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/python/triton/compiler/code_generator.py#L967)
+checks whether the condition is a Triton tensor; if it is a constant, it visits only the branch
+that is taken:
+
+```python
+@triton.jit
+def k(x_ptr, ACTIVATION: tl.constexpr):
+    x = tl.load(x_ptr + tl.arange(0, 128))
+    if ACTIVATION == "relu":      # decided while compiling; the other branch never becomes IR
+        x = tl.maximum(x, 0.0)
+    tl.store(x_ptr + tl.arange(0, 128), x)
+```
+
+Each value of `ACTIVATION` is a separate specialization with its own binary, and each binary
+contains only its own branch. This is how Triton kernels get templates without a template
+language.
+
+### Two caches
+
+`run` turns the specialization into a key and looks it up in `device_caches[device]`, the
+**in-memory cache** of this `JITFunction`. On a hit it skips straight to the launch. On a miss,
+`_do_compile` wraps the function and its specialization in an `ASTSource` and calls
+[`triton.compile`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/python/triton/compiler/compiler.py#L226).
+
+`compile` has a second, **on-disk cache**, by default under `~/.triton/cache` (set
+`TRITON_CACHE_DIR` to move it). Its key, from
+[`get_cache_key`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/python/triton/runtime/cache.py#L319),
+is a SHA-256 over:
+
+- `triton_key()`: a hash of Triton's own Python sources and of its compiled library
+  `libtriton.so`, so upgrading Triton invalidates everything;
+- the source hash: the kernel's source, the sources of every `@triton.jit` function it calls,
+  the signature, the constants and the hints;
+- the backend: the `ptxas` version and the target architecture;
+- the options, and any environment variables that change code generation.
+
+Each entry is a directory named after the hash. For our kernel it holds one file per stage plus
+the metadata:
+
+```text
+~/.triton/cache/5Y5T65XOTNKOLQXW2OLC7ZT3XFACDRYDA4YBMRYKIGA7ZR7S3NTA/
+  add_kernel.source   add_kernel.ttir   add_kernel.ttgir   add_kernel.llir
+  add_kernel.ptx      add_kernel.cubin  add_kernel.json    __grp__add_kernel.json
+```
+
+`add_kernel.json` holds the options and what the launcher needs later: `num_warps = 4`,
+`shared = 0` bytes of shared memory, the target `cuda:120`, the kernel name. Files are written to
+a temporary directory first and moved into place with `os.replace`, so two processes compiling
+the same kernel at once never see half-written files.
+
+### What the first call costs
+
+The sequence diagram puts these pieces in order for the first call in a fresh process and for
+every call after it. Step through it to see which steps disappear once the kernel is cached.
+
+<SequenceSteps participants={launchParticipants} messages={launchMessages} step={0} title="The first call and a later call to add_kernel[grid](...)" />
+
+I timed each case on the RTX 5070 Ti (median of three runs, wall-clock time of the first call
+including `torch.cuda.synchronize()`; per-stage times from Triton's own compile listener):
+
+| Situation | First call | Of which |
+| --- | ---: | --- |
+| Empty cache directory | 574 ms | about 290 ms to build Triton's C launcher module with the system C compiler, once per cache directory |
+| Launcher built, kernel not cached | 286 ms | 225 ms `triton_key()`, 21 ms for the five stages |
+| Kernel in the disk cache, new process | 258 ms | 225 ms `triton_key()`, then load the CUBIN |
+| Kernel in the memory cache | 6.2 µs | binding, key lookup and `cuLaunchKernelEx`; `torch.add` takes 4.5 µs |
+
+The compiler itself is the smallest part for a kernel this simple: TTIR 1.0 ms, TTGIR 4.0 ms, LLVM
+IR 4.7 ms, PTX 2.3 ms and `ptxas` 11.5 ms. The surprise is `triton_key()`. Profiling showed it
+reads and hashes the whole of `libtriton.so`, which is 506 MB in this wheel. It is cached with
+`functools.lru_cache`, so it costs about 225 ms once per process, even when every kernel is
+already on disk.<Sidenote>The C launcher is `driver.c`, compiled into a Python extension module
+`cuda_utils` the first time the CUDA driver is used, and cached in the same directory as the
+kernels. That is why the very first run in an empty cache is slower still.</Sidenote> A larger
+kernel shifts the balance: a matmul spends far longer in TTGIR passes and in `ptxas`.
+
+## From Python to TTIR
+
+On a miss, the compiler starts by turning Python into **TTIR**, the Triton IR: an MLIR module in
+the `tt` dialect (plus the standard `arith`, `math` and `scf` dialects) that still talks about
+whole tensors.
+
+### The AST visitor
+
+[`ast_to_ttir`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/python/triton/compiler/code_generator.py#L1662)
+parses the kernel's saved source into a Python AST (abstract syntax tree) with the `ast` module,
+then walks it with a `CodeGenerator`, a subclass of `ast.NodeVisitor`. Each `visit_*` method
+handles one kind of syntax:
+
+- `visit_Assign` binds a Python name to a Triton value. The name becomes the SSA name in the IR,
+  which is why the TTIR above has `%pid`, `%offsets` and `%mask`.
+- `visit_BinOp` maps `+` to `__add__` on the operand, and so on for each operator.
+- `visit_Call` resolves the callee. A call to another `@triton.jit` function is compiled into a
+  separate `tt.func` and called; a builtin such as `tl.load` is called directly, with an extra
+  `_semantic` argument.
+- `visit_If` and `visit_For` either evaluate the statement at compile time (constexpr condition,
+  `tl.static_range`) or emit `scf.if` and `scf.for`.
+
+The builtins in `triton.language` do not compute anything. They check types and call the IR
+builder. `tl.arange(0, 1024)` ends in
+[`TritonSemantic.arange`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/python/triton/language/semantic.py#L583),
+which raises `ValueError("arange's range must be a power of 2")` if `end - start` is not a power of
+two, and otherwise emits `tt.make_range`. The power-of-two rule comes from layouts: tensors are
+split evenly over threads, warps and registers, which all come in powers of two.
+
+`x_ptr + offsets` goes through
+[`TritonSemantic.add`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/python/triton/language/semantic.py#L230),
+which first broadcasts the scalar pointer to a tensor (`tt.splat`), then sees that one side is a
+pointer and emits `tt.addptr`, Triton's pointer arithmetic, scaled by the element size later. Two
+floats would give `arith.addf`, two integers `arith.addi`.
+
+### The frontend's output
+
+Step 2 of the figure is what the frontend emits before any pass runs. Most lines map one to one
+onto the source, but some are uncoloured: overflow checks. For every integer addition and
+multiplication the frontend computes the result again in 64 bits and compares it with the 32-bit
+range
+([`binary_op_sanitize_overflow_impl`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/python/triton/language/semantic.py#L212)).
+The assert that would use the comparison is only emitted when `debug=True`
+([`device_assert`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/python/triton/language/semantic.py#L1810)
+returns early otherwise), so in a normal build the checks are dead code, and the first pass
+deletes them. Step 3 shows the result.
+
+Type errors are caught while visiting: the builtins raise, and the visitor re-raises the error as a
+`CompilationError` that points at the offending line of the kernel. When the walk is done,
+`ast_to_ttir` runs the MLIR verifier on the finished module.
+
+## Stages and passes
+
+The rest of the compiler is a list of stages. `CUDABackend.add_stages` registers five functions,
+each taking the previous stage's output
+([`compiler.py`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/third_party/nvidia/backend/compiler.py#L598)):
+
+| Stage | Function | Input → output | Main tool |
+| --- | --- | --- | --- |
+| `ttir` | `make_ttir` | TTIR → TTIR | MLIR passes |
+| `ttgir` | `make_ttgir` | TTIR → TTGIR | MLIR passes |
+| `llir` | `make_llir` | TTGIR → LLVM IR text | MLIR passes, then LLVM -O3 |
+| `ptx` | `make_ptx` | LLVM IR → PTX text | LLVM NVPTX backend |
+| `cubin` | `make_cubin` | PTX → CUBIN bytes | NVIDIA `ptxas` |
+
+`compile` runs them in a loop and stores each output in the cache
+([`compiler.py#L326`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/python/triton/compiler/compiler.py#L326)):
+
+```python
+for ext, compile_ir in list(stages.items())[first_stage:]:
+    next_module = compile_ir(module, metadata)
+    metadata_group[f"{file_name}.{ext}"] = fn_cache_manager.put(next_module, ...)
+    module = next_module
+```
+
+The first three stages are each an MLIR **pass pipeline**: an ordered list of transformations of
+the module. The figure lists every pass Triton ran on three kernels, with the diff each pass
+made. Passes that changed nothing are dimmed; the arrow buttons jump between the ones that did.
+The vector add is the first tab. The other two, a matmul for `sm_120` and for `sm_90`, come up in
+[a later section](#what-a-matmul-adds).
+
+<TritonPasses kernels={[{ key: "add", label: "Vector add, sm_120", steps: addPasses }, { key: "mm120", label: "Matmul, sm_120", steps: mm120Passes }, { key: "mm90", label: "Matmul, sm_90", steps: mm90Passes }]} info={JIT_PASS_INFO} start="TritonGPUCoalesce" title="Every pass of Triton 3.8.0's NVIDIA pipeline, with what it changed" />
+
+Of the 84 passes run on the vector add, 15 change it, and most of those only add a module
+attribute. The pipeline is written for kernels like matmul and attention; on a simple kernel most
+passes look, find nothing to do, and move on.
+
+| Kernel | `make_ttir` | `make_ttgir` | `make_llir` |
+| --- | --- | --- | --- |
+| Vector add, `sm_120` | 7 passes (1 changes the IR) | 56 (5) | 21 (9) |
+| Matmul, `sm_120` | 7 (2) | 56 (13) | 21 (11) |
+| Matmul, `sm_90` | 7 (2) | 40 (11) | 21 (12) |
+
+`make_ttir` is nearly target independent: inlining, canonicalization, a few Triton peepholes, common
+subexpression elimination and dead-symbol removal. `make_ttgir` is where most of the work, and
+most of the differences between GPUs, live. Its pass list depends on the compute capability
+([`make_ttgir`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/third_party/nvidia/backend/compiler.py#L261)):
+`capability // 10` in 8 or 9 (Ampere, Ada, Hopper) adds the Hopper software-pipelining branch;
+10 and above adds the Blackwell branch with automatic warp specialization and tensor memory.
+`sm_120` is 12, so it takes the Blackwell branch, even though consumer Blackwell has no tensor
+memory. Those passes run and find nothing to do, which is why the `sm_120` pipeline is 16 passes
+longer than the `sm_90` one.
+
+## TTIR to TTGIR: giving every element a thread
+
+TTIR says "load 1024 floats". It does not say which of the 128 threads loads which float. That is
+the job of a **layout** (Triton calls it an encoding): a function from the elements of a tensor to
+the threads, warps and registers that hold them. **TTGIR**, the TritonGPU IR, is TTIR with a
+layout attached to every tensor type.
+
+### The blocked layout
+
+The first pass of `make_ttgir`, `ConvertTritonToTritonGPU`, gives every tensor a default
+**blocked layout**:
+
+```text
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+```
+
+Read it as nested tiling. Each thread holds `sizePerThread` consecutive elements; 32 threads of a
+warp hold consecutive chunks; 4 warps hold consecutive warp-chunks. One pass over this pattern
+covers $1 \times 32 \times 4 = 128$ elements. A 1024-element tensor is longer, so the pattern
+repeats 8 times, and each thread holds 8 elements, 128 apart.
+
+A few passes later, `TritonGPUCoalesce` replaces it with the layout you see in the TTGIR listing:
+
+```text
+#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+```
+
+Now each thread holds 4 consecutive floats, 16 bytes, which is the widest load an NVIDIA GPU has.
+The tile is $4 \times 32 \times 4 = 512$ elements, so it repeats twice: **thread $t$ holds
+elements $4t$ to $4t+3$ and $512 + 4t$ to $512 + 4t + 3$**.
+
+The figure draws this layout. Each square is one element of the 1024-element tensor, 32 per row,
+coloured by warp, with alternate threads shaded lighter so the groups of four stand out. Hover a
+square to see which thread holds it and what that thread loads. Switch "layout" to "before
+Coalesce" to compare the two layouts, and change `num_warps` or `BLOCK_SIZE` to see the tile
+change.
+
+<BlockedLayout block={1024} warps={4} n={98432} thread={5} title="add_kernel's layout: which thread holds which element (program 0)" />
+
+Check one thread by hand against the PTX. Thread 5 is warp 0, lane 5. The PTX computes its
+offset as `(tid.x << 2) & 508`, then ORs in `ctaid.x << 10` (the block's start, $1024 \times$ pid):
+for thread 5 in program 0 that is $(5 \times 4) \,\&\, 508 = 20$. The second group is
+`or.b32 %r32, %r31, 512`, element 532. The figure shows thread 5 holding 20–23 and 532–535. The
+`& 508` keeps $4t$ below 512, which it always is with 128 threads, but LLVM only knows
+`tid.x < 1024` (the range declared on the intrinsic), so it keeps the mask.
+
+The layout also fixes how a warp's memory accesses line up. In one `ld.global.v4` instruction, the
+32 lanes of warp 0 read bytes 0–15, 16–31, …, 496–511: 512 contiguous bytes, exactly four
+128-byte cache lines. That is a **coalesced** access, the best case for global memory, and it is
+what the pass is named after.
+
+How does `TritonGPUCoalesce` choose 4? In
+[`buildCoalescedEncoding`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/lib/Dialect/TritonGPU/Transforms/CoalesceUtils.cpp#L17)
+it asks the axis analysis (next section) how many contiguous, aligned elements each memory access
+has, takes the largest over the loads and stores that share the same indexing, caps it at 128 bits
+(4 floats), and caps it again at `BLOCK_SIZE / (32 × num_warps)` so that no two threads hold the
+same element. I compiled the kernel for several sizes to check: `BLOCK_SIZE = 256` with 4 warps
+gets `sizePerThread = [2]` and `ld.global.v2`, and `BLOCK_SIZE = 128` gets `[1]` and scalar
+loads.
+
+Changing a layout is not free, so `TritonGPUCoalesce` does not rewrite the whole kernel. It changes
+only the loads and the store, and wraps each in `ttg.convert_layout` operations from and back to
+the old layout. The next pass, `TritonGPURemoveLayoutConversions`, then propagates the new layout
+through the elementwise operations until every conversion converts a layout to itself and can be
+deleted. In the pass explorer above, the vector add's `TritonGPUCoalesce` adds 9 conversions and
+`TritonGPURemoveLayoutConversions` removes all of them. A layout conversion that survives becomes
+a round trip through shared memory, so the number of conversions left in a kernel's TTGIR is worth
+checking when a kernel is slow.
+
+### Coalescing and the mask
+
+A layout with `sizePerThread = [4]` makes 16-byte loads possible, but the compiler still has to
+prove they are safe. That proof comes from the **axis analysis**
+([`AxisInfo.cpp`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/lib/Analysis/AxisInfo.cpp#L1446)),
+a dataflow analysis that tracks three properties of every integer and pointer tensor:
+
+- **contiguity**: the length of runs of consecutive values (`tl.arange(0, 1024)` has 1024);
+- **divisibility**: the largest power of two every value is a multiple of (a pointer with the
+  `tt.divisibility = 16` hint has 16 bytes);
+- **constancy**: the length of runs of equal values (a `tt.splat` of a scalar is constant over
+  the whole tensor).
+
+When `tt.load` is lowered
+([`LoadOpConversion`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp#L115)),
+the vector width per thread is
+
+$$
+\text{vec} = \min\Big(\tfrac{128}{\text{bits per element}},\ \text{contiguity}(\text{ptr}),\ \text{constancy}(\text{mask})\Big)
+$$
+
+where the pointer's contiguity is itself capped by `sizePerThread` and by the pointer's
+alignment. The mask term is the subtle one. One vector load has one predicate, so the mask must be
+the same for all 4 elements it covers. For `offsets < n_elements`, the axis analysis
+([`CmpOpAxisInfoVisitor`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/lib/Analysis/AxisInfo.cpp#L796))
+gives a constancy of
+
+$$
+\gcd\big(\text{contiguity}(\textit{offsets}),\ \text{divisibility}(\textit{offsets}),\ \text{divisibility}(n)\big) = \gcd(1024,\ 1024,\ d_n).
+$$
+
+If `n_elements` has the divisible-by-16 hint, $d_n = 16$ and the mask is constant over every
+aligned run of 16 offsets, so $\text{vec} = \min(4, 4, 16) = 4$. Without the hint the compiler
+knows nothing about $n$, $d_n = 1$, and $\text{vec} = 1$: any element could be the first one
+out of range.
+
+That is why the specialization hint matters. Here is the same kernel compiled with `n = 98432`
+($98432 = 16 \times 6152$) and with `n = 1000` ($1000 \bmod 16 = 8$). Only the body of the PTX is
+shown:
+
+<CodeStages stages={maskStages} tags={addTags} step={0} maxLines={26} title="The PTX of add_kernel with and without the divisible-by-16 hint on n_elements" />
+
+With the hint, each thread computes 2 predicates and issues 4 loads and 2 stores of 16 bytes. Without
+it, 8 predicates, 16 loads and 8 stores of 4 bytes, for exactly the same work. A misaligned `x`
+does the same to the loads of `x` alone: with `x = base[1:98433]` the PTX has 8 scalar loads of
+`x` and 2 vector loads of `y`.
+
+You can try this in the layout figure: set `n_elements` to 1000 and hover thread 122. It holds
+elements 488–491, which are in range, and 1000–1003, which are not, so its second group of loads is
+switched off entirely. In program 96 of the real launch only 128 elements are in range, the first
+group of each thread in warp 0; every other load and store in that block is switched off.
+
+## TTGIR to LLVM IR
+
+`make_llir` lowers TTGIR to the MLIR **LLVM dialect**, translates that to a real LLVM module and
+optimizes it
+([`make_llir`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/third_party/nvidia/backend/compiler.py#L367)).
+Before the main conversion, a few passes prepare the module. `SCFToControlFlow` turns loops and ifs
+into basic blocks. `AllocateSharedMemoryNv` plans shared memory and records the total as
+`ttg.shared`: 0 bytes for the vector add, which needs none. `AllocateWarpGroups` records
+`ttg.total-num-warps = 4`.
+
+The main pass, `ConvertTritonGPUToLLVM`, is where the program stops being about tensors. For each
+operation it looks at the layout and writes code for **one thread**:
+
+- `tt.get_program_id x` becomes a read of the special register `ctaid.x`, the block index.
+- `tt.make_range` becomes `tid.x`, the thread index, times `sizePerThread`, plus each register's
+  position in the layout: `%10 = shl nuw nsw i32 %9, 2` and `or disjoint i32 %12, 512`.
+- A tensor of 1024 floats becomes 8 scalar SSA values per thread, the ones its layout gives it.
+- `arith.addf` on the tensor becomes 8 `fadd float` instructions.
+- `tt.load` becomes inline PTX: `ld.global.v4.b32` guarded by a predicate. Triton writes PTX
+  strings directly here, rather than LLVM loads, to control the exact instruction, including the
+  `mov.u32 $0, 0x0` that fills masked-off lanes with zero.
+
+The conversion produces about 510 lines of LLVM dialect for this kernel, much of it redundant;
+`CanonicalizeLLVMIR` and CSE cut it to about 120. Then the module is translated to LLVM IR proper,
+given the target triple `nvptx64-nvidia-cuda` and processor `sm_120a`, linked with NVIDIA's
+`libdevice` if it calls math functions (this one does not) and optimized with LLVM's `-O3`
+pipeline. The LLVM IR listing in the figure is the result.
+
+Two details in it are easy to miss. The function has **six** parameters, not four: Triton appends
+pointers to global and profile scratch memory to every kernel, for operations that need scratch
+space in global memory. Here they are unused and passed as null. And the function carries
+`"nvvm.reqntid"="128"`, which tells LLVM and `ptxas` the block size is exactly 128 threads; it
+becomes `.reqntid 128` in the PTX.
+
+## PTX, ptxas and the CUBIN
+
+`make_ptx` hands the module to LLVM's NVPTX backend, which selects PTX instructions, allocates
+virtual registers and prints text
+([`make_ptx`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/third_party/nvidia/backend/compiler.py#L480)).
+The [LLVM post](/blog/llvm-nvptx-backend/) follows that process step by step. Triton then edits
+the text: it rewrites the `.version` line to the newest PTX version the installed `ptxas`
+supports (9.3 here) and the `.target` line to the real architecture, and reads the kernel name
+from the `.entry` line.
+
+**PTX** is NVIDIA's virtual instruction set: stable across GPU generations, with unlimited
+virtual registers. It is not what the GPU runs. `make_cubin` writes the PTX to a temporary file and
+runs NVIDIA's assembler on it
+([`make_cubin`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/third_party/nvidia/backend/compiler.py#L513)):
+
+```bash
+ptxas-blackwell -lineinfo -v --regAllocOptLevel=2 --gpu-name=sm_120a /tmp/tmpXXXX.ptx -o /tmp/tmpXXXX.ptx.o
+```
+
+`ptxas` does the real register allocation and instruction scheduling and produces a **CUBIN**, an
+ELF file containing **SASS**, the GPU's actual machine code. Triton ships its own `ptxas` inside the wheel, and a
+separate `ptxas-blackwell` that it uses for capability 10.0 and above, `sm_120` included. The last listing in the
+figure is the SASS disassembled. It is shorter than the PTX: the 16 `mov 0x0` lines became eight
+`CS2R` instructions that each zero a pair of registers, the four loads are `LDG.E.128`, and parameters
+are read from the constant bank `c[0x0]`. The compiled kernel uses 28 registers per thread and no
+spills.
+
+## Loading and launching
+
+The CUBIN is bytes in a `CompiledKernel` object. It is loaded into the GPU the first time the
+kernel is launched, in
+[`CompiledKernel._init_handles`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/python/triton/compiler/compiler.py#L448).
+That method checks the kernel's shared memory against the device limit, then calls `load_binary`
+in Triton's C extension
+([`driver.c`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/third_party/nvidia/backend/driver.c#L266)),
+which uses the CUDA driver API:
+
+```cpp
+cuModuleLoadData(&mod, data);              // load the CUBIN into the current context
+cuModuleGetFunction(&fun, mod, name);      // find "add_kernel" in it
+cuFuncGetAttribute(&n_regs, CU_FUNC_ATTRIBUTE_NUM_REGS, fun);
+cuFuncGetAttribute(&n_spills, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, fun);
+```
+
+Loading is separate from compiling because a kernel found in the disk cache still has to be loaded
+into each new process's CUDA context.
+
+Every launch then goes through `CudaLauncher` and the C function `launch`. It drops the constexpr
+arguments, turns each tensor into its device pointer (`data_ptr()`, checked with
+`cuPointerGetAttribute` so a CPU tensor fails with a clear error), stores each scalar in a
+correctly sized slot, appends the two scratch pointers and builds the `void **params` array.
+Then
+[`_launch`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/third_party/nvidia/backend/driver.c#L968)
+fills in a `CUlaunchConfig`:
+
+```cpp
+config.gridDimX = gridX * num_ctas;    // 97
+config.gridDimY = gridY;               // 1
+config.gridDimZ = gridZ;               // 1
+config.blockDimX = 32 * num_warps;     // 128
+config.blockDimY = 1;
+config.blockDimZ = 1;
+config.sharedMemBytes = shared_memory; // 0
+config.hStream = stream;               // PyTorch's current stream
+cuLaunchKernelEx(&config, function, params, 0);
+```
+
+The grid lambda is evaluated just before this, with the bound arguments as `meta`, which is how
+`triton.cdiv(n_elements, meta["BLOCK_SIZE"])` can read the constexpr. Optional launch attributes are
+added for clusters (`num_ctas > 1`), cooperative launches and more than 228 KB of shared memory.
+`cuLaunchKernelEx` only queues the kernel on the stream, so `add_kernel[grid](...)` returns before
+the GPU starts; PyTorch synchronizes later when the result is needed.
+
+In the GPU, the 97 blocks are spread over the streaming multiprocessors. Each block runs the SASS
+above with 128 threads in 4 warps; thread $t$ of block $p$ adds elements $1024p + 4t$ to
+$1024p + 4t + 3$ and 512 elements later. The output matched `x + y` exactly.
+
+## What a matmul adds
+
+The vector add exercises the frontend, layouts and lowering, but it leaves the most important
+TTGIR passes idle. For contrast I compiled the
+[tutorial matmul](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/python/tutorials/03-matrix-multiplication.py)
+(fp16, 128 × 128 × 32 tiles, 4 warps, `num_stages = 3`) for both `sm_120` and `sm_90`; its passes
+are the second and third tabs of the pass explorer. On the RTX 5070 Ti it ran with a maximum
+absolute error of 0 against `torch.matmul` for 1024 × 1024 matrices.
+
+| | `sm_120` (RTX 5070 Ti) | `sm_90` (H100, compiled only) |
+| --- | --- | --- |
+| Accumulator layout from `AccelerateMatmul` | `#ttg.nvidia_mma` version 2, instruction 16 × 8 | version 3, instruction 16 × 128 × 16 |
+| Tensor-core instructions in the PTX | 64 `mma.sync` | 4 `wgmma.mma_async` |
+| Operand source | registers, loaded by `ldmatrix` | shared memory, read directly by wgmma |
+| Shared-memory buffers from `Pipeline` | 2 × (A tile + B tile) | 3 × (A tile + B tile) |
+| `ttg.shared` | 32768 bytes | 49152 bytes |
+| Passes in `make_ttgir` | 56 | 40 |
+
+The pipeline in the third tab is the part to look at. `AssignLatencies` marks the two loads in the
+K loop with `tt.latency = 2`. `ScheduleLoops` gives every operation a stage: the loads run two
+iterations ahead of the dot that uses them. `Pipeline` turns the loads into asynchronous copies
+(`cp.async`) into a ring of shared-memory buffers, adds a prologue that starts the first copies and
+waits only for the oldest copy in each iteration. While the tensor cores work on tile $k$, the
+copies of tiles $k+1$ and $k+2$ are already on their way.
+
+The buffer counts differ because of where the operands are read. With `mma.sync` (the same path
+`sm_80` takes, which also gets 2 buffers) each tile is copied from shared memory into registers
+before the dot. On `sm_90` the wgmma reads straight from shared memory, and the pipeliner leaves one
+wgmma running (`warp_group_dot_wait` with `pendings = 1`) while the loop moves on, so the buffer it
+reads cannot be reused yet and the ring needs a third slot. That is my reading of the IR rather than
+something the code states.
+
+## Inspecting each stage yourself
+
+Everything in this post can be reproduced with environment variables and the `CompiledKernel` that
+every launch returns. The variables are defined in
+[`knobs.py`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/python/triton/knobs.py):
+
+| Variable | Effect |
+| --- | --- |
+| `TRITON_KERNEL_DUMP=1` | Write every stage, plus disassembled SASS, to `TRITON_DUMP_DIR` (default `~/.triton/dump`) |
+| `MLIR_ENABLE_DUMP=1` | Print the IR before every MLIR pass to stderr (or `=add_kernel` for one kernel); used for the pass explorer |
+| `TRITON_ALWAYS_COMPILE=1` | Ignore the disk cache and always compile |
+| `TRITON_CACHE_DIR` | Move the disk cache |
+| `TRITON_KERNEL_OVERRIDE=1` | Replace a stage with a hand-edited file from `TRITON_OVERRIDE_DIR` |
+| `TRITON_DUMP_PTXAS_LOG=1` | Print `ptxas -v` output: registers, spills, shared memory |
+| `NVPTX_ENABLE_DUMP=1` | Print the PTX as it is produced |
+| `TRITON_INTERPRET=1` | Run kernels on the CPU with NumPy instead of compiling them, for debugging |
+
+From Python, the object returned by a launch holds every stage as text, plus the metadata:
+
+```python
+k = add_kernel[grid](x, y, out, n, BLOCK_SIZE=1024)
+print(k.asm["ttgir"])                      # also "ttir", "llir", "ptx", "cubin" (bytes)
+print(k.metadata.num_warps, k.metadata.shared, k.n_regs, k.n_spills)   # 4 0 28 0
+```
+
+And to compile for a GPU you do not have, call the compiler directly with a target. This is how
+the `sm_90` matmul above was produced:
+
+```python
+from triton.backends.compiler import GPUTarget
+from triton.compiler import ASTSource
+
+src = ASTSource(add_kernel,
+                signature={"x_ptr": "*fp32", "y_ptr": "*fp32", "output_ptr": "*fp32",
+                           "n_elements": "i32", "BLOCK_SIZE": "constexpr"},
+                constexprs={"BLOCK_SIZE": 1024},
+                attrs={(i,): [["tt.divisibility", 16]] for i in range(4)})
+k = triton.compile(src, target=GPUTarget("cuda", 90, 32), options={"num_warps": 4})
+print(k.asm["ptx"])
+```
+
+## Summary
+
+- **`@triton.jit` compiles nothing.** It returns a `JITFunction`; compilation happens at the first
+  launch, when argument types are known, and is cached in memory per device and on disk under a
+  hash of Triton, the source, the target and the options.
+- **The specialization key is the types plus hints.** Pointers 16-byte aligned, integers divisible
+  by 16, integers equal to 1 and every constexpr are part of it, so changing one of them compiles a
+  new kernel, and the hints are what let the compiler emit 16-byte loads.
+- **The compiler is a chain of five stages**: the Python AST becomes TTIR (tensors, no threads),
+  TTGIR (a layout maps every element to a thread, warp and register), LLVM IR (one thread's
+  code), PTX (virtual ISA) and a CUBIN from `ptxas` (SASS machine code).
+- **Layouts are the central decision.** `TritonGPUCoalesce` and the axis analysis choose how many
+  consecutive elements each thread holds and how wide its loads are; for a matmul, TTGIR passes
+  also pick tensor-core instructions and pipeline the loads through shared memory.
+- **The launch is a thin C layer** over the CUDA driver: `cuModuleLoadData` once per process,
+  then `cuLaunchKernelEx` with `32 × num_warps` threads per block, about 6 µs of CPU time per call.
+
+## References
+
+- Triton source at `v3.8.0`, commit [`c01b6774`](https://github.com/triton-lang/triton/tree/c01b6774b1865984607d89d89d3a10833de92037):
+  [`runtime/jit.py`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/python/triton/runtime/jit.py),
+  [`compiler/compiler.py`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/python/triton/compiler/compiler.py),
+  [`compiler/code_generator.py`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/python/triton/compiler/code_generator.py),
+  [`backend/compiler.py`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/third_party/nvidia/backend/compiler.py),
+  [`backend/driver.c`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/third_party/nvidia/backend/driver.c),
+  [`Analysis/AxisInfo.cpp`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/lib/Analysis/AxisInfo.cpp).
+- Triton tutorials: [vector addition](https://triton-lang.org/main/getting-started/tutorials/01-vector-add.html)
+  and [matrix multiplication](https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html).
+- P. Tillet, H. T. Kung and D. Cox, "Triton: An Intermediate Language and Compiler for Tiled Neural
+  Network Computations", MAPL 2019.
+- NVIDIA, [PTX ISA](https://docs.nvidia.com/cuda/parallel-thread-execution/) and
+  [CUDA Driver API: module and launch management](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__EXEC.html).
+- On this blog: [MLIR, One Lowering at a Time](/blog/mlir/),
+  [Inside LLVM: IR, TableGen and the NVPTX Backend](/blog/llvm-nvptx-backend/) and
+  [TorchInductor](/blog/torch-inductor/), which generates Triton kernels like these.

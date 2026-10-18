@@ -3,23 +3,34 @@
 // sm_90, with what each pass changed. The list shows each pass with +added / -removed lines
 // (passes that change nothing are dimmed); the panel shows the pass's description and the diff of
 // the IR it produced. Data: tritonPasses.ts (generated from MLIR_ENABLE_DUMP), descriptions:
-// tritonPassInfo.ts. The step buttons walk through the passes that change the IR.
+// tritonPassInfo.ts. The step buttons walk through the passes that change the IR. Other pass
+// dumps (same PassStep format) and descriptions can be passed in with `kernels` and `info`.
 // Usage in .mdx:
 //   <TritonPasses />
 //   <TritonPasses kernel="mm" start="TritonGPUPipeline" />
+//   <TritonPasses kernels={[{ key: "add", label: "Vector add", steps: addPasses }]} info={JIT_PASS_INFO} />
 import { PASS_INFO } from "./tritonPassInfo";
 import { type PassStep, mmPasses, softmaxPasses } from "./tritonPasses";
 
+interface KernelTab {
+	key: string;
+	label: string;
+	steps: PassStep[];
+}
+
 interface Props {
-	/** Which kernel's tab is open first. */
-	kernel?: "softmax" | "mm";
+	/** Tabs to show; defaults to the two Inductor kernels in tritonPasses.ts. */
+	kernels?: KernelTab[];
+	/** Which kernel's tab is open first (a key of `kernels`). */
+	kernel?: string;
+	/** Pass descriptions by pass name; defaults to tritonPassInfo.ts. */
+	info?: Record<string, string>;
 	/** Name of the pass selected first (its first occurrence). */
 	start?: string;
 	title?: string;
 }
 
-const { kernel = "softmax", start, title } = Astro.props;
-const kernels: { key: "softmax" | "mm"; label: string; steps: PassStep[] }[] = [
+const inductorKernels: KernelTab[] = [
 	{
 		key: "softmax",
 		label: "Fused softmax (persistent reduction)",
@@ -27,6 +38,13 @@ const kernels: { key: "softmax" | "mm"; label: string; steps: PassStep[] }[] = [
 	},
 	{ key: "mm", label: "Matmul template + relu", steps: mmPasses },
 ];
+const {
+	kernels = inductorKernels,
+	kernel = kernels[0].key,
+	info = PASS_INFO,
+	start,
+	title,
+} = Astro.props;
 const STAGES = {
 	ttir: "make_ttir",
 	ttgir: "make_ttgir",
@@ -92,7 +110,7 @@ const lineClass = (l: string) =>
 										</span>{" "}
 										<b>{s.name}</b> <code>{s.arg}</code>
 									</p>
-									<p class="info">{PASS_INFO[s.name] ?? ""}</p>
+									<p class="info">{info[s.name] ?? ""}</p>
 									{s.diff.length ? (
 										<pre class="diff">{[...s.diff, ...(s.more > 0 ? [`@ … ${s.more} more lines`] : [])].map((l) => <span class={lineClass(l)}>{l}</span>)}</pre>
 									) : (

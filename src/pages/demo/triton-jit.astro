@@ -1,0 +1,38 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import TritonPasses from "../../utils/compiler/TritonPasses.astro";
+import { JIT_PASS_INFO } from "../../utils/compiler/tritonJitPassInfo";
+import {
+	addPasses,
+	mm90Passes,
+	mm120Passes,
+} from "../../utils/compiler/tritonJitPasses";
+import BlockedLayout from "../../utils/gpu/BlockedLayout.astro";
+---
+
+<Layout title="Triton JIT components demo">
+	<h1>Triton JIT components demo</h1>
+
+	<h2>BlockedLayout</h2>
+	<p>The vector add's layout after Coalesce, n_elements = 1000 so the tail is masked; thread 122 selected.</p>
+	<BlockedLayout block={1024} warps={4} n={1000} thread={122} />
+	<p>Before Coalesce, BLOCK_SIZE = 256 and 2 warps.</p>
+	<BlockedLayout block={256} warps={2} n={256} before />
+	<p>A tile larger than the tensor: BLOCK_SIZE = 128, 8 warps, before Coalesce, so every element is held by two threads.</p>
+	<BlockedLayout block={128} warps={8} n={128} before thread={200} />
+
+	<h2>TritonPasses, default data (Inductor kernels, Triton 3.7.1)</h2>
+	<TritonPasses />
+
+	<h2>TritonPasses, kernels and descriptions passed in (Triton 3.8.0)</h2>
+	<TritonPasses
+		kernels={[
+			{ key: "add", label: "Vector add, sm_120", steps: addPasses },
+			{ key: "mm120", label: "Matmul, sm_120", steps: mm120Passes },
+			{ key: "mm90", label: "Matmul, sm_90", steps: mm90Passes },
+		]}
+		kernel="mm90"
+		info={JIT_PASS_INFO}
+		start="TritonGPUPipeline"
+	/>
+</Layout>
