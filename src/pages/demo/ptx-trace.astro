@@ -1,0 +1,31 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import PtxTrace from "../../utils/gpu/PtxTrace.astro";
+import {
+	branchyTrace,
+	heavyTrace,
+	saxpyTrace,
+	shflBflyTrace,
+	shflDownTrace,
+} from "../../utils/gpu/ptxFigures";
+---
+
+<Layout title="PtxTrace demo">
+	<h1>PtxTrace demo</h1>
+
+	<h2>saxpy with a bounds check</h2>
+	<p>CTA 1 of 8 threads, n = 12: lanes 4–7 branch straight to <code>ret</code>. Starts at the branch.</p>
+	<PtxTrace config={saxpyTrace} step={10} title="saxpy on one 8-lane warp" />
+
+	<h2>A divergent if/else</h2>
+	<p>Odd lanes take the else block, so the two blocks issue one after the other.</p>
+	<PtxTrace config={heavyTrace} step={11} />
+
+	<h2>The same shape, if-converted</h2>
+	<p>clang computes both sides and picks one with <code>selp</code>: every issue slot is used.</p>
+	<PtxTrace config={branchyTrace} />
+
+	<h2>Warp shuffles</h2>
+	<PtxTrace config={shflDownTrace} step={10} title="shfl.sync.down tree reduction" />
+	<PtxTrace config={shflBflyTrace} step={10} title="shfl.sync.bfly all-reduce" />
+</Layout>

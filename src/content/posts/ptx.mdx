@@ -1,0 +1,976 @@
+---
+title: "PTX, NVIDIA's Virtual Instruction Set"
+description: "What PTX is and why NVIDIA ships it, the machine it describes (threads, warps, CTAs, SIMT divergence), how to read a module, the state spaces, the calling convention, the main instruction families with worked examples, the memory model, and the tensor-core and async-copy instructions of Hopper and Blackwell."
+date: 2026-10-21
+tags: [CUDA, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import MarginNote from "../../components/MarginNote.astro";
+import BoxDiagram from "../../utils/payments/BoxDiagram.astro";
+import Matrix2D from "../../utils/matrix/Matrix2D.astro";
+import PtxTrace from "../../utils/gpu/PtxTrace.astro";
+import PtxAnatomy from "../../utils/gpu/PtxAnatomy.astro";
+import { mmaAtomFigures as F } from "../../utils/gpu/mmaAtomFigures";
+import {
+	branchyTrace,
+	heavyTrace,
+	saxpyTrace,
+	shflBflyTrace,
+	shflDownTrace,
+	spaceEdges,
+	spaceNodes,
+	toolchainEdges,
+	toolchainNodes,
+} from "../../utils/gpu/ptxFigures";
+
+## Background
+
+When you compile a CUDA kernel, the GPU does not run your C++. It runs **SASS**, the machine code
+of one GPU generation. SASS changes with every generation and NVIDIA does not fully document it.
+Between the two sits **PTX** (Parallel Thread Execution): a documented, assembly-like language for
+an idealised GPU. Compilers write PTX, and NVIDIA's tools turn PTX into SASS for whichever GPU the
+program finally runs on.
+
+PTX matters because it is the lowest level most GPU programmers can read and write. When a Triton
+kernel is slow, its PTX shows whether the loads were vectorised. When CUTLASS needs a Hopper
+tensor-core instruction that C++ has no syntax for, it writes the PTX by hand in an `asm`
+statement. And PTX is what makes a binary built today run on next year's GPU: the driver compiles
+the shipped PTX for the new chip.
+
+This post explains PTX from the bottom up. It starts with **where PTX sits** in the toolchain and
+how targets and versions work. Next comes **the machine PTX describes**: threads, warps, thread
+blocks and what happens when a warp's threads branch apart. Then it **reads a real PTX module**
+line by line: instruction syntax, types, registers and state spaces, followed by functions and
+the calling convention. The middle of the post walks through **the instruction families** with
+worked examples, then the **memory consistency model**, and finally the **tensor-core and
+asynchronous-copy instructions** of Hopper and Blackwell. The reference throughout is NVIDIA's
+PTX ISA 9.4, and every compiler listing is real output from LLVM 23.1.2.<Sidenote>Listings marked
+"LLVM output" come from `clang -x cuda --cuda-device-only -O3 --cuda-gpu-arch=sm_90` (with
+`-Xclang -target-feature -Xclang +ptx80` where the instruction needs it) or from `llc` on hand-written
+LLVM IR, with comment lines removed. I compiled without the CUDA SDK, writing
+`__nvvm_read_ptx_sreg_tid_x()` where CUDA code says `threadIdx.x`; clang's
+`__clang_cuda_builtin_vars.h` maps one to the other. `ptxas` is not available on macOS, so
+hand-written listings (marked as such) were checked against the ISA document but not
+assembled.</Sidenote>
+
+## Where PTX sits
+
+### A virtual ISA
+
+An **instruction set architecture** (ISA) is the contract between software and a processor: the
+instructions, registers and memory rules a program may use. PTX is a **virtual ISA**. No GPU
+executes it directly. It describes a machine that is general enough to cover every NVIDIA GPU
+since 2008, and NVIDIA's assembler `ptxas` lowers it to the real one.
+
+<BoxDiagram
+	nodes={toolchainNodes}
+	edges={toolchainEdges}
+	selected="ptx"
+	title="From source to SASS"
+/>
+
+Click the boxes to follow the two paths. Ahead of time, `ptxas` compiles PTX for the GPUs you
+name and the result is packed into a **fat binary** next to the PTX itself. At load time, if no
+SASS in the binary matches the GPU, the driver compiles the PTX (the dashed path) and caches the
+result. With `nvcc` you choose both parts: `-gencode arch=compute_90,code=[sm_90,compute_90]` embeds
+SASS for `sm_90` and PTX that newer GPUs can JIT-compile.
+
+PTX's own design goals, from the first chapter of the ISA document, explain its shape:
+
+- a **stable ISA** that spans GPU generations, so binaries keep working;
+- a **machine-independent target** for compilers, with performance close to native code;
+- a format that is easy to **write by hand** for libraries and performance kernels;
+- a programming model that **scales** from one execution unit to many.
+
+The first goal is why PTX has **unlimited virtual registers**. A real SM has 64K 32-bit registers
+shared among the resident threads, and each generation can change how many a thread may use. PTX
+leaves that to `ptxas`, which assigns physical registers and spills the rest to local memory. The
+[LLVM post](/blog/llvm-nvptx-backend/) shows why the NVPTX backend therefore never allocates
+registers itself.
+
+### Targets and versions
+
+Every PTX module starts with two lines that say what it needs. **`.version`** is the PTX ISA
+version the module is written in (it rises with each CUDA release). **`.target`** names the
+**SM architecture** (streaming multiprocessor generation) whose features the module uses: `sm_80`
+for Ampere A100, `sm_90` for Hopper H100, `sm_100` for Blackwell B200.
+
+Plain targets follow an **onion model**: each generation keeps every feature of the previous one,
+so PTX written for `sm_80` can be compiled for `sm_90`, `sm_100` and later. Two suffixes break the
+onion on purpose, because some instructions exist only on one chip:
+
+| Target | Example | Runs on |
+| --- | --- | --- |
+| plain | `sm_90` | that GPU and every later one |
+| family, `f` | `sm_100f` | later GPUs of the same family (`sm_100f` covers `sm_100`, `sm_103`, `sm_107`) |
+| architecture, `a` | `sm_90a` | exactly that GPU |
+
+`wgmma`, Hopper's warpgroup tensor-core instruction, needs `sm_90a`. A kernel that uses it cannot
+run on Blackwell from the same PTX; it needs a separate `sm_100a` build with `tcgen05`
+instructions instead. That is why libraries such as CUTLASS compile one kernel per architecture.
+
+#### New in PTX 9.3 and 9.4
+
+The two latest releases add, among other things:
+
+- **9.3**: `clmad` (carry-less multiply-add, for CRC and GF(2) arithmetic), the `fabric.*`
+  instructions for transfers across nodes, `multimem.st.async` and `multimem.red.async`, `.sem` and
+  `.scope` on `cp.async.bulk`, new `mbarrier` wait options (`.phase_type`, report operands,
+  `mbarrier.check_layout`), and the `.language` directive.
+- **9.4**: the `sm_107` targets, packed `.f32x2` and FP8/FP6/FP4 `x4` forms of `add`, `sub`, `mul`
+  and `fma`, `spcompress` and `spdecompress`, more `tcgen05.mma` kinds and qualifiers, and
+  per-CTA global memory (`.minperctamemory`).
+
+## The machine PTX describes
+
+### Threads, warps, CTAs and clusters
+
+A **kernel** is a function the host launches on the GPU as a very large number of threads. Each
+thread runs the same PTX on different data. The threads are grouped in a fixed hierarchy:
+
+- A **CTA** (cooperative thread array, a *thread block* in CUDA) is up to 1,024 threads that run
+  on one SM at the same time. They can synchronise with a barrier and share on-chip shared memory.
+- A **warp** is 32 consecutive threads of a CTA. The SM issues instructions per warp, and the
+  thread's position in it is its **lane**.
+- A **cluster** (`sm_90` and later) is a group of CTAs, scheduled together on nearby SMs, that can
+  synchronise and read each other's shared memory.
+- The **grid** is every CTA of a launch. CTAs in different clusters cannot synchronise except
+  through global memory.
+
+A thread finds its place by reading **special registers**, read-only registers whose names start
+with `%`:
+
+| Level | My index | Extent | Can synchronise with |
+| --- | --- | --- | --- |
+| thread in warp | `%laneid` | `WARP_SZ` (32) | warp: `shfl.sync`, `vote.sync`, `bar.warp.sync` |
+| thread in CTA | `%tid.{x,y,z}` | `%ntid.{x,y,z}` | CTA: `bar.sync`, shared memory |
+| CTA in cluster | `%cluster_ctaid`, `%cluster_ctarank` | `%cluster_nctaid`, `%cluster_nctarank` | cluster: `barrier.cluster`, distributed shared memory |
+| CTA in grid | `%ctaid.{x,y,z}` | `%nctaid.{x,y,z}` | nobody (only atomics in global memory) |
+| cluster in grid | `%clusterid` | `%nclusterid` | nobody |
+
+The classic first computation is the thread's **global index**,
+$i = \text{ctaid.x} \cdot \text{ntid.x} + \text{tid.x}$. Below, the saxpy kernel
+$y_i \leftarrow a x_i + y_i$ runs on one warp, scaled down from 32 lanes to 8 so the table fits.
+The warp is CTA 1 of a launch with 8 threads per CTA, and $n = 12$. Step through it and watch the
+`%r1` row: lane $l$ gets $i = 1 \cdot 8 + l$, so lanes 0–3 hold $i = 8 \ldots 11$ and lanes 4–7
+hold $i = 12 \ldots 15$, past the end of the array.
+
+<PtxTrace config={saxpyTrace} step={8} title="saxpy (LLVM output) on one 8-lane warp, n = 12" />
+
+Check one lane by hand: lane 2 has $i = 10$, so it loads $x_{10} = 5$ and $y_{10} = 1$ and stores
+$2 \cdot 5 + 1 = 11$, which is the `y[10] = 11` the store step reports. The chips to the left of
+each line show where each lane waits. After the branch on line 11, lanes 4–7 sit at `ret` while
+lanes 0–3 run the body.
+
+### SIMT and divergence
+
+The SM runs a warp as **SIMT** (single instruction, multiple threads): one instruction is issued
+for all the warp's lanes that are ready to run it. As long as every lane follows the same path,
+that costs one issue slot for 32 lanes of work. When a branch sends lanes different ways, the warp
+**diverges**: the hardware runs one path with the other lanes switched off, then the other path,
+and the lanes **reconverge** where the paths meet. Divergence costs time, not correctness.
+
+The kernel below computes `sin(x) * 2^x + sqrt(x)` for positive `x` and `cos(x) * 2 - x^3`
+otherwise. The input alternates signs, the worst case, so the odd lanes branch away on line 11.
+Step on from there and watch the lane headers: the then block runs with only the even lanes lit,
+then the else block with only the odd lanes.
+
+<PtxTrace config={heavyTrace} step={10} title="A divergent if/else (LLVM output)" />
+
+The footer counts the cost. The kernel took 25 issue slots for 156 lane-instructions of work, so
+$156 / (25 \cdot 8) = 78\%$ of the lane slots did something. The figure models the scheduling
+simply: the warp always issues the instruction with the smallest program counter among its waiting
+lanes. That reproduces the then-first, else-second order of structured code.<Sidenote>Since Volta,
+the GPU keeps a program counter and call stack per thread (**independent thread scheduling**), and
+a "schedule optimizer" decides how to group a warp's active threads. Threads can even wait on each
+other inside one warp without deadlock. The order the figure shows is one valid schedule, not the
+only one.</Sidenote>
+
+When both sides of a branch are short, the compiler avoids divergence altogether. It computes both
+results in every lane and keeps one with **`selp`** (select on predicate). This is called
+**if-conversion**. Clang did it for `x odd ? 3x + 1 : x / 2`:
+
+<PtxTrace config={branchyTrace} step={12} title="The same shape, if-converted by clang (LLVM output)" />
+
+Every step lights all eight lanes and the efficiency stays at 100%: 16 slots, 128 lane
+instructions. The price is that each lane does both computations. In the divergent kernel, the
+`bra.uni` on line 16 is a hint the other way: **`.uni`** promises `ptxas` that every lane reaching
+that branch takes it, so it needs no reconvergence bookkeeping. PTX assumes any branch may diverge
+unless it is marked `.uni`, and `ptxas` decides where diverged lanes reconverge.
+
+## Reading a PTX module
+
+### A whole module, line by line
+
+Here is the complete module clang produced for saxpy (LLVM output, for `sm_90`):
+
+```ptx
+.version 7.8
+.target sm_90
+.address_size 64
+
+.visible .entry saxpy(
+	.param .u32 saxpy_param_0,
+	.param .f32 saxpy_param_1,
+	.param .u64 .ptr .align 1 saxpy_param_2,
+	.param .u64 .ptr .align 1 saxpy_param_3
+)
+{
+	.reg .pred 	%p<2>;
+	.reg .b32 	%r<10>;
+	.reg .b64 	%rd<8>;
+
+	ld.param.b32 	%r3, [saxpy_param_0];
+	ld.param.b64 	%rd3, [saxpy_param_2];
+	cvta.to.global.u64 	%rd1, %rd3;
+	ld.param.b64 	%rd4, [saxpy_param_3];
+	cvta.to.global.u64 	%rd2, %rd4;
+	mov.u32 	%r4, %ctaid.x;
+	mov.u32 	%r5, %ntid.x;
+	mov.u32 	%r6, %tid.x;
+	mad.lo.s32 	%r1, %r4, %r5, %r6;
+	setp.ge.u32 	%p1, %r1, %r3;
+	@%p1 bra 	$L__BB0_2;
+	ld.param.b32 	%r2, [saxpy_param_1];
+	mul.wide.u32 	%rd5, %r1, 4;
+	add.s64 	%rd6, %rd1, %rd5;
+	ld.global.b32 	%r7, [%rd6];
+	add.s64 	%rd7, %rd2, %rd5;
+	ld.global.b32 	%r8, [%rd7];
+	fma.rn.f32 	%r9, %r2, %r7, %r8;
+	st.global.b32 	[%rd7], %r9;
+$L__BB0_2:
+	ret;
+}
+```
+
+A PTX file is a **module**: plain ASCII text, case-sensitive, with C-style comments, and it may
+go through the C preprocessor. It is a list of **statements**, and a statement is either a
+**directive** (starts with a dot and declares something) or an **instruction** (does something).
+Either can carry a label and ends with a semicolon. Reading top to bottom:
+
+- **The header.** `.version 7.8` (clang's default for `sm_90`), `.target sm_90`, and
+  `.address_size 64` for 64-bit pointers. These three must come first.
+- **The entry point.** `.entry` declares a kernel; `.visible` exports its symbol so the host can
+  launch it by name. Its four parameters are declared in the **`.param` state space**. The `.ptr`
+  attribute marks the two pointers.
+- **Register declarations.** `.reg .b32 %r<10>;` declares ten registers `%r0` … `%r9` in one
+  line. There are separate banks for predicates (`%p`), 32-bit values (`%r`) and 64-bit values
+  (`%rd`).
+- **The body.** Read the parameters (`ld.param`), turn the pointers into global addresses
+  (`cvta.to.global`), compute $i$, branch past the body if $i \geq n$, compute the byte offset
+  $4i$ (`mul.wide.u32` gives a 64-bit result), load, `fma`, store, return.
+
+Notice that `a * x[i] + y[i]` became one **`fma.rn.f32`**, a fused multiply-add with one rounding.
+Clang did that because CUDA allows floating-point contraction by default; the
+[LLVM post](/blog/llvm-nvptx-backend/) follows that transformation pass by pass.
+
+### The anatomy of an instruction
+
+Every instruction has the same shape: an optional **guard predicate**, the **opcode**, dotted
+**modifiers** and **types**, then the operands with the **destination first**. Hover the parts:
+
+<PtxAnatomy
+	title="A guarded, typed multiply-add"
+	parts={[
+		{ text: "@%p", kind: "guard", label: "guard", note: "The instruction runs only in lanes where predicate <code>%p</code> is true. <code>@!%p</code> negates it. Lanes where it is false do nothing, but the warp does not diverge." },
+		{ text: " mad", kind: "op", label: "opcode", note: "Multiply-add: <code>d = a × b + c</code>." },
+		{ text: ".lo", kind: "mod", label: "mode", note: "A 32 × 32-bit product has 64 bits. <code>.lo</code> keeps the low 32, <code>.hi</code> the high 32, <code>.wide</code> all 64 (into a 64-bit destination)." },
+		{ text: ".s32", kind: "type", label: "type", note: "Interpret the registers as signed 32-bit integers. Registers carry no type of their own; the instruction decides." },
+		{ text: " %r1,", kind: "operand", label: "d", note: "Destination: always the first operand." },
+		{ text: " %r4, %r5, %r6;", kind: "operand", label: "a, b, c", note: "Sources. Here <code>ctaid.x</code>, <code>ntid.x</code> and <code>tid.x</code>, giving the global index." },
+	]}
+/>
+
+The modifier and type tell you almost everything. `add.f32` and `add.s32` are different
+operations on the same kind of register. `setp.ge.u32` compares as unsigned, `setp.ge.s32` as
+signed, and they disagree when the top bit is set. Many instructions add more modifiers, in a
+fixed order the ISA document gives for each one: rounding (`.rn`), saturation (`.sat`),
+flush-to-zero (`.ftz`), cache hints (`.cg`), memory ordering (`.acquire`), scope (`.gpu`) and so
+on.
+
+### Types, registers and constants
+
+PTX types are thin. Each **fundamental type** is a size plus an interpretation:
+
+| Family | Types | Used for |
+| --- | --- | --- |
+| signed integer | `.s8` `.s16` `.s32` `.s64` | arithmetic, comparisons |
+| unsigned integer | `.u8` `.u16` `.u32` `.u64` | indices, addresses |
+| floating point | `.f16` `.f32` `.f64` | IEEE half, single, double |
+| untyped bits | `.b8` `.b16` `.b32` `.b64` `.b128` | moves, loads, bitwise logic |
+| predicate | `.pred` | 1-bit conditions |
+| alternate floats | `.bf16` `.tf32` `.e4m3` `.e5m2` `.e2m1` `.e3m2` `.e2m3` | tensor-core inputs |
+| packed | `.f16x2` `.bf16x2` `.u16x2` `.e4m3x2` … | two or more values in one register |
+
+A **bit-size type** such as `.b32` is compatible with every type of the same size. That is why
+the LLVM 23 output above keeps floats in `%r` registers declared `.b32` and loads them with
+`ld.global.b32`: only `fma.rn.f32` cares that they are floats. **Packed types** do SIMD inside one
+register: `fma.rn.f16x2` performs two half-precision fused multiply-adds with one instruction.
+Sub-word integers (`.u8`, `.s16`) mostly appear in loads, stores and conversions, and are held in
+wider registers.
+
+**Constants** are written as in C, with two additions. Integers are 64-bit and signed unless they
+need the `U` suffix. Floating-point constants can be written as their exact bit pattern: `0f`
+followed by eight hex digits for `.f32`, `0d` followed by sixteen for `.f64`. Check two from the
+listings: `0f3F800000` is $1.0$ and `0f40000000` (in the divergent kernel) is $2.0$. Clang prints
+float immediates in stores as decimal integers instead, so a store of `42.0f` appears as
+`st.global.b32 [%rd2], 1109917696;`, and $1109917696 = \text{0x42280000}$, the bits of $42.0$.
+
+Variables are declared with a state space, an optional alignment, a type and a name. Vectors use
+`.v2` or `.v4`, arrays use brackets:
+
+```ptx
+.reg    .b32        %r<8>;                  // %r0 … %r7
+.reg    .pred       %p, %q;
+.shared .align 16 .b8   tile[4096];         // 4 KiB of shared memory
+.global .f32        coeffs[4] = {1.0, 0.5, 0.25, 0.125};
+.const  .u32        width = 1920;
+
+ld.global.v4.f32    {%f0, %f1, %f2, %f3}, [%rd1];   // one 16-byte load
+```
+
+An **alignment** is a promise. The address of every memory access must be a multiple of its size,
+so the `ld.global.v4.f32` above needs a 16-byte aligned address. The ISA says a misaligned access
+is undefined: it may fault, or silently mask the low address bits.
+
+### State spaces and addresses
+
+A **state space** is a storage area with its own size, speed, lifetime and sharing. Every variable
+lives in one, and every memory instruction names the space it accesses (`ld.shared`,
+`st.global`). Click the boxes; the narrower the sharing, the faster the access.
+
+<BoxDiagram nodes={spaceNodes} edges={spaceEdges} selected="shared" title="State spaces by who can see them" />
+
+| Space | Addressable | Access | Shared by | Notes |
+| --- | --- | --- | --- | --- |
+| `.reg` | no | R/W | one thread | virtual, unlimited |
+| `.sreg` | no | RO | predefined | `%tid`, `%laneid`, `%clock64`, … |
+| `.local` | yes | R/W | one thread | stack and spills, in device memory |
+| `.shared` | yes | R/W | one CTA (peers in a cluster) | on-chip |
+| `.global` | yes | R/W | all threads and the host | persists across launches |
+| `.const` | yes | RO | the grid | cached |
+| `.param` | yes | RO in kernels | the grid, or one call | kernel arguments, function arguments |
+| `.tex` | yes | RO | the grid | deprecated |
+
+A memory operand is an **address expression** in square brackets. PTX allows five forms, and
+nothing else:
+
+- `[%rd1]`, a register holding a byte address;
+- `[%rd1+16]`, a register plus a constant byte offset;
+- `[tile]` or `[tile+16]`, a variable's address plus a constant;
+- `[0x100]`, an absolute address;
+- `tile[3]`, an array element with a constant index.
+
+There is no register-indexed form such as `[tile+%r2]`: to index with a runtime value, compute the
+address in a register first (`mov.u64 %rd2, tile; add.s64 %rd3, %rd2, %rd4;`). Addresses are
+always in bytes; there is no C-style scaling.<Sidenote>The ISA's operand chapter (6.4.1) lists the
+five forms. A load whose address register is wider than the space's address size is truncated, and
+one narrower is zero-extended.</Sidenote>
+
+**Generic addressing** lets one pointer reach several spaces. In the generic address space,
+`.shared`, `.local`, `.const` and `.param` each occupy a window, and everything else is `.global`.
+A load without a space (`ld.b32 %r1, [%rd1]`) works on any pointer, which is what C++ needs for
+plain pointers, but the hardware must first check which window the address falls in. **`cvta`**
+converts between generic and space-specific addresses: saxpy's
+`cvta.to.global.u64 %rd1, %rd3` turns the generic kernel argument into a global address, so the
+loads can be `ld.global`. `isspacep.shared %p, %rd1` asks whether a generic address is in the
+shared window.
+
+## Functions and the calling convention
+
+PTX hides the **ABI** (application binary interface, the rules for passing arguments in registers
+and on the stack) behind a small syntax. A **`.func`** is a device function. Its return value and
+parameters are declared in `.param` space, and a call names them explicitly. Here is a
+`__noinline__` device function `axpb(a, x, b) = a * x + b` and a kernel that calls it (LLVM
+output):
+
+```ptx
+.visible .func  (.param .b32 func_retval0) _Z4axpbfff(
+	.param .b32 _Z4axpbfff_param_0,
+	.param .b32 _Z4axpbfff_param_1,
+	.param .b32 _Z4axpbfff_param_2
+)
+{
+	.reg .b32 	%r<5>;
+	ld.param.b32 	%r1, [_Z4axpbfff_param_0];
+	ld.param.b32 	%r2, [_Z4axpbfff_param_1];
+	ld.param.b32 	%r3, [_Z4axpbfff_param_2];
+	fma.rn.f32 	%r4, %r1, %r2, %r3;
+	st.param.b32 	[func_retval0], %r4;
+	ret;
+}
+
+// … inside the kernel `calls`:
+	{ // callseq 0, 0
+	.param .b32 	param0;
+	.param .b32 	param1;
+	.param .b32 	param2;
+	.param .b32 	retval0;
+	st.param.b32 	[param1], %r3;
+	st.param.b32 	[param0], %r1;
+	st.param.b32 	[param2], 1065353216;      // 1.0f
+	call.uni (retval0), _Z4axpbfff, (param0, param1, param2);
+	ld.param.b32 	%r4, [retval0];
+	} // callseq 0
+```
+
+The caller opens a **block** (`{ … }`, which scopes declarations), declares one `.param` variable
+per argument and one for the result, stores the arguments into them, calls, and loads the result.
+The callee reads its parameters with `ld.param` and writes its result with `st.param`. None of this
+says which physical registers or stack slots are used; `ptxas` decides, and usually passes small
+arguments in registers. The call is `call.uni` because every lane makes it together.
+
+A kernel's parameters differ from a function's: they are per-grid and read-only, and the host
+fills them at launch. PTX also has **indirect calls** (through a function pointer, described with
+`.callprototype` and `.calltargets`), **variadic functions** and **`alloca`** for C-style dynamic
+stack allocation.
+
+## The instruction set
+
+Chapter 9.7 of the ISA groups the instructions into 21 families. Their names alone are a map of
+what a GPU can do:
+
+| Family | Examples |
+| --- | --- |
+| Integer arithmetic | `add` `mul` `mad` `div` `rem` `popc` `clz` `bfe` `bfi` `dp4a` `clmad` |
+| Extended precision | `add.cc` `addc` `sub.cc` `subc` `mad.cc` `madc` |
+| Floating point | `add` `fma` `div` `rcp` `sqrt` `rsqrt` `sin` `ex2` `lg2` `tanh` `testp` |
+| Half precision | `f16` / `bf16` and packed `x2` forms of `add` `mul` `fma` `min` `max` |
+| Mixed precision | `add` `sub` `fma` `mul` with `f16`/`bf16` inputs and an `f32` result |
+| Alternate floating point | `add` `sub` `mul` `fma` on packed FP8/FP6/FP4 |
+| Compare and select | `set` `setp` `selp` `slct` (and half-precision forms) |
+| Logic and shift | `and` `or` `xor` `not` `cnot` `lop3` `shf` `shl` `shr` |
+| Data movement and conversion | `mov` `ld` `st` `cvt` `cvta` `prmt` `shfl.sync` `ldmatrix` `cp.async` `cp.async.bulk` |
+| Fabric | `fabric.try_get` `try_put` `try_red` `wait` `submit` |
+| Texture, surface | `tex` `tld4` `txq`; `suld` `sust` `sured` |
+| Control flow | `bra` `brx.idx` `call` `ret` `exit` |
+| Synchronisation | `bar` `barrier.cluster` `fence` `atom` `red` `vote` `redux` `elect` `mbarrier` |
+| Warp MMA | `wmma` `mma` `mma.sp` |
+| Warpgroup MMA | `wgmma.mma_async` `wgmma.fence` `wgmma.commit_group` `wgmma.wait_group` |
+| tcgen05 | `tcgen05.alloc` `tcgen05.mma` `tcgen05.ld` `tcgen05.commit` |
+| Stack, video, misc. | `alloca` `stacksave`; `vadd4` `vabsdiff2`; `nanosleep` `trap` `setmaxnreg` |
+
+The rest of this section works through the ones you meet most often in real kernels.
+
+### Integer arithmetic and bits
+
+A 32 × 32-bit multiply produces 64 bits, so `mul` and `mad` always say which part to keep. Take
+$a = 100{,}000$ and $b = 300{,}000$, whose product $3 \times 10^{10} = \text{0x6FC23AC00}$ does
+not fit in 32 bits:
+
+| Instruction | Result |
+| --- | ---: |
+| `mul.lo.u32 d, a, b` | `0xFC23AC00` = 4,230,196,224 |
+| `mul.lo.s32 d, a, b` | −64,771,072 (same bits, read as signed) |
+| `mul.hi.u32 d, a, b` | 6 |
+| `mul.wide.u32 d, a, b` (64-bit `d`) | 30,000,000,000 |
+
+Check it: $6 \cdot 2^{32} + 4{,}230{,}196{,}224 = 25{,}769{,}803{,}776 + 4{,}230{,}196{,}224 =
+30{,}000{,}000{,}000$. Saxpy's `mul.wide.u32 %rd5, %r1, 4` uses `.wide` to get a 64-bit byte
+offset from a 32-bit index.
+
+**Extended precision.** For integers wider than 64 bits, PTX exposes a carry flag. `add.cc`
+writes the carry-out, `addc` adds the carry-in, and `addc.cc` does both, so a chain adds one 32-bit
+**limb** (word) at a time. Adding $\text{0x1\_FFFFFFFF} + 1$ with 32-bit limbs:
+
+```ptx
+// hand-written: {hi, lo} = {0x00000001, 0xFFFFFFFF} + {0x00000000, 0x00000001}
+add.cc.u32   %lo, %alo, %blo;    // 0xFFFFFFFF + 1 = 0x00000000, carry = 1
+addc.u32     %hi, %ahi, %bhi;    // 0x1 + 0x0 + carry = 0x2
+```
+
+The result is $\{\text{0x2}, \text{0x0}\} = \text{0x2\_00000000}$. Each lane has its own carry
+flag, the single bit of an implicit **condition code** register. Only these six instructions touch
+it, there is no way to test it, and it is not preserved across calls, so the ISA intends it for
+straight-line chains like this one.
+
+**Bit manipulation.** Most of these are one instruction on the GPU and several on a CPU. For
+$v = \text{0xABCD1234}$:
+
+| Instruction | Does | Result |
+| --- | --- | ---: |
+| `popc.b32` | count set bits | 15 |
+| `clz.b32` | count leading zeros | 0 |
+| `bfind.u32` | position of the highest set bit | 31 |
+| `brev.b32` | reverse the bit order | `0x2C48B3D5` |
+| `bfe.u32 d, v, 4, 8` | extract 8 bits starting at bit 4 | `0x23` |
+| `bfi.b32 d, 0x5A, 0xFFFFFFFF, 4, 8` | insert 8 bits of `0x5A` at bit 4 | `0xFFFFF5AF` |
+
+**`dp4a`** treats each 32-bit operand as four bytes and computes a four-term dot product plus an
+accumulator. With signed bytes $a = (1, -2, 3, 4)$ (packed `0x0403FE01`, lowest byte first),
+$b = (5, 6, -7, 8)$ and $c = 10$, `dp4a.s32.s32 d, a, b, c` gives
+$5 - 12 - 21 + 32 + 10 = 14$. This was the int8 inference instruction before tensor cores took
+over.
+
+### Floating point
+
+Floating-point instructions share a set of modifiers:
+
+| Modifier | Meaning |
+| --- | --- |
+| `.rn` `.rz` `.rm` `.rp` | round to nearest even (default), toward zero, toward −∞, toward +∞ |
+| `.ftz` | flush subnormal inputs and results to zero (faster, loses tiny values) |
+| `.sat` | clamp the result to $[0, 1]$; NaN becomes 0 |
+| `.approx` | a fast hardware approximation (`rcp`, `sqrt`, `div`, and all of `sin` `cos` `lg2` `ex2` `tanh`) |
+
+**Fused multiply-add** is the one to understand. `fma.rn.f32 d, a, b, c` computes $ab + c$
+exactly and rounds once. `mul` then `add` rounds twice, and the first rounding can lose exactly
+the bits that matter. Take $a = b = 1 + 2^{-12}$ and $c = -1$. The exact product is
+$1 + 2^{-11} + 2^{-24}$. A float has 23 fraction bits, so $2^{-24}$ is half an ulp at 1.0 and the
+product rounds (to even) to $1 + 2^{-11}$. Then:
+
+| Sequence | Result |
+| --- | ---: |
+| `mul.rn.f32` then `add.rn.f32` | $2^{-11} = 0.00048828125$ |
+| `fma.rn.f32` | $2^{-11} + 2^{-24} = 0.00048834085\ldots$ |
+
+The fused result is the correctly rounded answer; the separate one lost $2^{-24}$ for good. This
+is why the ISA says `mad.f32` is the same as `fma.f32` on `sm_20` and later. There is a catch for
+anyone who wants the unfused result: a `mul` or `add` **without** a rounding modifier "may be
+optimized aggressively", including being fused into an `fma` by `ptxas`. Writing the `.rn`
+explicitly asks for that exact operation.
+
+**Conversions** are explicit, with `cvt.dtype.atype`. Float-to-integer conversions take an integer
+rounding mode:
+
+| `x` | `.rni` (nearest even) | `.rzi` (toward 0) | `.rmi` (toward −∞) | `.rpi` (toward +∞) |
+| ---: | ---: | ---: | ---: | ---: |
+| 2.5 | 2 | 2 | 2 | 3 |
+| −2.5 | −2 | −2 | −3 | −2 |
+| −2.7 | −3 | −2 | −3 | −2 |
+
+Narrowing float conversions round too: `cvt.rn.bf16.f32` of $1/3$ (bits `0x3EAAAAAB`) keeps the
+top 16 bits after rounding, `0x3EAB`, which is $0.333984375$.
+
+**Min and max** have a NaN subtlety: by default `min.f32` returns the other operand when one input
+is NaN, and `min.NaN.f32` returns NaN instead.
+
+### Compare, select and logic
+
+**`setp`** compares two values and writes a predicate. Integer comparisons are `eq ne lt le gt ge`
+(signed or unsigned by type). Float comparisons have ordered forms that are false when either
+input is NaN, and unordered forms ending in `u` that are true: the divergent kernel's
+`setp.leu.f32 %p1, %r1, 0f00000000` is "less or equal, or unordered", the exact negation of
+`x > 0`. A **predicate** then guards instructions (`@%p1 bra …`) or feeds `selp`:
+
+```ptx
+// hand-written
+setp.gt.f32   %p, %fa, %fb;       // p = a > b
+selp.f32      %f1, %fa, %fb, %p;  // f1 = p ? a : b, no branch
+@!%p add.s32  %r1, %r1, 1;        // runs only where p is false
+```
+
+`setp` can also combine its result with another predicate:
+`setp.lt.and.s32 %p|%q, %a, %b, %r;` writes $p = (a < b) \land r$ and
+$q = \lnot(a < b) \land r$.
+
+**`lop3`** computes any logic function of three inputs in one instruction. The function is an
+8-bit **lookup table** (LUT) given as an immediate, and the ISA gives a neat way to find it:
+evaluate the expression on the constants $a = \text{0xF0}$, $b = \text{0xCC}$, $c = \text{0xAA}$.
+Their bits enumerate all eight input combinations, so the result is the truth table. For
+`(a & b) ^ c`: $\text{0xF0} \mathbin{\&} \text{0xCC} = \text{0xC0}$, and
+$\text{0xC0} \oplus \text{0xAA} = \text{0x6A}$:
+
+| Expression | LUT |
+| --- | ---: |
+| `(a & b) ^ c` | `0x6A` |
+| `a ^ b ^ c` | `0x96` |
+| `a ? b : c` (bitwise mux) | `0xCA` |
+| `(a \| b) & ~c` | `0x54` |
+
+I checked `0x6A` against `(a & b) ^ c` bit by bit on 1,000 random triples. Compilers use `lop3`
+to collapse chains of logic into one instruction, and the hash and crypto code in kernels relies
+on it.
+
+**`prmt`** (permute) builds a 32-bit result from any four of the eight bytes of two registers. The
+control operand holds four 4-bit selectors, lowest nibble for the lowest output byte. Bytes are
+numbered 0–3 in `a` and 4–7 in `b`. With `a = 0x44332211` and `b = 0x88776655`:
+
+| Control | Picks bytes | Result |
+| --- | --- | ---: |
+| `0x0123` | 3, 2, 1, 0 (low to high) | `0x11223344` (byte swap) |
+| `0x7654` | 4, 5, 6, 7 | `0x88776655` (all of `b`) |
+| `0x5140` | 0, 4, 1, 5 | `0x66225511` (interleave) |
+
+Setting the top bit of a selector replicates that byte's sign bit instead of copying it, which
+sign-extends a byte in the same instruction.
+
+### Loads, stores and caches
+
+`ld` and `st` name a state space, an optional **cache operator** and a type. Cache operators are
+hints about reuse:
+
+| Load | Meaning | Store | Meaning |
+| --- | --- | --- | --- |
+| `.ca` | cache in L1 and L2 (default) | `.wb` | write back (default) |
+| `.cg` | cache in L2 only | `.cg` | cache in L2 only |
+| `.cs` | streaming, evict first | `.cs` | streaming, evict first |
+| `.lu` | last use | `.wt` | write through |
+| `.cv` | do not cache, fetch again | | |
+
+`.cg` matters for data another SM wrote: L1 caches are not coherent with each other, so a default
+`.ca` load may see a stale line. Two more variants are common: `ld.global.nc` reads through the
+**non-coherent** read-only cache (what `__ldg` and `const __restrict__` produce), and **vector
+loads** (`.v2`, `.v4`) move up to 16 bytes per thread in one instruction. Vector loads are the
+first thing to check in a memory-bound kernel's PTX; [Triton's blocked layouts](/blog/triton-jit/)
+exists largely to make them possible.
+
+### Warp-level exchange
+
+The lanes of a warp can read each other's registers directly, without shared memory or a barrier.
+**`shfl.sync`** is the main tool. Its form is `shfl.sync.mode.b32 d[|p], a, b, c, membermask;`:
+each lane computes a source lane $j$ from `b` and the mode, and receives that lane's `a`.
+
+| Mode | Source lane $j$ |
+| --- | --- |
+| `.idx` | `b` (any lane) |
+| `.up` | lane − `b` |
+| `.down` | lane + `b` |
+| `.bfly` | lane XOR `b` |
+
+Operand `c` packs two fields. Bits 0–4 are a **clamp**: a lane whose $j$ falls outside the range
+copies its own `a`. Bits 8–12 are a **segment mask** that splits the warp into independent groups.
+`membermask` names the lanes that take part; since Volta every lane in it must execute the same
+`shfl.sync`, which is what the `.sync` promises. Clang compiles a 32-lane sum with
+`__shfl_down_sync` into five shuffles, `shfl.sync.down.b32 %r4, %r3, 16, 31, -1;` with offsets 16, 8,
+4, 2, 1 (LLVM output; `-1` is the full mask).
+
+The figure runs the same tree reduction on an 8-lane segment of a warp: `c = 0x181f` sets the
+segment mask to `0x18`, so lanes 0–7 form their own group, clamped at lane 7.
+
+<PtxTrace config={shflDownTrace} step={5} title="shfl.sync.down tree reduction over 8 lanes (hand-written)" />
+
+Follow lane 0: $3 + 5 = 8$, then $8 + 6 = 14$ (lane 2 held $4 + 2$), then $14 + 17 = 31$, the
+sum of $3, 1, 4, 1, 5, 9, 2, 6$. Three steps for 8 lanes, five for 32: $\log_2$ of the width.
+Only lane 0 ends with the total. Replace `.down` by `.bfly` and each step swaps values between
+partners instead, so every lane ends with the sum (an all-reduce):
+
+<PtxTrace config={shflBflyTrace} step={10} title="shfl.sync.bfly all-reduce over 8 lanes (hand-written)" />
+
+Three newer instructions do common warp patterns in one go. **`vote.sync.ballot.b32`** returns a
+32-bit mask with bit $l$ set if lane $l$'s predicate is true. **`redux.sync.add.u32`** (`sm_80`+)
+sums an integer across the warp in one instruction, replacing the whole shuffle tree for integers.
+**`elect.sync`** (`sm_90`+) picks one leader lane, the usual way to let one thread issue a bulk
+copy.
+
+### Barriers and atomics
+
+**`bar.sync 0`** (also spelled `barrier.sync`) makes each thread wait until every thread of the
+CTA has arrived at barrier 0. A CTA has 16 hardware barriers, numbered 0 to 15, and an optional
+thread count lets a subset of warps use one. `bar.arrive` signals without waiting, which lets
+producer warps run ahead of consumer warps.
+
+```ptx
+// hand-written
+st.shared.f32  [%rd1], %f1;       // write my element of the tile
+bar.sync       0;                 // wait for the whole CTA
+ld.shared.f32  %f2, [%rd2];       // now safe to read a neighbour's element
+```
+
+**`atom`** does an atomic read-modify-write and returns the old value; **`red`** does the same
+without returning anything. Both take an operation (`add`, `min`, `max`, `and`, `or`, `xor`,
+`exch`, `cas`, `inc`, `dec`), an ordering and a scope. Clang turns a relaxed device-scope fetch-add
+into `atom.relaxed.gpu.global.add.u32 %r1, [%rd2], 1;` (LLVM output). The `.gpu` in that line is
+the subject of the next section.
+
+## The memory consistency model
+
+Chapter 8 of the ISA defines precisely what one thread may see of another's memory operations.
+Two ideas carry most of it.
+
+**Scope** says which threads an ordering guarantee covers:
+
+| Scope | Covers |
+| --- | --- |
+| `.cta` | threads of the same CTA |
+| `.cluster` | threads of the same cluster (`sm_90`+) |
+| `.gpu` | all threads on the device |
+| `.sys` | the whole system: host threads and other GPUs too |
+
+**Semantics** say how an operation may be reordered with the thread's other memory operations:
+
+| Qualifier | Guarantee |
+| --- | --- |
+| `.relaxed` | atomic, but no ordering with other operations |
+| `.acquire` | later reads and writes cannot move before it |
+| `.release` | earlier reads and writes cannot move after it |
+| `.acq_rel` | both (for read-modify-writes and fences) |
+| `fence.sc` | a sequentially consistent fence |
+
+A plain `ld` or `st` is **weak**: it promises nothing to other threads. The standard pattern built
+from these pieces is **message passing**: the producer writes the data, then sets a flag with a
+release store; the consumer spins on the flag with acquire loads, then reads the data. If the
+consumer's acquire load sees the flag, the release-acquire pair guarantees it also sees the data.
+Clang produces exactly that from C++ scoped atomics (LLVM output):
+
+```ptx
+// producer:  data[0] = 42.0f; then release-store flag = 1 at device scope
+	st.global.b32 	[%rd2], 1109917696;
+	st.release.gpu.global.b32 	[%rd4], 1;
+
+// consumer:  spin until flag != 0 (acquire), then read data
+$L__BB1_1:
+	ld.acquire.gpu.global.b32 	%r1, [%rd1];
+	setp.eq.b32 	%p1, %r1, 0;
+	@%p1 bra 	$L__BB1_1;
+	ld.global.b32 	%r2, [%rd2];
+```
+
+The data store and the data load are weak; the release and the acquire order them. Scope `.gpu` is
+enough because both kernels run on one device. Had the consumer been the host, the pair would have
+to be `.sys`. The narrowest scope that covers both threads is the cheapest.
+
+`fence` orders memory operations without accessing memory itself. One variant matters for the
+next section: **`fence.proxy.async`**. The tensor-memory accelerator and `wgmma` reach shared
+memory through a different **proxy** (path to memory) than ordinary loads and stores, so a thread
+that writes shared memory with `st.shared` and then hands it to an asynchronous unit must fence
+between the two proxies.
+
+## Tensor cores and asynchronous copies
+
+**Tensor cores** are units that compute a small matrix multiply-accumulate,
+$D = A \cdot B + C$, as one operation. PTX exposes three generations of them, which differ in
+who issues the instruction, where the operands live and how you learn the result is ready:
+
+| Family | Issued by | A and B from | Accumulator in | Completion | GPU |
+| --- | --- | --- | --- | --- | --- |
+| `mma.sync` | one warp (32 threads) | registers | registers | synchronous | `sm_80` (and `sm_70` shapes) |
+| `wgmma.mma_async` | one warpgroup (128 threads) | shared memory (A may be registers) | registers | `commit_group` / `wait_group` | `sm_90a` |
+| `tcgen05.mma` | one thread, for 1 or 2 CTAs | shared memory or tensor memory | tensor memory | `tcgen05.commit` → mbarrier | `sm_100a` |
+
+Each step moves work off the register file and makes the multiply asynchronous, so that dedicated
+units keep the tensor cores fed while the threads do something else. The
+[warp and warpgroup MMA post](/blog/cute-dsl-warp-and-warpgroup-mma/) and the
+[tcgen05 post](/blog/cute-dsl-tcgen05-mma/) derive the layouts in full; this section shows what the
+PTX looks like.
+
+### mma.sync and ldmatrix
+
+`llc` turns the NVVM intrinsics for `ldmatrix` and `mma` into this (LLVM output, `sm_90`):
+
+```ptx
+ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r4, %r5, %r6, %r7}, [%rd4];
+ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r8, %r9}, [%rd6];
+mov.b32 	%r10, 0f00000000;
+mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+	{%r11, %r12, %r13, %r14},
+	{%r4, %r5, %r6, %r7},
+	{%r8, %r9},
+	{%r10, %r10, %r10, %r10};
+```
+
+The `mma` opcode packs a lot into its modifiers:
+
+<PtxAnatomy
+	title="One warp-level MMA"
+	parts={[
+		{ text: "mma", kind: "op", label: "opcode", note: "Matrix multiply-accumulate on the tensor cores." },
+		{ text: ".sync.aligned", kind: "mod", label: "warp-wide", note: "Every lane of the warp must execute this same instruction together; divergence here is undefined." },
+		{ text: ".m16n8k16", kind: "mod", label: "shape", note: "D is 16 × 8 (M × N), and one instruction contracts K = 16." },
+		{ text: ".row.col", kind: "mod", label: "layouts", note: "A is row-major (M × K), B is column-major (K × N), so K runs contiguously in both. This is the only layout pair for most types." },
+		{ text: ".f32", kind: "type", label: "D", note: "The four types are given in the order D, A, B, C." },
+		{ text: ".f16.f16", kind: "type", label: "A, B", note: "Half-precision multiplicands, two per 32-bit register." },
+		{ text: ".f32", kind: "type", label: "C", note: "Single-precision accumulator input." },
+		{ text: " {d0–d3}, {a0–a3}, {b0, b1}, {c0–c3};", kind: "operand", label: "fragments", note: "Each lane supplies a fragment: 4 registers of A (8 halves), 2 of B (4 halves) and 4 of C, and receives 4 of D." },
+	]}
+/>
+
+No lane holds a whole matrix. Each lane holds a **fragment**, and the fragment sizes follow from
+dividing the tiles by 32 lanes: $A$ has $16 \cdot 16 = 256$ halves, 8 per lane, in 4 registers;
+$B$ has 128 halves, 4 per lane, in 2 registers; $C$ and $D$ have 128 floats, 4 per lane. The
+accumulator's layout is fixed by the hardware. Lane $l$ belongs to **group** $g = \lfloor l/4
+\rfloor$ and has index $t = l \bmod 4$ within it, and owns rows $g$ and $g + 8$, columns $2t$ and
+$2t + 1$:
+
+<Matrix2D name="C tile of one m16n8k16, offset m + 16n" {...F.c} />
+
+Each cell shows the lane that owns it (`T`) and which of its four accumulator registers holds it
+(`V0`–`V3`, the `d0`–`d3` of the instruction). Check lane 5: $g = 1$, $t = 1$, so it owns $(1, 2)$
+and $(1, 3)$ in `V0`, `V1` and $(9, 2)$ and $(9, 3)$ in `V2`, `V3`. Find `T5` in rows 1 and 9 of
+the figure, in columns 2 and 3. **`ldmatrix`** exists to produce these
+fragments: each lane gives the shared-memory address of one 8-element row, and the instruction
+delivers to every lane exactly the elements its fragment needs. `.x4` loads four 8 × 8 matrices
+(the whole A fragment), and `.trans` transposes on the way, which B needs. A GEMM main loop is
+then a sequence of `ldmatrix` and `mma` instructions that feed the same `{d0–d3}` back in as C.
+
+### Hopper and Blackwell: TMA, wgmma and tcgen05
+
+#### The tensor memory accelerator
+
+The **TMA** (tensor memory accelerator, `sm_90`+) copies a whole multi-dimensional tile between
+global and shared memory. One thread issues one instruction; the hardware generates every address,
+handles the tile's edges, writes shared memory in a swizzled layout and reports completion to an
+**mbarrier**, a barrier object in shared memory that counts both thread arrivals and bytes
+delivered. The tile's shape is described by a 128-byte **tensor map** that the host builds once
+(CUDA's `CUtensorMap`), passed in `.param`, `.const` or `.global` space. The core of a TMA load
+(LLVM output, trimmed to the relevant lines):
+
+```ptx
+elect.sync 	%r3|%p2, -1;                         // pick one leader lane
+@%p3 bra 	$L__BB0_4;                           // others skip the issue
+mbarrier.init.shared.b64 	[bar], %r4;          // expect 1 arrival
+mbarrier.arrive.expect_tx.shared.b64 %rd6, [bar], %r5;   // arrive, expect 8192 bytes
+cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%rd9], [%rd3, {%r1, %r2}], [bar];
+$L__BB0_4:
+mbarrier.try_wait.parity.shared.b64 %p4, [bar], %r6;    // done with phase 0?
+not.pred 	%p5, %p4;
+@%p5 bra 	$L__BB0_4;                           // spin until the bytes have landed
+```
+
+Read the long opcode right to left: complete the transaction on an mbarrier, counted in bytes; a
+tile copy from global to shared memory of the cluster; two-dimensional; bulk tensor;
+asynchronous. The leader tells the barrier to expect 8,192 bytes, launches the copy with tile
+coordinates `{x, y}`, and every thread waits until the barrier's phase completes. Because arrival is
+counted in bytes, the barrier completes only when the data is actually in shared memory.
+
+#### Warpgroup MMA
+
+**`wgmma.mma_async`** (`sm_90a`) is issued by a **warpgroup**, four consecutive warps or 128
+threads. A and B are read straight from shared memory through 64-bit **matrix descriptors**, and
+the instruction is asynchronous. A shape is `m64nNk16` for 16-bit inputs, with $N$ any multiple of
+8 up to 256. LLVM has no intrinsic for it, so CUTLASS writes it in inline assembly; the form below
+follows the ISA's syntax (hand-written):
+
+```ptx
+wgmma.fence.sync.aligned;                       // order earlier register writes
+wgmma.mma_async.sync.aligned.m64n128k16.f32.f16.f16
+    {%f0, %f1, /* … */ %f63},                    // 64 accumulators per thread
+    %descA, %descB,                              // A and B in shared memory
+    %p,                                          // scale-d: false → D = A·B, true → D = A·B + D
+    1, 1,                                        // imm-scale-a, imm-scale-b (1 or −1)
+    0, 0;                                        // imm-trans-a, imm-trans-b
+wgmma.commit_group.sync.aligned;                // close a group of MMAs
+wgmma.wait_group.sync.aligned 0;                // wait until 0 groups are pending
+```
+
+The accumulator is spread over the 128 threads, $64 N / 128$ registers each: 4 for `m64n8`, 64
+for `m64n128`, 128 for `m64n256`. That register cost is what Blackwell removes.
+
+A matrix descriptor packs a shared-memory tile's address and layout into 64 bits. Each address
+field is encoded as `(x & 0x3FFFF) >> 4`, that is, in 16-byte units:
+
+| Bits | Field |
+| --- | --- |
+| 0–13 | start address |
+| 16–29 | leading-dimension byte offset (LBO) |
+| 32–45 | stride-dimension byte offset (SBO) |
+| 49–51 | base offset (for swizzle patterns that start off-boundary) |
+| 62–63 | swizzle: 0 none, 1 128-byte, 2 64-byte, 3 32-byte |
+
+A worked example: a tile at shared address `0x400`, LBO 16 bytes, SBO 1,024 bytes (eight rows of
+128 bytes) and 128-byte swizzle encodes to start $\text{0x400} \gg 4 = \text{0x40}$, LBO
+$16 \gg 4 = 1$, SBO $1024 \gg 4 = 64$ and swizzle 1, so the descriptor is
+`0x40 | 1 << 16 | 64 << 32 | 1 << 62` $=$ `0x4000004000010040`. The swizzle mode must match the
+one the TMA used to write the tile, or the MMA reads the wrong elements.
+
+#### tcgen05
+
+Blackwell's **`tcgen05`** family (`sm_100a`) adds **tensor memory** (TMEM), a 128-lane by
+512-column on-chip memory per SM that holds the accumulator. A single thread issues
+`tcgen05.mma`, which reads A and B through descriptors and accumulates into TMEM; two CTAs of a
+cluster can share one MMA with `.cta_group::2`. Completion is signalled by `tcgen05.commit` onto an
+mbarrier, and the epilogue copies the result to registers with `tcgen05.ld`. Tensor memory is
+allocated and freed explicitly with `tcgen05.alloc` and `tcgen05.dealloc`. The
+[tcgen05 post](/blog/cute-dsl-tcgen05-mma/) walks through the TMEM layouts and the pipeline.
+
+Put together, these instructions give the shape of every fast Hopper or Blackwell GEMM: a ring of
+shared-memory stages that the TMA fills ahead of the tensor cores, with "full" and "empty"
+mbarriers handing each stage back and forth, so that copying and computing overlap.
+
+## Special registers and directives
+
+Beyond the thread coordinates, the special registers expose the hardware and the clock:
+
+| Registers | Meaning |
+| --- | --- |
+| `%laneid`, `%warpid`, `%nwarpid` | lane in warp; warp in CTA (may change over time); max warps per CTA |
+| `%lanemask_eq` `_le` `_lt` `_ge` `_gt` | masks of lanes relative to mine (for warp prefix sums) |
+| `%smid`, `%nsmid` | which SM I run on; the SM count |
+| `%clock`, `%clock64`, `%globaltimer` | SM cycle counters; a nanosecond timer |
+| `%dynamic_smem_size`, `%total_smem_size` | shared memory of this launch |
+| `%pm0` … `%pm7` | performance-monitor counters |
+
+**Directives** declare structure rather than compute. The ones worth knowing beyond the module
+header are the **performance directives**, which constrain `ptxas`'s resource choices:
+
+| Directive | Effect |
+| --- | --- |
+| `.maxntid 256, 1, 1` | at most 256 threads per CTA (`__launch_bounds__`) |
+| `.reqntid 256, 1, 1` | exactly 256 threads per CTA |
+| `.minnctapersm 2` | aim for at least 2 resident CTAs per SM |
+| `.maxnreg 64` | at most 64 registers per thread |
+| `.reqnctapercluster 2, 1, 1` | the cluster shape (`sm_90`+) |
+| `.pragma "nounroll";` | a hint to `ptxas` |
+
+They trade registers for occupancy. An SM's registers and shared memory are divided among its
+resident CTAs, so a kernel that needs fewer registers per thread fits more warps at once. The
+[Nsight Compute post](/blog/nsight-compute-guide/) shows the occupancy curve. Linking directives
+(`.visible`, `.extern`, `.weak`) control symbol visibility across modules, and `.loc` and `.file`
+map PTX lines back to source lines for debuggers and profilers.
+
+## Writing PTX by hand
+
+You rarely write a whole `.ptx` file. Instead, CUDA's **inline assembly** puts one or a few PTX
+instructions inside C++, and the compiler fills in the registers:
+
+```cpp
+unsigned a = p[0], b = p[1], c = p[2], d;
+asm("lop3.b32 %0, %1, %2, %3, 0x6A;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+```
+
+`%0` … `%3` refer to the operands after the colons. **Constraints** say what kind of register
+each one is: `r` a 32-bit register, `l` 64-bit, `h` 16-bit, `f` `.f32`, `d` `.f64`, `n` an
+immediate; `=` marks an output. Clang pasted the instruction into its output with its own register
+names (LLVM output):
+
+```ptx
+	ld.global.b32 	%r2, [%rd2];
+	ld.global.b32 	%r3, [%rd2+4];
+	ld.global.b32 	%r4, [%rd2+8];
+	// begin inline asm
+	lop3.b32 %r1, %r2, %r3, %r4, 0x6A;
+	// end inline asm
+	st.global.b32 	[%rd2+12], %r1;
+```
+
+The compiler does not parse the string: errors appear only when `ptxas` assembles the result, and
+the compiler assumes the instruction has no effects beyond its outputs. Add `volatile` (or a
+`"memory"` clobber) for instructions with side effects such as barriers, so they are not moved or
+deleted. This is how CUTLASS, DeepGEMM and FlashAttention reach `wgmma`, TMA and `tcgen05`.
+
+To read the PTX of your own kernels, use `nvcc -ptx kernel.cu` (or `cuobjdump -ptx` on a binary).
+To see what `ptxas` made of it, use `cuobjdump -sass`. Comparing the two is often the fastest way
+to find out why a kernel is slower than expected.
+
+## Summary
+
+- PTX is a **virtual ISA**: a stable, documented assembly language with unlimited typed registers
+  that `ptxas`, ahead of time or in the driver, compiles to each GPU's SASS. Plain targets run on
+  later GPUs; `a` and `f` targets trade that for chip- or family-specific instructions.
+- The machine is a hierarchy of **threads, warps, CTAs, clusters and the grid**, read through
+  special registers. A warp runs **SIMT**; a divergent branch runs both sides one after the other,
+  and predication or `selp` avoids it for short bodies.
+- Every instruction is **guard, opcode, modifiers, type, destination, sources**. Registers have
+  no type; the instruction decides. Every memory access names a **state space**, and generic
+  addresses plus `cvta` connect them.
+- The instruction set has one-instruction versions of things CPUs spell out, such as `lop3`,
+  `prmt`, `bfe`, `dp4a` and warp shuffles, and the memory model adds **scopes and acquire/release**
+  so threads can publish data safely.
+- Tensor cores went from **synchronous warp MMAs in registers** (`mma.sync`) to **asynchronous
+  warpgroup MMAs from shared memory** (`wgmma`) to **single-thread MMAs into tensor memory**
+  (`tcgen05`), fed by the TMA and paced by mbarriers.
+
+## References
+
+- NVIDIA, [*Parallel Thread Execution ISA, version 9.4*](https://docs.nvidia.com/cuda/parallel-thread-execution/).
+  Chapters 2–3 (programming and machine model), 5–7 (state spaces, operands, ABI), 8 (memory
+  model), 9.7 (instructions), 10–11 (special registers, directives), 13 (release notes).
+- NVIDIA, [*Inline PTX Assembly in CUDA*](https://docs.nvidia.com/cuda/inline-ptx-assembly/).
+- LLVM 23.1.2 (Homebrew build), `clang` and `llc` with the NVPTX backend, used for every listing
+  marked "LLVM output".
+- On this blog: [Inside LLVM: IR, TableGen and the NVPTX Backend](/blog/llvm-nvptx-backend/),
+  [Warp MMA and Warpgroup MMA in the CuTe DSL, Mode by Mode](/blog/cute-dsl-warp-and-warpgroup-mma/),
+  [Blackwell's tcgen05 MMA in the CuTe DSL](/blog/cute-dsl-tcgen05-mma/),
+  [Understanding Nvidia Nsight Compute (NCU) Metrics](/blog/nsight-compute-guide/).

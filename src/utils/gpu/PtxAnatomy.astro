@@ -1,0 +1,169 @@
+---
+// One PTX instruction split into its parts (guard, opcode, modifiers, types, operands). Each part
+// is a chip with a short label under it; hovering, focusing or clicking a chip shows its note
+// below and highlights it. Chips of the same `kind` share a colour.
+// Usage in .mdx:
+//   import PtxAnatomy from "../../utils/gpu/PtxAnatomy.astro";
+//   <PtxAnatomy parts={[
+//     { text: "@%p", kind: "guard", label: "guard", note: "Runs only in lanes where %p is true." },
+//     { text: "add", kind: "op", label: "opcode", note: "Integer add." },
+//     { text: ".s32", kind: "type", label: "type", note: "Signed 32-bit." },
+//     { text: " %r1, %r2, %r3;", kind: "operand", label: "d, a, b", note: "Destination first." },
+//   ]} />
+
+interface Part {
+	text: string;
+	kind: "guard" | "op" | "mod" | "type" | "operand";
+	label?: string;
+	note?: string;
+}
+
+interface Props {
+	parts: Part[];
+	title?: string;
+	/** Text shown when no chip is selected. */
+	hint?: string;
+}
+
+const {
+	parts,
+	title,
+	hint = "Hover or tap a part to see what it means.",
+} = Astro.props;
+---
+
+<figure class="pta">
+	{title && <figcaption class="pta-title">{title}</figcaption>}
+	<div class="pta-row">
+		{
+			parts.map((p, i) => (
+				<button type="button" class:list={["pta-part", `k-${p.kind}`]} data-i={i}>
+					<code>{p.text}</code>
+					{p.label && <span class="pta-label">{p.label}</span>}
+				</button>
+			))
+		}
+	</div>
+	<p class="pta-note" aria-live="polite" data-hint={hint}>{hint}</p>
+	<template class="pta-notes">
+		{parts.map((p) => <p set:html={p.note ?? ""} />)}
+	</template>
+</figure>
+
+<script>
+	for (const fig of document.querySelectorAll<HTMLElement>(".pta")) {
+		const note = fig.querySelector<HTMLElement>(".pta-note");
+		const tpl = fig.querySelector<HTMLTemplateElement>(".pta-notes");
+		const notes = [...(tpl?.content.querySelectorAll("p") ?? [])].map((p) => p.innerHTML);
+		const parts = [...fig.querySelectorAll<HTMLButtonElement>(".pta-part")];
+		let pinned = -1;
+		const show = (i: number) => {
+			parts.forEach((p, k) => p.classList.toggle("sel", k === i));
+			if (note) note.innerHTML = i < 0 || !notes[i] ? (note.dataset.hint ?? "") : notes[i];
+		};
+		parts.forEach((p, i) => {
+			p.addEventListener("mouseenter", () => show(i));
+			p.addEventListener("focus", () => show(i));
+			p.addEventListener("mouseleave", () => show(pinned));
+			p.addEventListener("click", () => {
+				pinned = pinned === i ? -1 : i;
+				show(pinned);
+			});
+		});
+	}
+</script>
+
+<style>
+	.pta {
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+		--c-guard: #a3471f;
+		--c-op: #1f4f78;
+		--c-mod: #6b4a9a;
+		--c-type: #2f7a4b;
+		--c-operand: #6a6a64;
+	}
+	@media (prefers-color-scheme: dark) {
+		.pta {
+			--c-guard: #e8956f;
+			--c-op: #8dbbe3;
+			--c-mod: #bfa2e8;
+			--c-type: #84cc9c;
+			--c-operand: #9a9a94;
+		}
+	}
+	.pta-title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.5rem;
+	}
+	.pta-row {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		align-items: flex-start;
+		gap: 2px;
+		padding: 0.7rem 0.5rem;
+		background: var(--surface);
+		border: 1px solid var(--faint);
+		border-radius: 8px;
+	}
+	.pta-part {
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		gap: 0.2rem;
+		padding: 0.25rem 0.2rem;
+		background: none;
+		border: 0;
+		border-bottom: 3px solid var(--c);
+		border-radius: 4px 4px 0 0;
+		cursor: pointer;
+		color: var(--text);
+		font: inherit;
+	}
+	.pta-part code {
+		font-family: var(--mono);
+		font-size: 0.8rem;
+		background: none;
+		padding: 0;
+		color: var(--c);
+		white-space: pre;
+	}
+	.pta-part.sel,
+	.pta-part:hover,
+	.pta-part:focus-visible {
+		background: color-mix(in oklch, var(--c) 14%, transparent);
+		outline: none;
+	}
+	.pta-label {
+		font-size: 0.62rem;
+		color: var(--muted);
+		white-space: nowrap;
+	}
+	.k-guard {
+		--c: var(--c-guard);
+	}
+	.k-op {
+		--c: var(--c-op);
+	}
+	.k-mod {
+		--c: var(--c-mod);
+	}
+	.k-type {
+		--c: var(--c-type);
+	}
+	.k-operand {
+		--c: var(--c-operand);
+	}
+	.pta-note {
+		margin: 0.5rem 0 0;
+		font-size: 0.82rem;
+		line-height: 1.5;
+		min-height: 3em;
+	}
+	.pta-note :global(code) {
+		font-size: 0.74rem;
+	}
+</style>

@@ -1,0 +1,276 @@
+---
+// Step through a PTX kernel one issued instruction at a time on a small warp (8 lanes by default,
+// a scaled-down 32). The listing highlights the line the warp issues; the chips beside each line
+// show which lanes wait there before the step. The table below has one column per lane and one
+// row per register: a solid lane header means the instruction ran in that lane, a hatched one that
+// the lane was issued to but its guard predicate was false, a blank one that the lane was not
+// issued to at all (it waits on the other side of a branch, or has exited). Changed registers are
+// highlighted. The footer counts issue slots and the lane-instructions that did work, so a
+// divergent kernel and its branch-free twin can be compared. The interpreter is in ptxSim.ts;
+// the post's programs are in ptxFigures.ts.
+// Usage in .mdx:
+//   import PtxTrace from "../../utils/gpu/PtxTrace.astro";
+//   import { saxpyTrace } from "../../utils/gpu/ptxFigures";
+//   <PtxTrace config={saxpyTrace} title="saxpy on one 8-lane warp" step={8} />
+import StepControls from "../compiler/StepControls.astro";
+import { type PtxSimConfig, simulatePtx } from "./ptxSim";
+
+interface Props {
+	config: PtxSimConfig;
+	/** Step shown on load. */
+	step?: number;
+	title?: string;
+}
+
+const { config, step = 0, title } = Astro.props;
+const trace = simulatePtx(config);
+const { lines, steps, lanes, show } = trace;
+const at = Math.max(0, Math.min(steps.length - 1, step));
+const laneIds = Array.from({ length: lanes }, (_, l) => l);
+const firstLine = steps[0]?.line ?? 0;
+// Where each lane waits before step k: the previous step's positions (1-based lines).
+const before = steps.map((_, k) =>
+	k === 0
+		? laneIds.map(() => firstLine + 1)
+		: steps[k - 1].at.map((a) => Number(a) || 0),
+);
+const plan = steps.map((s, k) => ({ line: s.line, before: before[k] }));
+const labels = steps.map(
+	(s) => s.text.replace(/^@!?%\w+\s+/, "").split(/[\s.]/)[0],
+);
+const pct = (s: (typeof steps)[number]) =>
+	Math.round((100 * s.useful) / (s.issued * lanes));
+---
+
+<figure class="ptt" data-step={at} data-plan={JSON.stringify(plan)} data-lanes={lanes} tabindex="-1">
+	{title && <figcaption class="ptt-title">{title}</figcaption>}
+	<StepControls labels={labels} step={at} />
+	<pre class="ptt-code"><code>{
+		lines.map((l, i) => (
+			<span class:list={["ptt-ln", { hi: steps[at].line === i }]} data-i={i}>
+				<span class="ptt-no">{i + 1}</span>
+				<span class="ptt-lanes" aria-hidden="true">
+					{laneIds.map((lane) => (
+						<i class:list={{ on: before[at][lane] === i + 1 }} />
+					))}
+				</span>
+				<span class="ptt-src">{l === "" ? " " : l}</span>
+			</span>
+		))
+	}</code></pre>
+	<div class="ptt-panels">
+		{
+			steps.map((s, k) => (
+				<div class="ptt-panel" data-k={k} hidden={k !== at}>
+					<div class="ptt-scroll">
+						<table class="ptt-table">
+							<thead>
+								<tr>
+									<th>lane</th>
+									{laneIds.map((lane) => (
+										<th
+											class:list={{
+												ran: s.executed[lane],
+												off: s.active[lane] && !s.executed[lane],
+											}}
+										>
+											{lane}
+										</th>
+									))}
+								</tr>
+							</thead>
+							<tbody>
+								{show.map((reg, r) => (
+									<tr>
+										<th>{reg}</th>
+										{laneIds.map((lane) => (
+											<td class:list={{ ch: s.changed[r][lane] }}>{s.values[r][lane]}</td>
+										))}
+									</tr>
+								))}
+								<tr class="ptt-next">
+									<th>next line</th>
+									{laneIds.map((lane) => (
+										<td>{s.at[lane]}</td>
+									))}
+								</tr>
+							</tbody>
+						</table>
+					</div>
+					<p class="ptt-note">
+						<code>{s.text.replace(/\s+/g, " ").replace(/\s*\/\/.*$/, "")}</code> — {s.note}
+						{s.stores.length > 0 && <span class="ptt-stores"> Stores: {s.stores.join(", ")}.</span>}
+					</p>
+					<p class="ptt-stats">
+						Issue slots so far: {s.issued} · lane-instructions that did work: {s.useful} of{" "}
+						{s.issued * lanes} ({pct(s)}%)
+					</p>
+				</div>
+			))
+		}
+	</div>
+</figure>
+
+<script>
+	import { bindStepper } from "../compiler/stepper";
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".ptt")) {
+		const plan: { line: number; before: number[] }[] = JSON.parse(fig.dataset.plan ?? "[]");
+		const rows = [...fig.querySelectorAll<HTMLElement>(".ptt-ln")];
+		const panels = [...fig.querySelectorAll<HTMLElement>(".ptt-panel")];
+		bindStepper(fig, plan.length, (k) => {
+			const p = plan[k];
+			rows.forEach((el, i) => {
+				el.classList.toggle("hi", p.line === i);
+				el.querySelectorAll("i").forEach((chip, lane) => {
+					chip.classList.toggle("on", p.before[lane] === i + 1);
+				});
+			});
+			for (const el of panels) el.hidden = Number(el.dataset.k) !== k;
+		});
+	}
+</script>
+
+<style>
+	.ptt {
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+		outline: none;
+	}
+	.ptt-title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.3rem;
+	}
+	.ptt-code {
+		margin: 0.5rem 0 0;
+		padding: 0.5rem 0;
+		overflow-x: auto;
+		background: var(--surface);
+		border: 1px solid var(--faint);
+		border-radius: 8px;
+		font-family: var(--mono);
+		font-size: 0.68rem;
+		line-height: 1.55;
+	}
+	.ptt-code code {
+		display: block;
+		min-width: max-content;
+		background: none;
+		padding: 0;
+		font-size: inherit;
+	}
+	.ptt-ln {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		padding: 0 0.8rem 0 0.4rem;
+		white-space: pre;
+		transition: background 150ms ease;
+	}
+	.ptt-ln.hi {
+		background: color-mix(in oklch, var(--accent) 16%, transparent);
+		box-shadow: inset 3px 0 var(--accent);
+	}
+	.ptt-no {
+		width: 1.6em;
+		text-align: right;
+		color: var(--muted);
+		flex: none;
+	}
+	.ptt-lanes {
+		display: inline-flex;
+		gap: 1px;
+		flex: none;
+	}
+	.ptt-lanes i {
+		width: 5px;
+		height: 9px;
+		border-radius: 1px;
+		background: color-mix(in oklch, var(--faint) 60%, transparent);
+	}
+	.ptt-lanes i.on {
+		background: var(--accent);
+	}
+	.ptt-panels {
+		margin-top: 0.6rem;
+	}
+	.ptt-panel[hidden] {
+		display: none;
+	}
+	.ptt-scroll {
+		overflow-x: auto;
+		border: 1px solid var(--faint);
+		border-radius: 8px;
+	}
+	.ptt-table {
+		width: 100%;
+		border-collapse: collapse;
+		margin: 0;
+		font-size: 0.72rem;
+	}
+	.ptt-table th,
+	.ptt-table td {
+		padding: 0.22rem 0.45rem;
+		border-bottom: 1px solid var(--faint);
+		white-space: nowrap;
+		text-align: right;
+	}
+	.ptt-table tbody th {
+		text-align: left;
+		font-family: var(--mono);
+		font-weight: 500;
+		color: var(--muted);
+		font-size: 0.7rem;
+	}
+	.ptt-table td {
+		font-family: var(--mono);
+		font-size: 0.68rem;
+		font-variant-numeric: tabular-nums;
+	}
+	.ptt-table thead th {
+		font-weight: 600;
+		color: var(--muted);
+		font-size: 0.7rem;
+	}
+	.ptt-table thead th.ran {
+		background: var(--accent);
+		color: var(--bg);
+	}
+	.ptt-table thead th.off {
+		background: repeating-linear-gradient(
+			135deg,
+			color-mix(in oklch, var(--accent) 30%, transparent) 0 3px,
+			transparent 3px 6px
+		);
+		color: var(--text);
+	}
+	.ptt-table td.ch {
+		background: color-mix(in oklch, var(--accent) 16%, transparent);
+		font-weight: 600;
+	}
+	.ptt-table tr:last-child td,
+	.ptt-table tr:last-child th {
+		border-bottom: none;
+	}
+	.ptt-next td,
+	.ptt-next th {
+		color: var(--muted);
+	}
+	.ptt-note {
+		margin: 0.6rem 0 0.2rem;
+		font-size: 0.82rem;
+		line-height: 1.5;
+		min-height: 3em;
+	}
+	.ptt-note code {
+		font-size: 0.72rem;
+	}
+	.ptt-stats {
+		margin: 0;
+		font-size: 0.74rem;
+		color: var(--muted);
+		font-variant-numeric: tabular-nums;
+	}
+</style>
