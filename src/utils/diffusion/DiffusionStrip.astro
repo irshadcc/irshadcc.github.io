@@ -1,0 +1,82 @@
+---
+// The diffusion Markov chain as a strip of snapshots: the same 400 points of 2-D data noised to
+// several time steps with x_t = sqrt(ab_t) x_0 + sqrt(1 - ab_t) eps (one eps per point, so each
+// point keeps its identity across panels). An arrow above runs left to right for the fixed
+// forward process q(x_t | x_{t-1}); an arrow below runs right to left for the learned reverse
+// process p_theta(x_{t-1} | x_t). Drawn at build time (no script). Logic in diffusion.ts.
+// Usage in .mdx:
+//   <DiffusionStrip times={[0, 50, 100, 250, 500, 1000]} />
+import "../sampling/sampling.css";
+import "./diffusion.css";
+import {
+	moons2d,
+	mulberry32,
+	noiseTo,
+	normalGenerator,
+	ring2d,
+	sampleData,
+	schedules,
+} from "./diffusion";
+
+interface Props {
+	times?: number[];
+	data?: "ring" | "moons";
+	title?: string;
+	caption?: string;
+}
+
+const {
+	times = [0, 50, 100, 250, 500, 1000],
+	data = "ring",
+	title,
+	caption,
+} = Astro.props;
+const mix = data === "moons" ? moons2d : ring2d;
+const sched = schedules.linear;
+const x0 = sampleData(mix, 400, 9);
+const randn = normalGenerator(mulberry32(10));
+const eps = x0.map(() => [randn(), randn()]);
+
+const P = 92;
+const GAP = 22;
+const LEFT = 14;
+const W = LEFT * 2 + times.length * P + (times.length - 1) * GAP;
+const TOP = 34;
+const H = TOP + P + 70;
+const R = 3;
+const f = (v: number) => v.toFixed(1);
+
+let body = "";
+times.forEach((t, k) => {
+	const ox = LEFT + k * (P + GAP);
+	const ab = sched.alphaBar[t];
+	const sx = (v: number) => ox + ((v + R) / (2 * R)) * P;
+	const sy = (v: number) => TOP + P - ((v + R) / (2 * R)) * P;
+	body += `<rect x="${ox}" y="${TOP}" width="${P}" height="${P}" class="smp-plotbox" />`;
+	for (let i = 0; i < x0.length; i++) {
+		const p = noiseTo(x0[i], ab, eps[i]);
+		if (Math.abs(p[0]) < R && Math.abs(p[1]) < R)
+			body += `<circle cx="${f(sx(p[0]))}" cy="${f(sy(p[1]))}" r="1.1" class="smp-dot" opacity="0.7" />`;
+	}
+	body += `<text x="${ox + P / 2}" y="${TOP + P + 15}" text-anchor="middle" class="smp-text">t = ${t}</text>`;
+	const abText =
+		t === 0 ? "1" : ab < 1e-3 ? ab.toExponential(1) : ab.toFixed(3);
+	body += `<text x="${ox + P / 2}" y="${TOP + P + 29}" text-anchor="middle" class="smp-note">ᾱ = ${abText}</text>`;
+});
+const x1 = LEFT + P / 2;
+const x2 = W - LEFT - P / 2;
+const head = (x: number, y: number, dir: 1 | -1) =>
+	`<path d="M${x},${y}l${-7 * dir},-4v8z" class="dif-head" />`;
+body += `<line x1="${x1}" y1="16" x2="${x2 - 6}" y2="16" class="smp-q" />${head(x2, 16, 1).replace("dif-head", "dif-head dif-head-q")}`;
+body += `<text x="${(x1 + x2) / 2}" y="10" text-anchor="middle" class="smp-text">forward q(xₜ | xₜ₋₁): add a little Gaussian noise (fixed, no parameters)</text>`;
+const yb = TOP + P + 46;
+body += `<line x1="${x1 + 6}" y1="${yb}" x2="${x2}" y2="${yb}" class="smp-model" />${head(x1, yb, -1)}`;
+body += `<text x="${(x1 + x2) / 2}" y="${yb + 16}" text-anchor="middle" class="smp-text">reverse p_θ(xₜ₋₁ | xₜ): a network removes a little noise (learned)</text>`;
+const svg = `<svg class="smp-svg" viewBox="0 0 ${W} ${H}" role="img" aria-label="Forward and reverse diffusion chain">${body}</svg>`;
+---
+
+<figure class="smp-fig dif-strip">
+	{title && <div class="smp-title">{title}</div>}
+	<Fragment set:html={svg} />
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>

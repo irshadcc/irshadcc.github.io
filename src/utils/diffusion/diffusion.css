@@ -1,0 +1,58 @@
+/* Extra marks for the diffusion figures (src/utils/diffusion). They build on sampling.css; every
+   class starts with dif- and is global because the SVG content is created by scripts. */
+
+.smp-fig .dif-path {
+	fill: none;
+	stroke: var(--text);
+	stroke-width: 0.7;
+	opacity: 0.55;
+}
+.smp-fig .dif-prior {
+	stroke: var(--muted);
+}
+.smp-legend .dif-k-prior {
+	border-color: var(--muted);
+}
+.smp-legend .k-heat {
+	background: var(--smp-hist);
+}
+.smp-fig .dif-arrow {
+	stroke: var(--smp-model);
+	stroke-width: 1.1;
+	fill: none;
+	opacity: 0.8;
+}
+.smp-fig .dif-head {
+	fill: var(--smp-model);
+	opacity: 0.8;
+}
+.smp-fig .dif-x0 {
+	stroke: var(--smp-q);
+	stroke-width: 1.1;
+	stroke-dasharray: 3 2;
+}
+.smp-fig .dif-mean {
+	fill: none;
+	stroke: var(--smp-q);
+	stroke-width: 1;
+	opacity: 0.45;
+}
+.smp-fig .dif-hl {
+	fill: var(--smp-q);
+	stroke: var(--bg);
+	stroke-width: 0.8;
+}
+.smp-fig svg.dif-square {
+	max-width: 460px;
+	margin: 0 auto;
+}
+.dif-strip {
+	overflow-x: auto;
+}
+.dif-strip svg {
+	min-width: 560px;
+}
+.smp-fig .dif-head-q {
+	fill: var(--smp-q);
+	opacity: 1;
+}

@@ -1,0 +1,24 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import Diffusion2D from "../../utils/diffusion/Diffusion2D.astro";
+import DiffusionStrip from "../../utils/diffusion/DiffusionStrip.astro";
+import DiffusionTimeline from "../../utils/diffusion/DiffusionTimeline.astro";
+---
+
+<Layout title="Diffusion figures">
+	<main>
+		<h1>Diffusion figures</h1>
+		<h2>DiffusionStrip</h2>
+		<DiffusionStrip />
+		<DiffusionStrip data="moons" times={[0, 100, 300, 1000]} title="Moons, four steps" />
+		<h2>DiffusionTimeline</h2>
+		<DiffusionTimeline mode="forward" />
+		<DiffusionTimeline mode="forward" schedule="cosine" title="Cosine schedule" />
+		<DiffusionTimeline mode="reverse" />
+		<DiffusionTimeline mode="reverse" steps={5} eta={0} title="DDIM, 5 steps" />
+		<h2>Diffusion2D</h2>
+		<Diffusion2D data="ring" mode="forward" />
+		<Diffusion2D data="moons" mode="reverse" steps={100} />
+		<Diffusion2D data="moons" mode="reverse" steps={5} eta={0} title="DDIM, 5 steps" />
+	</main>
+</Layout>

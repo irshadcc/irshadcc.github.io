@@ -156,6 +156,7 @@ Once a component is stable, it will be migrated to `/src/component`
 | `Chain2D` | `src/utils/sampling/` | Metropolis / Gibbs (with over-relaxation α) / Langevin on a correlated 2D Gaussian: moves, trace, acceptance, sd, autocorrelation time |
 | `BayesNetSampler` | `src/utils/sampling/` | Sprinkler network: ancestral, logic sampling, likelihood weighting with running estimate vs exact |
 | `EbmTraining` | `src/utils/sampling/` | 1D energy-based model trained with Langevin samples (persistent or contrastive divergence), energy, densities, the two expectations of the likelihood gradient |
+| `DiffusionStrip`, `DiffusionTimeline`, `Diffusion2D` | `src/utils/diffusion/` | Denoising diffusion on exactly solvable mixture-of-Gaussian data: a static strip of 2-D snapshots along the forward chain with q / p_θ arrows; a 1-D forward or reverse process (heat map of exact q(x_t) over t with particle paths, histogram vs exact density at t, linear/cosine schedule, DDPM/DDIM and step count); a 2-D ring or moons sampler with score arrows and x_t → E[x₀ | x_t] lines. Samplers use the exact denoiser (logic in `diffusion.ts`) |
 
 ### Building a new component
 

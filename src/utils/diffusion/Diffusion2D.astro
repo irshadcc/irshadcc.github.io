@@ -1,0 +1,219 @@
+---
+// A 2-D diffusion on small data (eight Gaussians on a ring, or two half moons). The background
+// is the exact density q(x_t). "Forward" noises 800 data points straight to step t with
+// x_t = sqrt(ab_t) x_0 + sqrt(1 - ab_t) eps, keeping each point's eps fixed so points glide as t
+// moves. "Reverse" starts 800 particles at N(0, I) and runs DDPM (eta = 1) or DDIM (eta = 0)
+// with the exact denoiser. Arrows show the score grad log q(x_t), drawn as
+// 0.4 (sqrt(ab_t) E[x_0 | x_t] - x_t) = 0.4 (1 - ab_t) grad log q(x_t). Dashed lines join eight
+// particles to their denoised estimate E[x_0 | x_t]. Logic in diffusion.ts.
+// Usage in .mdx:
+//   <Diffusion2D data="moons" mode="reverse" steps={100} />
+import Player from "../sampling/Player.astro";
+import "../sampling/sampling.css";
+import "./diffusion.css";
+
+interface Props {
+	data?: "ring" | "moons";
+	mode?: "forward" | "reverse";
+	steps?: number;
+	eta?: number;
+	seed?: number;
+	title?: string;
+	caption?: string;
+}
+
+const {
+	data = "ring",
+	mode = "reverse",
+	steps = 100,
+	eta = 1,
+	seed = 5,
+	title,
+	caption,
+} = Astro.props;
+const stepOptions = [1000, 100, 20, 5, 1];
+---
+
+<figure class="smp-fig dif-2d" data-data={data} data-seed={seed}>
+	{title && <div class="smp-title">{title}</div>}
+	<div class="smp-legend">
+		<span><i class="box k-heat"></i>exact q(x_t)</span>
+		<span><i class="dot k-dot-p"></i>particles</span>
+		<span><i class="k-model"></i>score ∇ log q(x_t)</span>
+		<span><i class="k-qd"></i>x_t → E[x₀ | x_t]</span>
+	</div>
+	<svg class="smp-svg dif-square" viewBox="0 0 460 460" role="img" aria-label="Diffusion in two dimensions"></svg>
+	<div class="smp-controls">
+		<Player />
+		<label class="smp-slider">t <input type="range" class="i-t" min="0" step="1" /><strong class="o-t"></strong></label>
+	</div>
+	<div class="smp-controls">
+		<label>process
+			<select class="i-mode">
+				<option value="forward" selected={mode === "forward"}>forward (noising)</option>
+				<option value="reverse" selected={mode === "reverse"}>reverse (sampling)</option>
+			</select>
+		</label>
+		<label>sampler
+			<select class="i-eta">
+				<option value="1" selected={eta === 1}>DDPM (η = 1)</option>
+				<option value="0" selected={eta === 0}>DDIM (η = 0)</option>
+			</select>
+		</label>
+		<label>steps
+			<select class="i-steps">
+				{stepOptions.map((n) => <option value={n} selected={n === steps}>{n}</option>)}
+			</select>
+		</label>
+		<label><input type="checkbox" class="i-score" checked /> score</label>
+		<label><input type="checkbox" class="i-x0" checked /> E[x₀ | x_t]</label>
+	</div>
+	<div class="smp-metrics">
+		<div><span>time step t</span><strong class="m-t"></strong></div>
+		<div><span>ᾱ_t</span><strong class="m-ab"></strong></div>
+		<div><span>noise sd √(1 − ᾱ_t)</span><strong class="m-sd"></strong></div>
+		<div><span>particles on the data (within 3 s of a centre)</span><strong class="m-on"></strong></div>
+	</div>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import {
+		denoise,
+		type Mixture,
+		marginalPdf,
+		moons2d,
+		mulberry32,
+		noiseTo,
+		normalGenerator,
+		pointAt,
+		reverseStates,
+		ring2d,
+		sampleData,
+		schedules,
+	} from "./diffusion";
+	import { axes, bindPlayer, el, fmt } from "../sampling/plot";
+	import { heatImage, resolveColor } from "./diffusionPlot";
+
+	const N = 800;
+	const HL = 8;
+	const R: [number, number] = [-3, 3];
+	const sched = schedules.linear;
+
+	function onData(mix: Mixture, x: number[]) {
+		return mix.some((c) => Math.hypot(x[0] - c.mu[0], x[1] - c.mu[1]) < 3 * c.s);
+	}
+
+	function attach(fig: HTMLElement) {
+		const svg = fig.querySelector("svg")!;
+		const mix = fig.dataset.data === "moons" ? moons2d : ring2d;
+		const seed = Number(fig.dataset.seed);
+		const slider = fig.querySelector<HTMLInputElement>(".i-t")!;
+		const modeSel = fig.querySelector<HTMLSelectElement>(".i-mode")!;
+		const etaSel = fig.querySelector<HTMLSelectElement>(".i-eta")!;
+		const stepsSel = fig.querySelector<HTMLSelectElement>(".i-steps")!;
+		const scoreBox = fig.querySelector<HTMLInputElement>(".i-score")!;
+		const x0Box = fig.querySelector<HTMLInputElement>(".i-x0")!;
+		const accent = resolveColor(fig, "var(--smp-p)");
+		const x0 = sampleData(mix, N, seed);
+		const randn0 = normalGenerator(mulberry32(seed + 1));
+		const eps = x0.map(() => [randn0(), randn0()]);
+		const heats = new Map<number, string>();
+
+		let ts: number[] = [];
+		let states: Float64Array[] = [];
+		const reverse = () => modeSel.value === "reverse";
+
+		function run() {
+			etaSel.disabled = stepsSel.disabled = !reverse();
+			if (!reverse()) {
+				ts = Array.from({ length: sched.T + 1 }, (_, t) => t);
+				states = [];
+			} else {
+				({ ts, states } = reverseStates(mix, sched, Number(stepsSel.value), Number(etaSel.value), N, seed + 2));
+			}
+			slider.max = String(ts.length - 1);
+		}
+
+		function heat(t: number) {
+			// Cache one image per 10 steps; the density changes slowly.
+			const key = Math.round(t / 10) * 10;
+			if (!heats.has(key))
+				heats.set(key, heatImage(90, 90, (c, r) => marginalPdf(mix, sched.alphaBar[key], [R[0] + ((c + 0.5) / 90) * 6, R[1] - ((r + 0.5) / 90) * 6]), accent, false));
+			return heats.get(key)!;
+		}
+
+		let i = 0;
+		function draw() {
+			const t = ts[i];
+			const ab = sched.alphaBar[t];
+			const pts = reverse() ? Array.from({ length: N }, (_, k) => pointAt(states[i], k, 2)) : x0.map((p, k) => noiseTo(p, ab, eps[k]));
+			svg.replaceChildren();
+			const A = axes(svg, { x: 34, y: 10, w: 416, h: 416 }, R, R, { xTicks: 6, yTicks: 6 });
+			el("image", { href: heat(t), x: A.box.x, y: A.box.y, width: A.box.w, height: A.box.h, preserveAspectRatio: "none" }, svg);
+			for (const p of pts) if (Math.abs(p[0]) < R[1] && Math.abs(p[1]) < R[1]) el("circle", { cx: A.sx(p[0]), cy: A.sy(p[1]), r: 1.6, class: "smp-dot", opacity: 0.7 }, svg);
+			if (scoreBox.checked && t > 0) {
+				for (let gx = -2.75; gx <= 2.76; gx += 0.5)
+					for (let gy = -2.75; gy <= 2.76; gy += 0.5) {
+						const d = denoise(mix, ab, [gx, gy]);
+						let vx = 0.4 * (Math.sqrt(ab) * d.x0[0] - gx);
+						let vy = 0.4 * (Math.sqrt(ab) * d.x0[1] - gy);
+						const len = Math.hypot(vx, vy);
+						if (len > 0.45) {
+							vx *= 0.45 / len;
+							vy *= 0.45 / len;
+						}
+						if (len < 0.02) continue;
+						const x1 = A.sx(gx), y1 = A.sy(gy), x2 = A.sx(gx + vx), y2 = A.sy(gy + vy);
+						el("line", { x1, y1, x2, y2, class: "dif-arrow" }, svg);
+						const ang = Math.atan2(y2 - y1, x2 - x1);
+						const hx = (a: number) => (x2 + 4 * Math.cos(ang + a)).toFixed(1);
+						const hy = (a: number) => (y2 + 4 * Math.sin(ang + a)).toFixed(1);
+						el("path", { d: `M${x2.toFixed(1)},${y2.toFixed(1)}L${hx(2.6)},${hy(2.6)}L${hx(-2.6)},${hy(-2.6)}Z`, class: "dif-head" }, svg);
+					}
+			}
+			if (x0Box.checked && t > 0)
+				for (let k = 0; k < HL; k++) {
+					const p = pts[k];
+					const d = denoise(mix, ab, p);
+					el("line", { x1: A.sx(p[0]), y1: A.sy(p[1]), x2: A.sx(d.x0[0]), y2: A.sy(d.x0[1]), class: "dif-x0" }, svg);
+					el("circle", { cx: A.sx(d.x0[0]), cy: A.sy(d.x0[1]), r: 3.2, class: "smp-current" }, svg);
+					el("circle", { cx: A.sx(p[0]), cy: A.sy(p[1]), r: 3.2, class: "dif-hl" }, svg);
+				}
+
+			slider.value = String(i);
+			fig.querySelector(".o-t")!.textContent = reverse() ? `step ${i} of ${ts.length - 1}` : String(t);
+			fig.querySelector(".m-t")!.textContent = String(t);
+			fig.querySelector(".m-ab")!.textContent = ab > 1e-3 ? fmt(ab, 4) : ab.toExponential(2);
+			fig.querySelector(".m-sd")!.textContent = fmt(Math.sqrt(1 - ab), 3);
+			const on = pts.filter((p) => onData(mix, p)).length;
+			fig.querySelector(".m-on")!.textContent = `${fmt((100 * on) / N, 1)}%`;
+		}
+
+		const step = (dir: 1 | -1) => {
+			const per = Math.max(1, Math.round(ts.length / 60));
+			i = Math.max(0, Math.min(ts.length - 1, i + dir * per));
+			draw();
+			return i < ts.length - 1;
+		};
+		bindPlayer(fig, step, () => {
+			i = 0;
+			draw();
+		}, 140);
+		slider.addEventListener("input", () => {
+			i = Number(slider.value);
+			draw();
+		});
+		for (const s of [modeSel, etaSel, stepsSel])
+			s.addEventListener("change", () => {
+				run();
+				i = 0;
+				draw();
+			});
+		for (const b of [scoreBox, x0Box]) b.addEventListener("change", draw);
+		run();
+		draw();
+	}
+
+	document.querySelectorAll<HTMLElement>(".dif-2d").forEach(attach);
+</script>

@@ -1,0 +1,730 @@
+---
+title: "Diffusion Models: The Math, Step by Step"
+description: "How denoising diffusion models work: the forward noising process and its closed form, the reverse process, the evidence lower bound and why it becomes a simple noise-prediction loss, the optimal denoiser and the score, and the DDPM and DDIM samplers, each worked on small examples with interactive figures."
+date: 2026-10-22
+tags: [Machine learning, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import LineChart from "../../utils/charts/LineChart.astro";
+import DiffusionStrip from "../../utils/diffusion/DiffusionStrip.astro";
+import DiffusionTimeline from "../../utils/diffusion/DiffusionTimeline.astro";
+import Diffusion2D from "../../utils/diffusion/Diffusion2D.astro";
+import { schedules } from "../../utils/diffusion/diffusion";
+
+export const lin = schedules.linear.alphaBar;
+export const cos = schedules.cosine.alphaBar;
+
+## Background
+
+Adding noise to a picture is easy: add a random number to every pixel. Do it a thousand times
+and any picture becomes static that looks like every other static. Going the other way is the
+hard part. Given static, which picture did it come from? A **diffusion model** is a neural
+network trained to undo noise one small step at a time. Start it from pure static, let it run
+for a few hundred steps, and a new picture appears.
+
+This one idea is behind most image, video and audio generators released since 2021 (DALL·E 2,
+Imagen, Stable Diffusion, Sora). It matters for two reasons. First, the training loss is
+almost embarrassingly simple: add noise to a training example and ask the network to predict
+the noise, with a mean squared error. Second, sampling is slow, because it takes many network
+calls, and most of the engineering since the first papers has been about cutting that number.
+Both facts fall out of the math, so it pays to see where they come from.
+
+This post builds the model from scratch, in order:
+
+1. **The forward process**: how noise is added, and the closed form that lets us jump to any
+   step.
+2. **The reverse process**: why removing a little noise is a Gaussian step, and what its mean
+   is when the clean data are known.
+3. **The training objective**: the evidence lower bound, and how it simplifies to "predict the
+   noise".
+4. **What the network learns**: the optimal denoiser, worked out exactly for a tiny dataset,
+   and its link to the **score** $\nabla \log q$.
+5. **Sampling**: the DDPM and DDIM samplers, and what happens with fewer steps.
+
+Every figure runs on data small enough to solve exactly: a mixture of a few Gaussians in one
+or two dimensions. For such data the ideal network has a closed form, so the figures use it in
+place of a trained network, and what you see is the algorithm itself rather than the quality
+of a fit.<Sidenote>Every number in this post was computed by a script, from the same
+TypeScript module the figures run (`src/utils/diffusion/diffusion.ts`). The closed forms were
+cross-checked by Monte Carlo in NumPy, and the optimal denoiser against a small network trained
+with PyTorch 2.9.1 (see [A trained network](#a-trained-network-against-the-exact-answer)).</Sidenote>
+The post leans on Langevin sampling from the [sampling post](/blog/sampling-methods/) for one
+connection, but does not need it.
+
+## The forward process
+
+### One noising step
+
+Write $\mathbf{x}_0$ for a data point (an image flattened to a vector, say). The **forward
+process** builds a chain $\mathbf{x}_0 \to \mathbf{x}_1 \to \dots \to \mathbf{x}_T$ by
+repeatedly shrinking the current point a little and adding a little Gaussian noise:
+
+$$
+\mathbf{x}_t = \sqrt{1 - \beta_t}\, \mathbf{x}_{t-1} + \sqrt{\beta_t}\, \boldsymbol{\epsilon}_t,
+\qquad \boldsymbol{\epsilon}_t \sim \mathcal{N}(\mathbf{0}, \mathbf{I}).
+$$
+
+As a distribution, $q(\mathbf{x}_t \mid \mathbf{x}_{t-1}) = \mathcal{N}(\mathbf{x}_t;
+\sqrt{1-\beta_t}\,\mathbf{x}_{t-1}, \beta_t \mathbf{I})$. The numbers $\beta_1, \dots, \beta_T$
+are the **noise schedule**: small variances, fixed in advance. Ho et al.'s DDPM uses $T = 1000$
+steps with $\beta_t$ rising linearly from $10^{-4}$ to $0.02$.<Sidenote>J. Ho, A. Jain and P.
+Abbeel, "Denoising Diffusion Probabilistic Models", NeurIPS 2020,
+[arXiv:2006.11239](https://arxiv.org/abs/2006.11239). The model goes back to Sohl-Dickstein et
+al., 2015, [arXiv:1503.03585](https://arxiv.org/abs/1503.03585).</Sidenote> The forward process
+has no parameters. Nothing in it is learned.
+
+Why shrink by $\sqrt{1-\beta_t}$ rather than just add noise? Because it keeps the variance in
+check. If $\mathbf{x}_{t-1}$ has unit variance, then $\mathbf{x}_t$ has variance
+$(1 - \beta_t) + \beta_t = 1$. Data scaled to unit variance stay at unit variance, and the
+chain heads for $\mathcal{N}(\mathbf{0}, \mathbf{I})$ instead of blowing up. The strip below
+shows the chain on 400 points from a ring of eight small clusters: the forward arrow (orange)
+destroys the structure, and the job of the model is the reverse arrow (purple).
+
+<DiffusionStrip
+	title="The forward chain destroys structure; the reverse chain must rebuild it"
+	caption="The same 400 points of 2-D data (eight Gaussians on a circle) at six time steps of the linear schedule. Each point keeps one noise draw ε across panels. By t = 250 the ring is a blur and by t = 1000 it is indistinguishable from N(0, I). ᾱ is the fraction of the data's variance left, defined in the next section."
+/>
+
+### Jumping to any step
+
+Running 250 steps to get $\mathbf{x}_{250}$ would make training slow. Fortunately we do not
+have to. Define $\alpha_t = 1 - \beta_t$ and the running product
+
+$$
+\bar\alpha_t = \prod_{s=1}^{t} \alpha_s .
+$$
+
+Then
+
+$$
+q(\mathbf{x}_t \mid \mathbf{x}_0) = \mathcal{N}\!\left(\mathbf{x}_t;\ \sqrt{\bar\alpha_t}\,\mathbf{x}_0,\ (1-\bar\alpha_t)\mathbf{I}\right),
+\qquad\text{that is}\qquad
+\mathbf{x}_t = \sqrt{\bar\alpha_t}\,\mathbf{x}_0 + \sqrt{1-\bar\alpha_t}\,\boldsymbol{\epsilon}.
+$$
+
+**Why it holds.** Unroll two steps:
+
+$$
+\begin{aligned}
+\mathbf{x}_t &= \sqrt{\alpha_t}\big(\sqrt{\alpha_{t-1}}\,\mathbf{x}_{t-2} + \sqrt{1-\alpha_{t-1}}\,\boldsymbol{\epsilon}_{t-1}\big) + \sqrt{1-\alpha_t}\,\boldsymbol{\epsilon}_t \\
+&= \sqrt{\alpha_t\alpha_{t-1}}\,\mathbf{x}_{t-2} + \underbrace{\sqrt{\alpha_t(1-\alpha_{t-1})}\,\boldsymbol{\epsilon}_{t-1} + \sqrt{1-\alpha_t}\,\boldsymbol{\epsilon}_t}_{\text{sum of independent Gaussians}} .
+\end{aligned}
+$$
+
+A sum of independent zero-mean Gaussians is a Gaussian whose variance is the sum of the
+variances: $\alpha_t - \alpha_t\alpha_{t-1} + 1 - \alpha_t = 1 - \alpha_t\alpha_{t-1}$. So two
+steps are one step with signal $\sqrt{\alpha_t\alpha_{t-1}}$ and noise variance
+$1 - \alpha_t\alpha_{t-1}$. Repeat down to $\mathbf{x}_0$ and the products become
+$\bar\alpha_t$.
+
+The number $\bar\alpha_t$ is the whole story of the schedule. The point $\mathbf{x}_t$ is a
+blend of $\sqrt{\bar\alpha_t}$ parts signal and $\sqrt{1-\bar\alpha_t}$ parts noise, and the
+**signal-to-noise ratio** is $\mathrm{SNR}(t) = \bar\alpha_t / (1 - \bar\alpha_t)$.
+
+**Worked example.** Take a one-dimensional data point $x_0 = 1$, the linear schedule, and
+$t = 250$. The script gives $\bar\alpha_{250} = 0.5241$, so $\sqrt{\bar\alpha_{250}} = 0.7239$
+and $\sqrt{1 - \bar\alpha_{250}} = 0.6899$. With the noise draw $\epsilon = 0.8$:
+
+$$
+x_{250} = 0.7239 \times 1 + 0.6899 \times 0.8 = 1.2758 .
+$$
+
+About half of the original variance is left ($\bar\alpha = 0.52$, SNR $= 1.10$). Running the
+chain one step at a time from $x_0 = 1$ for 200,000 independent copies gives a mean of
+$0.7253$ and a variance of $0.4784$ at $t = 250$, against the closed form's $0.7239$ and
+$1 - 0.5241 = 0.4759$.
+
+### Noise schedules
+
+The schedule decides how fast information is destroyed. The table lists $\bar\alpha_t$ for
+DDPM's linear schedule and for the **cosine schedule** of Nichol and Dhariwal, which sets
+$\bar\alpha_t = f(t)/f(0)$ with $f(t) = \cos^2\!\big(\tfrac{t/T + s}{1+s}\cdot\tfrac{\pi}{2}\big)$
+and $s = 0.008$.<Sidenote>A. Nichol and P. Dhariwal, "Improved Denoising Diffusion
+Probabilistic Models", ICML 2021, [arXiv:2102.09672](https://arxiv.org/abs/2102.09672),
+eq. 17. The $\beta_t$ it implies are clipped at $0.999$ so the last step stays
+finite.</Sidenote>
+
+| $t$ | $\beta_t$ (linear) | $\bar\alpha_t$ (linear) | SNR (linear) | $\bar\alpha_t$ (cosine) | SNR (cosine) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.000100 | 0.9999 | 9999 | 1.0000 | 24220 |
+| 100 | 0.002072 | 0.8970 | 8.71 | 0.9721 | 34.8 |
+| 250 | 0.005060 | 0.5241 | 1.10 | 0.8470 | 5.54 |
+| 500 | 0.010040 | 0.0786 | 0.0853 | 0.4938 | 0.976 |
+| 750 | 0.015020 | 0.003351 | 0.00336 | 0.1443 | 0.169 |
+| 1000 | 0.020000 | 0.0000404 | 0.0000404 | ≈ 0 | ≈ 0 |
+
+The linear schedule has destroyed almost everything by the middle: $\bar\alpha_t$ falls below
+$0.01$ at $t = 674$, so the last 327 of its 1000 steps operate on nearly pure noise. The cosine
+schedule crosses $0.01$ only at $t = 936$ and spends its steps more evenly, which Nichol and
+Dhariwal found helps on small images.
+
+<LineChart
+	x={() => Array.from({ length: 101 }, (_, i) => i * 10)}
+	series={[
+		{ name: "linear ᾱ_t", fn: (t) => lin[t] },
+		{ name: "cosine ᾱ_t", fn: (t) => cos[t] },
+	]}
+	title="Signal fraction ᾱ_t of the two schedules (T = 1000)"
+	xLabel="time step t"
+	yLabel="ᾱ_t"
+	height={260}
+/>
+
+The figure below runs the forward chain one step at a time on one-dimensional data: a mixture
+$0.4\,\mathcal{N}(-1.2, 0.25^2) + 0.6\,\mathcal{N}(1.0, 0.3^2)$. The top panel is the density
+of $\mathbf{x}_t$ over time with 30 particle paths; the bottom panel is a cut at the chosen
+$t$. Drag the slider: the two bumps drift toward zero (the $\sqrt{\bar\alpha_t}$ shrink),
+widen (the added noise) and merge into the dashed $\mathcal{N}(0, 1)$. Switch to the cosine
+schedule to see the bumps survive much longer.
+
+<DiffusionTimeline
+	mode="forward"
+	title="The forward process on two bumps of 1-D data"
+	caption="2000 particles from the data mixture, noised one step at a time (seed 3). The heat map is the exact density q(x_t), scaled per column. The exact density follows from the closed form: each data component N(μ, s²) becomes N(√ᾱ_t μ, ᾱ_t s² + 1 − ᾱ_t). The metrics compare the particles with the exact mean and sd."
+/>
+
+Because the data are a mixture of Gaussians, the noised density is too: each component
+$\mathcal{N}(\mu_k, s_k^2)$ becomes
+$\mathcal{N}(\sqrt{\bar\alpha_t}\mu_k,\ \bar\alpha_t s_k^2 + 1 - \bar\alpha_t)$. That one fact is what lets every figure in this post be exact.
+
+## The reverse process
+
+### Why removing a little noise is a Gaussian step
+
+To generate data we want to run the chain backwards: draw $\mathbf{x}_T \sim
+\mathcal{N}(\mathbf{0}, \mathbf{I})$, then $\mathbf{x}_{T-1}$, and so on down to
+$\mathbf{x}_0$. That needs the **reverse conditional** $q(\mathbf{x}_{t-1} \mid \mathbf{x}_t)$.
+By Bayes' rule it is
+
+$$
+q(\mathbf{x}_{t-1} \mid \mathbf{x}_t) \propto q(\mathbf{x}_t \mid \mathbf{x}_{t-1})\, q(\mathbf{x}_{t-1}),
+$$
+
+and the marginal $q(\mathbf{x}_{t-1})$ depends on the whole data distribution, so in general
+this is intractable. The key fact that makes diffusion work: **when $\beta_t$ is small, the
+reverse conditional is close to a Gaussian.** The likelihood term
+$q(\mathbf{x}_t \mid \mathbf{x}_{t-1})$ is a narrow Gaussian of width $\sqrt{\beta_t}$ in
+$\mathbf{x}_{t-1}$, and over such a short distance the smooth function $q(\mathbf{x}_{t-1})$
+looks like $\exp$ of a straight line. A Gaussian times $\exp$ of a linear function is a
+Gaussian with a shifted mean.<Sidenote>Precisely: expand $\log q(\mathbf{x}_{t-1})$ to first
+order around $\mathbf{x}_t$. The product is then a Gaussian of variance about $\beta_t$ whose
+mean is moved by about $\beta_t \nabla \log q(\mathbf{x}_t)$, which is where the score enters
+later. The error is of order $\beta_t^2$, so it vanishes as steps get small. Feller (1949)
+proved the continuous-time version; Sohl-Dickstein et al. cite it as the reason the reverse
+process can share the forward process's functional form.</Sidenote>
+
+So the model is a chain of Gaussians running backwards:
+
+$$
+p_\theta(\mathbf{x}_{t-1} \mid \mathbf{x}_t) = \mathcal{N}\!\left(\mathbf{x}_{t-1};\ \boldsymbol{\mu}_\theta(\mathbf{x}_t, t),\ \sigma_t^2 \mathbf{I}\right),
+\qquad p(\mathbf{x}_T) = \mathcal{N}(\mathbf{0}, \mathbf{I}).
+$$
+
+A network computes the mean $\boldsymbol{\mu}_\theta$ from $\mathbf{x}_t$ and $t$. The
+variance $\sigma_t^2$ is fixed; DDPM tried $\sigma_t^2 = \beta_t$ and the
+$\tilde\beta_t$ defined below, and found both work about equally well.
+
+### The reverse step when the clean point is known
+
+The reverse conditional is intractable because it averages over every possible clean
+$\mathbf{x}_0$. If we also condition on $\mathbf{x}_0$, it becomes exact and Gaussian. This
+**forward posterior** $q(\mathbf{x}_{t-1} \mid \mathbf{x}_t, \mathbf{x}_0)$ is the target the
+model will be trained against.
+
+By Bayes' rule and the Markov property,
+
+$$
+q(\mathbf{x}_{t-1} \mid \mathbf{x}_t, \mathbf{x}_0) \propto
+\underbrace{q(\mathbf{x}_t \mid \mathbf{x}_{t-1})}_{\mathcal{N}(\sqrt{\alpha_t}\mathbf{x}_{t-1},\ \beta_t)}\
+\underbrace{q(\mathbf{x}_{t-1} \mid \mathbf{x}_0)}_{\mathcal{N}(\sqrt{\bar\alpha_{t-1}}\mathbf{x}_0,\ 1-\bar\alpha_{t-1})} .
+$$
+
+Both factors are Gaussian in $\mathbf{x}_{t-1}$, so the product is too. Collect the terms of
+the exponent that are quadratic in $\mathbf{x}_{t-1}$ to get the precision, and the linear ones
+to get the mean:
+
+$$
+\frac{1}{\tilde\beta_t} = \frac{\alpha_t}{\beta_t} + \frac{1}{1-\bar\alpha_{t-1}}
+= \frac{\alpha_t(1-\bar\alpha_{t-1}) + \beta_t}{\beta_t(1-\bar\alpha_{t-1})}
+= \frac{1-\bar\alpha_t}{\beta_t(1-\bar\alpha_{t-1})},
+$$
+
+using $\alpha_t - \alpha_t\bar\alpha_{t-1} + 1 - \alpha_t = 1 - \bar\alpha_t$. Then
+
+$$
+\tilde\beta_t = \frac{1-\bar\alpha_{t-1}}{1-\bar\alpha_t}\,\beta_t,
+$$
+
+$$
+\begin{aligned}
+\tilde{\boldsymbol{\mu}}_t(\mathbf{x}_t, \mathbf{x}_0) &= \tilde\beta_t\left(\frac{\sqrt{\alpha_t}}{\beta_t}\mathbf{x}_t + \frac{\sqrt{\bar\alpha_{t-1}}}{1-\bar\alpha_{t-1}}\mathbf{x}_0\right) \\
+&= \frac{\sqrt{\bar\alpha_{t-1}}\,\beta_t}{1-\bar\alpha_t}\,\mathbf{x}_0 + \frac{\sqrt{\alpha_t}\,(1-\bar\alpha_{t-1})}{1-\bar\alpha_t}\,\mathbf{x}_t .
+\end{aligned}
+$$
+
+The mean is a weighted blend of where we are, $\mathbf{x}_t$, and where we came from,
+$\mathbf{x}_0$.<Sidenote>These are eqs. 6–7 of Ho et al.</Sidenote>
+
+**Worked example.** Continue with $x_0 = 1$ and $x_{250} = 1.2758$. The script gives
+$\beta_{250} = 0.005060$, $\bar\alpha_{249} = 0.5268$ and $\bar\alpha_{250} = 0.5241$, so
+
+$$
+\tilde\mu = \underbrace{0.007717}_{\text{weight on } x_0} \times 1 + \underbrace{0.991880}_{\text{weight on } x_t} \times 1.2758 = 1.2732,
+\qquad
+\tilde\beta = 0.005032 .
+$$
+
+One reverse step moves $x_t$ back toward $x_0$ by only $0.0026$, and its variance
+$\tilde\beta = 0.005032$ is just below $\beta = 0.005060$. A Monte Carlo check agrees: of four
+million forward pairs $(x_{249}, x_{250})$ started from $x_0 = 1$, the 6685 with $x_{250}$
+within $0.002$ of $1.2758$ have $x_{249}$ with mean $1.2733$ and variance $0.005040$.
+
+### Writing the mean in terms of the noise
+
+During training we make $\mathbf{x}_t$ from $\mathbf{x}_0$ and a noise draw
+$\boldsymbol{\epsilon}$, so we can swap $\mathbf{x}_0$ for
+$(\mathbf{x}_t - \sqrt{1-\bar\alpha_t}\,\boldsymbol{\epsilon})/\sqrt{\bar\alpha_t}$. After
+simplifying, the posterior mean depends on $\mathbf{x}_t$ and the noise only:
+
+$$
+\tilde{\boldsymbol{\mu}}_t = \frac{1}{\sqrt{\alpha_t}}\left(\mathbf{x}_t - \frac{\beta_t}{\sqrt{1-\bar\alpha_t}}\,\boldsymbol{\epsilon}\right).
+$$
+
+In words: to step back, subtract a small multiple of the noise that is in $\mathbf{x}_t$,
+then undo the shrink. This suggests the parametrisation DDPM uses. The network
+$\boldsymbol{\epsilon}_\theta(\mathbf{x}_t, t)$ predicts the noise, and the mean is built from
+it:
+
+$$
+\boldsymbol{\mu}_\theta(\mathbf{x}_t, t) = \frac{1}{\sqrt{\alpha_t}}\left(\mathbf{x}_t - \frac{\beta_t}{\sqrt{1-\bar\alpha_t}}\,\boldsymbol{\epsilon}_\theta(\mathbf{x}_t, t)\right).
+$$
+
+Check on the example: $(1.2758 - \tfrac{0.005060}{0.6899} \times 0.8)/\sqrt{0.99494} = 1.2732$,
+the same $\tilde\mu$ as before.
+
+## The training objective
+
+### The evidence lower bound
+
+We want parameters $\theta$ that make the data likely under the model, that is, large
+$\log p_\theta(\mathbf{x}_0)$. But $p_\theta(\mathbf{x}_0) = \int p_\theta(\mathbf{x}_{0:T})\,
+d\mathbf{x}_{1:T}$ integrates over every path, which we cannot compute. The standard fix, as in
+a variational autoencoder, is a lower bound. The forward process is a natural choice of
+"encoder" $q(\mathbf{x}_{1:T} \mid \mathbf{x}_0)$, and Jensen's inequality gives the
+**evidence lower bound** (ELBO):
+
+$$
+\log p_\theta(\mathbf{x}_0) \ \ge\ \mathbb{E}_{q}\!\left[\log \frac{p_\theta(\mathbf{x}_{0:T})}{q(\mathbf{x}_{1:T} \mid \mathbf{x}_0)}\right]
+= \mathbb{E}_q\!\left[\log p(\mathbf{x}_T) + \sum_{t=1}^{T} \log \frac{p_\theta(\mathbf{x}_{t-1} \mid \mathbf{x}_t)}{q(\mathbf{x}_t \mid \mathbf{x}_{t-1})}\right].
+$$
+
+As written, every term involves a random $\mathbf{x}_t$ and $\mathbf{x}_{t-1}$, so a Monte Carlo
+estimate is noisy. The trick is to flip each forward factor around with Bayes' rule, conditioned
+on $\mathbf{x}_0$ (allowed because the chain is Markov):
+
+$$
+q(\mathbf{x}_t \mid \mathbf{x}_{t-1}) = q(\mathbf{x}_t \mid \mathbf{x}_{t-1}, \mathbf{x}_0)
+= \frac{q(\mathbf{x}_{t-1} \mid \mathbf{x}_t, \mathbf{x}_0)\, q(\mathbf{x}_t \mid \mathbf{x}_0)}{q(\mathbf{x}_{t-1} \mid \mathbf{x}_0)} .
+$$
+
+Substitute this for $t \ge 2$. The ratios $q(\mathbf{x}_t \mid \mathbf{x}_0) / q(\mathbf{x}_{t-1}
+\mid \mathbf{x}_0)$ telescope to $q(\mathbf{x}_T \mid \mathbf{x}_0) / q(\mathbf{x}_1 \mid
+\mathbf{x}_0)$, and the negative ELBO splits into three kinds of term:
+
+$$
+\begin{aligned}
+L &= \underbrace{D_{\mathrm{KL}}\!\big(q(\mathbf{x}_T \mid \mathbf{x}_0)\,\|\,p(\mathbf{x}_T)\big)}_{L_T:\ \text{prior}}
+\ \underbrace{-\ \mathbb{E}_q \log p_\theta(\mathbf{x}_0 \mid \mathbf{x}_1)}_{L_0:\ \text{reconstruction}} \\
+&\quad + \sum_{t=2}^{T} \underbrace{\mathbb{E}_q\, D_{\mathrm{KL}}\!\big(q(\mathbf{x}_{t-1} \mid \mathbf{x}_t, \mathbf{x}_0)\,\|\,p_\theta(\mathbf{x}_{t-1} \mid \mathbf{x}_t)\big)}_{L_{t-1}:\ \text{denoising}} .
+\end{aligned}
+$$
+
+Each term has a plain meaning.
+
+| Term | What it measures | Depends on $\theta$? | Size here |
+| --- | --- | :---: | ---: |
+| $L_T$ | how far the fully noised data are from $\mathcal{N}(\mathbf{0}, \mathbf{I})$ | no | $2.0\times10^{-5}$ nats for $x_0 = 1$ |
+| $L_{t-1}$ | how well one model step matches the exact posterior step | yes | trained |
+| $L_0$ | how well the last step reconstructs the data | yes | trained (DDPM uses a discrete decoder for 8-bit pixels) |
+
+The prior term is a constant: with $\bar\alpha_T = 4.04\times10^{-5}$, the KL between
+$\mathcal{N}(\sqrt{\bar\alpha_T}x_0, 1-\bar\alpha_T)$ and $\mathcal{N}(0,1)$ is
+$\tfrac12(\bar\alpha_T x_0^2 - \bar\alpha_T - \log(1 - \bar\alpha_T)) = 2.0\times 10^{-5}$ nats
+for $x_0 = 1$. The work is in the denoising terms, and each of them compares two Gaussians,
+the exact step from the previous section and the model's step, which has a closed form.
+
+### From KL divergence to noise prediction
+
+Two Gaussians with the same covariance $\sigma_t^2\mathbf{I}$ (taking the model's variance as
+fixed) have KL divergence $\tfrac{1}{2\sigma_t^2}\|\tilde{\boldsymbol{\mu}} -
+\boldsymbol{\mu}_\theta\|^2$ plus a constant. Both means are written in the noise form of the
+last section, so their difference is just the difference of the two noises:
+
+$$
+\tilde{\boldsymbol{\mu}}_t - \boldsymbol{\mu}_\theta = \frac{\beta_t}{\sqrt{\alpha_t}\sqrt{1-\bar\alpha_t}}\big(\boldsymbol{\epsilon}_\theta(\mathbf{x}_t, t) - \boldsymbol{\epsilon}\big),
+$$
+
+and therefore
+
+$$
+L_{t-1} = \underbrace{\frac{\beta_t^2}{2\sigma_t^2\,\alpha_t\,(1-\bar\alpha_t)}}_{\lambda_t}\ \mathbb{E}_{\mathbf{x}_0, \boldsymbol{\epsilon}}\Big[\big\|\boldsymbol{\epsilon} - \boldsymbol{\epsilon}_\theta\big(\sqrt{\bar\alpha_t}\,\mathbf{x}_0 + \sqrt{1-\bar\alpha_t}\,\boldsymbol{\epsilon},\ t\big)\big\|^2\Big] + C .
+$$
+
+The likelihood bound has turned into a regression: noise a data point, ask the network for
+the noise, and score it with a squared error. This is **denoising score matching** in
+disguise, as we will see shortly.<Sidenote>P. Vincent, "A Connection Between Score Matching
+and Denoising Autoencoders", *Neural Computation* 23(7), 2011, showed that this squared error
+on the noise is, up to scaling, score matching on the noised data.</Sidenote>
+
+### The simple loss
+
+The weights $\lambda_t$ vary a lot. With $\sigma_t^2 = \beta_t$,
+$\lambda_t = \beta_t / (2\alpha_t(1-\bar\alpha_t))$:
+
+| $t$ | 1 | 2 | 10 | 250 | 500 | 1000 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| $\lambda_t$ | 0.500 | 0.273 | 0.0737 | 0.0053 | 0.0055 | 0.0102 |
+
+The bound puts almost all its weight on the first few steps, where the noise is tiny and
+predicting it is hard but matters little for how a sample looks. Ho et al. dropped the weights
+and sampled $t$ uniformly, which gives the **simple loss**:
+
+$$
+L_{\text{simple}}(\theta) = \mathbb{E}_{t \sim \mathcal{U}\{1..T\},\ \mathbf{x}_0,\ \boldsymbol{\epsilon}}\Big[\big\|\boldsymbol{\epsilon} - \boldsymbol{\epsilon}_\theta\big(\sqrt{\bar\alpha_t}\,\mathbf{x}_0 + \sqrt{1-\bar\alpha_t}\,\boldsymbol{\epsilon},\ t\big)\big\|^2\Big].
+$$
+
+It is no longer a bound on the likelihood, but it gave better samples (DDPM's best FID on
+CIFAR-10 used it). Relative to the bound it down-weights the small-$t$ terms and spends the
+network's effort on the noisier steps that shape the image.<Sidenote>Ho et al., eq. 14 and
+Table 2. Nichol and Dhariwal later learned $\sigma_t^2$ with a hybrid of $L_{\text{simple}}$
+and a small weight on the true bound, which improves likelihood without hurting
+samples.</Sidenote>
+
+### Training and sampling in code
+
+The whole method fits in a few lines. Training picks a random step, noises a batch in one
+jump with the closed form, and regresses the noise:
+
+```python
+def train_step(model, x0, alpha_bar, opt):
+    t = torch.randint(1, T + 1, (x0.shape[0],))          # one random step per example
+    eps = torch.randn_like(x0)
+    a = alpha_bar[t].view(-1, *[1] * (x0.dim() - 1))
+    xt = a.sqrt() * x0 + (1 - a).sqrt() * eps            # jump straight to step t
+    loss = ((model(xt, t) - eps) ** 2).mean()            # L_simple
+    opt.zero_grad(); loss.backward(); opt.step()
+```
+
+Sampling (DDPM's ancestral sampler) runs the learned reverse chain from noise, one network call
+per step:
+
+```python
+@torch.no_grad()
+def sample(model, shape, beta, alpha_bar):
+    x = torch.randn(shape)                                # x_T ~ N(0, I)
+    for t in range(T, 0, -1):
+        eps = model(x, torch.full((shape[0],), t))
+        mean = (x - beta[t] / (1 - alpha_bar[t]).sqrt() * eps) / (1 - beta[t]).sqrt()
+        z = torch.randn(shape) if t > 1 else 0            # no noise on the last step
+        x = mean + beta[t].sqrt() * z                     # sigma_t^2 = beta_t
+    return x
+```
+
+Training is cheap per step (one network call, any $t$), while sampling needs $T$ calls in
+sequence. That asymmetry is the main practical weakness of diffusion models.
+
+## What the network learns
+
+### The optimal denoiser
+
+A squared-error regression has a well-known minimiser: the conditional mean. For every
+$\mathbf{x}_t$ and $t$, the best possible network outputs
+
+$$
+\boldsymbol{\epsilon}^\star(\mathbf{x}_t, t) = \mathbb{E}[\boldsymbol{\epsilon} \mid \mathbf{x}_t],
+\qquad\text{equivalently}\qquad
+\hat{\mathbf{x}}_0(\mathbf{x}_t, t) = \mathbb{E}[\mathbf{x}_0 \mid \mathbf{x}_t] = \frac{\mathbf{x}_t - \sqrt{1-\bar\alpha_t}\,\boldsymbol{\epsilon}^\star}{\sqrt{\bar\alpha_t}} .
+$$
+
+Two consequences follow. First, predicting noise and predicting the clean point are the same
+task: either output gives the other. We call $\hat{\mathbf{x}}_0$ the **denoised estimate**.
+Second, the loss cannot reach zero. A given $\mathbf{x}_t$ could have come from many
+$\mathbf{x}_0$, and the best network can only predict their average. The leftover loss is
+$\mathbb{E}\,\mathrm{Var}(\boldsymbol{\epsilon} \mid \mathbf{x}_t)$; for the 1-D bump data,
+averaged over $t$, it is about $0.226$.
+
+### Worked example: two points
+
+Let the data be two equally likely points, $x_0 = +1$ or $x_0 = -1$. Given $x_t$, the
+posterior probability of each is proportional to its likelihood
+$\mathcal{N}(x_t; \pm\sqrt{\bar\alpha_t}, 1-\bar\alpha_t)$. The ratio is
+$\exp\!\big(2\sqrt{\bar\alpha_t}\,x_t/(1-\bar\alpha_t)\big)$, and the posterior mean
+$P(+1) - P(-1)$ is a hyperbolic tangent:
+
+$$
+\hat x_0(x_t, t) = \tanh\!\left(\frac{\sqrt{\bar\alpha_t}\, x_t}{1-\bar\alpha_t}\right).
+$$
+
+Check one value: at $t = 250$ and $x_t = 0.3$, the argument is
+$0.7239 \times 0.3 / 0.4759 = 0.4563$ and $\tanh(0.4563) = 0.4271$. The posterior gives
+$P(+1) = 0.7136$ and $P(-1) = 0.2864$, whose difference is the same $0.4271$. The optimal noise
+prediction is $(0.3 - 0.7239 \times 0.4271)/0.6899 = -0.0133$: almost all of $x_t$ is
+explained as signal.
+
+<LineChart
+	x={() => Array.from({ length: 121 }, (_, i) => -3 + i * 0.05)}
+	series={[100, 250, 500, 750].map((t) => ({
+		name: `t = ${t} (ᾱ = ${lin[t].toFixed(4)})`,
+		fn: (x) => Math.tanh((Math.sqrt(lin[t]) * x) / (1 - lin[t])),
+	}))}
+	title="Optimal denoiser E[x₀ | x_t] for data at ±1 (linear schedule)"
+	xLabel="noisy input x_t"
+	yLabel="E[x₀ | x_t]"
+	height={280}
+/>
+
+The four curves tell the whole story of sampling. At $t = 100$ the curve is nearly a step: any
+$x_t$ not close to zero is confidently assigned to one point ($\hat x_0 = 0.992$ at
+$x_t = 0.3$). At $t = 750$ it is nearly flat at the data mean $0$ ($\hat x_0 = 0.017$ at
+$x_t = 0.3$): the input says almost nothing about the data. A sampler walks from the flat
+curve to the steep one, committing to a point gradually.
+
+### The score
+
+There is a second way to read the optimal network. The **score** of a distribution is the
+gradient of its log density, $\nabla_{\mathbf{x}} \log q(\mathbf{x})$: a vector field that
+points toward higher density. Differentiate
+$q(\mathbf{x}_t) = \int q(\mathbf{x}_t \mid \mathbf{x}_0)\, q(\mathbf{x}_0)\, d\mathbf{x}_0$
+and divide by $q(\mathbf{x}_t)$:
+
+$$
+\nabla \log q(\mathbf{x}_t)
+= \mathbb{E}\big[\nabla_{\mathbf{x}_t} \log q(\mathbf{x}_t \mid \mathbf{x}_0) \,\big|\, \mathbf{x}_t\big]
+= \mathbb{E}\!\left[-\frac{\mathbf{x}_t - \sqrt{\bar\alpha_t}\,\mathbf{x}_0}{1-\bar\alpha_t} \,\middle|\, \mathbf{x}_t\right]
+= -\frac{\boldsymbol{\epsilon}^\star(\mathbf{x}_t, t)}{\sqrt{1-\bar\alpha_t}} .
+$$
+
+So the optimal noise prediction is the score of the noised data, scaled by
+$-\sqrt{1-\bar\alpha_t}$. Rearranged, this is **Tweedie's formula**: $\mathbb{E}[\mathbf{x}_0
+\mid \mathbf{x}_t] = \big(\mathbf{x}_t + (1-\bar\alpha_t)\nabla \log
+q(\mathbf{x}_t)\big)/\sqrt{\bar\alpha_t}$.<Sidenote>B. Efron, "Tweedie's Formula and Selection
+Bias", *JASA* 106(496), 2011. Song et al. ("Score-Based Generative Modeling through Stochastic
+Differential Equations", ICLR 2021, [arXiv:2011.13456](https://arxiv.org/abs/2011.13456)) made
+the link the basis of a continuous-time view: DDPM is a discretised stochastic differential
+equation, and sampling solves its time reversal.</Sidenote> In the two-point example at
+$t = 250$, $x_t = 0.3$, the score is $0.0133/0.6899 = 0.0193$.
+
+This explains the reverse step. Plug $\boldsymbol{\epsilon}^\star = -\sqrt{1-\bar\alpha_t}\,
+\nabla\log q$ into the DDPM mean: $\boldsymbol{\mu} = (\mathbf{x}_t + \beta_t \nabla \log
+q(\mathbf{x}_t))/\sqrt{\alpha_t}$. Each step climbs the score by $\beta_t$, undoes the shrink
+and adds noise of variance $\beta_t$: it is a step of Langevin dynamics, the sampler of the
+[sampling post](/blog/sampling-methods/), on a target that changes slowly from
+$\mathcal{N}(\mathbf{0}, \mathbf{I})$ to the data.
+
+### A trained network against the exact answer
+
+Does a real network learn this? A small multilayer perceptron (input $(x_t, t/T)$, three hidden
+layers of 128 SiLU units) was trained on the 1-D bump data with $L_{\text{simple}}$: 20,000 Adam
+steps with batch 512 and a cosine-decayed learning rate from $10^{-3}$. Its final loss is
+$0.2257$, against $0.2266$ for the exact denoiser (both Monte Carlo estimates, so the gap is
+noise). Converting its noise output to $\hat x_0$:
+
+| $t$ | $x_t$ | network $\hat x_0$ | exact $\hat x_0$ |
+| ---: | ---: | ---: | ---: |
+| 50 | −1.0 | −1.060 | −1.075 |
+| 50 | 0.0 | 0.161 | 0.236 |
+| 50 | 1.0 | 1.010 | 1.011 |
+| 250 | −1.0 | −1.038 | −1.050 |
+| 250 | 0.0 | 0.218 | 0.205 |
+| 250 | 1.0 | 0.984 | 0.987 |
+| 500 | −1.0 | −0.246 | −0.254 |
+| 500 | 0.0 | 0.126 | 0.127 |
+| 500 | 1.0 | 0.486 | 0.467 |
+
+The network matches the exact denoiser to about $0.02$ everywhere except at $t = 50$,
+$x_t = 0$. That point lies between the two bumps at low noise, a place training examples
+almost never land, so the network has little data there. This is a general pattern: a
+diffusion model is accurate where the noised data are dense and guesses elsewhere.
+
+## Sampling
+
+### Ancestral sampling (DDPM)
+
+With a denoiser in hand, sampling is the loop from the training section: start at
+$\mathcal{N}(\mathbf{0}, \mathbf{I})$ and take $T$ Gaussian steps with mean
+$\boldsymbol{\mu}_\theta$. The figure runs it on the bump data with the exact denoiser. Press
+play and watch the particles start as one blob on the right, then split into two groups in
+the middle steps, which is where the denoiser curve turns from flat to steep.
+
+<DiffusionTimeline
+	mode="reverse"
+	title="Reverse process: sampling the 1-D bump data"
+	caption="2000 particles started at N(0, 1) (seed 3) and moved with the exact denoiser; the DDPM option uses the variance σ_t² = β̃_t (DDIM's η = 1, introduced below). Time runs from right (t = 1000) to left (t = 0). The histogram at each step should match the exact q(x_t), the same density the forward process produced. Change the sampler and the number of steps to see when that fails."
+/>
+
+At the end, the 2000 samples have mean $0.124$, standard deviation $1.106$, and $60.3\%$ of
+them land on the right bump; the data have $0.120$, $1.114$ and $60\%$.
+
+### DDIM: the same network, fewer steps
+
+A thousand network calls per sample is expensive. Song, Meng and Ermon noticed that the
+training loss only ever uses the marginals $q(\mathbf{x}_t \mid \mathbf{x}_0)$, never the
+step-by-step chain. Many different chains have those same marginals, and some of them allow
+large jumps. Their **DDIM** update goes from step $t$ to any earlier step $s < t$:
+
+$$
+\mathbf{x}_{s} = \sqrt{\bar\alpha_{s}}\ \hat{\mathbf{x}}_0
++ \sqrt{1 - \bar\alpha_{s} - \sigma^2}\ \hat{\boldsymbol{\epsilon}}
++ \sigma\, \mathbf{z},
+\qquad
+\sigma = \eta\,\sqrt{\frac{1-\bar\alpha_{s}}{1-\bar\alpha_t}}\sqrt{1-\frac{\bar\alpha_t}{\bar\alpha_{s}}},
+$$
+
+where $\hat{\boldsymbol{\epsilon}} = \boldsymbol{\epsilon}_\theta(\mathbf{x}_t, t)$ and
+$\hat{\mathbf{x}}_0$ is the denoised estimate built from it.<Sidenote>J. Song, C. Meng and S.
+Ermon, "Denoising Diffusion Implicit Models", ICLR 2021,
+[arXiv:2010.02502](https://arxiv.org/abs/2010.02502), eqs. 12 and 16.</Sidenote> Read it as:
+predict the clean point, then re-noise it to level $s$, reusing the predicted noise direction
+for most of the noise and fresh noise $\mathbf{z}$ for the rest.
+
+- **$\eta = 1$** with $s = t - 1$ gives $\sigma^2 = \tilde\beta_t$ and exactly the DDPM step with
+  variance $\tilde\beta_t$ (the script checks the means agree to $10^{-14}$ at $t = 2$, $250$
+  and $999$).
+- **$\eta = 0$** removes the fresh noise. Sampling becomes a deterministic map from
+  $\mathbf{x}_T$ to $\mathbf{x}_0$, a discretisation of an ordinary differential equation (the
+  **probability-flow ODE** of Song et al.). The same starting noise always gives the same
+  sample.
+
+Both work with a network trained on $L_{\text{simple}}$; only the sampler changes. The 2-D
+figure shows them on two half moons. The purple arrows are the score field at the current
+step; the dashed lines join eight particles to their denoised estimate
+$\mathbb{E}[\mathbf{x}_0 \mid \mathbf{x}_t]$. Early on every estimate sits near the centre (the
+data mean); as $t$ falls they spread to the moons and the particles follow.
+
+<Diffusion2D
+	data="moons"
+	mode="reverse"
+	steps={100}
+	title="Sampling two half moons with the exact score"
+	caption="800 particles from N(0, I) (seed 7), 100 sampling steps by default. Arrows: 0.4 (√ᾱ_t E[x₀ | x_t] − x_t) = 0.4 (1 − ᾱ_t) ∇ log q(x_t), capped in length. Switch to forward to see the data noised with the closed form, or cut the steps to 5 or 1 to see the sampler fail."
+/>
+
+### How many steps?
+
+Cutting the steps makes each jump large, and large jumps break the assumption the reverse step
+rests on. Each step replaces "all clean points that could have produced $\mathbf{x}_t$" by
+their average $\hat{\mathbf{x}}_0$, plus Gaussian noise. That is accurate for small steps.
+Over a large jump the true distribution of $\mathbf{x}_s$ given $\mathbf{x}_t$ is spread over
+several modes, but the sampler puts one Gaussian around a blend of them. Samples land between
+the modes and the spread shrinks. In the extreme of a single step from $t = 1000$, every sample
+is $\hat{\mathbf{x}}_0(\mathbf{x}_T)$, which is about the data mean: the blurry average.
+
+The table gives the final samples of the two figures for several step counts.
+
+| Steps | DDPM sd (1-D) | DDIM sd (1-D) | DDPM on the moons | DDIM on the moons |
+| ---: | ---: | ---: | ---: | ---: |
+| 1000 | 1.106 | 1.120 | 99.3% | 99.5% |
+| 100 | 1.099 | 1.111 | 99.6% | 99.4% |
+| 20 | 1.045 | 1.072 | 93.3% | 93.5% |
+| 5 | 0.757 | 0.802 | 35.8% | 37.0% |
+| 1 | 0.008 | 0.008 | 0.0% | 0.0% |
+| data | 1.114 | 1.114 | 99.1% | 99.1% |
+
+"On the moons" is the fraction of 800 samples within three standard deviations of a mixture
+centre; 1-D runs use 2000 samples. At 100 steps both samplers are as good as at 1000, a
+tenfold saving. At 20 steps the moons are still recognisable; at 5 they are not.
+
+DDIM is only slightly better than DDPM here, because the figures use the exact denoiser. With
+a trained network, the deterministic sampler is reported to hold quality far better at 10 to
+50 steps (DDIM's Table 1 on CIFAR-10 and CelebA), and later ODE solvers and distillation push
+the count lower still.
+
+## Practical considerations
+
+**What the network predicts.** Predicting $\boldsymbol{\epsilon}$, $\mathbf{x}_0$ or the
+**velocity** $\mathbf{v} = \sqrt{\bar\alpha_t}\,\boldsymbol{\epsilon} - \sqrt{1-\bar\alpha_t}\,
+\mathbf{x}_0$ are interchangeable at the optimum, since each converts to the others given
+$\mathbf{x}_t$. They differ in how errors scale: an $\boldsymbol{\epsilon}$ error is amplified
+by $\sqrt{1-\bar\alpha_t}/\sqrt{\bar\alpha_t}$ when turned into $\hat{\mathbf{x}}_0$, which is
+huge at high noise. The $\mathbf{v}$ target, from progressive distillation, stays well behaved
+at both ends.<Sidenote>T. Salimans and J. Ho, "Progressive Distillation for Fast Sampling of
+Diffusion Models", ICLR 2022, [arXiv:2202.00512](https://arxiv.org/abs/2202.00512).</Sidenote>
+
+**The network.** DDPM uses a U-Net that takes $\mathbf{x}_t$ and a sinusoidal embedding of $t$,
+and outputs a tensor of the same shape. Diffusion transformers (DiT) replace it with a
+transformer over image patches.<Sidenote>W. Peebles and S. Xie, "Scalable Diffusion Models with
+Transformers", ICCV 2023, [arXiv:2212.09748](https://arxiv.org/abs/2212.09748).</Sidenote> One
+network serves every $t$, which is why the time input matters: it tells the network which of
+the curves in the two-point figure to be.
+
+**Conditioning and guidance.** To generate from a prompt $c$, give $c$ to the network as an
+extra input. **Classifier-free guidance** trains one network both with $c$ and with $c$
+dropped (an empty prompt), then samples with an extrapolated noise prediction
+$\tilde{\boldsymbol{\epsilon}} = (1+w)\,\boldsymbol{\epsilon}_\theta(\mathbf{x}_t, t, c) -
+w\,\boldsymbol{\epsilon}_\theta(\mathbf{x}_t, t)$. Because the noise prediction is a scaled
+score, this sharpens the distribution toward samples that fit $c$, at the cost of
+diversity.<Sidenote>J. Ho and T. Salimans, "Classifier-Free Diffusion Guidance", 2022,
+[arXiv:2207.12598](https://arxiv.org/abs/2207.12598). With $w$ the guidance weight, the
+implied score is that of $q(\mathbf{x}_t \mid c)^{1+w} / q(\mathbf{x}_t)^{w}$.</Sidenote>
+
+**Latent diffusion.** Running diffusion on a 512×512×3 image is costly. Latent diffusion first
+compresses images with an autoencoder (Stable Diffusion v1 maps 512×512 images to 64×64×4
+latents), runs the diffusion model in that latent space and decodes at the
+end.<Sidenote>R. Rombach et al., "High-Resolution Image Synthesis with Latent Diffusion Models",
+CVPR 2022, [arXiv:2112.10752](https://arxiv.org/abs/2112.10752).</Sidenote>
+
+**Memorisation.** The optimal denoiser for a finite training set treats that set as the data
+distribution, so sampling with it would only reproduce training examples. Real networks
+generalise because they cannot represent that exact function; with enough data, two networks
+trained on disjoint halves of a dataset produce nearly the same samples.<Sidenote>Z. Kadkhodaie
+et al., "Generalization in Diffusion Models Arises from Geometry-Adaptive Harmonic
+Representations", ICLR 2024, [arXiv:2310.02557](https://arxiv.org/abs/2310.02557). This
+post's figures avoid the issue by using smooth mixtures, not a finite set of points.</Sidenote>
+
+## Summary
+
+- The forward process adds Gaussian noise in $T$ small steps, and has a closed form:
+  $\mathbf{x}_t = \sqrt{\bar\alpha_t}\,\mathbf{x}_0 + \sqrt{1-\bar\alpha_t}\,\boldsymbol{\epsilon}$.
+  The schedule $\bar\alpha_t$ decides how fast the signal disappears.
+- For small steps the reverse step is Gaussian too. Conditioned on $\mathbf{x}_0$ it is exact,
+  with a mean that blends $\mathbf{x}_t$ and $\mathbf{x}_0$, and that can be written using the
+  noise alone.
+- The evidence lower bound becomes a sum of Gaussian KL divergences, each a squared error on
+  the noise. Dropping the weights gives $L_{\text{simple}}$: noise a sample, predict the noise.
+- The best network predicts $\mathbb{E}[\boldsymbol{\epsilon} \mid \mathbf{x}_t]$, which is the
+  denoised estimate $\mathbb{E}[\mathbf{x}_0 \mid \mathbf{x}_t]$ and, scaled, the score
+  $\nabla \log q(\mathbf{x}_t)$. Sampling climbs that score while the noise level falls.
+- DDPM samples with fresh noise every step; DDIM reuses the same network with large or
+  deterministic jumps. Around 100 steps loses nothing on the toy data; a handful of steps
+  collapses samples toward the mean.
+
+## References
+
+1. J. Sohl-Dickstein, E. Weiss, N. Maheswaranathan and S. Ganguli, "Deep Unsupervised Learning
+   using Nonequilibrium Thermodynamics", ICML 2015,
+   [arXiv:1503.03585](https://arxiv.org/abs/1503.03585).
+2. J. Ho, A. Jain and P. Abbeel, "Denoising Diffusion Probabilistic Models", NeurIPS 2020,
+   [arXiv:2006.11239](https://arxiv.org/abs/2006.11239).
+3. J. Song, C. Meng and S. Ermon, "Denoising Diffusion Implicit Models", ICLR 2021,
+   [arXiv:2010.02502](https://arxiv.org/abs/2010.02502).
+4. A. Nichol and P. Dhariwal, "Improved Denoising Diffusion Probabilistic Models", ICML 2021,
+   [arXiv:2102.09672](https://arxiv.org/abs/2102.09672).
+5. Y. Song, J. Sohl-Dickstein, D. P. Kingma, A. Kumar, S. Ermon and B. Poole, "Score-Based
+   Generative Modeling through Stochastic Differential Equations", ICLR 2021,
+   [arXiv:2011.13456](https://arxiv.org/abs/2011.13456).
+6. P. Vincent, "A Connection Between Score Matching and Denoising Autoencoders", *Neural
+   Computation* 23(7), 2011.
+7. B. Efron, "Tweedie's Formula and Selection Bias", *Journal of the American Statistical
+   Association* 106(496), 2011.
+8. J. Ho and T. Salimans, "Classifier-Free Diffusion Guidance", 2022,
+   [arXiv:2207.12598](https://arxiv.org/abs/2207.12598).
+9. T. Salimans and J. Ho, "Progressive Distillation for Fast Sampling of Diffusion Models",
+   ICLR 2022, [arXiv:2202.00512](https://arxiv.org/abs/2202.00512).
+10. R. Rombach, A. Blattmann, D. Lorenz, P. Esser and B. Ommer, "High-Resolution Image Synthesis
+    with Latent Diffusion Models", CVPR 2022, [arXiv:2112.10752](https://arxiv.org/abs/2112.10752).
+11. W. Peebles and S. Xie, "Scalable Diffusion Models with Transformers", ICCV 2023,
+    [arXiv:2212.09748](https://arxiv.org/abs/2212.09748).
+12. Z. Kadkhodaie, F. Guth, E. P. Simoncelli and S. Mallat, "Generalization in Diffusion Models
+    Arises from Geometry-Adaptive Harmonic Representations", ICLR 2024,
+    [arXiv:2310.02557](https://arxiv.org/abs/2310.02557).

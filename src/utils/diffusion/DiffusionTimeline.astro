@@ -1,0 +1,215 @@
+---
+// A 1-D diffusion over time. Top: the exact density q(x_t) of the noised data as a heat map
+// (time t on the horizontal axis, x on the vertical; each column scaled to its own maximum) with
+// the paths of 30 particles. Bottom: at the selected t, a histogram of 2000 particles against the
+// exact q(x_t) and the N(0, 1) prior. mode="forward" runs the forward chain one step at a time
+// (x_t = sqrt(1 - beta_t) x_{t-1} + sqrt(beta_t) eps) from data; mode="reverse" starts from
+// N(0, 1) and runs DDPM (eta = 1) or DDIM (eta = 0) with the exact denoiser E[x_0 | x_t] in
+// place of a network, over 1000, 100, 20, 5 or 1 steps. Logic in diffusion.ts.
+// Usage in .mdx:
+//   <DiffusionTimeline mode="forward" />
+//   <DiffusionTimeline mode="reverse" steps={20} />
+import Player from "../sampling/Player.astro";
+import "../sampling/sampling.css";
+import "./diffusion.css";
+
+interface Props {
+	mode?: "forward" | "reverse";
+	schedule?: "linear" | "cosine";
+	/** Reverse mode: initial number of sampling steps (1000, 100, 20, 5 or 1). */
+	steps?: number;
+	/** Reverse mode: 1 for DDPM, 0 for DDIM. */
+	eta?: number;
+	seed?: number;
+	title?: string;
+	caption?: string;
+}
+
+const {
+	mode = "forward",
+	schedule = "linear",
+	steps = 1000,
+	eta = 1,
+	seed = 3,
+	title,
+	caption,
+} = Astro.props;
+const stepOptions = [1000, 100, 20, 5, 1];
+---
+
+<figure class="smp-fig dif-timeline" data-mode={mode} data-seed={seed}>
+	{title && <div class="smp-title">{title}</div>}
+	<div class="smp-legend">
+		<span><i class="box k-heat"></i>q(x_t) over time (heat map)</span>
+		<span><i class="k-text"></i>particle paths</span>
+		<span><i class="box k-hist"></i>particles at t</span>
+		<span><i class="k-q"></i>exact q(x_t)</span>
+		<span><i class="k-qd dif-k-prior"></i>N(0, 1)</span>
+	</div>
+	<svg class="smp-svg" viewBox="0 0 640 420" role="img" aria-label={`Diffusion ${mode} process in one dimension`}></svg>
+	<div class="smp-controls">
+		<Player />
+		<label class="smp-slider">t <input type="range" class="i-t" min="0" step="1" /><strong class="o-t"></strong></label>
+		<label>schedule
+			<select class="i-sched">
+				<option value="linear" selected={schedule === "linear"}>linear</option>
+				<option value="cosine" selected={schedule === "cosine"}>cosine</option>
+			</select>
+		</label>
+		{
+			mode === "reverse" && (
+				<>
+					<label>sampler
+						<select class="i-eta">
+							<option value="1" selected={eta === 1}>DDPM (η = 1)</option>
+							<option value="0" selected={eta === 0}>DDIM (η = 0)</option>
+						</select>
+					</label>
+					<label>steps
+						<select class="i-steps">
+							{stepOptions.map((n) => <option value={n} selected={n === steps}>{n}</option>)}
+						</select>
+					</label>
+				</>
+			)
+		}
+	</div>
+	<div class="smp-metrics">
+		<div><span>ᾱ_t (signal variance kept)</span><strong class="m-ab"></strong></div>
+		<div><span>SNR = ᾱ_t / (1 − ᾱ_t)</span><strong class="m-snr"></strong></div>
+		<div><span>particle mean, sd</span><strong class="m-emp"></strong></div>
+		<div><span>exact mean, sd of q(x_t)</span><strong class="m-exact"></strong></div>
+	</div>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import {
+		bimodal1d,
+		forwardStates,
+		marginalPdf,
+		mixtureMoments1d,
+		moments,
+		reverseStates,
+		type ScheduleName,
+		schedules,
+		snr,
+	} from "./diffusion";
+	import { axes, bars, bindPlayer, el, fmt, histogram } from "../sampling/plot";
+	import { heatImage, resolveColor } from "./diffusionPlot";
+
+	const N = 2000;
+	const SHOWN = 30;
+	const X: [number, number] = [-3.2, 3.2];
+	const mix = bimodal1d;
+
+	function attach(fig: HTMLElement) {
+		const svg = fig.querySelector("svg")!;
+		const reverse = fig.dataset.mode === "reverse";
+		const seed = Number(fig.dataset.seed);
+		const slider = fig.querySelector<HTMLInputElement>(".i-t")!;
+		const schedSel = fig.querySelector<HTMLSelectElement>(".i-sched")!;
+		const etaSel = fig.querySelector<HTMLSelectElement>(".i-eta");
+		const stepsSel = fig.querySelector<HTMLSelectElement>(".i-steps");
+		const accent = resolveColor(fig, "var(--smp-p)");
+
+		// states[i] holds every particle at time ts[i]; forward: ts = 0..T, reverse: T..0.
+		let ts: number[] = [];
+		let states: Float64Array[] = [];
+		let heat = "";
+
+		function run() {
+			const sched = schedules[schedSel.value as ScheduleName];
+			if (!reverse) {
+				ts = Array.from({ length: sched.T + 1 }, (_, t) => t);
+				states = forwardStates(mix, sched, N, seed);
+			} else {
+				({ ts, states } = reverseStates(mix, sched, Number(stepsSel!.value), Number(etaSel!.value), N, seed));
+			}
+			heat = heatImage(200, 128, (c, r) => {
+				const t = Math.round((c / 199) * sched.T);
+				const x = X[1] - ((r + 0.5) / 128) * (X[1] - X[0]);
+				return marginalPdf(mix, sched.alphaBar[t], [x]);
+			}, accent);
+			slider.max = String(ts.length - 1);
+		}
+
+		let i = 0;
+		function draw() {
+			const sched = schedules[schedSel.value as ScheduleName];
+			const t = ts[i];
+			const ab = sched.alphaBar[t];
+			svg.replaceChildren();
+			const top = axes(svg, { x: 52, y: 10, w: 568, h: 170 }, [0, sched.T], X, { xLabel: "time step t", yLabel: "x_t", yTicks: 4 });
+			el("image", { href: heat, x: top.box.x, y: top.box.y, width: top.box.w, height: top.box.h, preserveAspectRatio: "none" }, svg);
+			// Paths: forward ones up to t, reverse ones from T down to t.
+			const lo = reverse ? i : 0;
+			const hi = reverse ? ts.length - 1 : i;
+			const stride = Math.max(1, Math.ceil(ts.length / 250));
+			for (let p = 0; p < SHOWN; p++) {
+				let d = "";
+				const idx: number[] = [];
+				for (let k = 0; k <= hi; k += stride) if (k >= lo) idx.push(k);
+				if (idx[0] !== lo) idx.unshift(lo);
+				if (idx[idx.length - 1] !== hi) idx.push(hi);
+				for (const k of idx) {
+					const y = Math.max(X[0], Math.min(X[1], states[k][p]));
+					d += `${d ? "L" : "M"}${top.sx(ts[k]).toFixed(1)},${top.sy(y).toFixed(1)}`;
+				}
+				el("path", { d, class: "dif-path" }, svg);
+			}
+			el("line", { x1: top.sx(t), x2: top.sx(t), y1: top.box.y, y2: top.box.y + top.box.h, class: "smp-guide" }, svg);
+			el("text", { x: top.box.x + 6, y: top.box.y + 14, class: "smp-text" }, svg, reverse ? "noise → data (right to left)" : "data → noise (left to right)");
+
+			const xs = Array.from(states[i]);
+			const B = axes(svg, { x: 52, y: 220, w: 568, h: 160 }, X, [0, 1.1], { xLabel: "x", yLabel: "density", yTicks: 3 });
+			bars(svg, B, histogram(xs, X[0], X[1], 64), X[0], X[1], "smp-hist");
+			const path = (f: (x: number) => number) => {
+				let d = "";
+				for (let k = 0; k <= 400; k++) {
+					const x = X[0] + ((X[1] - X[0]) * k) / 400;
+					d += `${k ? "L" : "M"}${B.sx(x).toFixed(1)},${Math.max(B.box.y, B.sy(f(x))).toFixed(1)}`;
+				}
+				return d;
+			};
+			el("path", { d: path((x) => Math.exp(-0.5 * x * x) / Math.sqrt(2 * Math.PI)), class: "smp-q-dash dif-prior" }, svg);
+			el("path", { d: path((x) => marginalPdf(mix, ab, [x])), class: "smp-q" }, svg);
+
+			slider.value = String(i);
+			fig.querySelector(".o-t")!.textContent = reverse ? `${t} (step ${i} of ${ts.length - 1})` : String(t);
+			fig.querySelector(".m-ab")!.textContent = ab > 1e-3 ? fmt(ab, 4) : ab.toExponential(2);
+			const r = snr(ab);
+			fig.querySelector(".m-snr")!.textContent = t === 0 ? "∞" : r >= 0.01 ? fmt(r, 2) : r.toExponential(2);
+			const m = moments(xs);
+			const e = mixtureMoments1d(mix, ab);
+			fig.querySelector(".m-emp")!.textContent = `${fmt(m.mean, 2)}, ${fmt(m.sd, 2)}`;
+			fig.querySelector(".m-exact")!.textContent = `${fmt(e.mean, 2)}, ${fmt(e.sd, 2)}`;
+		}
+
+		const step = (dir: 1 | -1) => {
+			const per = Math.max(1, Math.round(ts.length / 100));
+			i = Math.max(0, Math.min(ts.length - 1, i + dir * per));
+			draw();
+			return i < ts.length - 1;
+		};
+		bindPlayer(fig, step, () => {
+			i = 0;
+			draw();
+		}, reverse ? 120 : 60);
+		slider.addEventListener("input", () => {
+			i = Number(slider.value);
+			draw();
+		});
+		for (const s of [schedSel, etaSel, stepsSel])
+			s?.addEventListener("change", () => {
+				run();
+				i = 0;
+				draw();
+			});
+		run();
+		i = reverse ? 0 : Math.round((ts.length - 1) / 4);
+		draw();
+	}
+
+	document.querySelectorAll<HTMLElement>(".dif-timeline").forEach(attach);
+</script>
