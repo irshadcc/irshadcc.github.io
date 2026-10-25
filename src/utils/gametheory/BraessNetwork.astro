@@ -1,0 +1,102 @@
+---
+// Braess's paradox on the four-node network s → v → t, s → w → t. One unit of traffic travels
+// from s to t; the roads s→v and w→t take x hours when a fraction x of the traffic uses them,
+// the roads v→t and s→w always take 1 hour. The checkbox adds a zero-cost road v → w. The slider
+// sets how much traffic takes each route (with the shortcut, the three routes share it as
+// up / zigzag / down); the table gives each route's travel time and the average, and the narration
+// says whether some driver would switch. Logic is inline: three route costs.
+// Usage in .mdx:
+//   <BraessNetwork />
+import "../sampling/sampling.css";
+import "./gametheory.css";
+
+interface Props {
+	shortcut?: boolean;
+	title?: string;
+	caption?: string;
+}
+
+const { shortcut = false, title, caption } = Astro.props;
+---
+
+<figure class="smp-fig gt-braess" data-shortcut={shortcut ? "1" : ""}>
+	{title && <div class="smp-title">{title}</div>}
+	<svg class="smp-svg" viewBox="0 0 640 250" role="img" aria-label="Braess network"></svg>
+	<div class="smp-controls">
+		<label><input type="checkbox" class="i-sc" checked={shortcut} /> add the road v → w (time 0)</label>
+		<label class="smp-slider">share via v <input type="range" class="i-up" min="0" max="1" step="0.05" value="0.5" /><strong class="o-up"></strong></label>
+		<label class="smp-slider c-zz">zigzag share <input type="range" class="i-zz" min="0" max="1" step="0.05" value="0" /><strong class="o-zz"></strong></label>
+	</div>
+	<table class="smp-table">
+		<thead><tr><th>route</th><th>traffic</th><th>time (h)</th></tr></thead>
+		<tbody class="o-table"></tbody>
+	</table>
+	<p class="smp-narration"></p>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import { el, fmt } from "../sampling/plot";
+
+	const P = { s: [70, 125], v: [320, 40], w: [320, 210], t: [570, 125] } as const;
+
+	function attach(fig: HTMLElement) {
+		const svg = fig.querySelector("svg")!;
+		const $ = <T extends Element>(q: string) => fig.querySelector<T>(q)!;
+		const sc = $<HTMLInputElement>(".i-sc");
+		const up = $<HTMLInputElement>(".i-up");
+		const zz = $<HTMLInputElement>(".i-zz");
+
+		function draw() {
+			const on = sc.checked;
+			const viaV = Number(up.value);
+			const zig = on ? Number(zz.value) * viaV : 0;
+			$<HTMLElement>(".c-zz").style.display = on ? "" : "none";
+			$(".o-up").textContent = fmt(viaV, 2);
+			$(".o-zz").textContent = fmt(on ? Number(zz.value) : 0, 2);
+			const top = viaV - zig; // s→v→t
+			const bot = 1 - viaV; // s→w→t
+			const sv = viaV; // traffic on s→v
+			const wt = bot + zig; // traffic on w→t
+			const cost = { up: sv + 1, down: 1 + wt, zig: sv + 0 + wt };
+			const avg = top * cost.up + bot * cost.down + zig * cost.zig;
+			svg.replaceChildren();
+			const road = (a: readonly number[], b: readonly number[], label: string, flow: number, cls: string) => {
+				el("path", { d: `M${a[0]},${a[1]}L${b[0]},${b[1]}`, class: `gt-road ${cls}`, style: `stroke-width: ${1.5 + 8 * flow}` }, svg);
+				const mx = (a[0] + b[0]) / 2;
+				const my = (a[1] + b[1]) / 2;
+				// Outer roads: label outside the diamond, so the text never sits on a line.
+				const out = my < 125 ? -1 : 1;
+				const dx = cls.includes("new") ? 8 : (mx < 320 ? -1 : 1) * 30;
+				el("text", { x: mx + dx, y: my + (cls.includes("new") ? 4 : out * 16 + (out > 0 ? 6 : 0)), class: "smp-text", "text-anchor": cls.includes("new") ? "start" : mx < 320 ? "end" : "start" }, svg, `${label}, traffic ${fmt(flow, 2)}`);
+			};
+			road(P.s, P.v, "time x", sv, "gt-busy");
+			road(P.v, P.t, "time 1", top, "");
+			road(P.s, P.w, "time 1", bot, "");
+			road(P.w, P.t, "time x", wt, "gt-busy");
+			if (on) road(P.v, P.w, "time 0", zig, "gt-new");
+			for (const [k, p] of Object.entries(P)) {
+				el("circle", { cx: p[0], cy: p[1], r: 14, class: "gt-node" }, svg);
+				el("text", { x: p[0], y: p[1] + 4, class: "smp-text", "text-anchor": "middle" }, svg, k);
+			}
+			const rows: [string, number, number][] = [
+				["s → v → t", top, cost.up],
+				["s → w → t", bot, cost.down],
+			];
+			if (on) rows.push(["s → v → w → t", zig, cost.zig]);
+			$(".o-table").innerHTML = rows.map(([n, f, c]) => `<tr><td>${n}</td><td>${fmt(f, 2)}</td><td>${fmt(c, 2)}</td></tr>`).join("") + `<tr><td>average over drivers</td><td>1</td><td>${fmt(avg, 3)}</td></tr>`;
+			// A driver on a used route gains by moving to a route that would be strictly faster.
+			const used = rows.filter((r) => r[1] > 1e-9);
+			const worst = Math.max(...used.map((r) => r[2]));
+			const best = Math.min(...rows.map((r) => r[2]));
+			$(".smp-narration").textContent = worst > best + 1e-9
+				? `Not an equilibrium: drivers on a ${fmt(worst, 2)}-hour route would rather take the ${fmt(best, 2)}-hour one.`
+				: `Equilibrium: every used route takes ${fmt(worst, 2)} hours and no route is faster.${on ? " Everyone is slower than the 1.5 hours of the network without the new road." : ""}`;
+		}
+
+		for (const i of [sc, up, zz]) i.addEventListener("input", draw);
+		draw();
+	}
+
+	document.querySelectorAll<HTMLElement>(".gt-braess").forEach(attach);
+</script>

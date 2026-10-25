@@ -1,0 +1,343 @@
+---
+// Grid world from Zhao's "Mathematical Foundations of Reinforcement Learning" (orange cells are
+// forbidden, the blue cell is the target; actions up, right, down, left, stay; rewards for
+// bumping into the boundary, entering a forbidden cell, entering the target, or anything else).
+// Modes:
+//   policy   — a given policy as arrows (length grows with π(a|s)) with its state values v_π;
+//              hover a cell for its action values q_π(s, a); optional dashed trajectory.
+//   evaluate — step-through iterative policy evaluation v_{k+1} = r_π + γ P_π v_k; hover a cell
+//              for the Bellman update that produced its value.
+//   optimal  — the optimal policy (every optimal action drawn) and v*, recomputed as the reader
+//              moves the γ, r_forbidden and "add β to every reward" sliders; hover for q*(s, a).
+//   values   — just numbers per cell (e.g. an approximation), tinted; hover compares with `compare`.
+// Logic in gridWorld.ts, drawing in gridDraw.ts.
+// Usage in .mdx:
+//   <GridWorld mode="policy" policy={[">>>>v", "^^>>v", "^<v>v", "^>o<v", "^>^<<"]} trajectory={[0, 0]} />
+//   <GridWorld mode="evaluate" policy={[...]} />
+//   <GridWorld mode="optimal" gamma={0.9} />
+//   <GridWorld mode="values" values={[...]} compare={[...]} />
+import Player from "../sampling/Player.astro";
+import "../sampling/sampling.css";
+import "./rl.css";
+import type { GridSpec } from "./gridWorld";
+import { bookGrid, smallGrid } from "./gridWorld";
+
+interface Props {
+	mode?: "policy" | "evaluate" | "optimal" | "values";
+	/** "book" is the 5 × 5 grid of the book, "small" the 2 × 2 grid of its chapters 2–4. */
+	grid?: "book" | "small";
+	gamma?: number;
+	rForbidden?: number;
+	rBoundary?: number;
+	rTarget?: number;
+	rOther?: number;
+	/** One string per row, one character per cell: ^ > v < o, * (uniform), b (right/down 0.5). */
+	policy?: string[];
+	/** Start cell [row, col] (0-based) of a trajectory that follows the most likely action. */
+	trajectory?: [number, number];
+	trajectorySteps?: number;
+	/** values mode: numbers per cell, row-major. */
+	values?: number[];
+	/** values mode: reference numbers shown on hover. */
+	compare?: number[];
+	valueLabel?: string;
+	compareLabel?: string;
+	digits?: number;
+	/** Show the sliders in optimal mode (default true). */
+	controls?: boolean;
+	title?: string;
+	caption?: string;
+}
+
+const p = Astro.props;
+const mode = p.mode ?? "policy";
+const over: Partial<GridSpec> = {};
+for (const k of [
+	"gamma",
+	"rForbidden",
+	"rBoundary",
+	"rTarget",
+	"rOther",
+] as const)
+	if (p[k] !== undefined) over[k] = p[k];
+const spec = p.grid === "small" ? smallGrid(over) : bookGrid(over);
+if ((mode === "policy" || mode === "evaluate") && !p.policy)
+	throw new Error(`GridWorld: mode="${mode}" needs a policy`);
+if (mode === "values" && p.values?.length !== spec.rows * spec.cols)
+	throw new Error("GridWorld: values must have one number per cell");
+const data = {
+	mode,
+	spec,
+	policy: p.policy ?? null,
+	trajectory: p.trajectory ?? null,
+	trajectorySteps: p.trajectorySteps ?? 12,
+	values: p.values ?? null,
+	compare: p.compare ?? null,
+	valueLabel: p.valueLabel ?? "value",
+	compareLabel: p.compareLabel ?? "reference",
+	digits: p.digits ?? 1,
+};
+const controls = p.controls ?? true;
+---
+
+<figure class="smp-fig rl-gw" data-cfg={JSON.stringify(data)}>
+	{p.title && <div class="smp-title">{p.title}</div>}
+	<div class="smp-legend">
+		<span><i class="box rl-k-forbid"></i>forbidden</span>
+		<span><i class="box rl-k-target"></i>target</span>
+		{mode !== "values" && <span><i class="rl-k-arrow"></i>policy</span>}
+		{p.trajectory && <span><i class="rl-k-trail"></i>trajectory</span>}
+	</div>
+	<div class="rl-layout">
+		<svg class="rl-grid" role="img" aria-label="Grid world"></svg>
+		<div class="rl-readout"></div>
+	</div>
+	{mode === "evaluate" && (
+		<div class="smp-controls">
+			<Player />
+			<span class="rl-step"></span>
+		</div>
+	)}
+	{mode === "optimal" && controls && (
+		<div class="smp-controls">
+			<label class="smp-slider">γ = <strong class="v-gamma"></strong>
+				<input type="range" class="i-gamma" min="0" max="0.99" step="0.01" value={spec.gamma} aria-label="Discount rate" />
+			</label>
+			<label class="smp-slider">r<sub>forbidden</sub> = <strong class="v-rf"></strong>
+				<input type="range" class="i-rf" min="-10" max="0" step="0.5" value={spec.rForbidden} aria-label="Forbidden-cell reward" />
+			</label>
+			<label class="smp-slider">add β = <strong class="v-beta"></strong>
+				<input type="range" class="i-beta" min="-3" max="3" step="0.5" value="0" aria-label="Constant added to every reward" />
+			</label>
+		</div>
+	)}
+	{mode !== "values" && <div class="smp-metrics"></div>}
+	{p.caption && <figcaption>{p.caption}</figcaption>}
+</figure>
+
+<script>
+	import { cellName, drawGrid } from "./gridDraw";
+	import {
+		ARROWS,
+		ACTIONS,
+		argmaxAll,
+		buildModel,
+		evaluatePolicy,
+		evaluateStep,
+		maxAbsDiff,
+		NA,
+		parsePolicy,
+		qValues,
+		solveOptimal,
+		type GridSpec,
+		type Policy,
+	} from "./gridWorld";
+	import { bindPlayer, fmt } from "../sampling/plot";
+
+	interface Cfg {
+		mode: "policy" | "evaluate" | "optimal" | "values";
+		spec: GridSpec;
+		policy: string[] | null;
+		trajectory: [number, number] | null;
+		trajectorySteps: number;
+		values: number[] | null;
+		compare: number[] | null;
+		valueLabel: string;
+		compareLabel: string;
+		digits: number;
+	}
+
+	function qTable(q: number[], best: number[], label: string): string {
+		const rows = q
+			.map((x, a) => `<tr class="${best.includes(a) ? "best" : ""}"><td>${ARROWS[a]} ${ACTIONS[a]}</td><td>${fmt(x, 2)}</td></tr>`)
+			.join("");
+		return `<table><tr><th>action</th><th>${label}</th></tr>${rows}</table>`;
+	}
+
+	function attach(fig: HTMLElement) {
+		const cfg = JSON.parse(fig.dataset.cfg ?? "{}") as Cfg;
+		const svg = fig.querySelector<SVGSVGElement>("svg.rl-grid")!;
+		const out = fig.querySelector<HTMLElement>(".rl-readout")!;
+		const metrics = fig.querySelector<HTMLElement>(".smp-metrics");
+		let spec: GridSpec = { ...cfg.spec };
+		let model = buildModel(spec);
+		const n = model.n;
+		const policy: Policy | null = cfg.policy ? parsePolicy(cfg.policy) : null;
+		let hot: number | undefined;
+		let render: () => void = () => {};
+		const hint = '<span class="rl-muted">Hover or tap a cell.</span>';
+
+		function bindHover(hits: SVGElement[], show: (s: number) => string) {
+			hits.forEach((h, s) => {
+				const on = () => {
+					if (hot !== s) {
+						hot = s;
+						render();
+					}
+					out.innerHTML = show(s);
+				};
+				h.addEventListener("mouseenter", on);
+				h.addEventListener("click", on);
+			});
+		}
+		const metric = (items: [string, string][]) => {
+			if (metrics) metrics.innerHTML = items.map(([k, v]) => `<div><span>${k}</span><strong>${v}</strong></div>`).join("");
+		};
+
+		function trajectory(pi: Policy): number[] {
+			if (!cfg.trajectory) return [];
+			let s = cfg.trajectory[0] * spec.cols + cfg.trajectory[1];
+			const path = [s];
+			for (let t = 0; t < cfg.trajectorySteps; t++) {
+				const a = pi[s].indexOf(Math.max(...pi[s]));
+				const s2 = model.next[s * NA + a];
+				if (s2 === s) break;
+				path.push(s2);
+				s = s2;
+			}
+			return path;
+		}
+
+		if (cfg.mode === "policy" && policy) {
+			const v = evaluatePolicy(model, spec, policy);
+			const q = qValues(model, spec, v);
+			const trail = trajectory(policy);
+			render = () => {
+				const hits = drawGrid(svg, spec, { policy, values: v, digits: cfg.digits, trail, agent: trail[0], hot });
+				bindHover(hits, (s) => {
+					const acts = policy[s].flatMap((x, a) => (x > 0 ? [a] : []));
+					return `State ${cellName(spec, s)}: v<sub>π</sub> = ${fmt(v[s], 2)}<br><span class="rl-muted">q<sub>π</sub>(s, a) = r(s, a) + γ v<sub>π</sub>(s′); the policy takes ${acts.map((a) => ARROWS[a]).join(" ")}</span>${qTable(q[s], argmaxAll(q[s], 1e-6), "q<sub>π</sub>")}`;
+				});
+			};
+			metric([
+				["γ", fmt(spec.gamma, 2)],
+				["v_π at (1, 1)", fmt(v[0], 2)],
+				["mean of v_π", fmt(v.reduce((a, b) => a + b, 0) / n, 2)],
+			]);
+			out.innerHTML = hint;
+			render();
+		}
+
+		if (cfg.mode === "evaluate" && policy) {
+			const vPi = evaluatePolicy(model, spec, policy);
+			const iterates = [new Array(n).fill(0)];
+			while (iterates.length < 120 && maxAbsDiff(iterates[iterates.length - 1], vPi) > 5e-3)
+				iterates.push(evaluateStep(model, spec, policy, iterates[iterates.length - 1]));
+			const K = iterates.length - 1;
+			let k = 0;
+			const stepLabel = fig.querySelector<HTMLElement>(".rl-step")!;
+			const explain = (s: number) => {
+				if (k === 0) return `State ${cellName(spec, s)}: v<sub>0</sub> = 0 (initial guess). Step forward.`;
+				const prev = iterates[k - 1];
+				const terms = policy[s]
+					.flatMap((pa, a) => {
+						if (!pa) return [];
+						const s2 = model.next[s * NA + a];
+						return [`${fmt(pa, 2)} × [${fmt(model.reward[s * NA + a], 1)} + ${fmt(spec.gamma, 2)} × ${fmt(prev[s2], 2)}]`];
+					})
+					.join(" + ");
+				return `State ${cellName(spec, s)}:<br>v<sub>${k}</sub>(s) = Σ<sub>a</sub> π(a|s) [r(s, a) + γ v<sub>${k - 1}</sub>(s′)]<br>= ${terms}<br>= <strong>${fmt(iterates[k][s], 3)}</strong><br><span class="rl-muted">true v<sub>π</sub>(s) = ${fmt(vPi[s], 3)}</span>`;
+			};
+			render = () => {
+				const v = iterates[k];
+				const changed = k ? v.map((x, s) => Math.abs(x - iterates[k - 1][s]) > 1e-9) : undefined;
+				const hits = drawGrid(svg, spec, { policy, values: v, digits: cfg.digits, changed, hot });
+				bindHover(hits, explain);
+				stepLabel.textContent = `k = ${k}${k === K ? " (within 0.005 of v_π)" : ""}`;
+				metric([
+					["iteration k", String(k)],
+					["‖v_k − v_π‖∞", fmt(maxAbsDiff(v, vPi), 3)],
+					["bound γ^k ‖v_0 − v_π‖∞", fmt(spec.gamma ** k * maxAbsDiff(iterates[0], vPi), 3)],
+				]);
+				if (hot !== undefined) out.innerHTML = explain(hot);
+			};
+			bindPlayer(
+				fig,
+				(dir) => {
+					const m = k + dir;
+					if (m < 0 || m > K) return false;
+					k = m;
+					render();
+					return k < K;
+				},
+				() => {
+					k = 0;
+					render();
+				},
+				350,
+			);
+			out.innerHTML = hint;
+			render();
+		}
+
+		if (cfg.mode === "optimal") {
+			const gIn = fig.querySelector<HTMLInputElement>(".i-gamma");
+			const fIn = fig.querySelector<HTMLInputElement>(".i-rf");
+			const bIn = fig.querySelector<HTMLInputElement>(".i-beta");
+			let sol = solveOptimal(model, spec);
+			let base = sol;
+			const recompute = () => {
+				const beta = bIn ? Number(bIn.value) : 0;
+				const gamma = gIn ? Number(gIn.value) : cfg.spec.gamma;
+				const rf = fIn ? Number(fIn.value) : cfg.spec.rForbidden;
+				spec = { ...cfg.spec, gamma, rForbidden: rf + beta, rBoundary: cfg.spec.rBoundary + beta, rTarget: cfg.spec.rTarget + beta, rOther: cfg.spec.rOther + beta };
+				model = buildModel(spec);
+				sol = solveOptimal(model, spec);
+				const baseSpec = { ...spec, rForbidden: rf, rBoundary: cfg.spec.rBoundary, rTarget: cfg.spec.rTarget, rOther: cfg.spec.rOther };
+				base = solveOptimal(buildModel(baseSpec), baseSpec);
+				const set = (c: string, v: string) => {
+					const e = fig.querySelector(c);
+					if (e) e.textContent = v;
+				};
+				set(".v-gamma", fmt(gamma, 2));
+				set(".v-rf", fmt(rf, 1));
+				set(".v-beta", fmt(beta, 1));
+				const shiftOk = maxAbsDiff(
+					sol.v,
+					base.v.map((x) => x + (gamma < 1 ? beta / (1 - gamma) : 0)),
+				);
+				metric([
+					["v* at (1, 1)", fmt(sol.v[0], 2)],
+					["v* at target", fmt(sol.v[spec.target[0] * spec.cols + spec.target[1]], 2)],
+					beta ? ["‖v* − (v*_β=0 + β/(1−γ))‖∞", fmt(shiftOk, 4)] : ["max_s v*(s)", fmt(Math.max(...sol.v), 2)],
+				]);
+			};
+			render = () => {
+				const optPolicy = sol.q.map((row) => {
+					const best = argmaxAll(row, 1e-6);
+					return Array.from({ length: NA }, (_, a) => (best.includes(a) ? 1 / best.length : 0));
+				});
+				const hits = drawGrid(svg, spec, { policy: optPolicy, values: sol.v, digits: cfg.digits, hot });
+				bindHover(hits, (s) => `State ${cellName(spec, s)}: v* = ${fmt(sol.v[s], 2)}<br><span class="rl-muted">q*(s, a) = r(s, a) + γ v*(s′); the greedy action(s) are optimal</span>${qTable(sol.q[s], argmaxAll(sol.q[s], 1e-6), "q*")}`);
+				if (hot !== undefined) out.innerHTML = `State ${cellName(spec, hot)}: v* = ${fmt(sol.v[hot], 2)}${qTable(sol.q[hot], argmaxAll(sol.q[hot], 1e-6), "q*")}`;
+			};
+			for (const input of [gIn, fIn, bIn])
+				input?.addEventListener("input", () => {
+					recompute();
+					render();
+				});
+			recompute();
+			out.innerHTML = hint;
+			render();
+		}
+
+		if (cfg.mode === "values" && cfg.values) {
+			const vals = cfg.values;
+			const lo = Math.min(...vals);
+			const hi = Math.max(...vals);
+			const heat = vals.map((x) => (hi > lo ? (x - lo) / (hi - lo) : 0));
+			render = () => {
+				const hits = drawGrid(svg, spec, { values: vals, digits: cfg.digits, heat, hot, bigValues: true });
+				bindHover(hits, (s) => {
+					let html = `State ${cellName(spec, s)}: ${cfg.valueLabel} = ${fmt(vals[s], cfg.digits + 1)}`;
+					if (cfg.compare) html += `<br>${cfg.compareLabel} = ${fmt(cfg.compare[s], cfg.digits + 1)}<br><span class="rl-muted">difference ${fmt(vals[s] - cfg.compare[s], cfg.digits + 1)}</span>`;
+					return html;
+				});
+			};
+			out.innerHTML = hint;
+			render();
+		}
+	}
+
+	document.querySelectorAll<HTMLElement>(".rl-gw").forEach(attach);
+</script>

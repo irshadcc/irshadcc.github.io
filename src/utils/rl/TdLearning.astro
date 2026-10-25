@@ -1,0 +1,212 @@
+---
+// Tabular Q-learning or Sarsa on the book's 5 × 5 grid world, run live in the browser. The agent
+// follows an ε-greedy behaviour policy along one long episode from the top-left cell; each step
+// updates one action value toward its TD target. The grid shows the greedy policy and max_a q(s, a)
+// of the current estimate, tinted by how often each cell was visited, with the agent and its last
+// steps; the plot shows the RMSE of max_a q against the optimal v* over steps. The readout
+// explains the most recent update. Speed runs 1 step per frame (watch single updates) up to 2000.
+// Logic in gridWorld.ts (makeTdLearner), drawing in gridDraw.ts.
+// Usage in .mdx:
+//   <TdLearning algorithm="q-learning" eps={1} />
+//   <TdLearning algorithm="sarsa" eps={0.1} steps={100000} />
+import Player from "../sampling/Player.astro";
+import "../sampling/sampling.css";
+import "./rl.css";
+
+interface Props {
+	algorithm?: "q-learning" | "sarsa";
+	eps?: number;
+	alpha?: number;
+	/** Steps the run stops at. */
+	steps?: number;
+	seed?: number;
+	title?: string;
+	caption?: string;
+}
+
+const {
+	algorithm = "q-learning",
+	eps = 1,
+	alpha = 0.1,
+	steps = 100000,
+	seed = 1,
+	title,
+	caption,
+} = Astro.props;
+---
+
+<figure class="smp-fig rl-td" data-alg={algorithm} data-steps={steps} data-seed={seed}>
+	{title && <div class="smp-title">{title}</div>}
+	<div class="smp-legend">
+		<span><i class="box rl-k-forbid"></i>forbidden</span>
+		<span><i class="box rl-k-target"></i>target</span>
+		<span><i class="rl-k-arrow"></i>greedy action of q</span>
+		<span><i class="rl-k-trail"></i>last steps</span>
+		<span><i class="k-p"></i>RMSE of max<sub>a</sub> q vs v*</span>
+	</div>
+	<div class="rl-layout">
+		<svg class="rl-grid" role="img" aria-label="Learned action values"></svg>
+		<div>
+			<svg class="smp-svg rl-err" viewBox="0 0 360 200" role="img" aria-label="Error against steps"></svg>
+			<div class="rl-readout"></div>
+		</div>
+	</div>
+	<div class="smp-controls">
+		<Player />
+		<label>algorithm
+			<select class="i-alg" aria-label="Algorithm">
+				<option value="q-learning">Q-learning</option>
+				<option value="sarsa">Sarsa</option>
+			</select>
+		</label>
+		<label>speed
+			<select class="i-speed" aria-label="Steps per frame">
+				<option value="1">1 step / frame</option>
+				<option value="20">20</option>
+				<option value="500" selected>500</option>
+				<option value="2000">2000</option>
+			</select>
+		</label>
+		<label class="smp-slider">ε = <strong class="v-eps"></strong>
+			<input type="range" class="i-eps" min="0.05" max="1" step="0.05" value={eps} aria-label="Exploration rate" />
+		</label>
+		<label class="smp-slider">α = <strong class="v-alpha"></strong>
+			<input type="range" class="i-alpha" min="0.01" max="1" step="0.01" value={alpha} aria-label="Learning rate" />
+		</label>
+	</div>
+	<div class="smp-metrics"></div>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import { cellName, drawGrid } from "./gridDraw";
+	import { ACTIONS, ARROWS, bookGrid, buildModel, deterministic, greedy, makeTdLearner, solveOptimal, tdScore, type TdLearner, type TdUpdate } from "./gridWorld";
+	import { axes, bindPlayer, el, fmt } from "../sampling/plot";
+
+	function attach(fig: HTMLElement) {
+		const spec = bookGrid();
+		const model = buildModel(spec);
+		const star = solveOptimal(model, spec);
+		const total = Number(fig.dataset.steps);
+		const seed = Number(fig.dataset.seed);
+		const grid = fig.querySelector<SVGSVGElement>("svg.rl-grid")!;
+		const plot = fig.querySelector<SVGSVGElement>("svg.rl-err")!;
+		const out = fig.querySelector<HTMLElement>(".rl-readout")!;
+		const metrics = fig.querySelector<HTMLElement>(".smp-metrics")!;
+		const algIn = fig.querySelector<HTMLSelectElement>(".i-alg")!;
+		const speedIn = fig.querySelector<HTMLSelectElement>(".i-speed")!;
+		const epsIn = fig.querySelector<HTMLInputElement>(".i-eps")!;
+		const alphaIn = fig.querySelector<HTMLInputElement>(".i-alpha")!;
+		algIn.value = fig.dataset.alg ?? "q-learning";
+		let L: TdLearner;
+		let t = 0;
+		let last: TdUpdate | null = null;
+		let trail: number[] = [];
+		let curve: [number, number, number][] = [];
+
+		function reset() {
+			L = makeTdLearner(model, spec, { algorithm: algIn.value as "q-learning" | "sarsa", alpha: Number(alphaIn.value), eps: Number(epsIn.value), seed, start: 0 });
+			t = 0;
+			last = null;
+			trail = [0];
+			curve = [[0, ...tdScore(L.q, star.v, star.q)]];
+			fig.querySelector(".v-eps")!.textContent = fmt(Number(epsIn.value), 2);
+			fig.querySelector(".v-alpha")!.textContent = fmt(Number(alphaIn.value), 2);
+			draw();
+		}
+
+		function advance(nSteps: number) {
+			const every = Math.max(1, Math.round(total / 200));
+			for (let i = 0; i < nSteps && t < total; i++) {
+				last = L.step();
+				t++;
+				trail.push(last.s2);
+				if (trail.length > 16) trail.shift();
+				if (t % every === 0) curve.push([t, ...tdScore(L.q, star.v, star.q)]);
+			}
+		}
+
+		function draw() {
+			const v = L.q.map((row) => Math.max(...row));
+			const maxVisit = Math.max(1, ...L.visits);
+			const heat = L.visits.map((c) => Math.log1p(c) / Math.log1p(maxVisit));
+			drawGrid(grid, spec, { policy: L.q.map((row) => (Math.max(...row) - Math.min(...row) < 1e-12 ? new Array(row.length).fill(0) : deterministic(greedy([row]))[0])), values: v, heat, trail, agent: L.state() });
+			const [err, good] = tdScore(L.q, star.v, star.q);
+			const isQ = algIn.value === "q-learning";
+			if (last) {
+				const u = last;
+				const tgt = isQ
+					? `r + γ max<sub>a</sub> q(s′, a) = ${fmt(u.r, 0)} + ${fmt(spec.gamma, 1)} × ${fmt((u.target - u.r) / spec.gamma, 2)}`
+					: `r + γ q(s′, a′) = ${fmt(u.r, 0)} + ${fmt(spec.gamma, 1)} × q(${cellName(spec, u.s2)}, ${ACTIONS[u.a2]})`;
+				out.innerHTML = `<strong>step ${u.t}</strong>: at ${cellName(spec, u.s)} took ${ARROWS[u.a]} ${ACTIONS[u.a]}, got r = ${fmt(u.r, 0)}, landed in ${cellName(spec, u.s2)}<br>TD target = ${tgt} = ${fmt(u.target, 3)}<br>q(s, a) ← q − α (q − target): ${fmt(u.before, 3)} → <strong>${fmt(u.after, 3)}</strong>`;
+			} else out.innerHTML = '<span class="rl-muted">Press play (or step) to start the episode at (1, 1). Set speed to 1 step / frame to watch single updates.</span>';
+			metrics.innerHTML = [
+				["steps", t.toLocaleString("en-US")],
+				["RMSE vs v*", fmt(err, 3)],
+				["greedy action optimal", `${good} / ${model.n}`],
+				["least-visited cell", L.visits.length ? Math.min(...L.visits).toLocaleString("en-US") : "0"],
+			]
+				.map(([k, x]) => `<div><span>${k}</span><strong>${x}</strong></div>`)
+				.join("");
+
+			plot.replaceChildren();
+			const A = axes(plot, { x: 40, y: 8, w: 308, h: 150 }, [0, total / 1000], [0, 9], { xLabel: "steps (thousands)", yLabel: "RMSE", yTicks: 3 });
+			const d = curve.map(([s, e], i) => `${i ? "L" : "M"}${A.sx(s / 1000).toFixed(1)},${A.sy(Math.min(e, 9)).toFixed(1)}`).join("");
+			el("path", { d, class: "smp-p" }, plot);
+			el("circle", { cx: A.sx(t / 1000), cy: A.sy(Math.min(err, 9)), r: 3.5, class: "smp-current" }, plot);
+		}
+
+		let frame = 0;
+		let playing = false;
+		const play = fig.querySelector<HTMLButtonElement>("[data-act=play]")!;
+		const loop = () => {
+			if (!playing) return;
+			advance(Number(speedIn.value));
+			draw();
+			if (t >= total) return stop();
+			frame = window.setTimeout(loop, 16);
+		};
+		function stop() {
+			playing = false;
+			window.clearTimeout(frame);
+			play.classList.remove("playing");
+			play.setAttribute("aria-label", "Play");
+		}
+		// The shared player steps with a timer; this figure plays with its own ~60 Hz timer instead,
+		// so the play button is handled here and bindPlayer only handles first / next.
+		play.addEventListener(
+			"click",
+			(e) => {
+				e.stopImmediatePropagation();
+				if (playing) return stop();
+				if (t >= total) reset();
+				playing = true;
+				play.classList.add("playing");
+				play.setAttribute("aria-label", "Pause");
+				loop();
+			},
+			true,
+		);
+		bindPlayer(
+			fig,
+			(dir) => {
+				if (dir < 0) return false;
+				advance(1);
+				draw();
+				return t < total;
+			},
+			() => {
+				stop();
+				reset();
+			},
+		);
+		for (const input of [algIn, epsIn, alphaIn])
+			input.addEventListener("input", () => {
+				stop();
+				reset();
+			});
+		reset();
+	}
+
+	document.querySelectorAll<HTMLElement>(".rl-td").forEach(attach);
+</script>

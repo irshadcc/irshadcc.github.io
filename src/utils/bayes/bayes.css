@@ -1,0 +1,109 @@
+/* Extra marks for the Bayesian statistics figures (src/utils/bayes). They build on
+   ../sampling/sampling.css (.smp-fig frame, controls, legend, player); every class here starts
+   with by-. SVG content is created by scripts, so the rules are global. */
+
+.smp-fig {
+	--by-heads: var(--accent);
+	--by-tails: #c2674c;
+	--by-band: rgba(31, 79, 120, 0.16);
+	--by-acq: #2e7d5b;
+	--by-acq-soft: rgba(46, 125, 91, 0.18);
+}
+@media (prefers-color-scheme: dark) {
+	.smp-fig {
+		--by-tails: #e8a07a;
+		--by-band: rgba(141, 187, 227, 0.2);
+		--by-acq: #6fcf9f;
+		--by-acq-soft: rgba(111, 207, 159, 0.18);
+	}
+}
+
+/* Flip sequence as chips */
+.by-chips {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.25rem;
+	margin: 0.1rem 0 0.5rem;
+}
+.by-chip {
+	display: grid;
+	place-items: center;
+	width: 1.7rem;
+	height: 1.7rem;
+	padding: 0;
+	border: 1px solid var(--faint);
+	border-radius: 5px;
+	background: var(--bg);
+	color: var(--muted);
+	cursor: pointer;
+	font: 600 0.8rem var(--sans);
+	opacity: 0.45;
+}
+.by-chip.seen {
+	opacity: 1;
+}
+.by-chip.h.seen {
+	border-color: var(--by-heads);
+	color: var(--by-heads);
+}
+.by-chip.t.seen {
+	border-color: var(--by-tails);
+	color: var(--by-tails);
+}
+.by-chip.last {
+	box-shadow: 0 0 0 2px var(--text);
+}
+.by-chip:hover {
+	opacity: 1;
+}
+
+/* Plot marks */
+.smp-fig .by-band {
+	fill: var(--by-band);
+	stroke: none;
+}
+.smp-fig .by-acq {
+	fill: none;
+	stroke: var(--by-acq);
+	stroke-width: 2;
+}
+.smp-fig .by-acq-area {
+	fill: var(--by-acq-soft);
+	stroke: none;
+}
+.smp-fig .by-next {
+	fill: var(--by-acq);
+}
+.smp-fig .by-next-line {
+	stroke: var(--by-acq);
+	stroke-width: 1.2;
+	stroke-dasharray: 4 3;
+}
+.smp-fig .by-obs {
+	fill: var(--text);
+}
+.smp-fig .by-best {
+	fill: none;
+	stroke: var(--by-acq);
+	stroke-width: 2;
+}
+.smp-legend .by-k-band {
+	background: var(--by-band);
+}
+.smp-legend .by-k-acq {
+	border-color: var(--by-acq);
+}
+.smp-legend .by-k-obs {
+	background: var(--text);
+}
+.smp-legend .by-k-muted {
+	border-color: var(--muted);
+	border-top-style: dashed;
+}
+.smp-legend .by-k-mle {
+	border-color: var(--muted);
+	border-top-style: dotted;
+}
+.by-param[hidden] {
+	display: none;
+}

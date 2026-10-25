@@ -1,0 +1,162 @@
+---
+// Step-through dynamic programming on the book's 5 × 5 grid world: value iteration, policy
+// iteration, or truncated policy iteration with j evaluation sweeps per iteration. The grid shows
+// the iteration's value estimate v_k and greedy policy π_k (cells whose action changed are
+// outlined in the readout count); below it, ‖v_k − v*‖∞ for all three algorithms against the
+// iteration index, with the current one highlighted.
+// Logic in gridWorld.ts (valueIteration, policyIteration), drawing in gridDraw.ts.
+// Usage in .mdx:
+//   <DpSteps algorithm="vi" />
+//   <DpSteps algorithm="tpi" j={3} gamma={0.9} />
+import Player from "../sampling/Player.astro";
+import "../sampling/sampling.css";
+import "./rl.css";
+
+interface Props {
+	algorithm?: "vi" | "pi" | "tpi";
+	/** Evaluation sweeps per iteration for truncated policy iteration. */
+	j?: number;
+	gamma?: number;
+	/** Iterations to precompute. */
+	iterations?: number;
+	title?: string;
+	caption?: string;
+}
+
+const {
+	algorithm = "vi",
+	j = 3,
+	gamma = 0.9,
+	iterations = 40,
+	title,
+	caption,
+} = Astro.props;
+---
+
+<figure class="smp-fig rl-dp" data-alg={algorithm} data-j={j} data-gamma={gamma} data-iters={iterations}>
+	{title && <div class="smp-title">{title}</div>}
+	<div class="smp-legend">
+		<span><i class="box rl-k-forbid"></i>forbidden</span>
+		<span><i class="box rl-k-target"></i>target</span>
+		<span><i class="rl-k-arrow"></i>greedy policy π<sub>k</sub></span>
+		<span><i class="k-p"></i>value iteration</span>
+		<span><i class="k-q"></i>policy iteration</span>
+		<span><i class="k-model"></i>truncated (j sweeps)</span>
+	</div>
+	<div class="rl-layout">
+		<svg class="rl-grid" role="img" aria-label="Value estimate and greedy policy"></svg>
+		<div>
+			<svg class="smp-svg rl-err" viewBox="0 0 360 230" role="img" aria-label="Error against iteration"></svg>
+			<div class="rl-readout"></div>
+		</div>
+	</div>
+	<div class="smp-controls">
+		<Player />
+		<label>algorithm
+			<select class="i-alg" aria-label="Algorithm">
+				<option value="vi">value iteration</option>
+				<option value="pi">policy iteration</option>
+				<option value="tpi">truncated policy iteration</option>
+			</select>
+		</label>
+		<label class="smp-slider rl-param p-j">j = <strong class="v-j"></strong>
+			<input type="range" class="i-j" min="1" max="30" step="1" value={j} aria-label="Evaluation sweeps per iteration" />
+		</label>
+	</div>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import { cellName, drawGrid } from "./gridDraw";
+	import { argmaxAll, bookGrid, buildModel, deterministic, policyIteration, qValues, solveOptimal, valueIteration, ARROWS, type DpStep } from "./gridWorld";
+	import { axes, bindPlayer, el, fmt } from "../sampling/plot";
+
+	function attach(fig: HTMLElement) {
+		const spec = bookGrid({ gamma: Number(fig.dataset.gamma) });
+		const model = buildModel(spec);
+		const iters = Number(fig.dataset.iters);
+		const star = solveOptimal(model, spec);
+		const opt = star.q.map((row) => new Set(argmaxAll(row, 1e-6)));
+		const stay = new Array(model.n).fill(4);
+		const grid = fig.querySelector<SVGSVGElement>("svg.rl-grid")!;
+		const plot = fig.querySelector<SVGSVGElement>("svg.rl-err")!;
+		const out = fig.querySelector<HTMLElement>(".rl-readout")!;
+		const algIn = fig.querySelector<HTMLSelectElement>(".i-alg")!;
+		const jIn = fig.querySelector<HTMLInputElement>(".i-j")!;
+		algIn.value = fig.dataset.alg ?? "vi";
+		let k = 0;
+		let hot: number | undefined;
+		let runs: Record<string, DpStep[]> = {};
+		const compute = () => {
+			const j = Number(jIn.value);
+			runs = {
+				vi: valueIteration(model, spec, iters),
+				pi: policyIteration(model, spec, stay, iters),
+				tpi: policyIteration(model, spec, stay, iters, j),
+			};
+			fig.querySelector(".v-j")!.textContent = String(j);
+			fig.querySelector<HTMLElement>(".p-j")!.hidden = algIn.value !== "tpi";
+		};
+
+		function draw() {
+			const steps = runs[algIn.value];
+			const st = steps[k];
+			const q = qValues(model, spec, st.v);
+			const hits = drawGrid(grid, spec, { policy: algIn.value === "vi" && k === 0 ? undefined : deterministic(st.pi), values: st.v, hot });
+			const good = st.pi.filter((a, s) => opt[s].has(a)).length;
+			const changed = k ? st.pi.filter((a, s) => a !== steps[k - 1].pi[s]).length : 0;
+			const totalSweeps = steps.slice(0, k + 1).reduce((a, s) => a + s.sweeps, 0);
+			const name = algIn.value === "vi" ? "Value iteration" : algIn.value === "pi" ? "Policy iteration" : `Truncated policy iteration (j = ${jIn.value})`;
+			let html = `<strong>${name}, k = ${k}</strong><br>‖v<sub>k</sub> − v*‖<sub>∞</sub> = ${fmt(st.err, 4)}<br>greedy action optimal in ${good} / ${model.n} states; ${changed} changed this iteration<br><span class="rl-muted">Bellman sweeps so far: ${totalSweeps}${algIn.value === "pi" && k ? ` (this iteration: ${st.sweeps})` : ""}</span>`;
+			if (hot !== undefined)
+				html += `<br>${cellName(spec, hot)}: v<sub>k</sub> = ${fmt(st.v[hot], 3)}, v* = ${fmt(star.v[hot], 3)}; q from v<sub>k</sub>: ${q[hot].map((x, a) => `${ARROWS[a]} ${fmt(x, 2)}`).join(", ")}`;
+			out.innerHTML = html;
+			hits.forEach((h, s) =>
+				h.addEventListener("mouseenter", () => {
+					if (hot === s) return;
+					hot = s;
+					draw();
+				}),
+			);
+
+			plot.replaceChildren();
+			const top = Math.max(...Object.values(runs).flatMap((r) => r.map((x) => x.err)));
+			const A = axes(plot, { x: 40, y: 8, w: 308, h: 180 }, [0, iters], [0, Math.ceil(top / 5) * 5], { xLabel: "iteration k", yLabel: "‖v_k − v*‖∞", yTicks: 4 });
+			const cls: Record<string, string> = { vi: "smp-p", pi: "smp-q", tpi: "smp-model" };
+			for (const [key, r] of Object.entries(runs)) {
+				const d = r.map((x, i) => `${i ? "L" : "M"}${A.sx(i).toFixed(1)},${A.sy(x.err).toFixed(1)}`).join("");
+				el("path", { d, class: cls[key], style: key === algIn.value ? "" : "opacity: 0.35" }, plot);
+			}
+			el("line", { x1: A.sx(k), x2: A.sx(k), y1: A.box.y, y2: A.box.y + A.box.h, class: "smp-guide" }, plot);
+			el("circle", { cx: A.sx(k), cy: A.sy(st.err), r: 4, class: "smp-current" }, plot);
+		}
+
+		bindPlayer(
+			fig,
+			(dir) => {
+				const m = k + dir;
+				if (m < 0 || m > iters) return false;
+				k = m;
+				draw();
+				return k < iters;
+			},
+			() => {
+				k = 0;
+				draw();
+			},
+			450,
+		);
+		algIn.addEventListener("change", () => {
+			compute();
+			draw();
+		});
+		jIn.addEventListener("input", () => {
+			compute();
+			draw();
+		});
+		compute();
+		draw();
+	}
+
+	document.querySelectorAll<HTMLElement>(".rl-dp").forEach(attach);
+</script>

@@ -1,0 +1,185 @@
+/* Grid-world figures for the reinforcement-learning foundations post (src/utils/rl). They build on
+   ../sampling/sampling.css (.smp-fig frame, controls, legend, player, metrics); every class here
+   starts with rl-. SVG content is created by scripts, so the rules are global. */
+
+.smp-fig {
+	--rl-forbid: #e9a23b;
+	--rl-forbid-soft: rgba(233, 162, 59, 0.45);
+	--rl-target: #4a90c8;
+	--rl-target-soft: rgba(74, 144, 200, 0.45);
+	--rl-arrow: #2e7d5b;
+	--rl-trail: #c0392b;
+	--rl-heat: 31, 79, 120;
+}
+@media (prefers-color-scheme: dark) {
+	.smp-fig {
+		--rl-forbid: #e8b060;
+		--rl-forbid-soft: rgba(232, 176, 96, 0.32);
+		--rl-target: #7fb6e6;
+		--rl-target-soft: rgba(127, 182, 230, 0.32);
+		--rl-arrow: #6fcf9f;
+		--rl-trail: #f08070;
+		--rl-heat: 141, 187, 227;
+	}
+}
+
+.rl-layout {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+	gap: 0.8rem;
+	align-items: start;
+}
+.rl-layout.rl-single {
+	grid-template-columns: minmax(0, 22rem);
+	justify-content: center;
+}
+@media (max-width: 620px) {
+	.rl-layout {
+		grid-template-columns: minmax(0, 1fr);
+	}
+}
+.smp-fig svg.rl-grid {
+	display: block;
+	width: 100%;
+	max-width: 22rem;
+	height: auto;
+	margin: 0 auto;
+	font: 11px var(--sans);
+	background: var(--bg);
+	border-radius: 5px;
+}
+
+.smp-fig .rl-cell {
+	fill: var(--bg);
+	stroke: var(--faint);
+	stroke-width: 1;
+}
+.smp-fig .rl-cell.forbidden {
+	fill: var(--rl-forbid-soft);
+}
+.smp-fig .rl-cell.target {
+	fill: var(--rl-target-soft);
+}
+.smp-fig .rl-cell.hot {
+	stroke: var(--text);
+	stroke-width: 2;
+}
+.smp-fig .rl-heat {
+	stroke: none;
+	pointer-events: none;
+}
+.smp-fig .rl-axis {
+	fill: var(--muted);
+	font-size: 10px;
+}
+.smp-fig .rl-val {
+	fill: var(--text);
+	font-size: 11px;
+	paint-order: stroke;
+	stroke: var(--bg);
+	stroke-width: 2.5px;
+	stroke-linejoin: round;
+	font-variant-numeric: tabular-nums;
+	pointer-events: none;
+}
+.smp-fig .rl-val.big {
+	font-size: 14px;
+}
+.smp-fig .rl-val.changed {
+	fill: var(--rl-trail);
+	font-weight: 600;
+}
+.smp-fig .rl-arrow {
+	stroke: var(--rl-arrow);
+	stroke-width: 2;
+	fill: none;
+	pointer-events: none;
+}
+.smp-fig .rl-arrowhead {
+	fill: var(--rl-arrow);
+	pointer-events: none;
+}
+.smp-fig .rl-stay {
+	fill: none;
+	stroke: var(--rl-arrow);
+	stroke-width: 2;
+	pointer-events: none;
+}
+.smp-fig .rl-trail {
+	fill: none;
+	stroke: var(--rl-trail);
+	stroke-width: 2;
+	stroke-dasharray: 5 3;
+	pointer-events: none;
+}
+.smp-fig .rl-agent {
+	fill: var(--rl-trail);
+	stroke: var(--bg);
+	stroke-width: 1.5;
+	pointer-events: none;
+}
+.smp-fig .rl-hit {
+	fill: transparent;
+	cursor: pointer;
+}
+
+.smp-legend .rl-k-forbid {
+	background: var(--rl-forbid-soft);
+	border: 1px solid var(--rl-forbid);
+}
+.smp-legend .rl-k-target {
+	background: var(--rl-target-soft);
+	border: 1px solid var(--rl-target);
+}
+.smp-legend .rl-k-arrow {
+	border-color: var(--rl-arrow);
+}
+.smp-legend .rl-k-trail {
+	border-color: var(--rl-trail);
+	border-top-style: dashed;
+}
+
+/* Hover readout beside the grid */
+.rl-readout {
+	min-height: 6rem;
+	padding: 0.5rem 0.7rem;
+	border: 1px solid var(--faint);
+	border-radius: 5px;
+	background: var(--bg);
+	color: var(--text);
+	font-size: 0.82rem;
+	line-height: 1.5;
+	font-variant-numeric: tabular-nums;
+}
+.rl-readout .rl-muted {
+	color: var(--muted);
+}
+.rl-readout table {
+	width: 100%;
+	margin-top: 0.3rem;
+	border-collapse: collapse;
+}
+.rl-readout th,
+.rl-readout td {
+	padding: 0.1rem 0.35rem;
+	border-bottom: 1px solid var(--faint);
+	text-align: right;
+	font-weight: 400;
+}
+.rl-readout th:first-child,
+.rl-readout td:first-child {
+	text-align: left;
+}
+.rl-readout th {
+	color: var(--muted);
+}
+.rl-readout tr.best td {
+	color: var(--rl-arrow);
+	font-weight: 600;
+}
+.rl-readout code {
+	font-size: 0.78rem;
+}
+.rl-param[hidden] {
+	display: none;
+}

@@ -1,0 +1,1072 @@
+---
+title: "Mathematical Foundations of Reinforcement Learning"
+description: "From Markov decision processes to actor-critic: returns, Bellman equations, the Bellman optimality equation and the contraction mapping theorem, value and policy iteration, Monte Carlo and stochastic approximation, TD learning, Sarsa and Q-learning, function approximation and DQN, policy gradients and actor-critic, all on one grid world with computed numbers."
+date: 2026-10-26
+tags: [Machine learning, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import LineChart from "../../utils/charts/LineChart.astro";
+import GridWorld from "../../utils/rl/GridWorld.astro";
+import DpSteps from "../../utils/rl/DpSteps.astro";
+import TdLearning from "../../utils/rl/TdLearning.astro";
+import {
+	banditStats,
+	epsTable,
+	linearFits,
+	reinforceCurves,
+	reinforceSteps,
+	rmCurves,
+	rmSamples,
+	stationaryEps,
+	tdCurves,
+	tdMinVisits,
+} from "../../utils/rl/rlFigures";
+
+export const goodPolicy = [">>>>v", "^^>>v", "^<v>v", "^>o<v", "^>^<<"];
+export const uniformRows = ["*****", "*****", "*****", "*****", "*****"];
+export const f2 = (x) => x.toFixed(2);
+
+## Background
+
+A robot that walks through a maze, a program that plays Go and a language model tuned on human
+preferences all face the same problem: choose actions one after another so that the total reward
+collected over time is large. A good move now may lead somewhere bad later, and the reward for a
+whole game may arrive only at its end. **Reinforcement learning** (RL) is the study of how to learn
+such behaviour from interaction, when nobody tells the learner which action was right.
+
+The field has a small mathematical core that almost every algorithm reuses: the **Bellman
+equation**, which says how values of neighbouring states relate; the **Bellman optimality
+equation**, whose unique solution defines the best possible behaviour; and **stochastic
+approximation**, which explains why replacing an expectation by one noisy sample still converges.
+Once these three tools are clear, Q-learning, deep Q-networks, REINFORCE and actor-critic stop
+looking like a zoo of tricks and become a handful of variations on one theme.
+
+This post follows Shiyu Zhao's book *Mathematical Foundations of Reinforcement
+Learning*<Sidenote>S. Zhao, *Mathematical Foundations of Reinforcement Learning*, Springer and
+Tsinghua University Press, 2025. The PDF is free on the
+[book's GitHub page](https://github.com/MathFoundationRL/Book-Mathematical-Foundation-of-Reinforcement-Learning/tree/0e348961c28496096d308f1066009266b3674c5a).
+Chapter, theorem and equation numbers below refer to it.</Sidenote> and borrows vocabulary from
+OpenAI's [Spinning Up introduction](https://spinningup.openai.com/en/latest/spinningup/rl_intro.html).
+It covers, in order: the agent–environment loop and Markov decision processes; state values and the
+Bellman equation; optimality and the contraction mapping theorem; dynamic programming (value and
+policy iteration); learning from samples (Monte Carlo, stochastic approximation, temporal-difference
+learning, Sarsa and Q-learning); function approximation and deep Q-learning; and finally policy
+gradients and actor-critic methods. Every idea is shown on the same 5 × 5 grid world, and every
+number in the text was computed by a script and checked against the book's printed tables. The
+companion post [From Reinforcement Learning to RLHF, PPO, DPO, GRPO and
+DRPO](/blog/reinforcement-learning-and-llm-alignment/) picks up where this one ends and applies
+policy gradients to language models.
+
+## The agent–environment loop
+
+An **agent** is the learner and decision maker; the **environment** is everything else. At each
+time step $t$ the agent observes a **state** $s_t$, picks an **action** $a_t$, and the environment
+answers with a scalar **reward** and a next state. A state is a complete description of the
+world; an **observation** is what the agent actually sees, which may be partial (a camera image of
+a room, not the room). This post assumes the agent sees the full state, the *fully observed* case
+on which the theory is built.
+
+The **action space** is the set of actions available. It can be **discrete** (the five moves in a
+grid world, the legal moves in Go) or **continuous** (the torques of a robot's joints, a vector in
+$\mathbb{R}^k$). The distinction decides how a policy is represented, as the next subsection shows.
+
+### Policies
+
+A **policy** is the agent's rule for choosing actions. A **deterministic policy** maps each state
+to one action, $a_t = \mu(s_t)$. A **stochastic policy** gives a probability distribution over
+actions, $a_t \sim \pi(\cdot \mid s_t)$, with $\sum_a \pi(a \mid s) = 1$. When the policy is a
+neural network with weights $\theta$ we write $\pi_\theta$; learning then means changing $\theta$.
+
+For a discrete action space, a **categorical policy** is the usual choice: the network outputs one
+score (a **logit**) per action, and a softmax turns the scores into probabilities. For example,
+logits $(2, 1, 0)$ for three actions give probabilities
+
+$$
+\pi(\cdot \mid s) = \frac{(e^2, e^1, e^0)}{e^2 + e^1 + e^0} = (0.665,\ 0.245,\ 0.090),
+$$
+
+so the log-probability of the second action is $\log 0.245 = -1.408$. Policy-gradient methods need
+exactly this log-probability, so it matters that it is cheap to compute.
+
+For a continuous action space, a **diagonal Gaussian policy** is common: a network outputs a mean
+vector $\mu_\theta(s)$, a separate parameter (or network) gives standard deviations $\sigma$, and
+the action is $a = \mu_\theta(s) + \sigma \odot z$ with $z \sim \mathcal{N}(0, I)$. Its
+log-likelihood for a $k$-dimensional action is
+
+$$
+\log \pi_\theta(a \mid s) = -\frac{1}{2}\left(\sum_{i=1}^{k} \left(\frac{(a_i - \mu_i)^2}{\sigma_i^2} + 2\log \sigma_i\right) + k \log 2\pi\right).
+$$
+
+Check it once with numbers: $\mu = (0.5, -1)$, $\sigma = (1, 0.5)$, $a = (1.5, -1)$. The squared
+standardised errors are $1^2/1 = 1$ and $0$; the log-scale terms are $2\log 1 = 0$ and
+$2 \log 0.5 = -1.386$; and $k \log 2\pi = 3.676$. The sum is $3.290$, so
+$\log \pi_\theta(a \mid s) = -1.645$.<Sidenote>Networks usually output $\log \sigma$ rather than
+$\sigma$, because $\log\sigma$ may be any real number while $\sigma$ must stay positive. The
+formula is from Spinning Up's "Diagonal Gaussian Policies".</Sidenote>
+
+### Returns and the RL objective
+
+A **trajectory** (also called an episode or rollout) is the sequence of states, actions and rewards
+the agent goes through:
+
+$$
+s_0 \xrightarrow{a_0} s_1, r_1 \xrightarrow{a_1} s_2, r_2 \xrightarrow{a_2} \cdots
+$$
+
+The **return** is what the agent wants to make large: the sum of the rewards along a trajectory.
+For a task that runs forever the plain sum can diverge, so we use the **discounted return**
+
+$$
+G_t = R_{t+1} + \gamma R_{t+2} + \gamma^2 R_{t+3} + \cdots = \sum_{k=0}^{\infty} \gamma^k R_{t+k+1},
+\qquad \gamma \in (0, 1).
+$$
+
+The **discount rate** $\gamma$ does two jobs. It keeps the sum finite when rewards are bounded (at
+most $r_{\max}/(1-\gamma)$), and it sets how far ahead the agent looks: with $\gamma$ near 0 the
+agent is short-sighted, with $\gamma$ near 1 it is far-sighted. Capital letters $S_t, A_t,
+R_{t+1}, G_t$ are random variables; lower-case letters are their observed values.
+
+Two conventions for the reward index are in use, and it pays to notice which one a text uses. Zhao
+writes $R_{t+1}$ for the reward that follows action $A_t$ (as Sutton and Barto do); Spinning Up
+writes $r_t = R(s_t, a_t, s_{t+1})$ and $R(\tau) = \sum_{t=0}^{\infty} \gamma^t r_t$. The two
+describe the same number; only the subscript shifts by one.
+
+The goal of RL is to find a policy with a large expected return. If the start state is drawn from
+a distribution $\rho_0$ and both policy and environment are stochastic, the probability of a
+$T$-step trajectory $\tau$ is
+
+$$
+P(\tau \mid \pi) = \rho_0(s_0) \prod_{t=0}^{T-1} p(s_{t+1} \mid s_t, a_t)\, \pi(a_t \mid s_t),
+$$
+
+and the objective is the expected return $J(\pi) = \mathbb{E}_{\tau \sim \pi}[R(\tau)]$, with
+$\pi^* = \arg\max_\pi J(\pi)$. Notice that the environment's transition probabilities appear in
+$P(\tau \mid \pi)$ but not $\theta$; this will make policy gradients computable without a model.
+
+### Markov decision processes
+
+A **Markov decision process** (MDP) makes this precise. It consists of
+
+- a **state space** $\mathcal{S}$ and, for each state, an **action space** $\mathcal{A}(s)$;
+- a **model**: transition probabilities $p(s' \mid s, a)$ and reward probabilities $p(r \mid s, a)$;
+- the **Markov property**: the next state and reward depend only on the current state and action,
+  $p(s_{t+1} \mid s_t, a_t, s_{t-1}, a_{t-1}, \ldots, s_0, a_0) = p(s_{t+1} \mid s_t, a_t)$, and
+  likewise for $r_{t+1}$.
+
+The Markov property is what makes everything below work: it lets the future be summarised by the
+present state. Once a policy is fixed, an MDP becomes a **Markov chain** (a Markov process): states
+move according to $p_\pi(s' \mid s) = \sum_a \pi(a \mid s) p(s' \mid s, a)$, with no decisions left.
+This post, like the book, considers **finite** MDPs (finitely many states and actions) with a
+**stationary** model, one that does not change over time.
+
+The running example is the book's grid world. A robot lives on a 5 × 5 board. Each cell is a
+state, so there are 25 states, written $(\text{row}, \text{column})$. In every state the robot has
+five actions: up, right, down, left and stay. Moves are deterministic. The rewards are:
+
+| event | reward |
+| --- | ---: |
+| trying to leave the board (the robot stays put) | $r_\text{boundary} = -1$ |
+| entering a forbidden (orange) cell | $r_\text{forbidden} = -1$ |
+| entering the target (blue) cell | $r_\text{target} = +1$ |
+| any other move | $r_\text{other} = 0$ |
+
+Forbidden cells can be entered, at a cost. The target is not terminal: staying in it earns $+1$ on
+every step, so the robot should learn to reach it and stay. Unless stated otherwise $\gamma = 0.9$.
+
+<GridWorld
+	mode="policy"
+	policy={goodPolicy}
+	trajectory={[0, 0]}
+	title="A policy on the grid world and the trajectory it produces from (1, 1)"
+	caption="Arrows show the action the policy takes in each cell; the number is the cell's state value v_π (next section). From the top-left cell the red dashed trajectory runs along the top row, down the right column and back along the bottom to the target, avoiding every forbidden cell. Hover a cell for its action values."
+/>
+
+Follow the trajectory in the figure from $(1, 1)$: four moves right, four down, two left and one up,
+eleven moves in all. The first ten earn reward 0; the eleventh enters the target and earns $+1$,
+and so does every later step spent staying there. The discounted return is
+
+$$
+0 + \gamma \cdot 0 + \cdots + \gamma^{9} \cdot 0 + \gamma^{10}(1 + \gamma + \gamma^2 + \cdots) = \frac{\gamma^{10}}{1-\gamma} = \frac{0.349}{0.1} = 3.49,
+$$
+
+the number shown in the $(1, 1)$ cell. Because this policy and the moves are deterministic, there
+is only one trajectory from each cell, and its return is the cell's value.
+
+## State values and the Bellman equation
+
+A return measures one trajectory. When the policy or the environment is random, the same start
+state can lead to many trajectories, so we average. The **state value** of $s$ under policy $\pi$
+is the expected return when starting from $s$ and following $\pi$:
+
+$$
+v_\pi(s) = \mathbb{E}[G_t \mid S_t = s].
+$$
+
+It depends on $s$ and on $\pi$, but not on $t$, because the model is stationary. State values let
+us compare policies: $\pi_1$ is **better** than $\pi_2$ if $v_{\pi_1}(s) \ge v_{\pi_2}(s)$ in every
+state.
+
+Here is the smallest useful example, the 2 × 2 grid from the book's chapter 2: $s_2$ (top right) is
+forbidden, $s_4$ (bottom right) is the target. In $s_1$ the policy goes right or down with
+probability 0.5 each; elsewhere it heads for the target and stays.
+
+<GridWorld
+	mode="policy"
+	grid="small"
+	policy={["bv", ">o"]}
+	title="The 2 × 2 grid with a stochastic policy at s₁"
+	caption="Top right is forbidden, bottom right is the target. From s₁ the policy moves right (into the forbidden cell, reward −1) or down (reward 0) with probability 0.5 each. The numbers are the state values for γ = 0.9."
+/>
+
+From $s_2$, $s_3$ and $s_4$ the robot reaches or stays in the target and earns $+1$ on every step,
+so their values are $1 + \gamma + \gamma^2 + \cdots = 1/(1-\gamma) = 10$. From $s_1$ it earns
+either $-1 + \gamma \cdot 10 = 8$ (right) or $0 + \gamma \cdot 10 = 9$ (down), each with
+probability 0.5, so $v_\pi(s_1) = 8.5$. A deterministic policy that always goes down from $s_1$
+would have $v(s_1) = 9$; it is better, and the values say so.
+
+### Deriving the Bellman equation
+
+The calculation above already used the key idea: the value of a state is the immediate reward plus
+the discounted value of where you land. To make it general, split the return into its first reward
+and the rest, $G_t = R_{t+1} + \gamma G_{t+1}$, and take expectations:
+
+$$
+v_\pi(s) = \mathbb{E}[R_{t+1} \mid S_t = s] + \gamma\, \mathbb{E}[G_{t+1} \mid S_t = s].
+$$
+
+The first term averages the immediate reward over actions and rewards,
+$\sum_a \pi(a \mid s) \sum_r p(r \mid s, a)\, r$. For the second term, condition on the next state
+and use the Markov property, $\mathbb{E}[G_{t+1} \mid S_t = s, S_{t+1} = s'] = \mathbb{E}[G_{t+1}
+\mid S_{t+1} = s'] = v_\pi(s')$. Putting the two together gives the **Bellman equation**:
+
+$$
+v_\pi(s) = \sum_{a} \pi(a \mid s) \left[ \sum_{r} p(r \mid s, a)\, r + \gamma \sum_{s'} p(s' \mid s, a)\, v_\pi(s') \right]
+\quad \text{for all } s \in \mathcal{S}.
+$$
+
+It is not one equation but $|\mathcal{S}|$ equations, one per state, and they are linear in the
+unknowns $v_\pi(s)$. Each value is defined through the values of its successors; this is called
+**bootstrapping**. Spinning Up writes the same thing compactly as
+$V^\pi(s) = \mathbb{E}_{a \sim \pi,\, s' \sim P}[r(s, a) + \gamma V^\pi(s')]$.
+
+### Solving the Bellman equation
+
+Stack the values into a vector $v_\pi \in \mathbb{R}^{|\mathcal{S}|}$. Define the expected
+immediate reward $r_\pi(s) = \sum_a \pi(a \mid s) \sum_r p(r \mid s, a) r$ and the transition
+matrix $[P_\pi]_{s s'} = p_\pi(s' \mid s)$. The Bellman equation becomes
+
+$$
+v_\pi = r_\pi + \gamma P_\pi v_\pi .
+$$
+
+For the 2 × 2 example, with states ordered $s_1, \ldots, s_4$,
+
+$$
+\begin{bmatrix} v_1 \\ v_2 \\ v_3 \\ v_4 \end{bmatrix}
+=
+\begin{bmatrix} -0.5 \\ 1 \\ 1 \\ 1 \end{bmatrix}
++ 0.9
+\begin{bmatrix} 0 & 0.5 & 0.5 & 0 \\ 0 & 0 & 0 & 1 \\ 0 & 0 & 0 & 1 \\ 0 & 0 & 0 & 1 \end{bmatrix}
+\begin{bmatrix} v_1 \\ v_2 \\ v_3 \\ v_4 \end{bmatrix}.
+$$
+
+$P_\pi$ is a **stochastic matrix**: its entries are non-negative and every row sums to 1. There
+are two ways to solve the system.
+
+**Closed form.** $v_\pi = (I - \gamma P_\pi)^{-1} r_\pi$. The inverse always exists: since every
+power $P_\pi^k$ is also stochastic and $\gamma \lt 1$, the series
+$I + \gamma P_\pi + \gamma^2 P_\pi^2 + \cdots$ converges, and it is the inverse. The series also
+shows $(I - \gamma P_\pi)^{-1} \ge I$ entrywise: more reward everywhere can only mean more value
+everywhere.<Sidenote>The book proves invertibility with the Gershgorin circle theorem (§2.7.1);
+the Neumann series argument here gives the same result and the non-negativity at once.</Sidenote>
+
+**Iteration.** Start from any guess $v_0$ and repeat $v_{k+1} = r_\pi + \gamma P_\pi v_k$. The
+error $\delta_k = v_k - v_\pi$ satisfies $\delta_{k+1} = \gamma P_\pi \delta_k$, so
+$\|\delta_k\|_\infty \le \gamma^k \|\delta_0\|_\infty \to 0$. Each sweep costs one matrix–vector
+product instead of an inversion, and this **iterative policy evaluation** is what larger problems
+use.
+
+The figure runs it on the policy drawn earlier. Step forward and watch values spread outward from
+the target: after one sweep only cells next to the target (and the target itself) are non-zero;
+after $k$ sweeps, cells up to $k$ moves away have heard about the reward.
+
+<GridWorld
+	mode="evaluate"
+	policy={goodPolicy}
+	title="Iterative policy evaluation: v_{k+1} = r_π + γ P_π v_k"
+	caption="Values changed by the latest sweep are in red. Hover a cell to see the Bellman update that produced its value, with the numbers substituted. The error to the true v_π is at most γ^k times the initial error; with v_0 = 0 it drops below 0.005 after 73 sweeps."
+/>
+
+Check one entry by hand. In the converged values the robot at $(1, 5)$ goes down to $(2, 5)$, whose
+value is $5.9$, with reward 0, so $v_\pi(1, 5) = 0 + 0.9 \times 5.9 = 5.3$. The values of this
+policy match the book's Figure 2.7(a) to the printed digit.
+
+### Action values
+
+The **action value** of a pair $(s, a)$ is the expected return when starting in $s$, taking $a$
+first, and following $\pi$ afterwards:
+
+$$
+q_\pi(s, a) = \mathbb{E}[G_t \mid S_t = s, A_t = a] = \sum_r p(r \mid s, a)\, r + \gamma \sum_{s'} p(s' \mid s, a)\, v_\pi(s').
+$$
+
+The two kinds of value determine each other. A state value is the policy's average of its action
+values, $v_\pi(s) = \sum_a \pi(a \mid s) q_\pi(s, a)$; an action value is one step of reward plus
+the discounted state value of the next state, as above. Substituting one into the other gives the
+Bellman equation for action values,
+$q_\pi(s, a) = \sum_r p(r \mid s, a) r + \gamma \sum_{s'} p(s' \mid s, a) \sum_{a'} \pi(a' \mid s')
+q_\pi(s', a')$.
+
+The difference $A_\pi(s, a) = q_\pi(s, a) - v_\pi(s)$ is called the **advantage**: how much better
+action $a$ is than the policy's average behaviour in $s$. It will return in actor-critic methods.
+
+| Spinning Up | Zhao | meaning |
+| --- | --- | --- |
+| $V^\pi(s)$ | $v_\pi(s)$ | expected return from $s$ under $\pi$ |
+| $Q^\pi(s, a)$ | $q_\pi(s, a)$ | expected return from $s$, first action $a$, then $\pi$ |
+| $V^*(s)$, $Q^*(s, a)$ | $v^*(s)$, $q^*(s, a)$ | the same under an optimal policy |
+| $A^\pi(s, a)$ | $\delta_\pi(s, a)$ | advantage $q_\pi - v_\pi$ |
+
+Action values are what make improvement possible. Take the 2 × 2 grid with a policy that goes
+*right* from $s_1$, into the forbidden cell. Its values are $v_\pi = (8, 10, 10, 10)$. The action
+values at $s_1$ are
+
+| action at $s_1$ | $q_\pi(s_1, a) = r + \gamma v_\pi(s')$ | value |
+| --- | --- | ---: |
+| up (bump, stay) | $-1 + 0.9 \times 8$ | 6.2 |
+| right (forbidden) | $-1 + 0.9 \times 10$ | 8.0 |
+| down | $0 + 0.9 \times 10$ | 9.0 |
+| left (bump, stay) | $-1 + 0.9 \times 8$ | 6.2 |
+| stay | $0 + 0.9 \times 8$ | 7.2 |
+
+Down has the largest action value, so switching $s_1$ to down should improve the policy, and it
+does: $v(s_1)$ rises from 8 to 9. Hover $s_1$ in the figure to see the same table.
+
+<GridWorld
+	mode="policy"
+	grid="small"
+	policy={[">v", ">o"]}
+	title="A policy that can be improved: action values at s₁"
+	caption="The policy moves right from s₁ into the forbidden cell. Hover s₁: the action value of down (9.0) beats that of the policy's own action (8.0), so a greedy switch improves the policy."
+/>
+
+## Optimality
+
+The improvement step above raises an obvious question: if we keep switching each state to its best
+action, where does it end? A policy $\pi^*$ is **optimal** if $v_{\pi^*}(s) \ge v_\pi(s)$ for every
+state $s$ and every policy $\pi$; its values are the **optimal state values** $v^*$. It is not
+obvious that such a policy exists, since one policy might be best at some states and another at
+others. The Bellman optimality equation settles it.
+
+The **Bellman optimality equation** (BOE) is
+
+$$
+v(s) = \max_{\pi(\cdot \mid s)} \sum_a \pi(a \mid s) \left[ \sum_r p(r \mid s, a)\, r + \gamma \sum_{s'} p(s' \mid s, a)\, v(s') \right]
+= \max_a q(s, a),
+$$
+
+where $q(s, a)$ is the bracket. The second equality holds because a weighted average of numbers
+$q(s, a)$ with weights that sum to one is largest when all the weight sits on the largest number.
+So the maximising policy is **greedy**: it puts probability 1 on $\arg\max_a q(s, a)$. In
+matrix–vector form the BOE reads $v = f(v)$ with $f(v) = \max_\pi (r_\pi + \gamma P_\pi v)$, the
+maximum taken state by state.
+
+The BOE looks like it has two unknowns, $v$ and $\pi$. But the inner maximisation can be solved for
+any $v$ (take the greedy action), which leaves one non-linear equation in $v$. The question is
+whether that equation has a solution and whether it is unique. The answer comes from a classical
+theorem.
+
+### The contraction mapping theorem
+
+A function $f: \mathbb{R}^n \to \mathbb{R}^n$ is a **contraction** if there is a $\gamma \in (0, 1)$
+with $\|f(x_1) - f(x_2)\| \le \gamma \|x_1 - x_2\|$ for all $x_1, x_2$: applying $f$ brings any two
+points closer together by at least a factor $\gamma$. A **fixed point** is an $x^*$ with
+$f(x^*) = x^*$.
+
+**Contraction mapping theorem.** If $f$ is a contraction, then (1) a fixed point exists, (2) it is
+unique, and (3) the iteration $x_{k+1} = f(x_k)$ converges to it from any start, with
+$\|x_k - x^*\| \le \frac{\gamma^k}{1-\gamma} \|x_1 - x_0\|$.
+
+The proof is short. Successive steps shrink geometrically,
+$\|x_{k+1} - x_k\| \le \gamma^k \|x_1 - x_0\|$, so for $m \gt n$ the triangle inequality gives
+$\|x_m - x_n\| \le (\gamma^n + \cdots + \gamma^{m-1})\|x_1 - x_0\| \le \frac{\gamma^n}{1-\gamma}\|x_1 - x_0\|$.
+The sequence is therefore Cauchy and converges to some $x^*$, which is a fixed point because $f$ is
+continuous. If $x'$ were another fixed point, $\|x' - x^*\| = \|f(x') - f(x^*)\| \le \gamma \|x' - x^*\|$
+would force $\|x' - x^*\| = 0$.
+
+**The BOE's right-hand side is a contraction** in the max norm
+$\|v\|_\infty = \max_s |v(s)|$. For any numbers, $|\max_a x_a - \max_a y_a| \le \max_a |x_a - y_a|$.
+Apply this in state $s$ with $x_a$ and $y_a$ the bracket of the BOE for $v_1$ and $v_2$; the reward
+terms cancel and
+
+$$
+|f(v_1)(s) - f(v_2)(s)| \le \max_a \gamma \sum_{s'} p(s' \mid s, a)\, |v_1(s') - v_2(s')| \le \gamma \|v_1 - v_2\|_\infty ,
+$$
+
+because the probabilities sum to one. Taking the maximum over $s$ gives
+$\|f(v_1) - f(v_2)\|_\infty \le \gamma \|v_1 - v_2\|_\infty$.<Sidenote>The book's Box 3.2 proves the
+same bound by sandwiching $f(v_1) - f(v_2)$ between $\gamma P_{\pi_2^*}(v_1 - v_2)$ and
+$\gamma P_{\pi_1^*}(v_1 - v_2)$.</Sidenote>
+
+The theorem then answers everything at once (Zhao, Theorems 3.3–3.5):
+
+- **Existence and uniqueness.** The BOE has exactly one solution $v^*$.
+- **It is optimal.** Let $\pi^*$ be greedy with respect to $v^*$. Then $v^* = r_{\pi^*} + \gamma P_{\pi^*} v^*$,
+  so $v^*$ is the value of $\pi^*$. For any other $\pi$, $v^* \ge r_\pi + \gamma P_\pi v^*$, hence
+  $v^* - v_\pi \ge \gamma P_\pi (v^* - v_\pi) \ge \cdots \ge \gamma^n P_\pi^n (v^* - v_\pi) \to 0$.
+  So $v^* \ge v_\pi$ everywhere.
+- **A deterministic optimal policy always exists**: the greedy one. Optimal policies need not be
+  unique (ties in $\arg\max$), but the optimal values are.
+- **An algorithm**: iterate $v_{k+1} = f(v_k)$. This is value iteration, the subject of the next
+  section.
+
+In Spinning Up's notation the two optimality equations are
+$V^*(s) = \max_a \mathbb{E}_{s'}[r(s, a) + \gamma V^*(s')]$ and
+$Q^*(s, a) = \mathbb{E}_{s'}[r(s, a) + \gamma \max_{a'} Q^*(s', a')]$; the only change from the
+Bellman equation of a fixed policy is the $\max$.
+
+### What shapes the optimal policy
+
+The optimal policy depends on the rewards, the discount rate and the model. The figure solves the
+BOE live; move the sliders to repeat the book's experiments.
+
+<GridWorld
+	mode="optimal"
+	title="Optimal policy and optimal values v*"
+	caption="Every optimal action is drawn (two arrows mean a tie). Hover a cell for q*(s, a). Lower γ to 0.5 and the policy stops cutting through forbidden cells; set r_forbidden to −10 and it avoids them even at γ = 0.9. The β slider adds the same constant to every reward: the policy does not change and every value shifts by β/(1 − γ)."
+/>
+
+With the baseline rewards and $\gamma = 0.9$ the optimal value at $(1, 1)$ is $5.83$, and the
+values match the book's Figure 3.4(a). Three experiments are worth trying.
+
+**The discount rate sets the horizon.** From $(4, 1)$ the optimal policy at $\gamma = 0.9$ goes
+right into the forbidden cell $(4, 2)$ and then into the target: it pays $-1$ once to save many
+steps. At $\gamma = 0.5$ it walks the long way round, 14 moves through $(1, 1)$ and down the right
+edge, because a reward 14 steps away is worth only $0.5^{14}$ of its face value and a $-1$ now
+looms large. At $\gamma = 0$ the agent maximises only the immediate reward and most states have
+value 0.
+
+**Penalties change behaviour.** With $r_\text{forbidden} = -10$ the optimal policy avoids all
+forbidden cells, and its values are those of the policy drawn at the top of this post (book
+Figure 3.4(d)).
+
+**Shifting all rewards changes nothing.** If every reward $r$ becomes $\alpha r + \beta$ with
+$\alpha \gt 0$, then $v' = \alpha v^* + \frac{\beta}{1-\gamma}\mathbf{1}$ solves the new BOE
+(substitute it and use $P_\pi \mathbf{1} = \mathbf{1}$), so the greedy policy is the same (Zhao,
+Theorem 3.6). For example, subtracting 2 from every reward makes all rewards negative, yet the
+optimal policy is unchanged and $v^*(1, 1)$ moves from $5.83$ to $5.83 - 2/0.1 = -14.17$. A common
+belief is that a step cost of $-1$ is needed to make the agent hurry; it is not, because discounting
+already does that. In a 2 × 2 grid, reaching the target directly is worth $1/(1-\gamma) = 10$ while
+a two-step detour is worth $\gamma^2/(1-\gamma) = 8.1$.
+
+## Dynamic programming
+
+When the model $p(s' \mid s, a)$ and $p(r \mid s, a)$ is known, the optimal policy can be computed
+without any interaction. The algorithms that do this are called **dynamic programming**. They are
+the template from which the model-free algorithms later in this post are built.
+
+### Value iteration
+
+**Value iteration** is the iteration suggested by the contraction mapping theorem,
+$v_{k+1} = \max_\pi (r_\pi + \gamma P_\pi v_k)$. Written per state, each iteration has two steps:
+
+1. **Policy update.** Compute $q_k(s, a) = \sum_r p(r \mid s, a) r + \gamma \sum_{s'} p(s' \mid s, a) v_k(s')$
+   and let $\pi_{k+1}(s)$ be the greedy action.
+2. **Value update.** $v_{k+1}(s) = \max_a q_k(s, a)$.
+
+Note that $v_k$ is not the value of any policy, just an estimate converging to $v^*$. Here are the
+first iterations on the 2 × 2 grid from $v_0 = 0$:
+
+| $k$ | $v_k(s_1)$ | $v_k(s_2)$ | $v_k(s_3)$ | $v_k(s_4)$ | greedy actions $s_1 \ldots s_4$ |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 0 | 0 | 0 | 0 | 0 | — |
+| 1 | 0 | 1 | 1 | 1 | down, down, right, stay |
+| 2 | 0.9 | 1.9 | 1.9 | 1.9 | down, down, right, stay |
+| 3 | 1.71 | 2.71 | 2.71 | 2.71 | down, down, right, stay |
+
+Check $k = 1$ at $s_2$: from $v_0 = 0$ every action value is just its immediate reward, and moving
+down into the target earns $+1$, the largest, so $v_1(s_2) = 1$. (At $s_1$, down and stay tie at
+0; any tie-break works, and the table takes the first action in the order up, right, down, left,
+stay.) At $k = 2$, $s_1$'s best action
+is down with $q_1(s_1, \text{down}) = 0 + 0.9 \times v_1(s_3) = 0.9$. The greedy policy is already
+optimal after one iteration; the values creep toward $v^* = (9, 10, 10, 10)$ at rate $\gamma$.
+
+### Policy iteration and its truncated form
+
+**Policy iteration** alternates two different steps, starting from any policy $\pi_0$:
+
+1. **Policy evaluation**: solve the Bellman equation $v_{\pi_k} = r_{\pi_k} + \gamma P_{\pi_k} v_{\pi_k}$
+   (iteratively, as above).
+2. **Policy improvement**: $\pi_{k+1} = \arg\max_\pi (r_\pi + \gamma P_\pi v_{\pi_k})$, the greedy policy.
+
+The **policy improvement theorem** guarantees progress: $v_{\pi_{k+1}} \ge v_{\pi_k}$. Proof:
+because $\pi_{k+1}$ is greedy, $r_{\pi_{k+1}} + \gamma P_{\pi_{k+1}} v_{\pi_k} \ge r_{\pi_k} + \gamma P_{\pi_k} v_{\pi_k} = v_{\pi_k}$.
+Subtracting this from $v_{\pi_{k+1}} = r_{\pi_{k+1}} + \gamma P_{\pi_{k+1}} v_{\pi_{k+1}}$ gives
+$v_{\pi_k} - v_{\pi_{k+1}} \le \gamma P_{\pi_{k+1}}(v_{\pi_k} - v_{\pi_{k+1}})$, and iterating as before
+shows the left side is $\le 0$. With finitely many deterministic policies, policy iteration
+therefore reaches an optimal one in finitely many iterations.
+
+The two algorithms differ only in how much work they put into evaluation. Value iteration does one
+Bellman sweep per iteration; policy iteration does infinitely many (until convergence). **Truncated
+policy iteration** does $j$ sweeps, starting from the previous estimate; $j = 1$ is value iteration
+and $j = \infty$ is policy iteration.
+
+<DpSteps
+	algorithm="vi"
+	title="Value iteration, policy iteration and truncated policy iteration on the 5 × 5 grid"
+	caption="The grid shows the iteration's estimate v_k and greedy policy π_k. The plot shows ‖v_k − v*‖∞ for all three algorithms; the selected one is drawn solid. Policy iteration and truncated policy iteration start from the policy that stays everywhere, value iteration from v_0 = 0."
+/>
+
+The numbers in the figure tell the trade-off:
+
+- **Value iteration** from $v_0 = 0$ has error exactly $10 \times 0.9^k$, the contraction bound,
+  because the target's value grows as $1 + \gamma + \cdots + \gamma^{k-1}$. Its greedy policy is
+  optimal in every state from iteration 6, but the values need 66 iterations to get within 0.01.
+- **Policy iteration** from "stay everywhere" spends 264 sweeps evaluating the first policy (the
+  values $-10$ in forbidden cells converge slowly), its error even rises to 20 at $k = 1$ because
+  $v_{\pi_0}$ is far from $v^*$, but its policy is optimal at iteration 5 and its values exact at
+  iteration 6.
+- **Truncated policy iteration** with $j = 3$ also finds the optimal policy at iteration 5, and
+  its values reach 0.01 at iteration 22. Drag $j$ to see it slide between the other two.
+
+## Learning from samples
+
+Dynamic programming needs the model. Usually we do not have it: we can only act and observe what
+happens. The rest of the post replaces model-based expectations by averages over experience. The
+first step is to notice that every value is an expectation, $v_\pi(s) = \mathbb{E}[G_t \mid S_t = s]$,
+so estimating a value is a **mean estimation** problem.
+
+### Monte Carlo
+
+**Monte Carlo** (MC) methods estimate an expectation by averaging samples. By the **law of large
+numbers**, the mean $\bar x = \frac{1}{n}\sum_i x_i$ of $n$ independent samples is unbiased and its
+variance is $\operatorname{var}(X)/n$. Applied to RL: run episodes from $(s, a)$ under $\pi$ and
+average their returns to estimate $q_\pi(s, a)$.
+
+**MC Basic** is policy iteration with this substitution: estimate $q_{\pi_k}(s, a)$ for every pair
+by averaging returns, then improve greedily. Two refinements make it practical. Every visit of a
+pair in an episode starts a sub-episode whose return is also a sample of its action value, so one
+long episode updates many pairs; and the policy can be improved after every episode rather than
+after accurate estimates of all pairs (**MC Exploring Starts**).
+
+The weak point is **exploration**: a greedy policy never tries actions it currently thinks are
+bad, so their estimates never improve. Starting episodes from every state-action pair (exploring
+starts) fixes this but is often impossible in practice. The usual fix is an **$\varepsilon$-greedy
+policy**, which takes the greedy action with high probability and every other action with a small
+equal probability:
+
+$$
+\pi(a \mid s) = \begin{cases} 1 - \dfrac{\varepsilon}{|\mathcal{A}(s)|}\,(|\mathcal{A}(s)| - 1) & a = a^*(s) \text{ (greedy)}, \\[2mm] \dfrac{\varepsilon}{|\mathcal{A}(s)|} & \text{each other action.} \end{cases}
+$$
+
+With five actions and $\varepsilon = 0.2$, the greedy action has probability $0.84$ and each other
+action $0.04$. Such a policy is **soft**: every action has positive probability, so one long
+episode visits every pair many times.
+
+Exploration has a price: an $\varepsilon$-greedy policy keeps making random moves, so even the best
+$\varepsilon$-greedy policy is worse than the optimal greedy one. The table gives the best
+$\varepsilon$-greedy policy on the grid for several $\varepsilon$ (found by policy iteration with an
+$\varepsilon$-greedy improvement step).
+
+<table>
+	<thead>
+		<tr><th>ε</th><th style="text-align:right">P(greedy action)</th><th style="text-align:right">P(each other)</th><th style="text-align:right">v at (1, 1)</th><th style="text-align:right">v at target</th><th style="text-align:right">RMSE vs v*</th><th style="text-align:right">greedy action not optimal</th></tr>
+	</thead>
+	<tbody>
+		{epsTable.map((r) => (
+			<tr><td>{r.eps}</td><td style="text-align:right">{r.greedyProb.toFixed(2)}</td><td style="text-align:right">{r.otherProb.toFixed(2)}</td><td style="text-align:right">{r.vStart.toFixed(2)}</td><td style="text-align:right">{r.vTarget.toFixed(2)}</td><td style="text-align:right">{r.rmse.toFixed(2)}</td><td style="text-align:right">{r.greedyDiffers} / 25</td></tr>
+		))}
+	</tbody>
+</table>
+
+Even $\varepsilon = 0.1$ lowers the target's value from 10 to 8.56, because the robot sometimes
+stumbles into the surrounding forbidden cells; at $\varepsilon = 0.2$ and $0.5$ the greedy part of
+the best $\varepsilon$-greedy policy already differs from the optimal policy in one state. This is
+the book's §5.5 point: use a large $\varepsilon$ to explore early and shrink it toward 0 later.
+
+### Stochastic approximation
+
+Monte Carlo waits for complete episodes and then averages. An incremental version updates an
+estimate as each sample arrives. The mean of $x_1, \ldots, x_k$ satisfies
+
+$$
+w_{k+1} = w_k - \frac{1}{k}(w_k - x_k),
+$$
+
+and replacing $1/k$ by a general step size $a_k \gt 0$ gives a family of algorithms with the same
+shape: *new estimate = old estimate − step × (old estimate − sample)*.
+
+**Stochastic approximation** studies such updates in general. The **Robbins–Monro** (RM) algorithm
+finds a root of $g(w) = 0$ when only noisy evaluations $\tilde g(w, \eta) = g(w) + \eta$ are
+available:
+
+$$
+w_{k+1} = w_k - a_k \tilde g(w_k, \eta_k).
+$$
+
+**Robbins–Monro theorem** (Zhao, Theorem 6.1). $w_k$ converges to the root $w^*$ with probability 1 if
+
+1. $0 \lt c_1 \le \nabla_w g(w) \le c_2$ for all $w$ ($g$ is increasing with bounded slope);
+2. $\sum_k a_k = \infty$ and $\sum_k a_k^2 \lt \infty$;
+3. the noise has zero conditional mean and bounded conditional variance.
+
+The step-size condition is the one to remember. $\sum a_k^2 \lt \infty$ makes the steps shrink
+fast enough that the noise averages out; $\sum a_k = \infty$ keeps them large enough to travel any
+distance, so a bad initial guess is forgotten. $a_k = 1/k$ satisfies both; a constant step
+violates the first.
+
+Mean estimation is the special case $g(w) = w - \mathbb{E}[X]$ with $\tilde g = w - x$. The
+figure estimates the mean of a fair die (3.5) from the same {rmSamples} rolls with three step sizes.
+
+<LineChart
+	x={() => Array.from({ length: rmSamples + 1 }, (_, k) => k)}
+	series={[
+		{ name: "a_k = 1/k (running mean)", fn: (k) => rmCurves.harmonic[k] },
+		{ name: "a_k = 1/k^0.6", fn: (k) => rmCurves.slow[k] },
+		{ name: "a_k = 0.1 (constant)", fn: (k) => rmCurves.constant[k] },
+		{ name: "true mean 3.5", fn: () => 3.5 },
+	]}
+	title="Robbins–Monro estimates of a die's mean from the same rolls"
+	xLabel="number of rolls k"
+	yLabel="estimate w_k"
+	height={300}
+/>
+
+With $a_k = 1/k$ the estimate is exactly the running mean, which is 3.607 after 300 rolls and stays
+within $[3.50, 3.83]$ after roll 100. The constant step $0.1$ never settles: it weights recent rolls
+most and still wanders between 2.49 and 4.76 after roll 100. The step $a_k = 1/k^{0.6}$ also meets
+both conditions ($\sum k^{-1.2}$ is finite), so it converges too, but more slowly than the running
+mean because it keeps weighting recent rolls more heavily. A constant step is still common in
+practice when the target moves (as it does when the policy changes), because it keeps tracking.
+
+**Stochastic gradient descent** (SGD) is the RM algorithm applied to $g(w) = \nabla_w J(w)$:
+minimising $J(w) = \mathbb{E}[f(w, X)]$ with the update $w_{k+1} = w_k - a_k \nabla_w f(w_k, x_k)$
+is root finding for the gradient, with one-sample noise. Every learning algorithm below has this
+shape.
+
+### TD learning, Sarsa and Q-learning
+
+**Temporal-difference** (TD) learning applies stochastic approximation to the Bellman equation
+itself. Write the Bellman equation as an expectation over one step,
+$v_\pi(s) = \mathbb{E}[R_{t+1} + \gamma v_\pi(S_{t+1}) \mid S_t = s]$, and solve
+$g(v(s)) = v(s) - \mathbb{E}[R_{t+1} + \gamma v_\pi(S_{t+1}) \mid S_t = s] = 0$ with RM. Each
+transition $(s_t, r_{t+1}, s_{t+1})$ gives one noisy evaluation, and the update is
+
+$$
+v_{t+1}(s_t) = v_t(s_t) - \alpha_t(s_t)\Big[\, v_t(s_t) - \underbrace{\big(r_{t+1} + \gamma v_t(s_{t+1})\big)}_{\text{TD target } \bar v_t} \Big],
+$$
+
+with all other states unchanged. The bracket is the **TD error** $\delta_t = v_t(s_t) - \bar v_t$.
+The **TD target** $\bar v_t$ is what the estimate is pulled toward.<Sidenote>The RM derivation
+assumes the true $v_\pi(s_{t+1})$ inside the target; TD uses the current estimate $v_t(s_{t+1})$
+instead. Zhao's Theorem 7.1 shows it still converges to $v_\pi$ for all states if every state is
+visited infinitely often and the step sizes satisfy the RM conditions.</Sidenote> For example, if
+$v_t(s_t) = 2$, the observed reward is 0, $v_t(s_{t+1}) = 5$, $\gamma = 0.9$ and $\alpha = 0.1$,
+the target is $0 + 0.9 \times 5 = 4.5$, the TD error is $2 - 4.5 = -2.5$, and the new estimate is
+$2 - 0.1 \times (-2.5) = 2.25$.
+
+Compared with Monte Carlo, TD learns from every step without waiting for the episode to end, and
+its target has lower variance (one random reward instead of a whole random return). The price is
+bias: the target uses an estimate, so early errors propagate. Monte Carlo targets are unbiased but
+noisy.
+
+To find a policy rather than evaluate one, we estimate action values, because greedy improvement
+needs $q$, not $v$, when there is no model. Two algorithms differ only in their target:
+
+- **Sarsa** (named after the tuple $s_t, a_t, r_{t+1}, s_{t+1}, a_{t+1}$) uses the action the
+  policy will actually take next: $\bar q_t = r_{t+1} + \gamma q_t(s_{t+1}, a_{t+1})$. It solves
+  the Bellman equation of the policy it follows.
+- **Q-learning** uses the best next action: $\bar q_t = r_{t+1} + \gamma \max_a q_t(s_{t+1}, a)$.
+  It solves the Bellman optimality equation for action values directly.
+
+That difference makes Q-learning **off-policy**: the **behaviour policy** that generates the data
+can differ from the **target policy** being learned (here the greedy policy), because the target
+does not depend on which action the behaviour policy takes next. Sarsa is **on-policy**: it learns
+the value of the (ε-greedy) behaviour policy itself. The book's Table 7.2 puts all these methods in
+one form, $q_{t+1}(s_t, a_t) = q_t(s_t, a_t) - \alpha_t[q_t(s_t, a_t) - \bar q_t]$:
+
+| algorithm | TD target $\bar q_t$ | equation it solves |
+| --- | --- | --- |
+| Sarsa | $r_{t+1} + \gamma q_t(s_{t+1}, a_{t+1})$ | Bellman equation of $\pi$ |
+| $n$-step Sarsa | $r_{t+1} + \gamma r_{t+2} + \cdots + \gamma^n q_t(s_{t+n}, a_{t+n})$ | Bellman equation of $\pi$ |
+| Q-learning | $r_{t+1} + \gamma \max_a q_t(s_{t+1}, a)$ | Bellman optimality equation |
+| Monte Carlo | $r_{t+1} + \gamma r_{t+2} + \gamma^2 r_{t+3} + \cdots$ | Bellman equation of $\pi$ (with $\alpha = 1$) |
+
+$n$-step Sarsa interpolates between Sarsa ($n = 1$) and Monte Carlo ($n \to \infty$), trading bias
+for variance.
+
+The figure runs Q-learning live, as in the book's Figure 7.4: one episode of 100,000 steps from
+$(1, 1)$, constant $\alpha = 0.1$, all action values starting at 0.
+
+<TdLearning
+	algorithm="q-learning"
+	eps={1}
+	title="Q-learning on the grid world (one long episode, ε-greedy behaviour)"
+	caption="The grid shows the greedy action and max_a q(s, a) of the current estimate; the tint is the visit count (log scale), the red dot is the agent and the dashed line its last steps. The plot is the RMSE of max_a q against v*. Set speed to 1 step per frame to read single updates in the box; switch to Sarsa or lower ε to compare."
+/>
+
+With a uniform behaviour policy ($\varepsilon = 1$) the robot wanders everywhere: every cell is
+visited at least {tdMinVisits.q1} times, and Q-learning recovers $v^*$ almost exactly by step
+100,000 even though it never *follows* the greedy policy it learns. The next chart compares
+behaviour policies, all with seed 1.
+
+<LineChart
+	x={() => Array.from({ length: tdCurves.q1.err.length }, (_, i) => i)}
+	series={[
+		{ name: "Q-learning, ε = 1", fn: (i) => tdCurves.q1.err[i] },
+		{ name: "Q-learning, ε = 0.5", fn: (i) => tdCurves.q05.err[i] },
+		{ name: "Q-learning, ε = 0.1", fn: (i) => tdCurves.q01.err[i] },
+		{ name: "Sarsa, ε = 0.1", fn: (i) => tdCurves.s01.err[i] },
+	]}
+	title="Error of max_a q against v* over 100,000 steps"
+	xLabel="steps (thousands)"
+	yLabel="RMSE"
+	height={300}
+/>
+
+After 100,000 steps the RMSE is {f2(tdCurves.q1.err[100])} with $\varepsilon = 1$,
+{f2(tdCurves.q05.err[100])} with $\varepsilon = 0.5$ and {f2(tdCurves.q01.err[100])} with
+$\varepsilon = 0.1$. Less exploration means fewer samples of the rarely visited cells (the least
+visited cell is seen {tdMinVisits.q05} and {tdMinVisits.q01} times respectively), and Q-learning
+can only learn values from data it has. Sarsa with $\varepsilon = 0.1$ ends at
+{f2(tdCurves.s01.err[100])}: it is slow for the same reason, and even at convergence it would not
+reach zero, because it learns the values of an ε-greedy policy, which the table above shows are
+lower than $v^*$ (RMSE 1.40 for the best one).
+
+## Function approximation
+
+Tables do not scale. A camera image has more states than there are atoms in the universe, and a
+table cannot generalise from one state to a similar one. **Function approximation** replaces the
+table by a parameterised function $\hat v(s, w)$, for example a linear model
+$\hat v(s, w) = \phi(s)^\top w$ with a **feature vector** $\phi(s)$, or a neural network.
+
+The natural objective is a weighted squared error,
+
+$$
+J(w) = \mathbb{E}_{S \sim d_\pi}\big[(v_\pi(S) - \hat v(S, w))^2\big] = \sum_s d_\pi(s)\,(v_\pi(s) - \hat v(s, w))^2 .
+$$
+
+The weights should be the **stationary distribution** $d_\pi$ of the Markov chain under $\pi$: the
+long-run fraction of time spent in each state, defined by $d_\pi^\top P_\pi = d_\pi^\top$. States the
+policy rarely visits matter less. For the uniform random policy on this grid, $d_\pi$ is exactly
+uniform, $1/25$ per cell, because every move is reversible and bumping into a wall keeps the robot
+in place, which makes $P_\pi$ symmetric. A more focused policy concentrates its mass: an
+ε-greedy version of the optimal policy with $\varepsilon = 0.5$ spends
+{(100 * stationaryEps[17]).toFixed(1)}% of its time in the target.
+
+<GridWorld
+	mode="values"
+	values={stationaryEps}
+	digits={3}
+	valueLabel="d_π(s)"
+	title="Stationary distribution of the ε-greedy (ε = 0.5) optimal policy"
+	caption="Long-run fraction of time spent in each cell. Half the mass sits on the target; cells far from the optimal route are almost never visited, so a weighted objective barely cares about errors there."
+/>
+
+Gradient descent on $J$ needs $v_\pi(s_t)$, which is unknown. Replacing it by a Monte Carlo return
+gives MC with function approximation; replacing it by the TD target gives **TD-Linear** for a linear
+model:
+
+$$
+w_{t+1} = w_t + \alpha_t \big[r_{t+1} + \gamma \phi(s_{t+1})^\top w_t - \phi(s_t)^\top w_t\big]\, \phi(s_t).
+$$
+
+This is a **semi-gradient** method: it differentiates only $\hat v(s_t, w)$ and treats the target
+as a constant. It does not minimise $J$. The book's §8.2.5 shows it converges to the solution of
+the **projected Bellman equation**, the $w$ that satisfies
+$\Phi^\top D_\pi (r_\pi + \gamma P_\pi \Phi w - \Phi w) = 0$, where $\Phi$ stacks the feature vectors
+and $D_\pi = \operatorname{diag}(d_\pi)$. With $\phi(s) = e_s$ (one-hot features) TD-Linear is
+exactly tabular TD.
+
+The book evaluates the uniform policy (its Figure 8.6) with polynomial features in the normalised
+column $x$ and row $y$: $[1, x, y]$, then all monomials up to degree 2 (6 features), then degree 3
+(10 features). The table compares the TD fixed point with the best possible fit in the same
+features.
+
+<table>
+	<thead>
+		<tr><th>features</th><th style="text-align:right">RMSE of TD-Linear fixed point</th><th style="text-align:right">RMSE of best d_π-weighted fit</th></tr>
+	</thead>
+	<tbody>
+		{linearFits.map((f) => (
+			<tr><td>{f.features}</td><td style="text-align:right">{f.rmseTd.toFixed(3)}</td><td style="text-align:right">{f.rmseBest.toFixed(3)}</td></tr>
+		))}
+	</tbody>
+</table>
+
+More features fit better, but none reaches zero: a cubic surface cannot follow the dips at the
+forbidden cells. The TD fixed point is slightly worse than the best fit, the price of
+bootstrapping.<Sidenote>The book proves
+$\|\Phi w_\text{TD} - v_\pi\|_{D} \le \frac{1}{1-\gamma}\min_w \|\Phi w - v_\pi\|_{D}$ in the
+$d_\pi$-weighted norm (eq. 8.32) and calls the bound loose; here the gap is far smaller than the
+factor of 10 it allows. Numbers computed by
+solving the two linear systems exactly and cross-checked with NumPy.</Sidenote>
+
+<GridWorld
+	mode="values"
+	values={linearFits[0].vTd}
+	compare={linearFits[0].v}
+	digits={2}
+	valueLabel="TD-Linear estimate with [1, x, y]"
+	compareLabel="true v_π"
+	title="A plane fitted by TD-Linear to the uniform policy's values"
+	caption="With three features the estimate is a plane: it rises to the right and toward the top, as the true values do on average (hover a cell to compare). The true values range from −4.5 to −2.9; the plane misses local structure such as the low values near the forbidden cells."
+/>
+
+### Deep Q-learning
+
+**Deep Q-learning** (DQN) brings function approximation to Q-learning. It minimises the squared
+Bellman optimality error
+
+$$
+J(w) = \mathbb{E}\Big[\big(R + \gamma \max_{a} \hat q(S', a, w) - \hat q(S, A, w)\big)^2\Big],
+$$
+
+where $(S, A, R, S')$ is a transition. Because $w$ appears inside the target too, the gradient is
+awkward, and DQN uses two techniques to tame it:
+
+- **A target network.** The target is computed with a copy $w_T$ of the parameters that is frozen
+  for a number of steps and then synced: $y = r + \gamma \max_a \hat q(s', a, w_T)$. With $w_T$
+  fixed, minimising $(y - \hat q(s, a, w))^2$ is ordinary regression.
+- **Experience replay.** Transitions are stored in a **replay buffer** and mini-batches are drawn
+  from it uniformly. The objective is an expectation over $(S, A)$, which must have a distribution;
+  consecutive transitions from one trajectory are strongly correlated, and drawing uniformly from
+  the buffer breaks that correlation (Zhao, §8.4.1). Replay also reuses each sample many times.
+
+Since Q-learning is off-policy, any behaviour policy can fill the buffer.
+
+## Policy gradient methods
+
+Everything so far is **value-based**: learn values, then act greedily. **Policy-based** methods
+parameterise the policy directly, $\pi(a \mid s, \theta)$, and climb the gradient of a scalar
+objective, $\theta_{t+1} = \theta_t + \alpha \nabla_\theta J(\theta_t)$. They handle continuous
+actions naturally (output a Gaussian's mean), can represent stochastic policies, and change the
+policy smoothly instead of jumping between greedy choices.
+
+With a function, "maximise every state value" is no longer possible, so we need a scalar. Two are
+standard:
+
+- the **average state value** $\bar v_\pi = \sum_s d(s) v_\pi(s)$, for a start-state distribution
+  $d$; with $d = \rho_0$ this is Spinning Up's $J(\pi) = \mathbb{E}_{\tau \sim \pi}[R(\tau)]$;
+- the **average reward** $\bar r_\pi = \sum_s d_\pi(s) r_\pi(s) = \lim_{n \to \infty}\frac{1}{n}\mathbb{E}[\sum_{t=0}^{n-1} R_{t+1}]$.
+
+In the discounted case they agree up to a constant when $d = d_\pi$: multiplying the Bellman
+equation by $d_\pi^\top$ gives $\bar v_\pi = \bar r_\pi + \gamma \bar v_\pi$, so
+$\bar r_\pi = (1-\gamma)\bar v_\pi$ (Lemma 9.1).
+
+**Policy gradient theorem** (Zhao, Theorem 9.1). For these objectives
+
+$$
+\nabla_\theta J(\theta) = \sum_s \eta(s) \sum_a \nabla_\theta \pi(a \mid s, \theta)\, q_\pi(s, a)
+= \mathbb{E}_{S \sim \eta,\, A \sim \pi}\big[\nabla_\theta \ln \pi(A \mid S, \theta)\, q_\pi(S, A)\big],
+$$
+
+where $\eta$ is a state distribution that depends on the objective. For $\bar v_\pi$ with a fixed
+start distribution $d_0$ the equality is exact and $\eta(s) = \sum_{s'} d_0(s') [(I - \gamma P_\pi)^{-1}]_{s's}$,
+the discounted number of visits to $s$ (Theorem 9.2). For $\bar r_\pi$ and $\bar v_\pi$ weighted by
+$d_\pi$ it holds approximately with $\eta = d_\pi$, more accurately as $\gamma \to 1$ (Theorem 9.3).
+The second form uses the **log-derivative trick** $\nabla_\theta \pi = \pi \nabla_\theta \ln \pi$,
+which turns a sum over actions into an expectation we can sample.
+
+The trajectory version shows why no model is needed. Since
+$\nabla_\theta P(\tau \mid \theta) = P(\tau \mid \theta)\nabla_\theta \ln P(\tau \mid \theta)$ and
+$\ln P(\tau \mid \theta) = \ln \rho_0(s_0) + \sum_t [\ln p(s_{t+1} \mid s_t, a_t) + \ln \pi_\theta(a_t \mid s_t)]$,
+the initial distribution and the dynamics do not depend on $\theta$ and drop out:
+
+$$
+\nabla_\theta J(\pi_\theta) = \mathbb{E}_{\tau \sim \pi_\theta}\Big[\sum_{t=0}^{T} \nabla_\theta \ln \pi_\theta(a_t \mid s_t)\, R(\tau)\Big].
+$$
+
+Only the policy's own log-probabilities are differentiated; the environment is a black box that
+returns samples. Because an action cannot affect rewards that came before it, $R(\tau)$ can be
+replaced by the reward-to-go from step $t$, which is a sample of $q_\pi(s_t, a_t)$; that recovers
+the theorem's form.<Sidenote>Spinning Up derives this in its "Intro to Policy Optimization" page;
+Zhao derives the state-distribution form for discounted and undiscounted objectives in §9.3, a long
+calculation built on $\nabla_\theta v_\pi = (I - \gamma P_\pi)^{-1}(\cdots)$.</Sidenote>
+
+#### REINFORCE
+
+Replacing the expectation by one sample and $q_\pi$ by a Monte Carlo return gives **REINFORCE**:
+
+$$
+\theta_{t+1} = \theta_t + \alpha\, \nabla_\theta \ln \pi(a_t \mid s_t, \theta_t)\, q_t(s_t, a_t).
+$$
+
+Rewriting it as $\theta_{t+1} = \theta_t + \alpha \beta_t \nabla_\theta \pi(a_t \mid s_t, \theta_t)$
+with $\beta_t = q_t(s_t, a_t)/\pi(a_t \mid s_t, \theta_t)$ shows what it does: for a small step, the
+probability of the taken action rises if $\beta_t \gt 0$ and falls if $\beta_t \lt 0$. Dividing by
+$\pi$ makes rarely chosen actions with high returns move a lot (exploration); multiplying by $q$
+favours good actions (exploitation).
+
+A worked example on a **bandit**, a one-state MDP where $q_\pi(a)$ is the mean reward of arm $a$.
+Take three arms with mean rewards $\mu = (1, 2, 4)$ and a softmax policy with $\theta = (0, 0, 0)$,
+so $\pi = (1/3, 1/3, 1/3)$. For a softmax, $\nabla_\theta \ln \pi(a) = e_a - \pi$. Suppose arm 3 is
+drawn and pays 4. Then $\nabla_\theta \ln \pi(3) = (-1/3, -1/3, 2/3)$, and with $\alpha = 0.1$ the
+update is $\theta = 0.1 \times 4 \times (-1/3, -1/3, 2/3) = (-0.133, -0.133, 0.267)$, giving
+$\pi = (0.286, 0.286, 0.427)$. The exact gradient at $\theta = 0$ is
+$\sum_a \pi(a)(e_a - \pi)\mu_a = (-0.444, -0.111, 0.556)$, which points toward arm 3, as it should.
+
+## Actor-critic methods
+
+REINFORCE works but is noisy: its gradient estimate multiplies a score by a whole random return.
+**Actor-critic** methods replace the Monte Carlo return by a learned estimate. The **actor** is the
+policy $\pi(a \mid s, \theta)$, updated by the policy gradient; the **critic** is a value function,
+updated by TD learning. The simplest version, **QAC**, uses a Sarsa critic $q(s, a, w)$:
+
+$$
+\theta_{t+1} = \theta_t + \alpha_\theta \nabla_\theta \ln \pi(a_t \mid s_t, \theta_t)\, q(s_t, a_t, w_t),
+\qquad
+w_{t+1} = w_t + \alpha_w \big[r_{t+1} + \gamma q(s_{t+1}, a_{t+1}, w_t) - q(s_t, a_t, w_t)\big]\nabla_w q(s_t, a_t, w_t).
+$$
+
+### Baselines and A2C
+
+Subtracting any function of the state, a **baseline** $b(s)$, leaves the gradient unchanged:
+
+$$
+\mathbb{E}_{A \sim \pi}\big[\nabla_\theta \ln \pi(A \mid s, \theta)\, b(s)\big] = b(s) \sum_a \nabla_\theta \pi(a \mid s, \theta) = b(s)\, \nabla_\theta \sum_a \pi(a \mid s, \theta) = b(s)\, \nabla_\theta 1 = 0 .
+$$
+
+But the *variance* of the one-sample estimate $X = \nabla_\theta \ln \pi(A \mid S, \theta)(q_\pi(S, A) - b(S))$
+does depend on $b$. The variance-minimising baseline is
+$b^*(s) = \mathbb{E}[\|\nabla_\theta \ln \pi\|^2 q_\pi(s, A)]/\mathbb{E}[\|\nabla_\theta \ln \pi\|^2]$
+(Zhao, eq. 10.5); dropping the weights gives the practical choice $b(s) = v_\pi(s)$. With it the
+gradient multiplies the score by the advantage $q_\pi(s, a) - v_\pi(s)$: actions are judged
+relative to the policy's average, not by their absolute return.
+
+In the bandit, the variance of the estimator (trace of its covariance, rewards with standard
+deviation 1) at $\theta = 0$ is:
+
+| arms' mean rewards | $b^*$ | $v_\pi$ | variance with $b = 0$ | variance with $b = v_\pi$ |
+| --- | ---: | ---: | ---: | ---: |
+| $(1, 2, 4)$ | {f2(banditStats[0].baseline.optimal)} | {f2(banditStats[0].baseline.value)} | {f2(banditStats[0].varNone)} | {f2(banditStats[0].varValue)} |
+| $(11, 12, 14)$ | {f2(banditStats[1].baseline.optimal)} | {f2(banditStats[1].baseline.value)} | {f2(banditStats[1].varNone)} | {f2(banditStats[1].varValue)} |
+
+At a uniform softmax every $\|\nabla_\theta \ln \pi(a)\|^2$ is equal, so $b^* = v_\pi$ exactly.
+Adding 10 to every reward does not change the gradient (it is still $(-0.444, -0.111, 0.556)$) or
+the optimal policy, but without a baseline the variance grows more than twentyfold, from 4.81 to
+102.59. With $b = v_\pi$ it stays at 1.19. The effect on learning is large:
+
+<LineChart
+	x={() => Array.from({ length: reinforceSteps + 1 }, (_, t) => t)}
+	series={[
+		{ name: "μ = (1, 2, 4), no baseline", fn: (t) => reinforceCurves.plain[t] },
+		{ name: "μ = (11, 12, 14), no baseline", fn: (t) => reinforceCurves.plainShift[t] },
+		{ name: "μ = (11, 12, 14), baseline v_π", fn: (t) => reinforceCurves.baseShift[t] },
+	]}
+	title="REINFORCE on a 3-armed bandit: probability of the best arm (mean of 1000 runs)"
+	xLabel="update t"
+	yLabel="π(best arm)"
+	height={300}
+/>
+
+After 300 updates with $\alpha = 0.1$, plain REINFORCE puts probability
+{f2(reinforceCurves.plain[reinforceSteps])} on the best arm when rewards are $(1, 2, 4)$ but only
+{f2(reinforceCurves.plainShift[reinforceSteps])} when they are shifted by 10. With rewards near
+12, every sampled arm gets a large positive push (its logit rises by about
+$0.1 \times 12 \times 2/3 = 0.8$ on the first step), so whichever arm happens to be drawn early
+runs away with the probability. In 977 of the 1000 runs one arm ends with probability above 0.95,
+but it is the best arm in only 530 of them (the middle arm in 312, the worst in 158). With the
+baseline the shifted problem learns as fast as the original
+({f2(reinforceCurves.baseShift[reinforceSteps])}).<Sidenote>The
+baseline here is the exact $v_\pi(\theta) = \sum_a \pi(a)\mu_a$, as a perfect critic would supply.
+A learned critic adds its own error.</Sidenote>
+
+**Advantage actor-critic** (A2C) learns only a state-value critic $v(s, w)$ and estimates the
+advantage with the TD error, which is unbiased for it because
+$\mathbb{E}[R_{t+1} + \gamma v_\pi(S_{t+1}) - v_\pi(S_t) \mid S_t = s, A_t = a] = q_\pi(s, a) - v_\pi(s)$.
+Each step:
+
+1. act $a_t \sim \pi(\cdot \mid s_t, \theta_t)$, observe $r_{t+1}, s_{t+1}$;
+2. TD error: $\delta_t = r_{t+1} + \gamma v(s_{t+1}, w_t) - v(s_t, w_t)$;
+3. actor: $\theta_{t+1} = \theta_t + \alpha_\theta\, \delta_t\, \nabla_\theta \ln \pi(a_t \mid s_t, \theta_t)$;
+4. critic: $w_{t+1} = w_t + \alpha_w\, \delta_t\, \nabla_w v(s_t, w_t)$.
+
+The policy is stochastic, so it explores without ε-greedy. A2C and its asynchronous parent A3C are
+the ancestors of PPO, which the [companion post](/blog/reinforcement-learning-and-llm-alignment/)
+covers.
+
+### Off-policy and deterministic actor-critic
+
+Policy gradients as written are on-policy: the expectation is over $A \sim \pi$, so the samples
+must come from the current policy. **Importance sampling** reuses data from a behaviour policy
+$\beta$. It rests on one identity: for distributions $p_0$ and $p_1$,
+
+$$
+\mathbb{E}_{X \sim p_0}[X] = \sum_x p_1(x) \frac{p_0(x)}{p_1(x)}\, x = \mathbb{E}_{X \sim p_1}\!\left[\frac{p_0(X)}{p_1(X)}\, X\right],
+$$
+
+so samples from $p_1$ weighted by the **importance weight** $p_0(x)/p_1(x)$ estimate a mean under
+$p_0$. Check with the book's coin: $X = \pm 1$ with $p_0$ uniform (mean 0), sampled from $p_1$ with
+$p_1(+1) = 0.8$. The weights are $0.5/0.8 = 0.625$ for $+1$ and $0.5/0.2 = 2.5$ for $-1$, and
+$0.8 \times 0.625 \times 1 + 0.2 \times 2.5 \times (-1) = 0$, as required. The identity needs
+$p_1(x) \gt 0$ wherever $p_0(x) \gt 0$. See [importance sampling](/blog/importance-sampling/) for
+the variance issues.
+
+The **off-policy policy gradient theorem** (Theorem 10.1) puts the weight
+$\pi(A \mid S, \theta)/\beta(A \mid S)$ in front of the on-policy gradient, and the off-policy
+actor-critic multiplies both the actor's and the critic's updates by it.
+
+A **deterministic policy** $a = \mu(s, \theta)$ is needed for continuous actions where a greedy
+$\max_a$ is expensive. The **deterministic policy gradient theorem** (Theorem 10.2) gives
+
+$$
+\nabla_\theta J(\theta) = \mathbb{E}_{S \sim \eta}\Big[\nabla_\theta \mu(S, \theta)\, \big(\nabla_a q_\mu(S, a)\big)\big|_{a = \mu(S, \theta)}\Big]:
+$$
+
+move the action in the direction that increases the critic's $q$, and push the actor's parameters
+that way. There is no expectation over actions, so any behaviour policy can supply the states,
+which makes the method naturally off-policy. DDPG is its deep version.
+
+## The map of methods
+
+| method | model needed | what it learns | target or gradient | on/off-policy |
+| --- | --- | --- | --- | --- |
+| value iteration | yes | $v^*$ | $\max_a [r + \gamma \sum p\, v_k]$ | — |
+| policy iteration | yes | $v_{\pi_k}$, then greedy | Bellman equation solved exactly | — |
+| Monte Carlo (ε-greedy) | no | $q_\pi$ | complete return | on |
+| Sarsa | no | $q_\pi$ | $r + \gamma q(s', a')$ | on |
+| Q-learning, DQN | no | $q^*$ | $r + \gamma \max_a q(s', a)$ | off |
+| REINFORCE | no | $\pi_\theta$ | $\nabla \ln \pi \cdot$ return | on |
+| A2C | no | $\pi_\theta$ and $v_w$ | $\nabla \ln \pi \cdot$ TD error | on |
+| off-policy AC | no | $\pi_\theta$ and $v_w$ | importance-weighted A2C | off |
+| deterministic AC | no | $\mu_\theta$ and $q_w$ | $\nabla_\theta \mu\, \nabla_a q$ | off |
+
+Read it top to bottom as the book does: first with a model and tables, then without a model, then
+with functions instead of tables, and finally with the policy itself as the function.
+
+## Summary
+
+- **Values satisfy Bellman equations.** $v_\pi = r_\pi + \gamma P_\pi v_\pi$ is a linear system with
+  a unique solution for $\gamma \lt 1$, solvable by iteration with error shrinking like $\gamma^k$.
+- **Optimality is a fixed point.** The Bellman optimality equation's right-hand side is a
+  $\gamma$-contraction in the max norm, so $v^*$ exists, is unique, and is reached by value
+  iteration; a greedy deterministic policy with respect to $v^*$ is optimal, and the optimal
+  policy is unchanged by $r \mapsto \alpha r + \beta$.
+- **Model-free RL is stochastic approximation.** Monte Carlo, TD, Sarsa and Q-learning all have the
+  form *estimate ← estimate − α (estimate − target)*; they differ in the target and hence in the
+  equation they solve. Q-learning is off-policy because its target uses $\max_a$.
+- **Exploration and generalisation cost something.** ε-greedy policies are suboptimal by design, and
+  linear or neural value functions converge to a projected fixed point, not to the true values.
+- **Policy gradients only differentiate the policy.** $\nabla J = \mathbb{E}[\nabla \ln \pi \cdot q_\pi]$
+  needs no model; a baseline $v_\pi$ leaves it unbiased and can cut its variance by orders of
+  magnitude, which is why actor-critic methods use the advantage.
+
+## References
+
+- S. Zhao, *Mathematical Foundations of Reinforcement Learning*, Springer Nature Press and Tsinghua
+  University Press, 2025.
+  [PDF at a pinned commit](https://raw.githubusercontent.com/mathfoundationrl/book-mathematical-foundation-of-reinforcement-learning/0e348961c28496096d308f1066009266b3674c5a/Book-all-in-one.pdf).
+  The grid world, its rewards and the reproduced numbers (Figures 2.7, 3.4, 7.4–7.5, 8.6) are from
+  chapters 1–8.
+- J. Achiam, [Spinning Up in Deep RL: Part 1, Key Concepts in RL](https://spinningup.openai.com/en/latest/spinningup/rl_intro.html),
+  OpenAI, 2018. Policies, trajectory probability, value functions and the notation table.
+- R. S. Sutton and A. G. Barto, *Reinforcement Learning: An Introduction*, 2nd ed., MIT Press, 2018.
+- H. Robbins and S. Monro, "A stochastic approximation method," *Annals of Mathematical
+  Statistics*, 1951.
+- C. Watkins and P. Dayan, "Q-learning," *Machine Learning*, 1992.
+- V. Mnih et al., "Human-level control through deep reinforcement learning," *Nature*, 2015 (DQN).
+- R. J. Williams, "Simple statistical gradient-following algorithms for connectionist
+  reinforcement learning," *Machine Learning*, 1992 (REINFORCE).
+- D. Silver et al., "Deterministic policy gradient algorithms," ICML 2014.

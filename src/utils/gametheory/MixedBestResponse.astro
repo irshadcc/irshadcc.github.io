@@ -1,0 +1,197 @@
+---
+// Mixed strategies in a 2 × 2 game. Left: the unit square of mixed profiles, q = P(Column plays
+// its first strategy) across and p = P(Row plays its first strategy) up, with Row's best-response
+// correspondence (blue) and Column's (orange); they cross at the Nash equilibria (green dots).
+// Right: each player's payoff from each pure strategy against the other's mixture, with the
+// current mixture marked; where the two lines cross, that player is indifferent. Drag the sliders
+// or click the square to move (q, p). With field on, grey arrows show Nash's map
+// σ → (σ + gains) / (1 + Σ gains) from the existence proof, drawn at 40% of the displacement;
+// its fixed points are the equilibria.
+// Logic in gameTheory.ts.
+// Usage in .mdx:
+//   <MixedBestResponse game="bos" />
+//   <MixedBestResponse game="pennies" field />
+import "../sampling/sampling.css";
+import "./gametheory.css";
+import { type Bimatrix, games, supportEnumeration } from "./gameTheory";
+
+interface Props {
+	game?: string;
+	/** Games offered in the selector (2 × 2 keys of `games`). */
+	choices?: string[];
+	/** Draw Nash's improvement map as arrows. */
+	field?: boolean;
+	p?: number;
+	q?: number;
+	title?: string;
+	caption?: string;
+}
+
+const {
+	game = "bos",
+	choices = ["bos", "pennies", "stagHunt", "chicken", "prisoners", "hawkDove"],
+	field = false,
+	p = 0.3,
+	q = 0.6,
+	title,
+	caption,
+} = Astro.props;
+const data: Record<string, Bimatrix & { ne: [number, number][] }> = {};
+for (const k of new Set([game, ...choices])) {
+	const g = games[k];
+	if (!g || g.rows.length !== 2 || g.cols.length !== 2)
+		throw new Error(`MixedBestResponse: ${k} is not a 2 × 2 game`);
+	data[k] = { ...g, ne: supportEnumeration(g).map((e) => [e.x[0], e.y[0]]) };
+}
+---
+
+<figure class="smp-fig gt-mbr" data-games={JSON.stringify(data)} data-game={game} data-field={field ? "1" : ""}>
+	{title && <div class="smp-title">{title}</div>}
+	<div class="smp-legend">
+		<span><i class="gt-k-row"></i>Row's best response p(q)</span>
+		<span><i class="gt-k-col"></i>Column's best response q(p)</span>
+		<span><i class="dot gt-k-ne"></i>Nash equilibrium</span>
+		{field && <span><i class="gt-k-muted"></i>Nash's map σ → f(σ)</span>}
+	</div>
+	<svg class="smp-svg" viewBox="0 0 640 320" role="img" aria-label="Best-response correspondences of a 2 by 2 game"></svg>
+	<div class="smp-controls">
+		<label>game
+			<select class="i-game">
+				{Object.entries(data).map(([k, g]) => <option value={k} selected={k === game}>{g.name}</option>)}
+			</select>
+		</label>
+		<label class="smp-slider">p <input type="range" class="i-p" min="0" max="1" step="0.01" value={p} /><strong class="o-p"></strong></label>
+		<label class="smp-slider">q <input type="range" class="i-q" min="0" max="1" step="0.01" value={q} /><strong class="o-q"></strong></label>
+	</div>
+	<p class="smp-narration"></p>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import type { Bimatrix } from "./gameTheory";
+	import { axes, el, fmt } from "../sampling/plot";
+
+	type G = Bimatrix & { ne: [number, number][] };
+
+	function attach(fig: HTMLElement) {
+		const svg = fig.querySelector("svg")!;
+		const all = JSON.parse(fig.dataset.games!) as Record<string, G>;
+		const sel = fig.querySelector<HTMLSelectElement>(".i-game")!;
+		const ip = fig.querySelector<HTMLInputElement>(".i-p")!;
+		const iq = fig.querySelector<HTMLInputElement>(".i-q")!;
+		const say = fig.querySelector(".smp-narration")!;
+		const field = fig.dataset.field === "1";
+
+		function draw() {
+			const g = all[sel.value];
+			const p = Number(ip.value);
+			const q = Number(iq.value);
+			fig.querySelector(".o-p")!.textContent = fmt(p, 2);
+			fig.querySelector(".o-q")!.textContent = fmt(q, 2);
+			svg.replaceChildren();
+			const { A, B } = g;
+			// Row's payoff from each row against q, Column's from each column against p.
+			const r0 = (x: number) => A[0][0] * x + A[0][1] * (1 - x);
+			const r1 = (x: number) => A[1][0] * x + A[1][1] * (1 - x);
+			const c0 = (x: number) => B[0][0] * x + B[1][0] * (1 - x);
+			const c1 = (x: number) => B[0][1] * x + B[1][1] * (1 - x);
+
+			const sq = axes(svg, { x: 52, y: 18, w: 250, h: 250 }, [0, 1], [0, 1], {
+				xLabel: `q = P(Column plays ${g.cols[0]})`,
+				yLabel: `p = P(Row plays ${g.rows[0]})`,
+				xTicks: 5,
+				yTicks: 5,
+			});
+			// Best-response correspondence of a player whose payoff difference is d(x) = f0(x) - f1(x).
+			const brPath = (f0: (x: number) => number, f1: (x: number) => number) => {
+				const d0 = f0(0) - f1(0);
+				const d1 = f0(1) - f1(1);
+				const v = (d: number) => (d > 1e-9 ? 1 : d < -1e-9 ? 0 : null);
+				if (Math.abs(d0) < 1e-9 && Math.abs(d1) < 1e-9) return { pts: [[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]], cross: null };
+				if (d0 * d1 < 0 || Math.abs(d0) < 1e-9 || Math.abs(d1) < 1e-9) {
+					const c = d0 / (d0 - d1);
+					const a = v(d0) ?? 1 - (v(d1) ?? 0);
+					const b = v(d1) ?? 1 - a;
+					return { pts: [[0, a], [c, a], [c, b], [1, b]], cross: c };
+				}
+				const a = v(d0) ?? 0;
+				return { pts: [[0, a], [1, a]], cross: null };
+			};
+			const rowBr = brPath(r0, r1); // points (q, p)
+			const colBr = brPath(c0, c1); // points (p, q)
+			if (field) {
+				for (let a = 0; a <= 10; a++)
+					for (let b = 0; b <= 10; b++) {
+						const qq = a / 10;
+						const pp = b / 10;
+						const ur = pp * r0(qq) + (1 - pp) * r1(qq);
+						const uc = qq * c0(pp) + (1 - qq) * c1(pp);
+						const g0 = Math.max(0, r0(qq) - ur);
+						const g1 = Math.max(0, r1(qq) - ur);
+						const h0 = Math.max(0, c0(pp) - uc);
+						const h1 = Math.max(0, c1(pp) - uc);
+						const np = (pp + g0) / (1 + g0 + g1);
+						const nq = (qq + h0) / (1 + h0 + h1);
+						const x0 = sq.sx(qq);
+						const y0 = sq.sy(pp);
+						// Arrows show 40% of the map's displacement so they stay short.
+						const x1 = x0 + 0.4 * (sq.sx(nq) - x0);
+						const y1 = y0 + 0.4 * (sq.sy(np) - y0);
+						const len = Math.hypot(x1 - x0, y1 - y0);
+						if (len < 1.5) {
+							el("circle", { cx: x0, cy: y0, r: 1.2, class: "gt-field-head" }, svg);
+							continue;
+						}
+						el("path", { d: `M${x0},${y0}L${x1},${y1}`, class: "gt-field" }, svg);
+						const ux = (x1 - x0) / len;
+						const uy = (y1 - y0) / len;
+						el("path", { d: `M${x1},${y1}l${-5 * ux - 2.5 * uy},${-5 * uy + 2.5 * ux}l${2.5 * uy * 2},${-2.5 * ux * 2}z`, class: "gt-field-head" }, svg);
+					}
+			}
+			el("path", { d: rowBr.pts.map(([x, y], i) => `${i ? "L" : "M"}${sq.sx(x)},${sq.sy(y)}`).join(""), class: "gt-row-line" }, svg);
+			el("path", { d: colBr.pts.map(([y, x], i) => `${i ? "L" : "M"}${sq.sx(x)},${sq.sy(y)}`).join(""), class: "gt-col-line gt-dash" }, svg);
+			for (const [pp, qq] of g.ne) {
+				el("circle", { cx: sq.sx(qq), cy: sq.sy(pp), r: 6, class: "gt-ne-dot" }, svg);
+			}
+			el("circle", { cx: sq.sx(q), cy: sq.sy(p), r: 5, class: "gt-cur" }, svg);
+
+			// Payoff lines.
+			const lo = Math.min(...A.flat(), ...B.flat());
+			const hi = Math.max(...A.flat(), ...B.flat());
+			const pad = (hi - lo) * 0.08 || 1;
+			const top = axes(svg, { x: 380, y: 18, w: 240, h: 100 }, [0, 1], [lo - pad, hi + pad], { xLabel: "q", yLabel: "Row's payoff", xTicks: 5, yTicks: 3 });
+			el("path", { d: `M${top.sx(0)},${top.sy(r0(0))}L${top.sx(1)},${top.sy(r0(1))}`, class: "gt-row-line" }, svg);
+			el("path", { d: `M${top.sx(0)},${top.sy(r1(0))}L${top.sx(1)},${top.sy(r1(1))}`, class: "gt-row-thin gt-dash" }, svg);
+			el("text", { x: top.sx(1) - 3, y: top.sy(r0(1)) - 5, class: "gt-row-text", "text-anchor": "end" }, svg, g.rows[0]);
+			el("text", { x: top.sx(0) + 3, y: top.sy(r1(0)) - 5, class: "gt-row-text" }, svg, g.rows[1]);
+			el("line", { x1: top.sx(q), x2: top.sx(q), y1: top.box.y, y2: top.box.y + top.box.h, class: "smp-guide" }, svg);
+			const bot = axes(svg, { x: 380, y: 168, w: 240, h: 100 }, [0, 1], [lo - pad, hi + pad], { xLabel: "p", yLabel: "Column's payoff", xTicks: 5, yTicks: 3 });
+			el("path", { d: `M${bot.sx(0)},${bot.sy(c0(0))}L${bot.sx(1)},${bot.sy(c0(1))}`, class: "gt-col-line" }, svg);
+			el("path", { d: `M${bot.sx(0)},${bot.sy(c1(0))}L${bot.sx(1)},${bot.sy(c1(1))}`, class: "gt-col-thin gt-dash" }, svg);
+			el("text", { x: bot.sx(1) - 3, y: bot.sy(c0(1)) - 5, class: "gt-col-text", "text-anchor": "end" }, svg, g.cols[0]);
+			el("text", { x: bot.sx(0) + 3, y: bot.sy(c1(0)) - 5, class: "gt-col-text" }, svg, g.cols[1]);
+			el("line", { x1: bot.sx(p), x2: bot.sx(p), y1: bot.box.y, y2: bot.box.y + bot.box.h, class: "smp-guide" }, svg);
+			for (const [a, f] of [[top, rowBr], [bot, colBr]] as const)
+				if (f.cross !== null) el("circle", { cx: a.sx(f.cross), cy: a.sy((a === top ? r0 : c0)(f.cross)), r: 4, class: "gt-ne-dot" }, svg);
+
+			const best = (x: number, y: number, n: [string, string]) =>
+				Math.abs(x - y) < 1e-9 ? `indifferent between ${n[0]} and ${n[1]}` : `best response ${x > y ? n[0] : n[1]}`;
+			const neText = g.ne.map(([pp, qq]) => `(p, q) = (${fmt(pp, 2)}, ${fmt(qq, 2)})`).join(", ");
+			say.textContent = `Against q = ${fmt(q, 2)}, Row gets ${fmt(r0(q), 2)} from ${g.rows[0]} and ${fmt(r1(q), 2)} from ${g.rows[1]}: ${best(r0(q), r1(q), [g.rows[0], g.rows[1]])}. Against p = ${fmt(p, 2)}, Column gets ${fmt(c0(p), 2)} from ${g.cols[0]} and ${fmt(c1(p), 2)} from ${g.cols[1]}: ${best(c0(p), c1(p), [g.cols[0], g.cols[1]])}. Equilibria: ${neText}.`;
+		}
+
+		svg.addEventListener("click", (e) => {
+			const r = svg.getBoundingClientRect();
+			const x = ((e.clientX - r.left) / r.width) * 640;
+			const y = ((e.clientY - r.top) / r.height) * 320;
+			if (x < 52 || x > 302 || y < 18 || y > 268) return;
+			iq.value = String(Math.round(((x - 52) / 250) * 100) / 100);
+			ip.value = String(Math.round((1 - (y - 18) / 250) * 100) / 100);
+			draw();
+		});
+		for (const i of [sel, ip, iq]) i.addEventListener("input", draw);
+		draw();
+	}
+
+	document.querySelectorAll<HTMLElement>(".gt-mbr").forEach(attach);
+</script>

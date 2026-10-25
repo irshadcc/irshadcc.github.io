@@ -1,0 +1,174 @@
+---
+// The repeated Prisoner's Dilemma (T = 5, R = 3, P = 1, S = 0) between two strategies picked in
+// the selectors. Each round is a chip (green C, red D) with the payoff under it; a black outline
+// marks a move that noise flipped. Readouts give the average payoff per round and the normalised
+// discounted payoff (1 - δ) Σ δ^t u_t. With tournament on, a round-robin table (every pair plays
+// `tournamentRounds` rounds at the same noise level, each strategy also meets a copy of itself)
+// ranks all strategies by average payoff per round. Logic in gameTheory.ts.
+// Usage in .mdx:
+//   <RepeatedGame a="tft" b="alld" />
+//   <RepeatedGame a="tft" b="tft" noise={0.05} tournament />
+import "../sampling/sampling.css";
+import "./gametheory.css";
+import { repeatedStrategies } from "./gameTheory";
+
+interface Props {
+	a?: string;
+	b?: string;
+	rounds?: number;
+	delta?: number;
+	noise?: number;
+	seed?: number;
+	tournament?: boolean;
+	tournamentRounds?: number;
+	title?: string;
+	caption?: string;
+}
+
+const {
+	a = "tft",
+	b = "alld",
+	rounds = 30,
+	delta = 0.9,
+	noise = 0,
+	seed = 4,
+	tournament = false,
+	tournamentRounds = 200,
+	title,
+	caption,
+} = Astro.props;
+const keys = Object.keys(repeatedStrategies);
+---
+
+<figure
+	class="smp-fig gt-rep"
+	data-rounds={rounds}
+	data-seed={seed}
+	data-tournament={tournament ? tournamentRounds : 0}
+>
+	{title && <div class="smp-title">{title}</div>}
+	<div class="smp-controls" style="margin-top: 0">
+		<label>A
+			<select class="i-a">{keys.map((k) => <option value={k} selected={k === a}>{repeatedStrategies[k].name}</option>)}</select>
+		</label>
+		<label>B
+			<select class="i-b">{keys.map((k) => <option value={k} selected={k === b}>{repeatedStrategies[k].name}</option>)}</select>
+		</label>
+		<button type="button" class="smp-btn i-seed">new noise draw</button>
+	</div>
+	<div class="smp-controls">
+		<label class="smp-slider">noise <input type="range" class="i-noise" min="0" max="0.2" step="0.01" value={noise} /><strong class="o-noise"></strong></label>
+		<label class="smp-slider">δ <input type="range" class="i-delta" min="0.5" max="0.99" step="0.01" value={delta} /><strong class="o-delta"></strong></label>
+	</div>
+	<div class="gt-matrix-wrap">
+		<div class="gt-rounds-label o-la"></div>
+		<div class="gt-rounds r-a"></div>
+		<div class="gt-rounds r-pa"></div>
+		<div class="gt-rounds-label o-lb"></div>
+		<div class="gt-rounds r-b"></div>
+		<div class="gt-rounds r-pb"></div>
+	</div>
+	<div class="smp-metrics">
+		<div><span>A: average per round</span><strong class="o-avga"></strong></div>
+		<div><span>B: average per round</span><strong class="o-avgb"></strong></div>
+		<div><span>A: discounted (1−δ)Σδᵗuₜ</span><strong class="o-disca"></strong></div>
+		<div><span>B: discounted (1−δ)Σδᵗuₜ</span><strong class="o-discb"></strong></div>
+	</div>
+	<p class="smp-narration"></p>
+	{
+		tournament && (
+			<table class="smp-table gt-tour">
+				<thead>
+					<tr><th>strategy</th>{keys.map((k) => <th title={repeatedStrategies[k].name}>vs {k.toUpperCase()}</th>)}<th>average</th></tr>
+				</thead>
+				<tbody></tbody>
+			</table>
+		)
+	}
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import { discounted, playMatch, repeatedStrategies, tournament } from "./gameTheory";
+	import { fmt } from "../sampling/plot";
+
+	function attach(fig: HTMLElement) {
+		const rounds = Number(fig.dataset.rounds);
+		const tRounds = Number(fig.dataset.tournament);
+		let seed = Number(fig.dataset.seed);
+		const $ = <T extends Element>(s: string) => fig.querySelector<T>(s)!;
+		const ia = $<HTMLSelectElement>(".i-a");
+		const ib = $<HTMLSelectElement>(".i-b");
+		const noise = $<HTMLInputElement>(".i-noise");
+		const delta = $<HTMLInputElement>(".i-delta");
+		const keys = Object.keys(repeatedStrategies);
+
+		const chips = (box: Element, moves: string[], flips: boolean[]) => {
+			box.replaceChildren();
+			moves.forEach((m, t) => {
+				const c = document.createElement("span");
+				c.className = `gt-chip ${m === "C" ? "gt-c" : "gt-d"}${flips[t] ? " gt-flip" : ""}`;
+				c.textContent = m;
+				c.title = `round ${t + 1}${flips[t] ? " (flipped by noise)" : ""}`;
+				box.append(c);
+			});
+		};
+		const pays = (box: Element, u: number[]) => {
+			box.replaceChildren();
+			for (const v of u) {
+				const c = document.createElement("span");
+				c.className = "gt-chip gt-pay";
+				c.textContent = String(v);
+				box.append(c);
+			}
+		};
+
+		function draw() {
+			const nz = Number(noise.value);
+			const d = Number(delta.value);
+			$(".o-noise").textContent = fmt(nz, 2);
+			$(".o-delta").textContent = fmt(d, 2);
+			const sa = repeatedStrategies[ia.value];
+			const sb = repeatedStrategies[ib.value];
+			const m = playMatch(sa, sb, rounds, nz, seed);
+			$(".o-la").textContent = `A, ${sa.name}: ${sa.note}`;
+			$(".o-lb").textContent = `B, ${sb.name}: ${sb.note}`;
+			chips($(".r-a"), m.a, m.fa);
+			pays($(".r-pa"), m.pa);
+			chips($(".r-b"), m.b, m.fb);
+			pays($(".r-pb"), m.pb);
+			const avg = (u: number[]) => u.reduce((s, v) => s + v, 0) / u.length;
+			$(".o-avga").textContent = fmt(avg(m.pa), 3);
+			$(".o-avgb").textContent = fmt(avg(m.pb), 3);
+			$(".o-disca").textContent = fmt(discounted(m.pa, d), 3);
+			$(".o-discb").textContent = fmt(discounted(m.pb, d), 3);
+			const flips = m.fa.filter(Boolean).length + m.fb.filter(Boolean).length;
+			const firstD = m.a.findIndex((x, t) => x === "D" || m.b[t] === "D");
+			$(".smp-narration").textContent = `${rounds} rounds. ${firstD < 0 ? "Both cooperate in every round." : `The first defection comes in round ${firstD + 1}.`}${nz > 0 ? ` Noise flipped ${flips} of ${2 * rounds} moves.` : ""} The discounted payoff weights round t by δ^t, so with δ = ${fmt(d, 2)} the first ${Math.round(1 / (1 - d))} or so rounds carry most of the weight (the sum is cut off after round ${rounds}).`;
+			if (tRounds) {
+				const res = tournament(keys, tRounds, nz, 1).sort((x, y) => y.score - x.score);
+				const body = $(".gt-tour tbody");
+				body.replaceChildren();
+				for (const r of res) {
+					const tr = document.createElement("tr");
+					const cells = [repeatedStrategies[r.key].name, ...r.vs.map((v) => fmt(v, 2)), fmt(r.score, 3)];
+					for (const c of cells) {
+						const td = document.createElement("td");
+						td.textContent = c;
+						tr.append(td);
+					}
+					body.append(tr);
+				}
+			}
+		}
+
+		for (const i of [ia, ib, noise, delta]) i.addEventListener("input", draw);
+		$(".i-seed").addEventListener("click", () => {
+			seed += 1;
+			draw();
+		});
+		draw();
+	}
+
+	document.querySelectorAll<HTMLElement>(".gt-rep").forEach(attach);
+</script>

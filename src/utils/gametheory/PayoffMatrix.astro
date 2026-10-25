@@ -1,0 +1,259 @@
+---
+// A two-player game in strategic form as a payoff table: each cell shows (Row's payoff,
+// Column's payoff). mode="br" underlines best responses (checkbox) and outlines pure Nash
+// equilibria; hovering or tapping a cell explains who would deviate from it. mode="iesds" steps
+// through iterated elimination of strictly dominated strategies (by a pure strategy or a mixture
+// of two), fading each removed row or column. mode="dist" writes a joint distribution of
+// recommendations into the cells and lists the obedience constraints of a correlated
+// equilibrium. Logic in gameTheory.ts.
+// Usage in .mdx:
+//   <PayoffMatrix game="prisoners" mode="br" />
+//   <PayoffMatrix game="iesds" mode="iesds" />
+//   <PayoffMatrix game="chicken" mode="dist" dist={[[0, 0.25], [0.25, 0.5]]} />
+import Player from "../sampling/Player.astro";
+import "../sampling/sampling.css";
+import "./gametheory.css";
+import {
+	type Bimatrix,
+	type Matrix,
+	bestResponses,
+	fmtNum,
+	games,
+	iesds,
+	pureNash,
+} from "./gameTheory";
+
+interface Props {
+	game: string | Bimatrix;
+	mode?: "plain" | "br" | "iesds" | "dist";
+	/** mode="dist": probability of recommending (row i, column j). */
+	dist?: Matrix;
+	/** Cells to outline, as [row, column]. */
+	highlight?: [number, number][];
+	/** mode="br": start with best responses marked. */
+	marked?: boolean;
+	title?: string;
+	caption?: string;
+}
+
+const {
+	game,
+	mode = "plain",
+	dist,
+	highlight = [],
+	marked = true,
+	title,
+	caption,
+} = Astro.props;
+const g = typeof game === "string" ? games[game] : game;
+if (!g) throw new Error(`PayoffMatrix: unknown game ${game}`);
+const br = bestResponses(g);
+const ne = pureNash(g);
+const isNe = (i: number, j: number) => ne.some(([a, b]) => a === i && b === j);
+const isHl = (i: number, j: number) =>
+	highlight.some(([a, b]) => a === i && b === j);
+const [P1, P2] = g.players;
+
+// What happens at each cell, for the hover readout.
+const explain = (i: number, j: number) => {
+	const col = g.A.map((r) => r[j]);
+	const bestRow = col.indexOf(Math.max(...col));
+	const bestCol = g.B[i].indexOf(Math.max(...g.B[i]));
+	const head = `(${g.rows[i]}, ${g.cols[j]}) pays ${P1} ${g.A[i][j]} and ${P2} ${g.B[i][j]}.`;
+	const r = br[i][j][0]
+		? `${g.rows[i]} is a best response to ${g.cols[j]}`
+		: `${P1} would switch to ${g.rows[bestRow]} (${g.A[bestRow][j]} > ${g.A[i][j]})`;
+	const c = br[i][j][1]
+		? `${g.cols[j]} is a best response to ${g.rows[i]}`
+		: `${P2} would switch to ${g.cols[bestCol]} (${g.B[i][bestCol]} > ${g.B[i][j]})`;
+	const verdict = isNe(i, j)
+		? " Neither gains by deviating alone: a Nash equilibrium."
+		: "";
+	return `${head} ${r}; ${c}.${verdict}`;
+};
+
+const steps = mode === "iesds" ? iesds(g) : [];
+
+// Obedience constraints for a correlated equilibrium: expected gain of deviating from each
+// recommendation, conditional on it (unnormalised: multiplied by the recommendation's probability).
+const obedience: { who: string; rec: string; dev: string; gain: number }[] = [];
+if (dist) {
+	g.rows.forEach((ri, i) =>
+		g.rows.forEach((rk, k) => {
+			if (k === i) return;
+			const gain = g.cols.reduce(
+				(s, _, j) => s + dist[i][j] * (g.A[k][j] - g.A[i][j]),
+				0,
+			);
+			obedience.push({ who: P1, rec: ri, dev: rk, gain });
+		}),
+	);
+	g.cols.forEach((cj, j) =>
+		g.cols.forEach((ck, k) => {
+			if (k === j) return;
+			const gain = g.rows.reduce(
+				(s, _, i) => s + dist[i][j] * (g.B[i][k] - g.B[i][j]),
+				0,
+			);
+			obedience.push({ who: P2, rec: cj, dev: ck, gain });
+		}),
+	);
+}
+const probText = (v: number) => {
+	for (const d of [2, 3, 4, 6, 8, 12]) {
+		const n = Math.round(v * d);
+		if (Math.abs(n / d - v) < 1e-9)
+			return n === 0 ? "0" : n === d ? "1" : `${n}/${d}`;
+	}
+	return fmtNum(v, 3);
+};
+const u1 = dist
+	? g.A.reduce((s, r, i) => s + r.reduce((t, a, j) => t + a * dist[i][j], 0), 0)
+	: 0;
+const u2 = dist
+	? g.B.reduce((s, r, i) => s + r.reduce((t, b, j) => t + b * dist[i][j], 0), 0)
+	: 0;
+---
+
+<figure class="smp-fig gt-pm" data-mode={mode} data-steps={JSON.stringify(steps)}>
+	{title && <div class="smp-title">{title}</div>}
+	<div class="gt-matrix-wrap">
+		<table class:list={["gt-matrix", { "gt-show-br": mode === "br" && marked }]}>
+			<thead>
+				<tr><th></th><th></th><th class="gt-player" colspan={g.cols.length}>{P2}</th></tr>
+				<tr>
+					<th></th><th></th>
+					{g.cols.map((c, j) => <th data-col={j}>{c}</th>)}
+				</tr>
+			</thead>
+			<tbody>
+				{
+					g.rows.map((r, i) => (
+						<tr>
+							{i === 0 && <th class="gt-player" rowspan={g.rows.length}>{P1}</th>}
+							<th data-row={i}>{r}</th>
+							{g.cols.map((_, j) => (
+								<td
+									class:list={["gt-cell", { "gt-ne": isNe(i, j), "gt-hl": isHl(i, j), "gt-heat": dist && dist[i][j] > 0 }]}
+									data-i={i}
+									data-j={j}
+									data-say={explain(i, j)}
+									tabindex={mode === "br" ? 0 : undefined}
+								>
+									<span class:list={["gt-u1", { "gt-br1": br[i][j][0] }]}>{g.A[i][j]}</span>,{" "}
+									<span class:list={["gt-u2", { "gt-br2": br[i][j][1] }]}>{g.B[i][j]}</span>
+									{dist && <span class="gt-prob">p = {probText(dist[i][j])}</span>}
+								</td>
+							))}
+						</tr>
+					))
+				}
+			</tbody>
+		</table>
+	</div>
+	{
+		mode === "br" && (
+			<>
+				<div class="smp-controls">
+					<label><input type="checkbox" class="i-br" checked={marked} /> mark best responses and pure equilibria</label>
+				</div>
+				<p class="smp-narration">Hover or tap a cell to see whether either player would deviate from it.</p>
+			</>
+		)
+	}
+	{
+		mode === "iesds" && (
+			<>
+				<div class="smp-controls">
+					<Player />
+					<span class="smp-count" />
+				</div>
+				<p class="smp-narration" />
+			</>
+		)
+	}
+	{
+		dist && (
+			<>
+				<table class="smp-table">
+					<thead>
+						<tr><th>player</th><th>told</th><th>deviates to</th><th>gain × P(told)</th></tr>
+					</thead>
+					<tbody>
+						{obedience.map((o) => (
+							<tr><td>{o.who}</td><td>{o.rec}</td><td>{o.dev}</td><td>{fmtNum(o.gain, 3)}</td></tr>
+						))}
+					</tbody>
+				</table>
+				<p class="smp-narration">
+					Expected payoffs: {P1} {fmtNum(u1, 3)}, {P2} {fmtNum(u2, 3)}.{" "}
+					{obedience.every((o) => o.gain <= 1e-9)
+						? "No row of the table is positive, so obeying is a best response: a correlated equilibrium."
+						: "A positive row means that player gains by disobeying: not a correlated equilibrium."}
+				</p>
+			</>
+		)
+	}
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import type { EliminationStep } from "./gameTheory";
+	import { bindPlayer } from "../sampling/plot";
+
+	function attach(fig: HTMLElement) {
+		const table = fig.querySelector<HTMLTableElement>("table.gt-matrix")!;
+		const say = fig.querySelector(".smp-narration");
+		const cells = [...fig.querySelectorAll<HTMLElement>("td.gt-cell")];
+		if (fig.dataset.mode === "br") {
+			fig.querySelector<HTMLInputElement>(".i-br")?.addEventListener("change", (e) => {
+				table.classList.toggle("gt-show-br", (e.target as HTMLInputElement).checked);
+			});
+			const show = (c: HTMLElement) => {
+				for (const d of cells) d.classList.toggle("gt-hover", d === c);
+				if (say) say.textContent = c.dataset.say ?? "";
+			};
+			for (const c of cells) {
+				c.addEventListener("mouseenter", () => show(c));
+				c.addEventListener("focus", () => show(c));
+				c.addEventListener("click", () => show(c));
+			}
+		}
+		if (fig.dataset.mode === "iesds") {
+			const steps = JSON.parse(fig.dataset.steps ?? "[]") as EliminationStep[];
+			const nRows = fig.querySelectorAll("th[data-row]").length;
+			const nCols = fig.querySelectorAll("th[data-col]").length;
+			let k = 0;
+			const draw = () => {
+				const rows = k ? steps[k - 1].rows : [...Array(nRows).keys()];
+				const cols = k ? steps[k - 1].cols : [...Array(nCols).keys()];
+				for (const th of fig.querySelectorAll<HTMLElement>("th[data-row]"))
+					th.classList.toggle("gt-out", !rows.includes(Number(th.dataset.row)));
+				for (const th of fig.querySelectorAll<HTMLElement>("th[data-col]"))
+					th.classList.toggle("gt-out", !cols.includes(Number(th.dataset.col)));
+				for (const c of cells) {
+					const i = Number(c.dataset.i);
+					const j = Number(c.dataset.j);
+					c.classList.toggle("gt-out", !rows.includes(i) || !cols.includes(j));
+					c.classList.toggle("gt-hl", k === steps.length && rows.length === 1 && cols.length === 1 && rows[0] === i && cols[0] === j);
+				}
+				fig.querySelector(".smp-count")!.textContent = `step ${k} of ${steps.length}`;
+				if (say)
+					say.textContent = k === 0
+						? "The full game. Press next to remove one strictly dominated strategy at a time."
+						: steps[k - 1].text + (k === steps.length ? (rows.length === 1 && cols.length === 1 ? " One cell is left: the game is dominance solvable." : " Nothing else is dominated.") : "");
+			};
+			bindPlayer(fig, (dir) => {
+				k = Math.max(0, Math.min(steps.length, k + dir));
+				draw();
+				return k < steps.length;
+			}, () => {
+				k = 0;
+				draw();
+			}, 1300);
+			draw();
+		}
+	}
+
+	document.querySelectorAll<HTMLElement>(".gt-pm").forEach(attach);
+</script>

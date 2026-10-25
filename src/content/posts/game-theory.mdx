@@ -1,0 +1,1866 @@
+---
+title: "Game Theory from the Ground Up"
+description: "A complete tour of game theory with proofs and worked examples: dominance, Nash equilibrium and its existence proof, zero-sum games and the minimax theorem, correlated equilibrium, extensive-form and repeated games, Bayesian games and auctions, signalling, mechanism design, bargaining, cooperative games and the Shapley value, stable matching, evolutionary dynamics, learning in games, congestion games and the price of anarchy."
+date: 2026-10-25
+tags: [Math, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import LineChart from "../../utils/charts/LineChart.astro";
+import BraessNetwork from "../../utils/gametheory/BraessNetwork.astro";
+import GaleShapleySteps from "../../utils/gametheory/GaleShapleySteps.astro";
+import GameTree from "../../utils/gametheory/GameTree.astro";
+import MixedBestResponse from "../../utils/gametheory/MixedBestResponse.astro";
+import PayoffMatrix from "../../utils/gametheory/PayoffMatrix.astro";
+import PayoffRegion from "../../utils/gametheory/PayoffRegion.astro";
+import RepeatedGame from "../../utils/gametheory/RepeatedGame.astro";
+import SimplexDynamics from "../../utils/gametheory/SimplexDynamics.astro";
+import { congestionDynamics, shapley, gloveGame, airportCost } from "../../utils/gametheory/gameTheory";
+import {
+	auctionTable,
+	beautyRounds,
+	hedgeAvgRegret,
+	hedgeBound,
+	hedgeRock,
+	hedgeRockAvg,
+	zeroSumEnvelope,
+	zeroSumLines,
+} from "../../utils/gametheory/gameTheoryFigures";
+
+export const nbsFrontier = Array.from({ length: 101 }, (_, i) => [i / 100, Math.sqrt(1 - i / 100)]);
+
+## Background
+
+Most of the decisions studied in an optimisation course have one decision maker and a fixed
+world: choose the cheapest route, the best model, the right price. Many real decisions are not
+like that. The best price for one shop depends on what the shop across the street charges. The
+best bid in an ad auction depends on the other bidders. The fastest route home depends on which
+routes everyone else picks. **Game theory** is the mathematics of such situations: several
+decision makers, each with their own goals, whose outcomes depend on what all of them do.
+
+It matters for two reasons. First, it predicts behaviour that looks irrational from a single
+person's point of view: two prisoners who both confess although both would be better off
+silent, a new road that makes every driver's trip longer, a bidder who should bid less than the
+item is worth. Second, it is a design tool. Search ads are sold with auctions designed by game
+theorists, medical residents are matched to hospitals by an algorithm from a 1962 game theory
+paper, generative adversarial networks are trained as a two-player zero-sum game, and the SHAP
+method for explaining a model's predictions is the Shapley value of a cooperative game.
+
+The post builds the subject up in the order it is usually taught, with a proof and a small
+worked example for each result:
+
+1. **Static games**: strategic form, dominance, Nash equilibrium (pure and mixed) and Nash's
+   existence proof, zero-sum games and the minimax theorem, correlated equilibrium.
+2. **Dynamic games**: game trees, backward induction and subgame perfection, imperfect
+   information, repeated games and the folk theorem.
+3. **Incomplete information**: Bayesian games, auctions and revenue equivalence, signalling and
+   perfect Bayesian equilibrium, mechanism design.
+4. **Cooperation**: bargaining, the core, the Shapley value, stable matching.
+5. **Dynamics and computation**: evolutionary game theory, learning in games and no-regret,
+   congestion games and the price of anarchy, and how hard it is to compute an equilibrium.
+
+Every number in the post was computed by a script.<Sidenote>The figures run on
+`src/utils/gametheory/gameTheory.ts`. Its results were cross-checked independently in Python:
+every equilibrium against `nashpy` 0.0.43's support enumeration, the zero-sum value and the
+best correlated equilibrium against `scipy.optimize.linprog` (SciPy 1.18.1), the Shapley values
+against the exact formula with fractions, the stable matchings by brute force over all 24
+matchings, and the Bayesian Cournot and bargaining answers with SymPy.</Sidenote> The section on
+learning connects to the [online learning and regret post](/blog/online-learning-regret-ftrl/),
+which goes deeper into regret bounds.
+
+## What a game is
+
+A game in **strategic form** (also called normal form) has three parts:
+
+- a set of **players** $N = \lbrace 1, \dots, n \rbrace$;
+- for each player $i$, a set $S_i$ of **strategies** (actions it can choose);
+- for each player $i$, a **payoff function** $u_i : S_1 \times \dots \times S_n \to \mathbb{R}$
+  that says how much player $i$ likes each combination of choices.
+
+A **strategy profile** $s = (s_1, \dots, s_n)$ lists one strategy per player. We write $s_{-i}$
+for everyone's strategy except player $i$'s, so $s = (s_i, s_{-i})$. Payoffs are utilities:
+bigger is better, and only their order matters until we start mixing strategies, when expected
+utility makes their differences matter too.
+
+The standing assumptions are that each player is **rational** (picks what maximises its own
+payoff given what it believes) and that the game itself, including the fact that everyone is
+rational, is **common knowledge**: everyone knows it, knows that everyone knows it, and so on.
+
+With two players and finitely many strategies the game fits in a table, a **bimatrix**: Row's
+strategies label the rows, Column's label the columns, and each cell holds the pair (Row's
+payoff, Column's payoff). Here is the most famous one.
+
+<PayoffMatrix
+	game="prisoners"
+	title="The Prisoner's Dilemma"
+	caption="Each cell is (Row's payoff, Column's payoff). Both players do better at (Cooperate, Cooperate) than at (Defect, Defect), but each does better by defecting whatever the other does."
+/>
+
+Two suspects are questioned in separate rooms. If both stay silent (Cooperate with each other)
+they get light sentences, worth 3 each. If one confesses (Defects) and the other does not, the
+defector goes free (5) and the other gets the harshest sentence (0). If both confess they both
+get a medium sentence (1). The labels $T = 5$ (temptation), $R = 3$ (reward), $P = 1$
+(punishment) and $S = 0$ (sucker) satisfy $T \gt R \gt P \gt S$, which is all that makes it a
+Prisoner's Dilemma.
+
+Five two-by-two games come up again and again, because each isolates one kind of strategic
+tension:
+
+| Game | Payoffs of (first, first), (first, second), (second, first), (second, second) | Tension |
+| --- | --- | --- |
+| Prisoner's Dilemma | (3, 3), (0, 5), (5, 0), (1, 1) | individual gain against joint gain |
+| Battle of the Sexes | (2, 1), (0, 0), (0, 0), (1, 2) | coordinate, but on whose favourite? |
+| Stag Hunt | (4, 4), (0, 3), (3, 0), (3, 3) | the better outcome is riskier |
+| Chicken (Hawk–Dove) | (0, 0), (7, 2), (2, 7), (6, 6) | each wants the other to back down |
+| Matching Pennies | (1, −1), (−1, 1), (−1, 1), (1, −1) | pure conflict: be unpredictable |
+
+In the Battle of the Sexes, Row prefers the opera and Column the football match, but both
+prefer going together to going alone. In the Stag Hunt, hunting stag together pays 4 each, but a
+stag needs both hunters, while a hare (3) can be caught alone. In Chicken two drivers head at
+each other; whoever swerves is the chicken.
+
+## Dominance and rationalizability
+
+#### Dominated strategies
+
+The simplest way to solve a game is to throw out choices no rational player would make.
+Strategy $s_i$ **strictly dominates** $t_i$ if it pays strictly more against every possible
+choice of the others:
+
+$$
+u_i(s_i, s_{-i}) \gt u_i(t_i, s_{-i}) \quad \text{for all } s_{-i}.
+$$
+
+A rational player never plays a strictly dominated strategy, because switching to the
+dominating one is better no matter what it believes the others will do. If one strategy
+dominates all others it is a **dominant strategy**.
+
+In the Prisoner's Dilemma, Defect strictly dominates Cooperate for Row: against Cooperate it
+pays $5 \gt 3$, against Defect $1 \gt 0$. The game is symmetric, so the same holds for Column.
+Two rational players therefore end at (Defect, Defect) and get 1 each, although (Cooperate,
+Cooperate) would give both 3. Individual rationality does not imply collective rationality;
+that gap is the whole point of the game.
+
+A strategy can be dominated by a **mixture** of other strategies even if no single strategy
+dominates it. Playing Top and Bottom with probability ½ each is a strategy too (we treat such
+**mixed strategies** properly below); its payoff is the average.
+
+#### Iterated elimination
+
+Once Row knows Column will never play a dominated column, some row may become dominated in the
+smaller game, and so on. **Iterated elimination of strictly dominated strategies** (IESDS)
+repeats the removal until nothing more is dominated. Step through it on a 3 × 3 game:
+
+<PayoffMatrix
+	game="iesds"
+	mode="iesds"
+	title="Iterated elimination of strictly dominated strategies"
+	caption="Press next to remove one dominated strategy per step. Step 2 removes Middle, which no single row dominates; only the mixture ½ Top + ½ Bottom does."
+/>
+
+The four steps are:
+
+1. **Right** is dominated for Column by Left: against Top, Middle, Bottom it pays $(0, 0, 0)$
+   against Left's $(1, 4, 1)$.
+2. **Middle** is now dominated for Row by ½ Top + ½ Bottom. Check it: against Left the mixture
+   pays $\tfrac12 \cdot 4 + \tfrac12 \cdot 0 = 2 \gt 1$; against Center
+   $\tfrac12 \cdot 0 + \tfrac12 \cdot 4 = 2 \gt 1$. Neither Top $(4, 0)$ nor Bottom $(0, 4)$
+   beats Middle $(1, 1)$ alone. Before step 1, Middle was not dominated at all: against Right it
+   pays 5 and the mixture only 0.5.
+3. **Left** is now dominated for Column by Center: against Top and Bottom, Center pays $(2, 3)$
+   and Left only $(1, 1)$.
+4. **Top** is dominated for Row by Bottom: against Center, $4 \gt 0$.
+
+One cell is left, (Bottom, Center) with payoffs (4, 3). A game where IESDS leaves a single
+profile is **dominance solvable**.
+
+A useful fact is that the order of removal does not matter for strict dominance in finite
+games.<Sidenote>Proof sketch. Removing opponents' strategies only removes inequalities from the
+definition, so a strategy that is strictly dominated stays strictly dominated as the game
+shrinks, as long as its dominator survives. If the dominator is removed later, it was itself
+dominated by something, and dominance by mixtures is transitive; in a finite game the chain
+ends at a surviving dominator. So whatever one order removes, any other order eventually
+removes too, and both end at the same set. See Osborne and Rubinstein, *A Course in Game
+Theory*, ch. 4, or Gilboa, Kalai and Zemel (1990).</Sidenote> For **weak** dominance
+($\ge$ everywhere and $\gt$ somewhere) it does. In the game below, Row's Top and Bottom are both
+weakly dominated by Middle.
+
+| | L | R |
+| --- | --- | --- |
+| T | 1, 1 | 0, 0 |
+| M | 1, 1 | 2, 1 |
+| B | 0, 0 | 2, 1 |
+
+Remove T first, and in the rows that are left, R weakly dominates L for Column; the outcome is a
+payoff of (2, 1). Remove B first instead, and L weakly dominates R; the outcome is (1, 1). So
+weak dominance is a weaker solution idea: it is safe to play a weakly dominant strategy, but not
+safe to reason by deleting weakly dominated ones in an arbitrary order.
+
+#### Common knowledge of rationality
+
+Each round of elimination uses one more layer of "I know that you know that I am rational". The
+**p-beauty contest** shows how far that reasoning reaches. Everyone writes a number between 0
+and 100; the winner is whoever is closest to two thirds of the average. No guess above
+$\tfrac23 \cdot 100 \approx 66.7$ can ever win, so a rational player never makes one. If
+everyone knows that, the average is at most 66.7 and no guess above 44.4 makes sense, and so on.
+After $k$ rounds the bound is $100 \cdot (2/3)^k$:
+
+<table>
+	<thead><tr><th>Round k</th>{beautyRounds.map((_, k) => <th style="text-align: right">{k}</th>)}</tr></thead>
+	<tbody><tr><td>Bound</td>{beautyRounds.map((v) => <td style="text-align: right">{v.toFixed(1)}</td>)}</tr></tbody>
+</table>
+
+The only number that survives every round is 0, and everyone guessing 0 is the unique
+equilibrium. Real players stop after one or two rounds: in Nagel's experiments the average first
+guess with $p = 2/3$ was about 37.<Sidenote>R. Nagel, "Unraveling in Guessing Games: An
+Experimental Study", *American Economic Review* 85(5), 1995. Models that cap the number of
+reasoning steps ("level-k" thinking) fit such data well.</Sidenote> Game-theoretic predictions
+that need many layers of mutual knowledge should be treated with care.
+
+The strategies that survive this reasoning are called **rationalizable** (Bernheim 1984, Pearce
+1984). A strategy is rationalizable if it is a best response to some belief about the others
+that puts weight only on rationalizable strategies. In two-player games this is the same as
+surviving IESDS with mixed dominance, because of the following lemma.
+
+**Lemma (Pearce).** In a finite two-player game, a strategy is never a best response to any
+belief if and only if it is strictly dominated by some mixed strategy.
+
+One direction is easy: a dominated strategy is beaten by its dominator under every belief. The
+other is a minimax argument: if $t$ is never a best response, the zero-sum game in which Row
+picks a mixture $\sigma$ and Column picks a belief $\mu$, with payoff
+$u(\sigma, \mu) - u(t, \mu)$, has a positive value, and the maximising $\sigma$ dominates $t$.
+We prove the minimax theorem it rests on [below](#zero-sum-games-and-the-minimax-theorem).
+
+## Nash equilibrium
+
+Most games are not dominance solvable. In the Battle of the Sexes neither player has a dominated
+strategy, yet some outcomes are clearly more stable than others. Nash's idea was to look for
+profiles where everyone is already doing the best they can, given what the others do.
+
+The **best-response correspondence** of player $i$ maps the others' strategies to the set of
+strategies that maximise $i$'s payoff:
+
+$$
+BR_i(s_{-i}) = \arg\max_{s_i \in S_i} u_i(s_i, s_{-i}).
+$$
+
+A profile $s^\ast$ is a **Nash equilibrium** if every player's strategy is a best response to
+the others':
+
+$$
+u_i(s_i^\ast, s_{-i}^\ast) \ge u_i(s_i, s_{-i}^\ast) \quad \text{for all players } i \text{ and all } s_i \in S_i.
+$$
+
+Equivalently, no player can gain by changing its strategy **alone**. An equilibrium is a
+self-enforcing agreement: if the players agreed on it beforehand, nobody would want to break the
+agreement. It is also a steady state: if everyone expects $s^\ast$, nobody has a reason to do
+anything else.
+
+To find the pure equilibria of a bimatrix, mark Row's best payoff in each column and Column's
+best payoff in each row. A cell with both marks is an equilibrium. In the figure, underlines are
+the marks and the green cell is the equilibrium; hover over a cell to see who would deviate from
+it.
+
+<PayoffMatrix
+	game="prisoners"
+	mode="br"
+	title="Best responses in the Prisoner's Dilemma"
+	caption="Underlined payoffs are best responses. (Defect, Defect) is the only cell where both are underlined."
+/>
+
+Some relations between the two solution ideas are worth stating, because they get used all the
+time:
+
+- A strictly dominant strategy equilibrium is the unique Nash equilibrium.
+- IESDS never removes a strategy used in a Nash equilibrium. (A Nash strategy is a best response
+  to $s_{-i}^\ast$, which survives every round by induction, so nothing beats it against all
+  surviving profiles.) So if IESDS leaves one profile, that profile is the unique equilibrium,
+  as for (Bottom, Center) above.
+- A game can have several equilibria. The Battle of the Sexes has (Opera, Opera) and
+  (Football, Football); the Stag Hunt has (Stag, Stag) and (Hare, Hare). The theory says which
+  profiles are stable, not which one will be played. **Focal points** (Schelling 1960), history
+  and communication select among them in practice.
+- A game can have no pure equilibrium. In Matching Pennies, whichever cell you start in, one
+  player wants to switch.
+
+### Mixed strategies
+
+Matching Pennies has an obvious solution in practice: flip the coin. A **mixed strategy**
+$\sigma_i$ is a probability distribution over $S_i$. Players randomise independently, and payoffs
+are expected utilities:
+
+$$
+u_i(\sigma) = \sum_{s \in S} \Big( \prod_{j} \sigma_j(s_j) \Big) u_i(s).
+$$
+
+For two players with payoff matrices $A$ (Row) and $B$ (Column) and mixtures $x$, $y$ this is
+$x^\top A y$ and $x^\top B y$. A **mixed Nash equilibrium** is defined exactly as before, with
+mixed strategies in place of pure ones. The key tool for finding one is:
+
+**Indifference principle.** $\sigma^\ast$ is a Nash equilibrium if and only if, for every player
+$i$, every pure strategy in the support of $\sigma_i^\ast$ (played with positive probability)
+earns the same payoff $u_i(\sigma^\ast)$ against $\sigma_{-i}^\ast$, and no pure strategy earns
+more.
+
+*Proof.* Player $i$'s payoff is an average of its pure strategies' payoffs,
+$u_i(\sigma_i, \sigma^\ast_{-i}) = \sum_{s_i} \sigma_i(s_i)\, u_i(s_i, \sigma^\ast_{-i})$. An
+average is at most the largest term, and equals it only if all the weight sits on terms equal to
+the largest. So $\sigma_i^\ast$ is a best response if and only if it puts weight only on pure
+strategies that achieve the maximum. Also, no mixed deviation can beat the best pure one, so
+checking pure deviations is enough. $\blacksquare$
+
+The principle has a surprising consequence: in an equilibrium, **each player's mixture is chosen
+to make the other player indifferent**, so it depends on the other player's payoffs, not on its
+own.
+
+**Worked example: Battle of the Sexes.** Let Row play Opera with probability $p$ and Column play
+Opera with probability $q$. For Column to be willing to mix, Opera and Football must pay Column
+the same:
+
+$$
+\underbrace{1 \cdot p}_{\text{Column picks Opera}} = \underbrace{2 \cdot (1 - p)}_{\text{Column picks Football}}
+\quad\Rightarrow\quad p = \tfrac23 .
+$$
+
+For Row to be willing to mix, $2q = 1 \cdot (1 - q)$, so $q = \tfrac13$. Check one payoff: Row
+gets $2 \cdot \tfrac13 = \tfrac23$ from Opera and $1 \cdot \tfrac23 = \tfrac23$ from Football, as
+required. Both players get $\tfrac23$ in this equilibrium, worse than either pure equilibrium,
+because they miscoordinate with probability $\tfrac23 \cdot \tfrac23 + \tfrac13 \cdot \tfrac13 = \tfrac59$.
+
+The figure shows the whole picture for a 2 × 2 game. On the left, the blue line is Row's best
+response: for each $q$ across, the $p$ Row should choose. It jumps from $p = 0$ to $p = 1$ at
+$q = \tfrac13$, where Row is indifferent. The dashed orange line is Column's best response, which
+jumps at $p = \tfrac23$. Equilibria are the points on both lines: the two corners (the pure
+equilibria) and $(p, q) = (\tfrac23, \tfrac13)$. On the right, the crossing of the two payoff
+lines is the indifference point. Switch the game to Matching Pennies, Stag Hunt or Chicken and
+the same construction gives their equilibria.
+
+<MixedBestResponse
+	game="bos"
+	title="Best-response correspondences in a 2 × 2 game"
+	caption="Left: Row's best response (blue) and Column's (dashed orange) on the square of mixed profiles; green dots are Nash equilibria. Right: each player's payoff from each pure strategy against the other's mixture; the dashed line marks the current mixture."
+/>
+
+The equilibria of the five classic games, all checked by support enumeration:
+
+| Game | Pure equilibria | Mixed equilibrium $(p, q)$ | Payoffs in the mixed one |
+| --- | --- | --- | --- |
+| Prisoner's Dilemma | (D, D) | none | |
+| Battle of the Sexes | (O, O), (F, F) | $(\tfrac23, \tfrac13)$ | $(\tfrac23, \tfrac23)$ |
+| Stag Hunt | (S, S), (H, H) | $(\tfrac34, \tfrac34)$ | $(3, 3)$ |
+| Chicken | (D, C), (C, D) | $(\tfrac13, \tfrac13)$ | $(\tfrac{14}3, \tfrac{14}3)$ |
+| Matching Pennies | none | $(\tfrac12, \tfrac12)$ | $(0, 0)$ |
+
+### Existence: Nash's theorem
+
+**Theorem (Nash 1950).** Every game with finitely many players and finitely many pure strategies
+has at least one Nash equilibrium in mixed strategies.
+
+The proof uses a fixed-point theorem.
+
+**Brouwer's fixed-point theorem.** Every continuous function $f$ from a nonempty, compact,
+convex set $K \subset \mathbb{R}^d$ to itself has a fixed point $f(x) = x$.
+
+In one dimension this is the intermediate value theorem: a continuous $f : [0,1] \to [0,1]$ has
+$f(0) - 0 \ge 0$ and $f(1) - 1 \le 0$, so $f(x) - x$ crosses zero. We take Brouwer's theorem as
+given.<Sidenote>Short proofs go through Sperner's lemma or the no-retraction theorem; see e.g.
+the appendix of Osborne and Rubinstein or Border, *Fixed Point Theorems with Applications to
+Economics and Game Theory* (1985).</Sidenote>
+
+*Proof of Nash's theorem.* The set $\Sigma$ of mixed profiles is a product of simplices, so it
+is compact and convex. For a profile $\sigma$, define the **gain** of switching to pure strategy
+$s$:
+
+$$
+g_i(s; \sigma) = \max\big(0,\ u_i(s, \sigma_{-i}) - u_i(\sigma)\big),
+$$
+
+and Nash's map, which shifts probability towards strategies that do better than the current
+mixture:
+
+$$
+f(\sigma)_i(s) = \frac{\sigma_i(s) + g_i(s; \sigma)}{1 + \sum_{s'} g_i(s'; \sigma)} .
+$$
+
+Each $f(\sigma)_i$ is again a probability distribution, and $f$ is continuous because $u_i$ is
+(it is a polynomial in the probabilities) and $\max(0, \cdot)$ is. By Brouwer, $f$ has a fixed
+point $\sigma^\ast$. We show that fixed points of $f$ are exactly the Nash equilibria.
+
+If $\sigma$ is an equilibrium, all gains are 0 and $f(\sigma) = \sigma$. Conversely, let
+$\sigma^\ast = f(\sigma^\ast)$ and fix a player $i$. Since $u_i(\sigma^\ast)$ is an average of
+$u_i(s, \sigma^\ast_{-i})$ over $s$ with weights $\sigma_i^\ast(s)$, some $s$ with
+$\sigma^\ast_i(s) \gt 0$ has $u_i(s, \sigma^\ast_{-i}) \le u_i(\sigma^\ast)$, so its gain is
+zero. For that $s$ the fixed-point equation reads
+
+$$
+\sigma^\ast_i(s) = \frac{\sigma^\ast_i(s)}{1 + G}, \qquad G = \sum_{s'} g_i(s'; \sigma^\ast),
+$$
+
+which with $\sigma^\ast_i(s) \gt 0$ forces $G = 0$. All of player $i$'s gains are zero: no pure
+strategy beats $\sigma^\ast_i$, and by the indifference principle no mixed one does either.
+This holds for every $i$, so $\sigma^\ast$ is a Nash equilibrium. $\blacksquare$
+
+Turn on Nash's map for Matching Pennies to see it. Each grey arrow goes from a profile $\sigma$
+towards $f(\sigma)$ (drawn at 40% of its length so the arrows stay short). The arrows swirl
+around the centre and vanish only at $(\tfrac12, \tfrac12)$, the fixed point and the only
+equilibrium.
+
+<MixedBestResponse
+	game="pennies"
+	field
+	title="Nash's map in Matching Pennies"
+	caption="Grey arrows: σ → f(σ), scaled to 40%. The only point the map leaves in place is the mixed equilibrium (½, ½)."
+/>
+
+Two remarks. The proof is not constructive: Brouwer says a fixed point exists, not how to find
+one, and we will see that finding one is computationally hard in general. And Nash's original
+1950 note used Kakutani's fixed-point theorem on the best-response correspondence instead; the
+continuous map above is from his 1951 paper.
+
+### Games with continuous strategies
+
+Strategies need not be finite lists. Three classic models of competition have strategy sets that
+are intervals, and their equilibria are found with calculus.
+
+#### Cournot competition
+
+Two firms choose quantities $q_1, q_2 \ge 0$ of the same good. The price is $P = a - q_1 - q_2$
+and each unit costs $c$. Firm 1's profit is $\pi_1 = (a - q_1 - q_2 - c)\, q_1$, a concave
+parabola in $q_1$; setting $\partial \pi_1 / \partial q_1 = 0$ gives its best response
+
+$$
+q_1 = BR_1(q_2) = \frac{a - c - q_2}{2},
+$$
+
+and symmetrically for firm 2. The equilibrium is where the two best-response lines cross:
+$q_1 = q_2 = (a - c)/3$. With $a = 10$ and $c = 1$: each firm makes 3 units, the price is
+$10 - 6 = 4$, and each earns $(4 - 1) \cdot 3 = 9$.
+
+<LineChart
+	x={() => Array.from({ length: 91 }, (_, i) => i / 10)}
+	series={[
+		{ name: "Firm 2's best response q₂ = (9 − q₁)/2", fn: (q) => (9 - q) / 2 },
+		{ name: "Firm 1's best response q₁ = (9 − q₂)/2, i.e. q₂ = 9 − 2q₁", fn: (q) => Math.max(0, 9 - 2 * q) },
+	]}
+	title="Cournot best responses (a = 10, c = 1): they cross at (3, 3)"
+	xLabel="q₁"
+	yLabel="q₂"
+	height={300}
+/>
+
+A monopolist would produce $(a - c)/2 = 4.5$ and earn $3.5 \cdot 4.5 = 20.25$, so the two
+firms could split the monopoly output (2.25 each) and earn 10.125 each instead of 9. That
+agreement is not an equilibrium: against $q_2 = 2.25$, firm 1's best response is
+$(9 - 2.25)/2 = 3.375$. Cournot competition is a Prisoner's Dilemma with a continuum of
+strategies.
+
+#### Bertrand competition
+
+Now let the firms choose prices instead, with identical products: everyone buys from the
+cheaper firm, and they split the market on a tie. The unique equilibrium is $p_1 = p_2 = c$,
+with zero profit. *Proof by cases.* If the lower price is above $c$, the other firm can undercut
+it slightly and take the whole market, which pays more. If one price is below $c$, that firm
+loses money on every sale and should raise its price. If one firm prices at $c$ and the other
+above, the first can raise its price a little and still sell to everyone at a profit. Only
+$p_1 = p_2 = c$ is left, and there neither firm gains by moving. $\blacksquare$ Two firms are
+enough for the competitive outcome, the **Bertrand paradox**; it disappears with capacity limits
+or differentiated products.
+
+#### Hotelling and the median voter
+
+Two candidates choose positions on a line $[0, 1]$; voters are spread uniformly and vote for
+the nearer candidate. The unique equilibrium is both at $\tfrac12$. If one candidate stands at
+$x \ne \tfrac12$, the other can stand just on the larger side of $x$ and win more than half the
+votes, so $x$ is not a best response unless both are at the median. This is why two-party
+platforms converge and why shops cluster.
+
+## Zero-sum games and the minimax theorem
+
+In a **zero-sum game** one player's gain is the other's loss: $B = -A$. We only need Row's
+matrix $A$; Row maximises $x^\top A y$ and Column minimises it. Chess, poker, Matching Pennies
+and Rock–Paper–Scissors are zero-sum, and so is the training game of a generative adversarial
+network in its original form.
+
+Row can guarantee itself $\max_i \min_j a_{ij}$ (the **maxmin** or lower value) by picking the
+row whose worst case is best. Column can hold Row to $\min_j \max_i a_{ij}$ (the **minmax** or
+upper value). Here is a game where the two differ:
+
+<PayoffMatrix
+	game="zeroSum"
+	title="A zero-sum game (each cell shows Row's payoff, Column's)"
+	caption="Row's worst cases are −1, −2, −1, so the maxmin is −1. Column's worst cases (largest entry of each column) are 3, 4, 2, so the minmax is 2."
+/>
+
+With pure strategies Row can only guarantee $-1$ and Column can only hold Row to 2. A cell
+where the two meet, the largest in its column and the smallest in its row, is a **saddle point**;
+this game has none. Mixed strategies close the gap.
+
+**Minimax theorem (von Neumann 1928).** For every matrix $A$,
+
+$$
+\max_{x \in \Delta_m} \min_{y \in \Delta_n} x^\top A y \;=\; \min_{y \in \Delta_n} \max_{x \in \Delta_m} x^\top A y \;=\; v,
+$$
+
+where $\Delta_k$ is the set of probability vectors of length $k$. The common number $v$ is the
+**value** of the game.
+
+*Proof.* The inequality $\le$ always holds: for any $x'$ and $y'$,
+$\min_y x'^\top A y \le x'^\top A y' \le \max_x x^\top A y'$; take the max over $x'$ on the left
+and the min over $y'$ on the right. For $\ge$, write Row's problem as a linear program. For a
+fixed $x$ the inner minimum is attained at a pure column, so Row solves
+
+$$
+\max_{x, v}\ v \quad \text{s.t.} \quad \sum_i x_i a_{ij} \ge v \ \ (j = 1..n), \quad \sum_i x_i = 1,\ x \ge 0 .
+$$
+
+Its linear programming dual is exactly Column's problem,
+$\min_{y, w} w$ subject to $\sum_j a_{ij} y_j \le w$ for every $i$, $\sum_j y_j = 1$, $y \ge 0$.
+Both programs are feasible and bounded, so by strong LP duality their optima are equal.
+$\blacksquare$ (A second proof, from no-regret learning and needing no duality, comes
+[later](#learning-in-games).)
+
+The theorem has strong consequences. In a zero-sum game the Nash equilibria are exactly the
+pairs of maxmin strategies, every equilibrium gives Row the same payoff $v$, and equilibria are
+**interchangeable**: if $(x, y)$ and $(x', y')$ are equilibria, so are $(x, y')$ and $(x', y)$.
+There is no coordination problem, which is why zero-sum games are the easy case.
+
+**Worked example.** First simplify. Row 3, $(1, 0, -1)$, is strictly dominated by
+½ r1 + ½ r2 $= (0.5, 1.5, 1.5)$, so remove it. With Row playing r1 with probability $p$, its
+payoff against each column is a line in $p$:
+
+$$
+c_1: 3p - 2(1 - p) = 5p - 2, \qquad c_2: -p + 4(1 - p) = 4 - 5p, \qquad c_3: 2p + (1 - p) = 1 + p .
+$$
+
+Column will answer with whichever column is lowest, so Row's guarantee is the **lower envelope**
+of the three lines, and Row should pick the $p$ where the envelope peaks.
+
+<LineChart
+	x={() => Array.from({ length: 101 }, (_, i) => i / 100)}
+	series={[
+		{ name: "against c1: 5p − 2", fn: zeroSumLines[0] },
+		{ name: "against c2: 4 − 5p", fn: zeroSumLines[1] },
+		{ name: "against c3: 1 + p", fn: zeroSumLines[2] },
+		{ name: "Row's guarantee (lower envelope)", fn: zeroSumEnvelope },
+	]}
+	title="Solving the zero-sum game graphically: the envelope peaks at p = 0.6, value 1"
+	xLabel="p = P(Row plays r1)"
+	yLabel="Row's expected payoff"
+	height={300}
+/>
+
+The peak is where $c_1$ and $c_2$ cross: $5p - 2 = 4 - 5p$, so $p = 0.6$ and $v = 1$. Column
+then mixes c1 and c2 so that Row is indifferent between r1 and r2: $3y - (1 - y) = -2y + 4(1 - y)$
+gives $y = \tfrac12$. Check: against $y = (\tfrac12, \tfrac12, 0)$, r1 pays $\tfrac12(3 - 1) = 1$,
+r2 pays $\tfrac12(-2 + 4) = 1$, r3 pays $\tfrac12(1 + 0) = 0.5 \lt 1$. And c3 is not used because
+it gives Row $1.6 \gt 1$ at $p = 0.6$. The value 1 lies between the pure maxmin $-1$ and minmax 2,
+as it must; the LP solver returns the same $x = (0.6, 0.4, 0)$, $y = (0.5, 0.5, 0)$, $v = 1$.
+
+## Correlated equilibrium
+
+In Chicken, both pure equilibria are lopsided, (7, 2) or (2, 7), and the mixed one gives each
+driver $\tfrac{14}3 \approx 4.67$ but crashes with probability $\tfrac19$. A traffic light does
+better. Suppose a device draws one of three outcomes, (Dare, Chicken), (Chicken, Dare) or
+(Chicken, Chicken), with probability $\tfrac13$ each, and privately tells each driver only its
+own part. If Row is told "Dare", it knows Column was told "Chicken", and Dare (7) beats Chicken
+(6). If Row is told "Chicken", Column was told Dare or Chicken with probability ½ each; obeying
+pays $\tfrac12 \cdot 2 + \tfrac12 \cdot 6 = 4$, disobeying $\tfrac12 \cdot 0 + \tfrac12 \cdot 7 = 3.5$.
+Obeying is optimal either way, and each driver expects 5, more than the mixed equilibrium.
+
+**Definition (Aumann 1974).** A probability distribution $p$ over strategy profiles is a
+**correlated equilibrium** if, for every player $i$ and every pair of strategies $s_i, s_i'$,
+
+$$
+\sum_{s_{-i}} p(s_i, s_{-i}) \big[ u_i(s_i, s_{-i}) - u_i(s_i', s_{-i}) \big] \ge 0 .
+$$
+
+Read it as: conditional on being told $s_i$, switching to $s'_i$ does not help. (The constraint
+is multiplied through by the probability of being told $s_i$.) These **obedience constraints**
+are linear in $p$, so the set of correlated equilibria is a convex polytope, and the best one for
+any linear objective is a linear program. Every Nash equilibrium is a correlated equilibrium (the
+product distribution of the mixtures), so the set is never empty.
+
+Maximising the sum of payoffs over correlated equilibria of Chicken gives probability ½ on
+(Chicken, Chicken) and ¼ on each of the other two cells, with payoff 5.25 each. The figure lists
+its obedience constraints. Check the tight one by hand: a driver told "Chicken" believes the
+other was told Dare with probability $\tfrac{1/4}{3/4} = \tfrac13$; obeying pays
+$\tfrac13 \cdot 2 + \tfrac23 \cdot 6 = \tfrac{14}3$ and disobeying
+$\tfrac13 \cdot 0 + \tfrac23 \cdot 7 = \tfrac{14}3$: exactly indifferent.
+
+<PayoffMatrix
+	game="chicken"
+	mode="dist"
+	dist={[[0, 0.25], [0.25, 0.5]]}
+	title="The welfare-maximising correlated equilibrium of Chicken"
+	caption="Each cell shows its probability. The table lists, for each player and recommendation, the gain from disobeying (times the probability of the recommendation); none is positive."
+/>
+
+Correlated equilibria matter beyond traffic lights for a computational reason: they can be
+computed in polynomial time by linear programming, unlike Nash equilibria, and simple learning
+rules converge to them, as we will see.
+
+## Extensive-form games
+
+Many games unfold over time: one player moves, another sees it and responds. An
+**extensive-form game** is a tree. Each internal node belongs to a player, who chooses one of its
+outgoing edges (actions); **chance nodes** choose randomly with known probabilities; leaves carry
+payoffs. A **strategy** is a complete contingent plan: an action for every node the player owns,
+including nodes that will never be reached if the plan is followed.
+
+Take the **entry game**. A potential entrant decides whether to enter a market (In) or stay out
+(Out). If it enters, the incumbent decides whether to start a price war (Fight) or share the
+market (Accommodate).
+
+<GameTree
+	tree="entry"
+	title="Entry deterrence"
+	caption="Payoffs are (Entrant, Incumbent). Press next: the Incumbent, moving last, prefers Accommodate (2) to Fight (−1); knowing that, the Entrant prefers In (1) to Out (0)."
+/>
+
+Written in strategic form the game has two pure Nash equilibria:
+
+<PayoffMatrix
+	game="entry"
+	mode="br"
+	title="The entry game in strategic form"
+	caption="(Out, Fight) is a Nash equilibrium: given the threat to fight, staying out is optimal, and the threat costs the Incumbent nothing because it is never carried out."
+/>
+
+(Out, Fight) is an equilibrium only because of an **empty threat**. If the Entrant did enter,
+fighting would cost the Incumbent 3 compared with accommodating; it would never actually fight.
+Nash equilibrium checks only whether strategies are optimal on the path of play, and Fight is
+off the path.
+
+### Backward induction and subgame perfection
+
+A **subgame** is the part of the tree below some node, provided it does not cut through an
+information set (defined below; in a game of perfect information every node starts a subgame).
+A profile is a **subgame perfect equilibrium** (SPE, Selten 1965) if it is a Nash equilibrium in
+every subgame, so that threats and promises must be credible. In the entry game the subgame after
+In has only the Incumbent moving, and Fight is not optimal there, so (Out, Fight) is not subgame
+perfect; (In, Accommodate) is.
+
+In finite games of **perfect information** (every player sees all earlier moves) SPE are found
+by **backward induction**: solve the last decisions first, replace each solved node by the
+payoff it leads to, and repeat towards the root.
+
+**Theorem (Zermelo 1913, Kuhn 1953).** Every finite game of perfect information has a subgame
+perfect equilibrium in pure strategies, namely any profile found by backward induction.
+
+*Proof by induction on the depth of the tree.* A tree of depth 0 is a leaf, with nothing to
+choose. Suppose the claim holds for depth below $d$ and take a tree of depth $d$. Each child of
+the root starts a subgame of smaller depth, which by hypothesis has a pure SPE with some payoff
+vector. Let the root's player choose the child whose SPE payoff is best for it (ties broken any
+way). The combined profile is a Nash equilibrium in every subgame below the root by hypothesis,
+and at the root the mover cannot gain: any other first action leads to a subgame whose play is
+fixed and pays it less or the same. $\blacksquare$
+
+A corollary is Zermelo's theorem about chess: since chess is finite, either White can force a
+win, or Black can, or both can force at least a draw. Nobody knows which.
+
+Backward induction can give uncomfortable answers. In the **centipede game** two players take
+turns; each can Take (end the game, grabbing the larger share of a growing pot) or Pass.
+
+<GameTree
+	tree="centipede"
+	title="A four-move centipede game"
+	caption="Payoffs are (Ann, Bob). Backward induction makes every player Take, so Ann takes at once and gets 2, although both would get more by passing to the end."
+/>
+
+At the last node Bob takes (5 beats 4). Knowing that, Ann takes at the third node (4 beats 3);
+then Bob takes at the second (3 beats 2), and Ann takes immediately: (2, 0), while passing
+throughout would have given (6, 4). In experiments most players pass for several
+rounds.<Sidenote>R. McKelvey and T. Palfrey, "An Experimental Study of the Centipede Game",
+*Econometrica* 60(4), 1992. The SPE needs common knowledge of rationality at every node,
+including nodes that rationality says will never be reached; that tension has a large
+literature.</Sidenote>
+
+The **ultimatum game** is another. A proposer splits 4 coins by offering the responder 1, 2 or 3
+of them; the responder accepts (the split happens) or rejects (both get nothing).
+
+<GameTree
+	tree="ultimatum"
+	title="The ultimatum game with 4 coins"
+	caption="Payoffs are (Proposer, Responder). A responder who only cares about coins accepts every positive offer, so the proposer offers the minimum."
+/>
+
+Backward induction predicts the smallest offer, accepted. Real responders often reject offers
+below 20 to 30 percent of the pie, and proposers anticipate it: the most common offers are 40 to 50
+percent.<Sidenote>W. Güth, R. Schmittberger and B. Schwarze, "An Experimental Analysis of
+Ultimatum Bargaining", *Journal of Economic Behavior and Organization* 3(4), 1982. The usual
+reading is that payoffs in money are not the players' utilities: people also value
+fairness.</Sidenote>
+
+#### Commitment: Stackelberg competition
+
+Sequential moves can help the first mover. In the Cournot market above, let firm 1 choose its
+quantity first and firm 2 respond. Firm 2 plays its best response $q_2 = (9 - q_1)/2$; firm 1,
+anticipating it, maximises $(10 - q_1 - (9 - q_1)/2 - 1)\, q_1 = \tfrac12 (9 - q_1)\, q_1$, so
+$q_1 = 4.5$ and $q_2 = 2.25$. The price is $3.25$ and the leader earns $2.25 \cdot 4.5 = 10.125$
+against 9 in Cournot, while the follower earns $2.25 \cdot 2.25 = 5.0625$. Being able to commit
+to a large output is worth something; the same backward induction is the basis of
+**Stackelberg security games** used to schedule patrols.
+
+#### The one-shot deviation principle
+
+Checking subgame perfection directly means checking every possible deviation in every subgame,
+including complicated multi-step ones. A theorem reduces this to single-step deviations.
+
+**One-shot deviation principle.** In a finite game of perfect information (and in infinite games
+with discounting), a profile is subgame perfect if and only if no player can gain by changing
+its action at a single node and then following its strategy afterwards.
+
+*Proof for finite games.* "Only if" is clear: a one-shot deviation is a deviation. For "if",
+suppose no one-shot deviation is profitable, but some player $i$ has a profitable deviation
+$s_i'$ in some subgame. Among all profitable deviations, take one that differs from $s_i$ at the
+fewest nodes, and let $h$ be a deepest node where it differs. Below $h$, $s'_i$ agrees with
+$s_i$, so at $h$ the difference between $s'_i$ and $s_i$ is a one-shot deviation, which by
+assumption does not help: changing $s_i'$ back to $s_i$ at $h$ does not lower $i$'s payoff in the
+subgame at $h$, and so not in the bigger subgame either. That gives a profitable deviation
+differing at fewer nodes, a contradiction. $\blacksquare$ With discounting, any profitable
+deviation can be truncated after $T$ steps while still profitable (the payoffs beyond $T$ are
+worth at most $\delta^T$ times a bounded amount), which reduces the infinite case to the finite
+one.
+
+### Imperfect information
+
+In many games a player does not see everything that happened before. An **information set** is a
+set of nodes that the player to move cannot tell apart; it must choose the same action at all of
+them. A simultaneous-move game is a tree with an information set: the Prisoner's Dilemma below
+has Column move without seeing Row's choice (dashed line).
+
+<GameTree
+	tree="pdTree"
+	mode="static"
+	highlight={{ r: "D", cC: "D", cD: "D" }}
+	title="The Prisoner's Dilemma as a tree"
+	caption="The dashed line joins the two nodes of Column's information set: Column must choose without knowing Row's move. The green edges are the equilibrium (Defect, Defect)."
+/>
+
+With imperfect information there are two ways to randomise. A **mixed strategy** draws one pure
+plan at the start. A **behaviour strategy** randomises independently at each information set
+when it is reached. A game has **perfect recall** if no player ever forgets what it knew or did.
+
+**Kuhn's theorem (1953).** In a game with perfect recall, every mixed strategy has a behaviour
+strategy that induces the same distribution over outcomes against every strategy of the others,
+and conversely.
+
+Perfect recall is needed. The **absent-minded driver** (Piccione and Rubinstein 1997) drives
+home past two identical exits and cannot tell whether it has passed the first. Exiting at the
+first pays 0, at the second 4, and missing both pays 1. A pure plan is "exit" (0) or "continue"
+(1), so mixing between them gets at most 1. A behaviour strategy that continues with probability
+$p$ at each exit gets $4p(1 - p) + p^2 = 4p - 3p^2$, maximised at $p = \tfrac23$ with value
+$\tfrac43 \gt 1$. Without perfect recall the two kinds of randomisation are not equivalent.
+
+Subgame perfection says little when information sets cut the tree into few subgames; the
+[signalling section](#signalling-and-perfect-bayesian-equilibrium) introduces the refinement used
+there, perfect Bayesian equilibrium.
+
+## Repeated games
+
+#### Finitely many rounds
+
+Cooperation in the Prisoner's Dilemma looks hopeless in one round. People nevertheless cooperate
+with neighbours, colleagues and trading partners. The difference is that they meet again. A
+**repeated game** plays the same **stage game** over and over, and each player sees the history
+of play before each round.
+
+If the number of rounds $T$ is finite and known, repetition does not help.
+
+**Claim.** In the $T$-times repeated Prisoner's Dilemma, the unique subgame perfect equilibrium
+is to defect in every round after every history.
+
+*Proof by backward induction on the rounds.* In round $T$ nothing follows, so it is a one-shot
+Prisoner's Dilemma and both defect whatever the history. Suppose both defect in rounds
+$t + 1, \dots, T$ after every history. Then what happens in round $t$ has no effect on later
+payoffs, so round $t$ is also a one-shot game and both defect. By induction both defect in every
+round. $\blacksquare$
+
+(Cooperation can survive in finitely repeated games whose stage game has several equilibria: the
+threat of switching to the worse one in the last rounds can sustain good behaviour earlier.)
+
+#### Infinitely many rounds and the folk theorem
+
+If the game has no known last round (it continues each round with probability $\delta$, or
+players discount the future by a factor $\delta \lt 1$ per round), backward induction has nowhere
+to start. Payoffs are measured as the **normalised discounted sum**
+
+$$
+U_i = (1 - \delta) \sum_{t=0}^{\infty} \delta^t u_i(s^t),
+$$
+
+where the factor $1 - \delta$ puts $U_i$ on the same scale as stage payoffs: cooperating forever
+is worth $(1 - \delta) \cdot 3 / (1 - \delta) = 3$.
+
+**Grim trigger** cooperates until the opponent defects once, then defects forever. When is
+(grim, grim) a subgame perfect equilibrium? By the one-shot deviation principle we only check
+single deviations. In the punishment phase both defect forever, which repeats a stage
+equilibrium, so no one-shot deviation helps. In the cooperative phase, deviating once earns
+$T = 5$ now and then 1 forever:
+
+$$
+\underbrace{3}_{\text{cooperate}} \ \ge\ \underbrace{(1 - \delta)\, 5 + \delta \cdot 1}_{\text{defect once}}
+\quad\Longleftrightarrow\quad \delta \ge \frac{T - R}{T - P} = \frac{5 - 3}{5 - 1} = \frac12 .
+$$
+
+Patient players can sustain cooperation; impatient ones cannot.
+
+**Tit for tat** (TFT) cooperates in round 1 and then copies the opponent's previous move. Against
+TFT, two deviations matter: defecting forever, worth $(1 - \delta) 5 + \delta \cdot 1$ (same
+condition $\delta \ge \tfrac12$), and alternating D, C, D, C, which TFT answers with C, D, C, D
+and which pays $5, 0, 5, 0, \dots$, worth $(1 - \delta) \cdot 5 / (1 - \delta^2) = 5/(1 + \delta)$.
+Cooperation beats it when $3 \ge 5/(1 + \delta)$, that is $\delta \ge \tfrac{T - R}{R - S} = \tfrac23$.
+So (TFT, TFT) is a Nash equilibrium exactly when $\delta \ge \tfrac23$.<Sidenote>Checked by value
+iteration on TFT's two states: the best reply to TFT switches from "defect" to "cooperate" between
+$\delta = 0.66$ and $0.67$. TFT is generally not subgame perfect: after a single accidental
+defection, TFT against TFT locks into alternating punishments, and a player would rather
+forgive.</Sidenote>
+
+Play two strategies against each other below. With noise switched on, each intended move is
+flipped with the given probability, and a black outline marks a flipped move.
+
+<RepeatedGame
+	a="tft"
+	b="alld"
+	title="Repeated Prisoner's Dilemma"
+	caption="Each chip is a round (green C, red D) with the payoff under it. TFT loses only the first round to Always defect, then defects too."
+/>
+
+Axelrod's computer tournaments around 1980 made TFT famous: it won both, by being nice (never
+defecting first), retaliatory and forgiving.<Sidenote>R. Axelrod, *The Evolution of Cooperation*,
+Basic Books, 1984.</Sidenote> Noise changes the picture. Set both players to TFT with noise 0.05:
+one accidental D starts an echo of alternating defections that lasts until the next accident.
+**Win-stay, lose-shift** (repeat your move after a good payoff, switch after a bad one) recovers
+from a mistake in two rounds.<Sidenote>M. Nowak and K. Sigmund, "A strategy of win-stay,
+lose-shift that outperforms tit-for-tat in the Prisoner's Dilemma game", *Nature* 364,
+1993.</Sidenote> The table under the figure is a round-robin among the seven strategies (200
+rounds per match, each also meeting a copy of itself). Its ranking depends on the noise and on
+which strategies are entered, which is the real lesson of these tournaments: there is no best
+strategy, only best responses to a population.
+
+<RepeatedGame
+	a="tft"
+	b="tft"
+	noise={0.05}
+	tournament
+	title="Noise and a round-robin tournament"
+	caption="Two TFT players with 5% noise: a single flipped move (outlined) triggers an echo of alternating defections. The table ranks all seven strategies by average payoff per round."
+/>
+
+How much can repetition sustain? A payoff vector is **feasible** if it is a convex combination
+of stage-game payoffs, and **individually rational** if it gives every player at least its
+**minmax** payoff $\underline{v}_i = \min_{s_{-i}} \max_{s_i} u_i(s_i, s_{-i})$, the least the
+others can force it down to. In the Prisoner's Dilemma $\underline{v}_i = 1$ (the others defect,
+and the best reply is to defect too).
+
+**Folk theorem (Friedman 1971, Nash-threat version).** Let $e$ be the payoffs of a stage-game
+Nash equilibrium, and $v$ a feasible payoff vector with $v_i \gt e_i$ for every player. Then for
+all $\delta$ close enough to 1 there is a subgame perfect equilibrium of the infinitely repeated
+game with payoffs $v$.
+
+*Proof sketch.* Choose a sequence of stage profiles whose discounted average is $v$ (or use a
+public random device to pick profiles with the right probabilities each round). Everyone plays the
+sequence; after any deviation, everyone plays the stage equilibrium forever, which is
+self-enforcing. A deviation gains at most $(1 - \delta) M$ today for some bound $M$ on stage
+payoffs, and switches the future from about $v_i$ to $e_i$, a loss of about $\delta (v_i - e_i)$.
+Since $v_i \gt e_i$, the loss exceeds the gain once $\delta$ is close to 1. By the one-shot
+deviation principle this is an SPE. $\blacksquare$
+
+Fudenberg and Maskin (1986) strengthened this to every feasible payoff above the minmax
+(with a dimension condition), using punishments that are themselves rewarded. In the Prisoner's
+Dilemma both versions agree, since the stage equilibrium is also the minmax point (1, 1). The
+green region below is everything that patient players can sustain, which is the theorem's
+weakness as a prediction: almost anything can be an equilibrium.
+
+<PayoffRegion
+	polygon={[[1, 1], [5, 0], [3, 3], [0, 5]]}
+	ir={[1, 1]}
+	x={[0, 5.2]}
+	y={[0, 5.2]}
+	points={[{ at: [3, 3], label: "(C, C)" }, { at: [1, 1], label: "(D, D) = minmax", ne: true }, { at: [5, 0], label: "(D, C)" }, { at: [0, 5], label: "(C, D)" }]}
+	title="Feasible and individually rational payoffs of the repeated Prisoner's Dilemma"
+	caption="Blue: averages of the four stage payoffs. Green: the part where both players get more than their minmax 1. By the folk theorem every green point is an SPE payoff for δ close to 1."
+/>
+
+## Bayesian games
+
+So far everyone knew everyone's payoffs. Often they do not: a firm does not know its rival's
+costs, a bidder does not know how much others value the item. Harsanyi (1967) turned such
+situations into ordinary games by adding a chance move. Each player $i$ has a **type**
+$\theta_i \in \Theta_i$ (its private information), types are drawn from a common prior
+$p(\theta)$, each player learns only its own type, and payoffs $u_i(s, \theta)$ may depend on all
+types.
+
+In this **Bayesian game**, a strategy is a function $s_i : \Theta_i \to S_i$, an action for every
+type. A **Bayesian Nash equilibrium** is a profile in which every type of every player maximises
+its expected payoff given its beliefs about the others' types:
+
+$$
+s_i(\theta_i) \in \arg\max_{a_i} \ \mathbb{E}_{\theta_{-i} \mid \theta_i}\Big[ u_i\big(a_i, s_{-i}(\theta_{-i}), \theta\big) \Big] .
+$$
+
+**Worked example: Cournot with a private cost.** Demand is $P = 10 - q_1 - q_2$. Firm 1's cost
+is 2. Firm 2's cost is 1 or 3 with probability ½ each, and only firm 2 knows which. Firm 2 of
+cost $c$ best-responds to $q_1$ with $q_2(c) = (10 - c - q_1)/2$. Firm 1 does not know $q_2$; it
+maximises $(10 - q_1 - \mathbb{E}[q_2] - 2)\, q_1$, so $q_1 = (8 - \mathbb{E}[q_2])/2$. Since
+$\mathbb{E}[q_2] = (10 - 2 - q_1)/2 = (8 - q_1)/2$ (average cost 2),
+
+$$
+q_1 = \frac{8 - (8 - q_1)/2}{2} = 2 + \frac{q_1}{4} \quad\Rightarrow\quad q_1 = \frac83 ,
+$$
+
+and then $q_2(1) = (9 - \tfrac83)/2 = \tfrac{19}6 \approx 3.17$ and
+$q_2(3) = (7 - \tfrac83)/2 = \tfrac{13}6 \approx 2.17$. The low-cost type produces more; firm 1
+responds to the average.
+
+## Auctions
+
+Auctions are the most important Bayesian games in practice. One item is sold to $n$ bidders.
+Bidder $i$ values it at $v_i$, drawn independently from a known distribution $F$ (the
+**independent private values** model); here uniform on $[0, 1]$.
+
+#### Second-price auctions
+
+In a **second-price** (Vickrey) sealed-bid auction the highest bidder wins and pays the second
+highest bid.
+
+**Claim.** Bidding one's value, $b_i = v_i$, is a weakly dominant strategy.
+
+*Proof.* Fix the others' bids and let $m$ be the highest of them. If $v_i \gt m$, bidding $v_i$
+wins and pays $m$, a profit of $v_i - m \gt 0$. Any other bid above $m$ gives the same; any bid
+below $m$ loses and gets 0. If $v_i \lt m$, bidding $v_i$ loses and gets 0; winning would
+require a bid above $m$ and pay $m \gt v_i$, a loss. (Ties are similar.) In every case, truthful
+bidding is at least as good as any other bid. $\blacksquare$
+
+The bid only decides **whether** you win, never **how much** you pay, so there is no reason to
+shade it. The English (ascending) auction works the same way: stay in until the price reaches
+your value.
+
+#### First-price auctions
+
+In a **first-price** auction the winner pays its own bid, so bidding one's value guarantees zero
+profit. Look for a symmetric equilibrium where everyone bids $b(v) = \beta v$. A bidder with
+value $v$ who bids $b$ wins if every other bid is lower, that is if every $v_j \lt b/\beta$, which
+happens with probability $(b/\beta)^{n-1}$. Its expected profit is
+
+$$
+(v - b)\left(\frac{b}{\beta}\right)^{n-1} .
+$$
+
+Setting the derivative in $b$ to zero, $-b^{n-1} + (n - 1)(v - b) b^{n-2} = 0$, gives
+$b = \frac{n-1}{n} v$, which is linear with $\beta = \frac{n-1}{n}$, as assumed. With two bidders,
+bid half your value; with ten, bid 90%.<Sidenote>Numerical check: for $n = 3$ and $v = 0.8$,
+searching all bids on a grid of step $10^{-5}$ against two opponents bidding $\tfrac23 v$ gives
+the best bid 0.53333, against $\tfrac23 \cdot 0.8 = 0.5\overline{3}$.</Sidenote>
+
+<LineChart
+	x={() => Array.from({ length: 101 }, (_, i) => i / 100)}
+	series={[
+		{ name: "second-price: b = v", fn: (v) => v },
+		{ name: "first-price, n = 2: b = v/2", fn: (v) => v / 2 },
+		{ name: "first-price, n = 3: b = 2v/3", fn: (v) => (2 * v) / 3 },
+		{ name: "first-price, n = 10: b = 0.9v", fn: (v) => 0.9 * v },
+		{ name: "all-pay, n = 3: b = 2v³/3", fn: (v) => (2 * v ** 3) / 3 },
+	]}
+	title="Equilibrium bids with values uniform on [0, 1]"
+	xLabel="value v"
+	yLabel="bid b(v)"
+	height={300}
+/>
+
+#### Revenue equivalence
+
+Which format earns the seller more? In the first-price auction the winner is the bidder with the
+highest value, whose expected value is $\frac{n}{n+1}$, and it pays $\frac{n-1}{n}$ of that:
+$\frac{n-1}{n+1}$. In the second-price auction the winner pays the second-highest value, whose
+expectation is also $\frac{n-1}{n+1}$. The same revenue, by a different route. This is no
+accident.
+
+**Revenue equivalence theorem (Myerson 1981; Riley and Samuelson 1981).** With independent private
+values, any two auctions in which (a) the bidder with the highest value wins in equilibrium and (b)
+a bidder with the lowest possible value expects zero payoff give each bidder type the same
+expected payment, hence the seller the same expected revenue.
+
+*Proof.* Fix an auction and its equilibrium. Let $Q(v)$ be the probability that a bidder with
+value $v$ wins and $P(v)$ its expected payment. Its expected utility is $U(v) = vQ(v) - P(v)$.
+Because it could imitate any other type $w$, equilibrium requires
+$U(v) = \max_w \big[ v Q(w) - P(w) \big]$. A maximum of functions linear in $v$ is convex, and by
+the envelope theorem its slope is the winning probability at the optimum, $U'(v) = Q(v)$. So
+
+$$
+U(v) = U(0) + \int_0^v Q(t)\, dt, \qquad P(v) = vQ(v) - U(0) - \int_0^v Q(t)\, dt .
+$$
+
+Condition (a) fixes $Q(v) = F(v)^{n-1}$ and condition (b) fixes $U(0) = 0$, so $P(v)$ is the
+same in every such auction. $\blacksquare$
+
+The formula also computes equilibria. In an **all-pay auction** everyone pays its bid, so the bid
+equals the expected payment: with $Q(v) = v^{n-1}$,
+$b(v) = P(v) = v^n - v^n/n = \frac{n-1}{n} v^n$. Its revenue is
+$n \cdot \frac{n-1}{n} \mathbb{E}[v^n] = \frac{n-1}{n+1}$ once more. A simulation of 200,000
+auctions per row agrees:
+
+<table>
+	<thead>
+		<tr>
+			<th style="text-align: right">Bidders n</th>
+			<th style="text-align: right">Theory (n − 1)/(n + 1)</th>
+			<th style="text-align: right">First-price</th>
+			<th style="text-align: right">Second-price</th>
+			<th style="text-align: right">All-pay</th>
+			<th style="text-align: right">Second-price, reserve ½</th>
+		</tr>
+	</thead>
+	<tbody>
+		{auctionTable.map((r) => (
+			<tr>
+				<td style="text-align: right">{r.n}</td>
+				<td style="text-align: right">{r.theory.toFixed(4)}</td>
+				<td style="text-align: right">{r.first.toFixed(4)}</td>
+				<td style="text-align: right">{r.second.toFixed(4)}</td>
+				<td style="text-align: right">{r.allPay.toFixed(4)}</td>
+				<td style="text-align: right">{r.secondReserve.toFixed(4)}</td>
+			</tr>
+		))}
+	</tbody>
+</table>
+
+The last column breaks condition (a) on purpose: a **reserve price** of ½ means the item is not
+sold if every value is below ½, and revenue goes up. Why that is optimal is the subject of
+[mechanism design](#mechanism-design).
+
+One caution: with **common values** (an oil field worth the same unknown amount to everyone, each
+bidder holding a noisy estimate), the winner is the bidder with the most optimistic estimate and
+overpays on average unless it shades its bid, the **winner's curse**.
+
+## Signalling and perfect Bayesian equilibrium
+
+In a **signalling game** an informed player moves first and an uninformed player, seeing the move
+but not the type, responds. The informed player's action can reveal its type, and it knows that.
+
+**Spence's job-market model, scaled down.** A worker's productivity is high ($\theta = 2$) or low
+($\theta = 1$) with probability ½ each. The worker chooses education $e \ge 0$, which costs
+$e/\theta$: education is cheaper for the able. Education does not raise productivity at all. The
+firm sees $e$, not $\theta$, and competition makes it pay the expected productivity given what it
+believes: $w = \mathbb{E}[\theta \mid e]$.
+
+Subgame perfection does not help here: after the chance move, no node starts a subgame of its own
+because the firm's information sets join the two types. The right equilibrium idea adds beliefs.
+
+**Definition.** A **perfect Bayesian equilibrium** (PBE) is a strategy profile together with a
+belief (a probability over nodes) at every information set such that:
+
+- **sequential rationality**: at every information set, the mover's strategy is optimal given its
+  belief and everyone's later strategies;
+- **consistency**: on the path of play, beliefs follow from the strategies by Bayes' rule. Off the
+  path, Bayes' rule says nothing and beliefs may be anything (refinements restrict them).
+
+**Separating equilibria.** The two types choose different education levels: low chooses $e = 0$
+and gets $w = 1$; high chooses $e^\ast$ and gets $w = 2$. The firm believes "low" at any other
+level. The low type must not want to imitate: $1 \ge 2 - e^\ast / 1$, so $e^\ast \ge 1$. The high
+type must prefer to signal: $2 - e^\ast / 2 \ge 1$, so $e^\ast \le 2$. Every $e^\ast \in [1, 2]$
+gives a separating PBE. The tree below shows the one with $e^\ast = 1.5$, with education
+restricted to two levels.
+
+<GameTree
+	tree="signalling"
+	mode="static"
+	highlight={{ H: "e = 1.5", L: "e = 0", H1: "w = 2", L1: "w = 2", H0: "w = 1", L0: "w = 1" }}
+	title="A separating equilibrium of the signalling game"
+	caption="Chance (N) picks the worker's type; the worker (W) picks education; the firm (F) sees only the education level (dashed information sets) and picks a wage. Payoffs are (worker: wage − cost, firm: −(wage − productivity)²). Green edges are the equilibrium."
+/>
+
+Check it on the tree: the high type gets 1.25 from $e = 1.5$ against 1 from $e = 0$; the low type
+gets 1 from $e = 0$ against 0.5 from imitating. The firm, seeing $e = 1.5$, knows by Bayes' rule
+that the worker is high and pays 2 (payoff 0 rather than $-1$); seeing $e = 0$ it pays 1.
+
+**Pooling equilibria.** Both types choose the same $e_p$ and get $w = 1.5$; the firm believes
+"low" at any other level. The low type must not prefer $e = 0$ with wage 1:
+$1.5 - e_p \ge 1$, so $e_p \le 0.5$. (The high type's condition, $e_p \le 1$, is then automatic.)
+Every $e_p \in [0, 0.5]$ is a pooling PBE.
+
+**The intuitive criterion** (Cho and Kreps 1987) removes the implausible ones. In a pooling
+equilibrium at $e_p$, consider a level $e'$ with $0.5 + e_p \lt e' \lt 1 + e_p$. The low type
+would lose by choosing $e'$ even at the best possible wage ($2 - e' \lt 1.5 - e_p$), while the high
+type would gain if the firm believed it ($2 - e'/2 \gt 1.5 - e_p/2$). A reasonable firm should
+therefore believe that $e'$ comes from the high type, and then the high type deviates. Every
+pooling equilibrium fails; among separating ones only the cheapest, $e^\ast = 1$, survives. Other
+refinements serve the same purpose in general games: **trembling-hand perfection** (Selten 1975)
+asks that strategies stay optimal when everyone makes rare mistakes, and **sequential
+equilibrium** (Kreps and Wilson 1982) asks that beliefs be limits of beliefs under such mistakes.
+
+## Mechanism design
+
+Game theory predicts what happens in a given game. **Mechanism design** runs the other way: choose
+the game so that its equilibrium achieves a goal, such as allocating an item to whoever values it
+most, or maximising revenue. It is sometimes called reverse game theory.
+
+Agents have private types $\theta_i$. A designer wants to implement a **social choice function**
+$f(\theta)$ that picks an outcome for each type profile. A **mechanism** gives each agent a message
+space and maps messages to outcomes (and payments). A **direct mechanism** simply asks every agent
+for its type. It is **incentive compatible** if reporting the truth is an equilibrium, and
+**dominant-strategy incentive compatible** (DSIC) if truth-telling is a dominant strategy.
+
+**Revelation principle.** If some mechanism implements $f$ in dominant strategies (or in Bayesian
+Nash equilibrium), then the direct mechanism that asks for types and outputs $f$ is DSIC (or
+Bayesian incentive compatible) and also implements $f$.
+
+*Proof.* Let $s_i(\theta_i)$ be the equilibrium strategies of the original mechanism $M$. Build
+the direct mechanism $D(\hat\theta) = M\big(s_1(\hat\theta_1), \dots, s_n(\hat\theta_n)\big)$: it
+plays the equilibrium on each agent's behalf. If an agent with type $\theta_i$ could gain in $D$
+by reporting $\hat\theta_i$, it could gain in $M$ by sending $s_i(\hat\theta_i)$ instead of
+$s_i(\theta_i)$, contradicting that $s$ is an equilibrium of $M$. $\blacksquare$
+
+So when asking what can be implemented, we may restrict attention to truthful direct mechanisms.
+
+#### The VCG mechanism
+
+Suppose the designer wants to choose the outcome $k$ that maximises total value
+$\sum_i v_i(k, \theta_i)$. The **Vickrey–Clarke–Groves** mechanism asks for reports, chooses
+$k^\ast$ maximising the reported total, and charges each agent the harm it does to the others:
+
+$$
+p_i = \max_{k} \sum_{j \ne i} v_j(k, \hat\theta_j) \;-\; \sum_{j \ne i} v_j(k^\ast, \hat\theta_j) ,
+$$
+
+the others' best total without $i$, minus their total with $i$ present.
+
+**Claim.** Truth-telling is a dominant strategy in VCG.
+
+*Proof.* Agent $i$'s utility is
+
+$$
+v_i(k^\ast, \theta_i) + \sum_{j \ne i} v_j(k^\ast, \hat\theta_j) - \max_k \sum_{j \ne i} v_j(k, \hat\theta_j).
+$$
+
+The last term does not depend on $i$'s report. The first two are the total value of $k^\ast$
+measured with $i$'s **true** type, and the mechanism chooses $k^\ast$ to maximise the total with
+$i$'s **reported** type. Reporting truthfully makes the mechanism maximise exactly what $i$ cares
+about, so no report can do better. $\blacksquare$
+
+**Worked example.** Two identical items, three bidders who each want one, with values 10, 8 and
+5. VCG gives the items to the bidders valuing 10 and 8. Bidder 1's payment: without it, the others
+would get $8 + 5 = 13$; with it, they get 8; so it pays 5. Bidder 2 pays $(10 + 5) - 10 = 5$. Both
+pay the highest losing bid. With one item VCG is exactly the second-price auction. Its drawbacks:
+payments need not balance the budget, it is vulnerable to collusion, and its revenue can be low.
+
+#### Optimal auctions
+
+Which auction maximises the seller's expected revenue? Using the payment formula from the revenue
+equivalence proof (with $U(0) = 0$) and swapping the order of integration,
+
+$$
+\mathbb{E}[P(v)] = \int_0^1 \Big( vQ(v) - \int_0^v Q(t)\, dt \Big) f(v)\, dv
+= \mathbb{E}\big[ \varphi(v)\, Q(v) \big], \qquad \varphi(v) = v - \frac{1 - F(v)}{f(v)} .
+$$
+
+$\varphi$ is the **virtual value**. Revenue is the expected virtual value of the winner, so it is
+maximised by giving the item to the bidder with the highest virtual value, and to nobody when all
+virtual values are negative (Myerson 1981). For values uniform on $[0, 1]$,
+$\varphi(v) = v - (1 - v) = 2v - 1$, negative below ½. The optimal auction is a second-price
+auction with **reserve price** ½. Its expected revenue is
+$\frac{2n}{n+1}\big(1 - 2^{-(n+1)}\big) - 1 + 2^{-n}$: with two bidders $\tfrac5{12} \approx 0.417$
+instead of $\tfrac13$, matching the simulation in the auction table. The gain shrinks as $n$
+grows, because competition does the reserve's job.
+
+#### Impossibility results
+
+Not everything can be implemented.
+
+- **Gibbard–Satterthwaite (1973, 1975).** With at least three outcomes and no payments, every
+  social choice function that is onto and DSIC is a dictatorship. Every reasonable voting rule can
+  be manipulated.
+- **Myerson–Satterthwaite (1983).** In bilateral trade with private values whose ranges overlap, no
+  mechanism is simultaneously efficient (trade exactly when the buyer values more), Bayesian
+  incentive compatible, individually rational and budget balanced without outside subsidy.
+
+Payments, as in VCG, are what escape the first result; the second says even payments are not
+enough for bargaining between two privately informed parties.
+
+## Bargaining
+
+Two parties can split a surplus if they agree, and get nothing (or some fallback) if they do not.
+How should they split it? There are two classic answers, one from axioms and one from a game, and
+they agree in the limit.
+
+#### The Nash bargaining solution
+
+A **bargaining problem** is a compact convex set $U \subset \mathbb{R}^2$ of achievable utility
+pairs and a **disagreement point** $d \in U$. Nash (1950) asked for a rule $F(U, d)$ with four
+properties:
+
+1. **Pareto efficiency**: no point of $U$ is better for both.
+2. **Symmetry**: if $U$ is symmetric and $d_1 = d_2$, then $F_1 = F_2$.
+3. **Scale invariance**: rescaling a player's utility by $a u + b$ ($a \gt 0$) rescales the
+   solution the same way.
+4. **Independence of irrelevant alternatives**: if $F(U, d) \in U' \subset U$, then
+   $F(U', d) = F(U, d)$.
+
+**Theorem.** The only such rule picks the point of $U$ (with $u \ge d$) that maximises the **Nash
+product** $(u_1 - d_1)(u_2 - d_2)$.
+
+*Proof.* The maximiser $u^\ast$ satisfies the four axioms (checking this is routine; scale
+invariance holds because rescaling multiplies the product by a constant). For uniqueness, take any
+rule $F$ with the axioms. By scale invariance, rescale so that $d = (0, 0)$ and $u^\ast = (1, 1)$.
+The hyperbola $u_1 u_2 = 1$ touches $U$ at $(1, 1)$ and its tangent there is the line
+$u_1 + u_2 = 2$. No point of $U$ lies above that line: if some $u$ did, points on the segment from
+$(1, 1)$ to $u$ (inside $U$ by convexity) close to $(1, 1)$ would have a product above 1. Now let
+$T$ be a large symmetric set containing $U$, bounded by $u_1 + u_2 \le 2$. By symmetry and
+efficiency, $F(T, 0) = (1, 1)$. Since $(1, 1) \in U \subset T$, independence gives
+$F(U, 0) = (1, 1) = u^\ast$. $\blacksquare$
+
+**Worked example.** Split one dollar. Player 1 is risk neutral, $u_1 = x$; player 2 is risk averse,
+$u_2 = \sqrt{1 - x}$; disagreement gives $(0, 0)$. Maximise $x \sqrt{1 - x}$: the derivative
+$\sqrt{1 - x} - x / (2\sqrt{1 - x})$ vanishes at $x = \tfrac23$. The risk-averse player gets only a
+third of the money: fear of disagreement is a weakness.
+
+<PayoffRegion
+	frontier={nbsFrontier}
+	x={[0, 1.05]}
+	y={[0, 1.05]}
+	levels={{ d: [0, 0], c: [0.2, 0.3849, 0.5] }}
+	points={[{ at: [2 / 3, Math.sqrt(1 / 3)], label: "Nash solution (2/3, 0.577)", ne: true }]}
+	title="Nash bargaining over a dollar with a risk-averse player 2"
+	caption="The feasible set is bounded by u₂ = √(1 − u₁). The dashed curves are level sets u₁u₂ = c; the highest one that touches the set (c ≈ 0.385) touches it at the Nash solution."
+/>
+
+#### Rubinstein's alternating offers
+
+Rubinstein (1982) modelled the haggling itself. Player 1 proposes a split of 1; player 2 accepts
+or rejects; after a rejection one period passes and player 2 proposes; and so on forever. Player
+$i$ discounts each period by $\delta_i \lt 1$.
+
+**Theorem.** The game has a unique subgame perfect equilibrium. Player 1 proposes
+$x^\ast = \frac{1 - \delta_2}{1 - \delta_1 \delta_2}$ for itself and player 2 accepts at once.
+
+*Derivation.* In a stationary equilibrium, let $x_1$ be what player 1 keeps when proposing and
+$x_2$ what player 2 keeps when proposing. Player 2 accepts an offer exactly when it is worth at
+least waiting a period to propose, $\delta_2 x_2$; player 1 offers exactly that. So
+$x_1 = 1 - \delta_2 x_2$ and symmetrically $x_2 = 1 - \delta_1 x_1$. Solving,
+$x_1 = (1 - \delta_2)/(1 - \delta_1 \delta_2)$.
+
+*Uniqueness (Shaked and Sutton 1984).* Let $M_1$ and $m_1$ be the largest and smallest SPE
+payoffs of player 1 in any subgame where it proposes, and $M_2$, $m_2$ the same for player 2. When
+1 proposes, 2 accepts anything above $\delta_2 M_2$, so $m_1 \ge 1 - \delta_2 M_2$; and 2 can
+always reject to get at least $\delta_2 m_2$, so $M_1 \le 1 - \delta_2 m_2$. The same holds with
+the players swapped. Combining, $M_1 \le 1 - \delta_2 (1 - \delta_1 M_1)$, so
+$M_1 \le \frac{1 - \delta_2}{1 - \delta_1 \delta_2}$; and
+$m_1 \ge 1 - \delta_2 (1 - \delta_1 m_1)$, so $m_1 \ge \frac{1 - \delta_2}{1 - \delta_1 \delta_2}$.
+Hence $M_1 = m_1$: the SPE payoff is unique. $\blacksquare$
+
+With $\delta_1 = \delta_2 = 0.9$ the proposer gets $\tfrac{1}{1.9} \approx 0.526$; with
+$\delta_1 = 0.9$, $\delta_2 = 0.8$ player 1 gets $\tfrac{0.2}{0.28} \approx 0.714$: patience is
+bargaining power. As the time between offers shrinks, $\delta \to 1$ and the split tends to
+$(\tfrac12, \tfrac12)$, the Nash bargaining solution of this problem (Binmore, Rubinstein and
+Wolinsky 1986 make the link precise).
+
+<LineChart
+	x={() => Array.from({ length: 99 }, (_, i) => 0.01 + i / 100)}
+	series={[
+		{ name: "proposer's share, δ₁ = δ₂ = δ: 1/(1 + δ)", fn: (d) => 1 / (1 + d) },
+		{ name: "player 1's share, δ₁ = δ, δ₂ = 0.8", fn: (d) => 0.2 / (1 - 0.8 * d) },
+	]}
+	title="Rubinstein bargaining: the proposer's share"
+	xLabel="δ (δ₁ for the second line)"
+	yLabel="share of player 1"
+	height={280}
+/>
+
+## Cooperative games
+
+Everything so far was **non-cooperative**: players choose actions alone. **Cooperative game
+theory** assumes groups can sign binding agreements and asks which coalitions form and how they
+share what they create. A **transferable-utility (TU) game** is a set of players $N$ and a
+**characteristic function** $v$ that gives every coalition $S \subseteq N$ the total value $v(S)$ it
+can secure on its own, with $v(\varnothing) = 0$. An **allocation** $x \in \mathbb{R}^N$ divides
+$v(N)$.
+
+### The core
+
+The **core** is the set of allocations that no coalition can improve on by going alone:
+
+$$
+\sum_{i \in N} x_i = v(N), \qquad \sum_{i \in S} x_i \ge v(S) \quad \text{for every coalition } S .
+$$
+
+**Example: the glove game.** Player 1 owns a left glove, players 2 and 3 a right glove each. A
+pair is worth 1; a coalition is worth 1 if it has player 1 and at least one of the others. The
+core is the single point $(1, 0, 0)$. *Proof.* The constraints for $\lbrace 1, 2 \rbrace$ and
+$\lbrace 1, 3 \rbrace$ say $x_1 + x_2 \ge 1$ and $x_1 + x_3 \ge 1$; with $x_1 + x_2 + x_3 = 1$
+they give $x_3 \le 0$ and $x_2 \le 0$, and individual rationality gives $x_2, x_3 \ge 0$.
+$\blacksquare$ The scarce left glove captures everything, because the two right-glove owners
+compete each other's share down to zero.
+
+The core can be empty. In the **majority game** on three players, any two can take 1:
+$v(S) = 1$ when $|S| \ge 2$. Adding the three pair constraints gives $2(x_1 + x_2 + x_3) \ge 3$,
+but the total is 1. Whatever the split, some pair can do better.
+
+**Bondareva–Shapley theorem (1963, 1967).** The core is nonempty if and only if the game is
+**balanced**: for every collection of weights $\lambda_S \ge 0$ with
+$\sum_{S \ni i} \lambda_S = 1$ for every player $i$, $\sum_S \lambda_S v(S) \le v(N)$. The proof is
+LP duality again: the core is nonempty iff the LP "minimise $\sum_i x_i$ subject to the coalition
+constraints" has value at most $v(N)$, and the balancedness condition is its dual.
+
+### The Shapley value
+
+The core is a set, sometimes empty. Shapley (1953) asked for a single fair allocation
+$\phi(v)$ satisfying four axioms:
+
+1. **Efficiency**: $\sum_i \phi_i(v) = v(N)$.
+2. **Symmetry**: players who contribute the same to every coalition get the same.
+3. **Null player**: a player who adds nothing to any coalition gets 0.
+4. **Additivity**: $\phi(v + w) = \phi(v) + \phi(w)$.
+
+**Theorem.** Exactly one rule satisfies the four axioms: each player gets its average **marginal
+contribution** over all $n!$ orders in which the players could arrive,
+
+$$
+\phi_i(v) = \frac{1}{n!} \sum_{\text{orders } \pi} \Big[ v\big(P^\pi_i \cup \lbrace i \rbrace\big) - v\big(P^\pi_i\big) \Big]
+= \sum_{S \subseteq N \setminus \lbrace i \rbrace} \frac{|S|!\,(n - |S| - 1)!}{n!} \big[ v(S \cup \lbrace i \rbrace) - v(S) \big],
+$$
+
+where $P^\pi_i$ is the set of players before $i$ in the order $\pi$.
+
+*Proof.* The formula satisfies the axioms: in each order the marginal contributions add up to
+$v(N)$ (they telescope), symmetric players have the same distribution of contributions, a null
+player always contributes 0, and the formula is linear in $v$. For uniqueness, consider the
+**unanimity games** $u_T(S) = 1$ if $S \supseteq T$ and 0 otherwise, one for each nonempty
+$T \subseteq N$. In $c\, u_T$, players outside $T$ are null and get 0; players in $T$ are symmetric;
+efficiency then forces $c/|T|$ each. So the axioms fix $\phi$ on every $c\, u_T$. These
+$2^n - 1$ games form a basis of all TU games: there are as many of them as coalitions, and they are
+linearly independent (order coalitions by size; $u_T$ is the first basis game that is nonzero on
+$T$). Every $v$ is a sum $\sum_T c_T u_T$, and by additivity $\phi(v)$ is determined.
+$\blacksquare$ (Additivity is applied to sums with possibly negative coefficients $c_T$; one checks
+the axioms imply $\phi(-w) = -\phi(w)$ too.)
+
+**Worked example: the glove game again.** Go through the six orders and record each player's
+marginal contribution:
+
+<table>
+	<thead>
+		<tr><th>Order</th><th style="text-align: right">Player 1</th><th style="text-align: right">Player 2</th><th style="text-align: right">Player 3</th></tr>
+	</thead>
+	<tbody>
+		{shapley(3, gloveGame).orders.map((o) => (
+			<tr>
+				<td>{o.order.map((p) => p + 1).join(", ")}</td>
+				{o.marginal.map((m) => <td style="text-align: right">{m}</td>)}
+			</tr>
+		))}
+		<tr>
+			<td><strong>Shapley value (average)</strong></td>
+			<td style="text-align: right"><strong>2/3</strong></td>
+			<td style="text-align: right"><strong>1/6</strong></td>
+			<td style="text-align: right"><strong>1/6</strong></td>
+		</tr>
+	</tbody>
+</table>
+
+Player 1 completes a pair whenever it does not arrive first, 4 orders out of 6. Player 2 adds
+value only in the order (1, 2, 3). The Shapley value $(\tfrac23, \tfrac16, \tfrac16)$ is **not** in
+the core $\lbrace (1, 0, 0) \rbrace$: the coalition $\lbrace 1, 2 \rbrace$ gets $\tfrac56 \lt 1$.
+The two ideas answer different questions, stability and fairness, and need not agree.
+
+**Worked example: sharing a runway.** Three planes need runways of length 1, 2 and 3; building a
+runway long enough for a group costs its longest plane's need. The Shapley cost shares are
+{shapley(3, airportCost).phi.map((v) => v.toFixed(3)).join(", ")}: the first unit of runway is
+shared by all three ($\tfrac13$ each), the second by the two larger planes ($\tfrac12$ each), the
+third paid by the largest alone. This "split each segment among its users" rule was used to set
+landing fees (Littlechild and Owen 1973); here, unlike in the glove game, it lies in the core.
+
+In machine learning the same formula is SHAP (Lundberg and Lee 2017): the features of one input are
+the players, $v(S)$ is the model's expected output when only the features in $S$ are known, and a
+feature's Shapley value is its contribution to the prediction. The four axioms are why SHAP
+attributions add up to the prediction and give nothing to features the model ignores. The
+**nucleolus** (Schmeidler 1969), which minimises the largest dissatisfaction of any coalition, is
+another single-point solution and always lies in the core when the core is nonempty.
+
+## Matching markets
+
+Some markets have no prices: doctors and hospitals, students and schools, kidney donors and
+patients. Each side has preferences over the other, and a central clearing house picks a matching.
+A matching is **stable** if no doctor and hospital would both rather be with each other than with
+their current assignments; such a pair is a **blocking pair**. An unstable matching invites
+side deals that unravel the market.
+
+**Deferred acceptance (Gale and Shapley 1962).** Doctors propose, hospitals hold.
+
+1. Every free doctor proposes to its favourite hospital that has not yet rejected it.
+2. Each hospital holds the best proposal it has received so far and rejects the rest.
+3. Repeat until no doctor is free.
+
+Step through it on four doctors (A–D) and four hospitals (W–Z) with one place each:
+
+<GaleShapleySteps
+	title="Deferred acceptance, doctors proposing"
+	caption="Each step one free doctor proposes. Struck-out hospitals have rejected that doctor; bold names are the offers currently held. After 9 proposals: A–Z, B–Y, C–X, D–W, with no blocking pair."
+/>
+
+**Theorem.** Deferred acceptance stops after at most $n^2$ proposals with a stable matching, and
+every doctor gets the best hospital it has in any stable matching.
+
+*Proof.* **Termination**: each doctor proposes to each hospital at most once. **A full matching**:
+a hospital that receives a proposal holds one from then on, so if some doctor were still free after
+being rejected everywhere, all $n$ hospitals would be holding other doctors, which is impossible
+with $n$ doctors. **Stability**: suppose doctor $d$ prefers hospital $h$ to its partner. Then $d$
+proposed to $h$ earlier and was rejected, at that moment or later, in favour of someone $h$ likes
+more; a hospital's held offer only improves, so $h$ prefers its final partner to $d$. No blocking
+pair. **Doctor optimality**: call $h$ *achievable* for $d$ if some stable matching pairs them.
+Suppose, for contradiction, some doctor is rejected by an achievable hospital, and take the first
+such rejection in the run: $h$ rejects $d$ in favour of $d'$. Let $M$ be a stable matching with
+$d$–$h$. Up to now no doctor was rejected by an achievable hospital, so $d'$ (who proposes in
+order) likes $h$ at least as much as every hospital achievable for it, including its partner in
+$M$, and strictly more since that partner is not $h$. And $h$ prefers $d'$ to $d$. So $(d', h)$
+blocks $M$, a contradiction. Hence no doctor is ever rejected by an achievable hospital, and each
+ends with its best achievable one. $\blacksquare$
+
+This example has three stable matchings. Running the algorithm with hospitals proposing instead
+gives the **hospital-optimal** one, A–Y, B–X, C–W, D–Z, in which every doctor is worse off (A, for
+example, gets its last choice instead of its third). The same proof shows the doctor-optimal
+matching is the worst stable matching for every hospital.
+
+<GaleShapleySteps
+	receiversPropose
+	title="Deferred acceptance, hospitals proposing"
+	caption="The same preferences with the hospitals proposing: 5 proposals give W–C, X–B, Y–A, Z–D, the hospital-optimal stable matching."
+/>
+
+Deferred acceptance is **strategy-proof for the proposing side**: no doctor can get a better
+hospital by misreporting its preferences (Dubins and Freedman 1981; Roth 1982). The receiving side
+can sometimes gain by lying, and no stable mechanism is strategy-proof for both sides. A variant of
+the algorithm runs the US National Resident Matching Program (Roth and Peranson 1999), and similar
+ones assign students to schools in Boston and New York.
+
+## Evolutionary game theory
+
+Evolutionary game theory drops rationality altogether. A large population plays a symmetric game
+in random pairs; strategies are inherited behaviours, and those that earn more than average
+spread. Payoff is reproductive fitness. Remarkably, Nash-like predictions come back.
+
+#### Evolutionarily stable strategies
+
+A mixed strategy $\sigma^\ast$ is an **evolutionarily stable strategy** (ESS, Maynard Smith and
+Price 1973) if, for every mutant strategy $\sigma \ne \sigma^\ast$, either
+
+$$
+u(\sigma^\ast, \sigma^\ast) \gt u(\sigma, \sigma^\ast), \quad \text{or} \quad
+u(\sigma^\ast, \sigma^\ast) = u(\sigma, \sigma^\ast) \text{ and } u(\sigma^\ast, \sigma) \gt u(\sigma, \sigma) .
+$$
+
+The first condition says mutants do worse against the residents; if they tie there, the second
+says residents do better against mutants than mutants do against each other. Either way a small
+group of mutants shrinks. An ESS is a symmetric Nash equilibrium (the first part of each condition
+says no $\sigma$ does better against $\sigma^\ast$), but not every symmetric equilibrium is an ESS.
+
+**Hawk–Dove.** Two animals contest a resource of value $V = 2$. Hawks fight; a fight costs the
+loser $C = 4$. Doves display and share. Payoffs: Hawk vs Hawk $(V - C)/2 = -1$, Hawk vs Dove 2,
+Dove vs Hawk 0, Dove vs Dove 1. A population of Doves is invaded by Hawks (2 beats 1), and a
+population of Hawks by Doves (0 beats −1). The indifference principle gives the mixed equilibrium:
+a fraction $p$ of Hawks makes the two strategies equal when $-p + 2(1 - p) = 1 - p$, so
+$p = V/C = \tfrac12$. It is an ESS. *Proof.* Write $u(p, q)$ for a $p$-Hawk mixture against a
+$q$-Hawk mixture. Expanding, $u(p, q) = p(1 - 2q) + 1 - q$. At $p^\ast = \tfrac12$ every mutant
+ties in the first condition, so check the second:
+$u(\tfrac12, q) - u(q, q) = (\tfrac12 - q)(1 - 2q) = 2(\tfrac12 - q)^2 \gt 0$ for $q \ne \tfrac12$.
+$\blacksquare$
+
+#### Replicator dynamics
+
+The **replicator dynamics** let the share $x_i$ of strategy $i$ grow in proportion to how much
+better than average it does:
+
+$$
+\dot x_i = x_i \big( (Ax)_i - x^\top A x \big).
+$$
+
+In Hawk–Dove, with $x$ the share of Hawks, the Hawk-minus-Dove payoff difference is
+$(2 - 3x) - (1 - x) = 1 - 2x$, so $\dot x = x(1 - x)(1 - 2x)$. The share grows below ½ and
+shrinks above it: the ESS is the stable rest point.
+
+<LineChart
+	x={() => Array.from({ length: 101 }, (_, i) => i / 100)}
+	series={[{ name: "dx/dt = x(1 − x)(1 − 2x)", fn: (x) => x * (1 - x) * (1 - 2 * x) }]}
+	title="Replicator dynamics of Hawk–Dove: positive below ½, negative above"
+	xLabel="share of Hawks x"
+	yLabel="dx/dt"
+	height={260}
+/>
+
+The links between the dynamics and equilibrium are known as the folk theorem of evolutionary game
+theory (Hofbauer and Sigmund): every Nash equilibrium is a rest point; every Lyapunov-stable rest
+point is a Nash equilibrium; and every ESS is asymptotically stable (Taylor and Jonker 1978). The
+middle claim has a short proof: if $x^\ast$ is not an equilibrium, some strategy $i$ earns more
+than average at $x^\ast$, and by continuity also near $x^\ast$, so its share grows at a positive
+rate along any nearby path with $x_i \gt 0$, which leaves the neighbourhood.
+
+**Rock–Paper–Scissors** shows that the dynamics need not converge. Let a win pay $a$ and a loss
+cost $b$. Its only equilibrium is $(\tfrac13, \tfrac13, \tfrac13)$, and the product
+$V = x_R x_P x_S$ decides its fate. Since every column of $A$ sums to $a - b$ and
+$x^\top A x = (a - b)(x_R x_P + x_P x_S + x_S x_R)$,
+
+$$
+\frac{\dot V}{V} = \sum_i \big( (Ax)_i - x^\top A x \big) = (a - b)\Big(1 - 3 (x_R x_P + x_P x_S + x_S x_R)\Big).
+$$
+
+The bracket is positive except at the centre (the sum of pairwise products is at most $\tfrac13$).
+So with $a = b$, $V$ is constant and every orbit is a closed loop; with $a \gt b$, $V$ grows and paths
+spiral into the centre; with $a \lt b$ they spiral out to the edges. Move the sliders and see:
+
+<SimplexDynamics
+	mode="replicator"
+	win={1}
+	lose={1}
+	title="Replicator dynamics in Rock–Paper–Scissors"
+	caption="Each point of the triangle is a population mix (Rock at the top). With win = lose the path is a closed orbit around the equilibrium; raise win above lose and it spirals in. Click to start elsewhere."
+/>
+
+In standard RPS ($a = b$) the equilibrium is not an ESS (a mutant ties in both conditions), and the
+population cycles for ever. Such cycles are seen in nature: the three throat-colour morphs of male
+side-blotched lizards cycle in frequency over a few years (Sinervo and Lively 1996).
+
+## Learning in games
+
+Equilibrium assumes players already know what others will do. Learning asks whether simple rules,
+played repeatedly, get there.
+
+#### Fictitious play
+
+In **fictitious play** (Brown 1951), each round every player best-responds to the empirical
+frequency of the opponents' past play. If the frequencies converge, the limit is a Nash equilibrium.
+They converge in two-player zero-sum games (Robinson 1951), in 2 × 2 games and in potential games,
+but not always: Shapley (1964) found a 3 × 3 game where play cycles through ever longer runs. In
+Rock–Paper–Scissors the frequencies circle in towards the centre:
+
+<SimplexDynamics
+	mode="fictitious"
+	title="Fictitious play in Rock–Paper–Scissors"
+	caption="The empirical frequency of play over 1,000 rounds, starting from one Rock. Each best response chases the last, in ever smaller loops."
+/>
+
+#### Regret and Hedge
+
+The **external regret** of a sequence of plays is how much better the best fixed strategy would
+have done in hindsight:
+
+$$
+R_T = \max_{s} \sum_{t=1}^{T} u(s, s^t_{-i}) - \sum_{t=1}^{T} u(\sigma^t, s^t_{-i}) .
+$$
+
+An algorithm has **no regret** if $R_T / T \to 0$ against any sequence of opponents' plays, even
+adversarial ones. The **Hedge** algorithm (multiplicative weights) keeps a weight per strategy,
+$w_s = \exp(\eta G_s)$ where $G_s$ is the strategy's total payoff so far, and plays each with
+probability proportional to its weight.
+
+**Theorem.** With $N$ strategies and payoffs in $[0, 1]$, Hedge with $0 \lt \eta \le 1$ has
+$R_T \le \frac{\ln N}{\eta} + \eta T$. With $\eta = \sqrt{\ln N / T}$ the average regret is at most
+$2\sqrt{\ln N / T}$.
+
+*Proof.* Let $\Phi_t = \sum_s w_s$ before round $t$, so $\Phi_1 = N$, and let $p_t$ be the
+mixture played and $g_t$ the payoffs. Using $e^z \le 1 + z + z^2$ for $z \le 1$,
+
+$$
+\frac{\Phi_{t+1}}{\Phi_t} = \sum_s p_t(s)\, e^{\eta g_t(s)} \le 1 + \eta \langle p_t, g_t \rangle + \eta^2 \le \exp\big(\eta \langle p_t, g_t \rangle + \eta^2\big).
+$$
+
+Multiplying over rounds, $\ln \Phi_{T+1} \le \ln N + \eta \sum_t \langle p_t, g_t \rangle + \eta^2 T$.
+And $\Phi_{T+1}$ is at least the weight of the best strategy, $\exp(\eta \max_s G_s)$. Combining and
+dividing by $\eta$ gives the bound. $\blacksquare$ (Hoeffding's lemma sharpens $\eta T$ to
+$\eta T / 8$; for payoffs in $[-1, 1]$ that gives $R_T / T \le \frac{\ln N}{\eta T} + \frac{\eta}{2}$.)
+
+**No regret implies equilibrium on average.** Let every player use a no-regret rule and let $D_T$ be
+the empirical distribution of the joint plays. Regret at most $\epsilon T$ says that for every fixed
+deviation $s'_i$,
+
+$$
+\mathbb{E}_{s \sim D_T}\big[ u_i(s'_i, s_{-i}) \big] - \mathbb{E}_{s \sim D_T}\big[ u_i(s) \big] \le \epsilon .
+$$
+
+That is the definition of an $\epsilon$-**coarse correlated equilibrium**: like a correlated
+equilibrium, except the deviation is chosen before seeing the recommendation. So the time average
+of no-regret play converges to the set of coarse correlated equilibria. Rules with no **swap
+regret** (comparing with "whenever I played $a$, I should have played $b$") converge to correlated
+equilibria; **regret matching** (Hart and Mas-Colell 2000), which plays each action with
+probability proportional to its positive regret, is one.<Sidenote>Running regret matching for
+both drivers in Chicken (seed 1), the largest obedience violation of the empirical distribution is
+0.002 after 1,000 rounds and 0 after 100,000; in this run play settles on the pure equilibrium
+(Chicken, Dare).</Sidenote>
+
+**A second proof of the minimax theorem.** Let both players of a zero-sum game run Hedge for $T$
+rounds and let $\bar x$, $\bar y$ be their average mixtures, with average regret at most $\epsilon$
+each. Row's regret bound says
+$\frac1T \sum_t x_t^\top A y_t \ge \max_x x^\top A \bar y - \epsilon$; Column's says
+$\frac1T \sum_t x_t^\top A y_t \le \min_y \bar x^\top A y + \epsilon$. Hence
+
+$$
+\min_y \max_x x^\top A y \le \max_x x^\top A \bar y \le \min_y \bar x^\top A y + 2\epsilon \le \max_x \min_y x^\top A y + 2\epsilon .
+$$
+
+Letting $\epsilon \to 0$ gives the hard direction of the minimax theorem, and shows $(\bar x, \bar y)$
+is an approximate equilibrium (Freund and Schapire 1999). This is the idea behind the solvers that
+computed near-equilibrium poker strategies, and it explains a phenomenon of GAN training: the
+**averages** converge, but the **current** strategies need not.
+
+<SimplexDynamics
+	mode="hedge"
+	title="Hedge against Hedge in Rock–Paper–Scissors"
+	caption="Row's current mixture (blue) spirals out towards the corners while its running average (orange) converges to (⅓, ⅓, ⅓). η = 0.1, 2,000 rounds."
+/>
+
+<LineChart
+	x={() => Array.from({ length: 200 }, (_, i) => (i + 1) * 10)}
+	series={[
+		{ name: "current P(Rock)", fn: hedgeRock },
+		{ name: "average P(Rock)", fn: hedgeRockAvg },
+	]}
+	title="Hedge self-play: Row's probability of Rock over time"
+	xLabel="round"
+	yLabel="P(Rock)"
+	height={260}
+/>
+
+<LineChart
+	x={() => Array.from({ length: 200 }, (_, i) => (i + 1) * 10)}
+	series={[
+		{ name: "Row's average regret R_T / T", fn: hedgeAvgRegret },
+		{ name: "bound ln 3 / (ηT) + η / 2", fn: hedgeBound },
+	]}
+	title="Average regret stays under the bound and falls towards 0"
+	xLabel="round T"
+	yLabel="regret per round"
+	height={260}
+/>
+
+After 2,000 rounds Row's average regret is {hedgeAvgRegret(2000).toFixed(4)} per round, under the
+bound {hedgeBound(2000).toFixed(4)}, and its average mixture puts {hedgeRockAvg(2000).toFixed(3)} on
+Rock, while its current mixture puts {hedgeRock(2000).toFixed(3)} there.
+
+## Potential games and the price of anarchy
+
+#### Congestion games
+
+In a **congestion game** (Rosenthal 1973) players choose sets of resources, such as roads, and a
+resource's cost to each user depends only on how many use it: $c_r(k)$ for $k$ users.
+
+**Theorem (Rosenthal).** Every congestion game has a pure Nash equilibrium, and repeatedly letting
+one player switch to a strictly better choice always ends at one.
+
+*Proof.* Define the **potential**
+
+$$
+\Phi(s) = \sum_{r} \sum_{k=1}^{n_r(s)} c_r(k),
+$$
+
+where $n_r(s)$ is the number of users of $r$. When player $i$ switches from path $P$ to $P'$, its
+cost changes by $\sum_{r \in P' \setminus P} c_r(n_r + 1) - \sum_{r \in P \setminus P'} c_r(n_r)$.
+The potential changes by exactly the same amount: the sums gain the term $c_r(n_r + 1)$ for each
+new resource and lose the term $c_r(n_r)$ for each one left. So every strict improvement lowers
+$\Phi$, which takes finitely many values; the process must stop, and where it stops nobody can
+improve. $\blacksquare$
+
+Games with such a function are **exact potential games** (Monderer and Shapley 1996): they behave
+like one shared objective that every player is unknowingly minimising. Example: four drivers choose
+road A, costing $k$ per driver with $k$ users, or road B, costing $k + 1$. Starting with everyone on
+B:
+
+<table>
+	<thead>
+		<tr>
+			<th style="text-align: right">Drivers on A</th>
+			<th style="text-align: right">Drivers on B</th>
+			<th style="text-align: right">Cost on A</th>
+			<th style="text-align: right">Cost on B</th>
+			<th style="text-align: right">Potential Φ</th>
+			<th>Next</th>
+		</tr>
+	</thead>
+	<tbody>
+		{congestionDynamics(4, (k) => k, (k) => k + 1).map((r) => (
+			<tr>
+				<td style="text-align: right">{r.nA}</td>
+				<td style="text-align: right">{r.nB}</td>
+				<td style="text-align: right">{r.nA ? r.costA : "–"}</td>
+				<td style="text-align: right">{r.costB}</td>
+				<td style="text-align: right">{r.phi}</td>
+				<td>{r.text}</td>
+			</tr>
+		))}
+	</tbody>
+</table>
+
+Each switch lowers the switching driver's cost and $\Phi$ by the same amount: 5 to 1 is $-4$, then
+4 to 2 is $-2$.
+
+#### The price of anarchy
+
+Equilibria of congestion games are often worse for everyone than a coordinated solution. The
+**price of anarchy** (Koutsoupias and Papadimitriou 1999) is the ratio of the total cost in the
+worst equilibrium to the optimal total cost.
+
+**Pigou's example.** One unit of traffic (many small drivers) goes from $s$ to $t$ on two roads: one
+always takes 1 hour, the other takes $x$ hours when a fraction $x$ of the traffic uses it. Every
+driver prefers the variable road (it never takes more than 1 hour), so in equilibrium everyone uses
+it and the average time is 1. Splitting the traffic in half gives total time
+$\tfrac12 \cdot \tfrac12 + \tfrac12 \cdot 1 = \tfrac34$. The price of anarchy is $\tfrac43$.
+
+<LineChart
+	x={() => Array.from({ length: 101 }, (_, i) => i / 100)}
+	series={[{ name: "average travel time x · x + (1 − x) · 1", fn: (x) => x * x + (1 - x) }]}
+	title="Pigou's network: average travel time against the share x on the variable road"
+	xLabel="share x on the variable road"
+	yLabel="average time (h)"
+	height={260}
+/>
+
+**Theorem (Roughgarden and Tardos 2002).** With linear costs $c_e(x) = a_e x + b_e$
+($a_e, b_e \ge 0$), the price of anarchy of selfish routing is at most $\tfrac43$, so Pigou's
+example is the worst case.
+
+*Proof.* Let $f$ be an equilibrium flow and $f^\ast$ any other flow carrying the same traffic. In
+equilibrium every driver uses a cheapest path given $f$, so moving the traffic to $f^\ast$'s paths
+cannot lower the cost measured at $f$'s prices:
+$\sum_e c_e(f_e) f_e \le \sum_e c_e(f_e) f^\ast_e$. For each edge,
+
+$$
+c_e(f_e) f^\ast_e = a_e f_e f^\ast_e + b_e f^\ast_e \le a_e (f^\ast_e)^2 + b_e f^\ast_e + \tfrac14 a_e f_e^2
+\le c_e(f^\ast_e) f^\ast_e + \tfrac14 c_e(f_e) f_e ,
+$$
+
+using $f f^\ast - (f^\ast)^2 \le f^2/4$, which is $(f/2 - f^\ast)^2 \ge 0$. Summing over edges,
+$C(f) \le C(f^\ast) + \tfrac14 C(f)$, so $C(f) \le \tfrac43 C(f^\ast)$. $\blacksquare$
+
+**Braess's paradox.** Adding a road can make everyone slower. In the network below, half the
+traffic goes up ($s \to v \to t$) and half down, and both routes take $\tfrac12 + 1 = 1.5$ hours.
+Now add a free road from $v$ to $w$. The zigzag $s \to v \to w \to t$ takes at most $1 + 0 + 1 = 2$
+hours but, with the old split, only $\tfrac12 + 0 + \tfrac12 = 1$, so drivers switch to it. In the
+new equilibrium everyone takes the zigzag and every trip takes 2 hours, longer than before the road
+was built, and again a ratio of $2 / 1.5 = \tfrac43$. Move the sliders to try other splits.
+
+<BraessNetwork
+	title="Braess's paradox"
+	caption="Edge widths show traffic. Without the new road the even split is an equilibrium at 1.5 hours. Tick the box, set share via v to 1 and zigzag share to 1: everyone takes 2 hours, and no driver can do better alone."
+/>
+
+Cities have seen the reverse effect: when Seoul removed the Cheonggyecheon elevated highway in
+2005, traffic in the area was reported to flow better rather than worse.
+
+## Computing equilibria
+
+Nash's theorem says an equilibrium exists. How do we find one?
+
+**Support enumeration.** By the indifference principle, once we guess which strategies each player
+uses (the supports), an equilibrium solves a linear system: the opponent's mixture must equalise
+the payoffs of the strategies in the support, and the probabilities must sum to 1. For each pair of
+supports we solve the system and keep solutions with nonnegative probabilities and no better
+strategy outside the support. This game has five equilibria:
+
+<PayoffMatrix
+	game="support"
+	mode="br"
+	marked={false}
+	title="A 3 × 3 game with five equilibria"
+	caption="Tick the box to mark best responses: (a, x) and (c, z) are the pure equilibria. The other three are mixed."
+/>
+
+| Row's mixture $x$ (a, b, c) | Column's mixture $y$ (x, y, z) | Payoffs |
+| --- | --- | ---: |
+| (1, 0, 0) | (1, 0, 0) | 3, 3 |
+| (0, 0, 1) | (0, 0, 1) | 4, 4 |
+| (0.8, 0.2, 0) | (2/3, 1/3, 0) | 3, 2.8 |
+| (0.25, 0, 0.75) | (4/7, 0, 3/7) | 1.714, 3 |
+| (0.091, 0.318, 0.591) | (0.533, 0.267, 0.2) | 2.4, 2.682 |
+
+Check the third one by hand. Against $x = (0.8, 0.2, 0)$, Column's payoffs are $3(0.8) + 2(0.2) = 2.8$
+from x, $2(0.8) + 6(0.2) = 2.8$ from y and $0.2$ from z: x and y tie, z is worse. Against
+$y = (\tfrac23, \tfrac13, 0)$, Row gets $3$ from a, $\tfrac43 + \tfrac53 = 3$ from b and $2$ from c.
+Both supports are best responses, so it is an equilibrium. The count is odd, as it must be:
+nondegenerate games have an odd number of equilibria (Wilson 1971), a fact that also falls out of
+the **Lemke–Howson algorithm** (1964), which follows a path of almost-equilibria from an artificial
+starting point to an equilibrium, like a pivoting LP solver.
+
+Support enumeration tries exponentially many supports, and Lemke–Howson can take exponentially many
+steps. That seems unavoidable: computing a Nash equilibrium of a two-player game is
+**PPAD-complete** (Daskalakis, Goldberg and Papadimitriou 2006 for three or more players; Chen and
+Deng 2006 for two). PPAD is the class of search problems whose solutions are guaranteed by a
+parity argument on a directed graph, like Brouwer fixed points; no polynomial algorithm is known for
+it. The contrast with the other solution ideas is sharp:
+
+| Problem | Method | Complexity |
+| --- | --- | --- |
+| Zero-sum game: value and optimal strategies | linear programming | polynomial |
+| Correlated equilibrium (any, or best for a linear objective) | linear programming | polynomial |
+| Coarse correlated equilibrium, approximately | no-regret dynamics | polynomial in $1/\epsilon$ |
+| Nash equilibrium of a two-player game | Lemke–Howson, support enumeration | PPAD-complete |
+| Best (e.g. welfare-maximising) Nash equilibrium | | NP-hard (Gilboa and Zemel 1989) |
+| Pure equilibrium of a congestion game | better-response dynamics | PLS-complete (Fabrikant et al. 2004) |
+
+If equilibrium is hard to compute, it is also hard to believe that real players always find it,
+which is one more argument for the learning-based and correlated solution ideas.
+
+## Summary
+
+- A **Nash equilibrium** is a profile where nobody gains by deviating alone. It always exists in
+  mixed strategies (Nash's map plus Brouwer), each player's mixture makes the others indifferent,
+  and computing one is PPAD-complete. **Dominance** and **rationalizability** are weaker,
+  belief-free predictions that sometimes already pin down the answer.
+- **Zero-sum games** are the easy case: the minimax theorem gives a single value, optimal strategies
+  come from a linear program, and no-regret learners converge to them on average. **Correlated
+  equilibria** are also LP-computable and are where no-regret play converges in general games.
+- In **dynamic games**, credibility matters: subgame perfection and backward induction remove empty
+  threats; **repetition** with patient players sustains cooperation (grim trigger needs
+  $\delta \ge \frac{T - R}{T - P}$) and, by the folk theorem, almost any individually rational
+  payoff.
+- With **private information**, players best-respond to beliefs (Bayesian Nash, perfect Bayesian
+  equilibrium). Revenue equivalence says payments are pinned down by who wins; designing the game
+  (VCG, Myerson's reserve price, deferred acceptance) turns these results into working markets.
+- **Cooperative** solutions answer different questions: the core asks what is stable, the Shapley
+  value what is fair (and gives SHAP); Nash bargaining and Rubinstein's game agree that patience and
+  risk tolerance are bargaining power. Selfish routing can cost up to $\tfrac43$ of the optimum with
+  linear costs, and adding a road can make everyone slower.
+
+## References
+
+Textbooks:
+
+- M. Osborne and A. Rubinstein, *A Course in Game Theory*, MIT Press, 1994 (free online).
+- D. Fudenberg and J. Tirole, *Game Theory*, MIT Press, 1991.
+- M. Maschler, E. Solan and S. Zamir, *Game Theory*, Cambridge University Press, 2013.
+- N. Nisan, T. Roughgarden, É. Tardos and V. Vazirani (eds.), *Algorithmic Game Theory*, Cambridge
+  University Press, 2007.
+- J. Hofbauer and K. Sigmund, *Evolutionary Games and Population Dynamics*, Cambridge University
+  Press, 1998.
+
+Original papers:
+
+- J. von Neumann, "Zur Theorie der Gesellschaftsspiele", *Mathematische Annalen* 100, 1928.
+- J. Nash, "Equilibrium points in n-person games", *PNAS* 36, 1950; "Non-cooperative games",
+  *Annals of Mathematics* 54, 1951; "The bargaining problem", *Econometrica* 18, 1950.
+- R. Aumann, "Subjectivity and correlation in randomized strategies", *Journal of Mathematical
+  Economics* 1, 1974.
+- R. Selten, "Reexamination of the perfectness concept for equilibrium points in extensive games",
+  *International Journal of Game Theory* 4, 1975.
+- H. W. Kuhn, "Extensive games and the problem of information", *Contributions to the Theory of
+  Games* II, 1953.
+- J. Harsanyi, "Games with incomplete information played by Bayesian players", *Management Science*
+  14, 1967–68.
+- J. Friedman, "A non-cooperative equilibrium for supergames", *Review of Economic Studies* 38, 1971;
+  D. Fudenberg and E. Maskin, "The folk theorem in repeated games with discounting or with
+  incomplete information", *Econometrica* 54, 1986.
+- W. Vickrey, "Counterspeculation, auctions, and competitive sealed tenders", *Journal of Finance*
+  16, 1961; R. Myerson, "Optimal auction design", *Mathematics of Operations Research* 6, 1981.
+- M. Spence, "Job market signaling", *Quarterly Journal of Economics* 87, 1973; I.-K. Cho and D.
+  Kreps, "Signaling games and stable equilibria", *QJE* 102, 1987.
+- A. Rubinstein, "Perfect equilibrium in a bargaining model", *Econometrica* 50, 1982.
+- L. Shapley, "A value for n-person games", *Contributions to the Theory of Games* II, 1953.
+- D. Gale and L. Shapley, "College admissions and the stability of marriage", *American
+  Mathematical Monthly* 69, 1962; A. Roth and E. Peranson, "The redesign of the matching market for
+  American physicians", *American Economic Review* 89, 1999.
+- J. Maynard Smith and G. Price, "The logic of animal conflict", *Nature* 246, 1973.
+- S. Hart and A. Mas-Colell, "A simple adaptive procedure leading to correlated equilibrium",
+  *Econometrica* 68, 2000; Y. Freund and R. Schapire, "Adaptive game playing using multiplicative
+  weights", *Games and Economic Behavior* 29, 1999.
+- R. Rosenthal, "A class of games possessing pure-strategy Nash equilibria", *International Journal
+  of Game Theory* 2, 1973; T. Roughgarden and É. Tardos, "How bad is selfish routing?", *Journal of
+  the ACM* 49, 2002.
+- C. Daskalakis, P. Goldberg and C. Papadimitriou, "The complexity of computing a Nash
+  equilibrium", *SIAM Journal on Computing* 39, 2009; X. Chen and X. Deng, "Settling the complexity
+  of two-player Nash equilibrium", FOCS 2006.
+- S. Lundberg and S.-I. Lee, "A unified approach to interpreting model predictions", NeurIPS 2017.

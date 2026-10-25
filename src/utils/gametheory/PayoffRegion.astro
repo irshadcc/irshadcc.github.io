@@ -1,0 +1,140 @@
+---
+// A set of payoff pairs (u1, u2) drawn at build time, no script. `polygon` is a feasible set
+// given by its corner points (shaded blue); `frontier` is a curve (points) bounding a bargaining
+// set; `ir` is the minmax point, and the part of the feasible set above and to the right of it is
+// shaded green (feasible and individually rational, the payoffs the folk theorem can sustain).
+// `points` are labelled dots, `levels` draws the hyperbolas (u1 − d1)(u2 − d2) = c about the
+// point `d` (Nash bargaining).
+// Usage in .mdx:
+//   <PayoffRegion polygon={[[1, 1], [5, 0], [3, 3], [0, 5]]} ir={[1, 1]} points={[{ at: [3, 3], label: "(C, C)" }]} />
+import "../sampling/sampling.css";
+import "./gametheory.css";
+
+interface Props {
+	polygon?: [number, number][];
+	frontier?: [number, number][];
+	ir?: [number, number];
+	points?: { at: [number, number]; label: string; ne?: boolean }[];
+	levels?: { d: [number, number]; c: number[] };
+	x: [number, number];
+	y: [number, number];
+	xLabel?: string;
+	yLabel?: string;
+	title?: string;
+	caption?: string;
+}
+
+const {
+	polygon,
+	frontier,
+	ir,
+	points = [],
+	levels,
+	x,
+	y,
+	xLabel = "u₁",
+	yLabel = "u₂",
+	title,
+	caption,
+} = Astro.props;
+const W = 640;
+const H = 340;
+const box = { x: 60, y: 16, w: 540, h: 280 };
+const sx = (v: number) => box.x + ((v - x[0]) / (x[1] - x[0])) * box.w;
+const sy = (v: number) => box.y + box.h - ((v - y[0]) / (y[1] - y[0])) * box.h;
+const step = (r: number) => {
+	const raw = r / 6;
+	const p = 10 ** Math.floor(Math.log10(raw));
+	const m = raw / p;
+	return (m < 1.5 ? 1 : m < 3.5 ? 2 : m < 7.5 ? 5 : 10) * p;
+};
+const ticks = (lo: number, hi: number) => {
+	const s = step(hi - lo);
+	const out: number[] = [];
+	for (let t = Math.ceil(lo / s - 1e-9) * s; t <= hi + 1e-9; t += s)
+		out.push(Number(t.toFixed(6)));
+	return out;
+};
+const pathOf = (pts: [number, number][], close: boolean) =>
+	pts
+		.map(
+			([a, b], i) => `${i ? "L" : "M"}${sx(a).toFixed(1)},${sy(b).toFixed(1)}`,
+		)
+		.join("") + (close ? "Z" : "");
+
+// Clip the convex polygon to the quadrant u1 >= ir1, u2 >= ir2 (Sutherland–Hodgman, two edges).
+function clip(
+	poly: [number, number][],
+	k: 0 | 1,
+	v: number,
+): [number, number][] {
+	const out: [number, number][] = [];
+	for (let i = 0; i < poly.length; i++) {
+		const a = poly[i];
+		const b = poly[(i + 1) % poly.length];
+		const ina = a[k] >= v - 1e-12;
+		const inb = b[k] >= v - 1e-12;
+		if (ina) out.push(a);
+		if (ina !== inb) {
+			const t = (v - a[k]) / (b[k] - a[k]);
+			out.push([a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])]);
+		}
+	}
+	return out;
+}
+const irPoly = polygon && ir ? clip(clip(polygon, 0, ir[0]), 1, ir[1]) : null;
+const levelPaths = levels
+	? levels.c.map((c) => {
+			const pts: [number, number][] = [];
+			for (let i = 1; i <= 200; i++) {
+				const u1 = levels.d[0] + ((x[1] - levels.d[0]) * i) / 200;
+				const u2 = levels.d[1] + c / (u1 - levels.d[0]);
+				if (u2 <= y[1] && u2 >= y[0]) pts.push([u1, u2]);
+			}
+			return pathOf(pts, false);
+		})
+	: [];
+---
+
+<figure class="smp-fig gt-region-fig">
+	{title && <div class="smp-title">{title}</div>}
+	<svg class="smp-svg" viewBox={`0 0 ${W} ${H}`} role="img" aria-label="Set of payoff pairs">
+		{ticks(x[0], x[1]).map((t) => (
+			<>
+				<line x1={sx(t)} x2={sx(t)} y1={box.y} y2={box.y + box.h} class="smp-grid" />
+				<text x={sx(t)} y={box.y + box.h + 13} class="smp-tick" text-anchor="middle">{t}</text>
+			</>
+		))}
+		{ticks(y[0], y[1]).map((t) => (
+			<>
+				<line x1={box.x} x2={box.x + box.w} y1={sy(t)} y2={sy(t)} class="smp-grid" />
+				<text x={box.x - 5} y={sy(t) + 3.5} class="smp-tick" text-anchor="end">{t}</text>
+			</>
+		))}
+		<rect x={box.x} y={box.y} width={box.w} height={box.h} class="smp-plotbox" />
+		<text x={box.x + box.w / 2} y={box.y + box.h + 30} class="smp-label" text-anchor="middle">{xLabel}</text>
+		<text x={box.x - 34} y={box.y + box.h / 2} class="smp-label" text-anchor="middle" transform={`rotate(-90 ${box.x - 34} ${box.y + box.h / 2})`}>{yLabel}</text>
+		{polygon && <path d={pathOf(polygon, true)} class="gt-region" />}
+		{frontier && <path d={`${pathOf(frontier, false)}L${sx(frontier[frontier.length - 1][0])},${sy(Math.max(y[0], 0))}L${sx(frontier[0][0])},${sy(Math.max(y[0], 0))}Z`} class="gt-region" />}
+		{irPoly && irPoly.length > 2 && <path d={pathOf(irPoly, true)} class="gt-ir" />}
+		{ir && (
+			<>
+				<line x1={sx(ir[0])} x2={sx(ir[0])} y1={sy(ir[1])} y2={box.y} class="smp-muted-line" />
+				<line x1={sx(ir[0])} x2={box.x + box.w} y1={sy(ir[1])} y2={sy(ir[1])} class="smp-muted-line" />
+			</>
+		)}
+		{levelPaths.map((d) => <path d={d} class="gt-col-thin gt-dash" />)}
+		{points.map((p) => (
+			<>
+				<circle cx={sx(p.at[0])} cy={sy(p.at[1])} r={p.ne ? 6 : 4} class={p.ne ? "gt-ne-dot" : "gt-point"} />
+				<text x={sx(p.at[0]) + 8} y={sy(p.at[1]) - 7} class={p.ne ? "gt-ne-text" : "smp-text"}>{p.label}</text>
+			</>
+		))}
+	</svg>
+	<div class="smp-legend" style="margin: 0.45rem 0 0">
+		{(polygon || frontier) && <span><i class="box" style="background: var(--gt-row-soft); border: 1px solid var(--gt-row)"></i>feasible payoffs</span>}
+		{irPoly && <span><i class="box" style="background: var(--gt-ne-soft); border: 1px dashed var(--gt-ne)"></i>feasible and individually rational</span>}
+		{levels && <span><i class="gt-k-col" style="border-top-style: dashed"></i>level curves of the Nash product</span>}
+	</div>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>

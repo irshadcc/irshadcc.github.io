@@ -1,0 +1,49 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import BraessNetwork from "../../utils/gametheory/BraessNetwork.astro";
+import GaleShapleySteps from "../../utils/gametheory/GaleShapleySteps.astro";
+import GameTree from "../../utils/gametheory/GameTree.astro";
+import MixedBestResponse from "../../utils/gametheory/MixedBestResponse.astro";
+import PayoffMatrix from "../../utils/gametheory/PayoffMatrix.astro";
+import PayoffRegion from "../../utils/gametheory/PayoffRegion.astro";
+import RepeatedGame from "../../utils/gametheory/RepeatedGame.astro";
+import SimplexDynamics from "../../utils/gametheory/SimplexDynamics.astro";
+---
+
+<Layout title="Game theory figures">
+	<main>
+		<h1>Game theory figures</h1>
+		<h2>PayoffMatrix</h2>
+		<PayoffMatrix game="prisoners" mode="br" title="Best responses" />
+		<PayoffMatrix game="support" mode="br" marked={false} title="Marks off at start" />
+		<PayoffMatrix game="iesds" mode="iesds" title="Iterated elimination" />
+		<PayoffMatrix game="chicken" mode="dist" dist={[[0, 0.25], [0.25, 0.5]]} title="Correlated equilibrium" />
+		<PayoffMatrix game="chicken" mode="dist" dist={[[0.25, 0.25], [0.25, 0.25]]} title="Not a correlated equilibrium" />
+		<h2>MixedBestResponse</h2>
+		<MixedBestResponse game="bos" />
+		<MixedBestResponse game="pennies" field title="With Nash's map" />
+		<h2>GameTree</h2>
+		<GameTree tree="entry" />
+		<GameTree tree="centipede" />
+		<GameTree tree="ultimatum" />
+		<GameTree tree="pdTree" mode="static" highlight={{ r: "D", cC: "D", cD: "D" }} />
+		<GameTree tree="signalling" mode="static" highlight={{ H: "e = 1.5", L: "e = 0", H1: "w = 2", L1: "w = 2", H0: "w = 1", L0: "w = 1" }} />
+		<h2>RepeatedGame</h2>
+		<RepeatedGame a="tft" b="alld" />
+		<RepeatedGame a="tft" b="tft" noise={0.05} tournament />
+		<h2>SimplexDynamics</h2>
+		<SimplexDynamics mode="replicator" />
+		<SimplexDynamics mode="replicator" win={2} lose={1} />
+		<SimplexDynamics mode="fictitious" />
+		<SimplexDynamics mode="hedge" />
+		<h2>GaleShapleySteps</h2>
+		<GaleShapleySteps />
+		<GaleShapleySteps receiversPropose title="Receivers propose" />
+		<h2>PayoffRegion</h2>
+		<PayoffRegion polygon={[[1, 1], [5, 0], [3, 3], [0, 5]]} ir={[1, 1]} x={[0, 5.2]} y={[0, 5.2]} points={[{ at: [3, 3], label: "(C, C)" }, { at: [1, 1], label: "(D, D)", ne: true }, { at: [5, 0], label: "(D, C)" }, { at: [0, 5], label: "(C, D)" }]} />
+		<PayoffRegion frontier={Array.from({ length: 101 }, (_, i) => [i / 100, Math.sqrt(1 - i / 100)] as [number, number])} x={[0, 1.05]} y={[0, 1.05]} levels={{ d: [0, 0], c: [0.2, 0.3849, 0.5] }} points={[{ at: [2 / 3, Math.sqrt(1 / 3)], label: "Nash bargaining solution", ne: true }]} />
+		<h2>BraessNetwork</h2>
+		<BraessNetwork />
+		<BraessNetwork shortcut />
+	</main>
+</Layout>

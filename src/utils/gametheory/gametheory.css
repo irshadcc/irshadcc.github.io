@@ -1,0 +1,346 @@
+/* Extra marks for the game theory figures (src/utils/gametheory). They build on
+   ../sampling/sampling.css (.smp-fig frame, controls, legend); every class here starts with gt-.
+   SVG content is created by scripts, so the rules are global. */
+
+.smp-fig {
+	--gt-row: var(--accent);
+	--gt-col: #c2674c;
+	--gt-ne: #2e7d5b;
+	--gt-row-soft: rgba(31, 79, 120, 0.12);
+	--gt-col-soft: rgba(194, 103, 76, 0.13);
+	--gt-ne-soft: rgba(46, 125, 91, 0.16);
+}
+@media (prefers-color-scheme: dark) {
+	.smp-fig {
+		--gt-col: #e8a07a;
+		--gt-ne: #6fcf9f;
+		--gt-row-soft: rgba(141, 187, 227, 0.16);
+		--gt-col-soft: rgba(232, 160, 122, 0.16);
+		--gt-ne-soft: rgba(111, 207, 159, 0.18);
+	}
+}
+
+/* Payoff matrices */
+.gt-matrix-wrap {
+	overflow-x: auto;
+}
+table.gt-matrix {
+	width: auto;
+	margin: 0.2rem auto 0;
+	border-collapse: collapse;
+	font: 0.9rem var(--sans);
+	font-variant-numeric: tabular-nums;
+}
+table.gt-matrix th {
+	border: none;
+	text-align: center;
+	padding: 0.3rem 0.6rem;
+	color: var(--muted);
+	font-weight: 500;
+	white-space: nowrap;
+}
+table.gt-matrix th.gt-player {
+	color: var(--text);
+	font-weight: 600;
+	font-size: 0.8rem;
+}
+table.gt-matrix td.gt-cell {
+	min-width: 5.6rem;
+	padding: 0.5rem 0.7rem;
+	border: 1px solid var(--faint);
+	background: var(--bg);
+	text-align: center;
+	white-space: nowrap;
+	cursor: default;
+	transition: opacity 0.2s;
+}
+table.gt-matrix td.gt-cell .gt-u1 {
+	color: var(--gt-row);
+	font-weight: 600;
+}
+table.gt-matrix td.gt-cell .gt-u2 {
+	color: var(--gt-col);
+	font-weight: 600;
+}
+table.gt-matrix td.gt-cell .gt-prob {
+	display: block;
+	margin-top: 0.15rem;
+	color: var(--text);
+	font-size: 0.78rem;
+}
+table.gt-matrix.gt-show-br td.gt-cell .gt-br1 {
+	text-decoration: underline 2px;
+	text-underline-offset: 3px;
+}
+table.gt-matrix.gt-show-br td.gt-cell .gt-br2 {
+	text-decoration: underline 2px;
+	text-underline-offset: 3px;
+}
+table.gt-matrix.gt-show-br td.gt-cell.gt-ne {
+	background: var(--gt-ne-soft);
+	outline: 2px solid var(--gt-ne);
+	outline-offset: -2px;
+}
+table.gt-matrix td.gt-cell.gt-hl {
+	background: var(--gt-ne-soft);
+	outline: 2px solid var(--gt-ne);
+	outline-offset: -2px;
+}
+table.gt-matrix td.gt-cell.gt-hover {
+	background: var(--accent-soft);
+}
+table.gt-matrix .gt-out {
+	opacity: 0.18;
+}
+table.gt-matrix th.gt-out {
+	text-decoration: line-through;
+}
+table.gt-matrix td.gt-cell.gt-heat {
+	background: var(--gt-row-soft);
+}
+
+/* Lines and dots in plots */
+.smp-fig .gt-row-line {
+	fill: none;
+	stroke: var(--gt-row);
+	stroke-width: 2.4;
+}
+.smp-fig .gt-col-line {
+	fill: none;
+	stroke: var(--gt-col);
+	stroke-width: 2.4;
+}
+.smp-fig .gt-row-thin {
+	fill: none;
+	stroke: var(--gt-row);
+	stroke-width: 1.6;
+}
+.smp-fig .gt-col-thin {
+	fill: none;
+	stroke: var(--gt-col);
+	stroke-width: 1.6;
+}
+.smp-fig .gt-dash {
+	stroke-dasharray: 5 3;
+}
+.smp-fig .gt-ne-dot {
+	fill: var(--gt-ne);
+	stroke: var(--bg);
+	stroke-width: 1.5;
+}
+.smp-fig .gt-ne-text {
+	fill: var(--gt-ne);
+	font-size: 11px;
+	font-weight: 600;
+}
+.smp-fig .gt-row-text {
+	fill: var(--gt-row);
+	font-size: 11px;
+}
+.smp-fig .gt-col-text {
+	fill: var(--gt-col);
+	font-size: 11px;
+}
+.smp-fig .gt-cur {
+	fill: var(--bg);
+	stroke: var(--text);
+	stroke-width: 2;
+}
+.smp-fig .gt-field {
+	stroke: var(--muted);
+	stroke-width: 1;
+	fill: none;
+	opacity: 0.75;
+}
+.smp-fig .gt-field-head {
+	fill: var(--muted);
+	opacity: 0.75;
+}
+.smp-legend .gt-k-row {
+	border-color: var(--gt-row);
+}
+.smp-legend .gt-k-col {
+	border-color: var(--gt-col);
+}
+.smp-legend .gt-k-ne {
+	background: var(--gt-ne);
+}
+.smp-legend .gt-k-muted {
+	border-color: var(--muted);
+}
+
+/* Game trees */
+.smp-fig .gt-edge {
+	stroke: var(--muted);
+	stroke-width: 1.4;
+	fill: none;
+}
+.smp-fig .gt-edge.gt-off {
+	stroke: var(--faint);
+	stroke-dasharray: 4 3;
+}
+.smp-fig .gt-edge.gt-on {
+	stroke: var(--gt-ne);
+	stroke-width: 3.2;
+}
+.smp-fig .gt-node {
+	fill: var(--bg);
+	stroke: var(--text);
+	stroke-width: 1.6;
+}
+.smp-fig .gt-node.gt-p0 {
+	fill: var(--gt-row-soft);
+	stroke: var(--gt-row);
+}
+.smp-fig .gt-node.gt-p1 {
+	fill: var(--gt-col-soft);
+	stroke: var(--gt-col);
+}
+.smp-fig .gt-node.gt-now {
+	stroke-width: 3.2;
+}
+.smp-fig .gt-info {
+	stroke: var(--text);
+	stroke-width: 1.2;
+	stroke-dasharray: 3 3;
+	fill: none;
+}
+.smp-fig .gt-action {
+	fill: var(--text);
+	font-size: 10.5px;
+}
+.smp-fig .gt-value {
+	fill: var(--gt-ne);
+	font-size: 10.5px;
+	font-weight: 600;
+}
+.smp-fig .gt-leaf {
+	fill: var(--text);
+	font-size: 11px;
+	font-variant-numeric: tabular-nums;
+}
+.smp-fig svg.gt-tree {
+	max-width: 640px;
+	margin: 0 auto;
+}
+
+/* Repeated games */
+.gt-rounds {
+	display: grid;
+	grid-auto-flow: column;
+	grid-auto-columns: minmax(1.1rem, 1fr);
+	gap: 2px;
+	min-width: min-content;
+	padding-bottom: 0.2rem;
+}
+.gt-rounds-label {
+	margin: 0.4rem 0 0.15rem;
+	color: var(--muted);
+	font-size: 0.78rem;
+}
+.gt-chip {
+	display: grid;
+	place-items: center;
+	height: 1.25rem;
+	border-radius: 3px;
+	font: 600 0.7rem var(--mono);
+	color: var(--bg);
+}
+.gt-chip.gt-c {
+	background: var(--gt-ne);
+}
+.gt-chip.gt-d {
+	background: var(--smp-bad);
+}
+.gt-chip.gt-flip {
+	outline: 2px solid var(--text);
+	outline-offset: -2px;
+}
+.gt-chip.gt-pay {
+	background: none;
+	color: var(--muted);
+	font-weight: 400;
+}
+
+/* Matching */
+.smp-fig .gt-match {
+	stroke: var(--gt-ne);
+	stroke-width: 3;
+}
+.smp-fig .gt-propose {
+	stroke: var(--gt-row);
+	stroke-width: 2;
+	stroke-dasharray: 5 3;
+}
+.smp-fig .gt-reject {
+	stroke: var(--smp-bad);
+	stroke-width: 2;
+	stroke-dasharray: 2 3;
+}
+.smp-fig .gt-pref {
+	fill: var(--muted);
+	font: 11px var(--mono);
+}
+.smp-fig .gt-pref-on {
+	fill: var(--text);
+	font-weight: 700;
+}
+.smp-fig .gt-pref-gone {
+	fill: var(--faint);
+	text-decoration: line-through;
+}
+
+/* Simplex */
+.smp-fig svg.gt-simplex {
+	max-width: 600px;
+	margin: 0 auto;
+	cursor: crosshair;
+}
+.smp-fig .gt-tri {
+	fill: var(--bg);
+	stroke: var(--muted);
+	stroke-width: 1.2;
+}
+.smp-fig .gt-path {
+	fill: none;
+	stroke: var(--gt-row);
+	stroke-width: 1.4;
+}
+.smp-fig .gt-path-avg {
+	fill: none;
+	stroke: var(--gt-col);
+	stroke-width: 1.8;
+}
+
+/* Static regions */
+.smp-fig .gt-region {
+	fill: var(--gt-row-soft);
+	stroke: var(--gt-row);
+	stroke-width: 1.4;
+}
+.smp-fig .gt-ir {
+	fill: var(--gt-ne-soft);
+	stroke: var(--gt-ne);
+	stroke-width: 1.2;
+	stroke-dasharray: 4 3;
+}
+.smp-fig .gt-point {
+	fill: var(--text);
+}
+
+/* Networks */
+.smp-fig .gt-road {
+	stroke: var(--muted);
+	stroke-width: 2;
+	fill: none;
+}
+.smp-fig .gt-road.gt-busy {
+	stroke: var(--gt-col);
+}
+.smp-fig .gt-road.gt-new {
+	stroke: var(--gt-ne);
+	stroke-dasharray: 6 3;
+}
+.smp-fig .gt-road.gt-hidden {
+	display: none;
+}

@@ -1,0 +1,229 @@
+---
+// Step-through Bayesian optimisation of a 1-D black box on [0, 1] (default: the negated
+// Forrester function, maximum ≈ 6.021 at x ≈ 0.757). Top: the true function (dashed), the
+// Gaussian-process posterior mean with a ±2σ band, the evaluations so far (the best one ringed)
+// and the next point. Bottom: the acquisition function, maximised on a 201-point grid; for
+// Thompson sampling it shows the posterior sample instead. Controls: acquisition (EI, PI, UCB,
+// Thompson), its parameter (ξ for EI/PI in standardised units of y, κ for UCB), the kernel
+// length-scale ℓ, and play/step through the iterations. The GP uses a squared-exponential kernel
+// with σ_f = 1 and σ_n = 10⁻³ on y standardised by the data's mean and standard deviation.
+// Logic in bayes.ts (runBo).
+// Usage in .mdx:
+//   <BayesOptSteps acquisition="ei" iterations={10} />
+//   <BayesOptSteps acquisition="ucb" param={2} ell={0.1} />
+import Player from "../sampling/Player.astro";
+import "../sampling/sampling.css";
+import "./bayes.css";
+
+interface Props {
+	acquisition?: "ei" | "pi" | "ucb" | "ts";
+	/** ξ for EI / PI, κ for UCB. Defaults: ξ = 0 (EI), 0.01 (PI), κ = 2 (UCB). */
+	param?: number;
+	ell?: number;
+	iterations?: number;
+	/** Initial design (x values in [0, 1]). */
+	init?: number[];
+	/** Iteration shown at the start. */
+	start?: number;
+	seed?: number;
+	title?: string;
+	caption?: string;
+}
+
+const {
+	acquisition = "ei",
+	param,
+	ell = 0.1,
+	iterations = 10,
+	init = [0, 0.5, 1],
+	start = 0,
+	seed = 1,
+	title,
+	caption,
+} = Astro.props;
+const defaults = { ei: 0, pi: 0.01, ucb: 2, ts: 0 };
+const p0 = param ?? defaults[acquisition];
+---
+
+<figure
+	class="smp-fig by-bo"
+	data-acq={acquisition}
+	data-param={p0}
+	data-ell={ell}
+	data-iter={iterations}
+	data-init={JSON.stringify(init)}
+	data-start={start}
+	data-seed={seed}
+>
+	{title && <div class="smp-title">{title}</div>}
+	<div class="smp-legend">
+		<span><i class="by-k-muted"></i>true f(x)</span>
+		<span><i class="k-p"></i>posterior mean μ(x)</span>
+		<span><i class="box by-k-band"></i>μ ± 2σ</span>
+		<span><i class="dot by-k-obs"></i>evaluations</span>
+		<span><i class="by-k-acq"></i>acquisition, next point</span>
+	</div>
+	<svg class="smp-svg" viewBox="0 0 640 400" role="img" aria-label="Gaussian process posterior and acquisition function"></svg>
+	<div class="smp-controls">
+		<Player />
+		<label>acquisition
+			<select class="i-acq" aria-label="Acquisition function">
+				<option value="ei" selected={acquisition === "ei"}>expected improvement</option>
+				<option value="pi" selected={acquisition === "pi"}>probability of improvement</option>
+				<option value="ucb" selected={acquisition === "ucb"}>upper confidence bound</option>
+				<option value="ts" selected={acquisition === "ts"}>Thompson sampling</option>
+			</select>
+		</label>
+		<label class="smp-slider by-param"><span class="v-pname"></span> = <strong class="v-p"></strong>
+			<input type="range" class="i-p" min="0" max="1" step="0.01" value={p0} aria-label="Acquisition parameter" />
+		</label>
+		<label class="smp-slider">ℓ = <strong class="v-ell"></strong>
+			<input type="range" class="i-ell" min="0.03" max="0.3" step="0.01" value={ell} aria-label="Kernel length-scale" />
+		</label>
+	</div>
+	<div class="smp-metrics">
+		<div><span>evaluations (iteration)</span><strong class="m-n"></strong></div>
+		<div><span>best f so far (x)</span><strong class="m-best"></strong></div>
+		<div><span>gap to true max 6.021</span><strong class="m-gap"></strong></div>
+		<div><span>next x: μ, σ</span><strong class="m-next"></strong></div>
+	</div>
+	<p class="smp-narration"></p>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import { type Acquisition, type BoStep, boGrid, forrester, runBo } from "./bayes";
+	import { area, axes, bindPlayer, curve, el, fmt } from "../sampling/plot";
+
+	const TRUE_MAX = 6.0207;
+	const NAMES: Record<Acquisition, string> = { ei: "EI", pi: "PI", ucb: "UCB", ts: "the posterior sample" };
+
+	function attach(fig: HTMLElement) {
+		const svg = fig.querySelector("svg")!;
+		const acqIn = fig.querySelector<HTMLSelectElement>(".i-acq")!;
+		const pIn = fig.querySelector<HTMLInputElement>(".i-p")!;
+		const ellIn = fig.querySelector<HTMLInputElement>(".i-ell")!;
+		const pLabel = fig.querySelector<HTMLElement>(".by-param")!;
+		const iterations = Number(fig.dataset.iter);
+		const init = JSON.parse(fig.dataset.init ?? "[0, 0.5, 1]") as number[];
+		const seed = Number(fig.dataset.seed);
+		const grid = boGrid(201);
+		let k = Number(fig.dataset.start) || 0;
+		let steps: BoStep[] = [];
+
+		function configureParam() {
+			const a = acqIn.value as Acquisition;
+			pLabel.hidden = a === "ts";
+			pIn.max = a === "ucb" ? "5" : "1";
+			pIn.step = a === "ucb" ? "0.1" : "0.01";
+			fig.querySelector(".v-pname")!.textContent = a === "ucb" ? "κ" : "ξ";
+		}
+
+		function recompute() {
+			steps = runBo({
+				acquisition: acqIn.value as Acquisition,
+				param: Number(pIn.value),
+				h: { ell: Number(ellIn.value), sf: 1, sn: 1e-3 },
+				iterations,
+				init,
+				seed,
+			});
+			k = Math.min(k, steps.length - 1);
+		}
+
+		function draw() {
+			const s = steps[k];
+			const a = acqIn.value as Acquisition;
+			const lo = s.mu.map((m, i) => m - 2 * s.sd[i]);
+			const hi = s.mu.map((m, i) => m + 2 * s.sd[i]);
+			const at = (arr: number[]) => (x: number) => arr[Math.round(x * 200)];
+			const yMin = Math.max(Math.min(-17, ...lo), -30);
+			const yMax = Math.min(Math.max(10, ...hi), 25);
+
+			svg.replaceChildren();
+			const T = axes(svg, { x: 46, y: 10, w: 578, h: 230 }, [0, 1], [yMin, yMax], { yLabel: "f(x)", yTicks: 5 });
+			// Band between μ − 2σ and μ + 2σ.
+			let d = "";
+			grid.forEach((x, i) => {
+				d += `${i ? "L" : "M"}${T.sx(x).toFixed(1)},${Math.max(T.box.y, Math.min(T.box.y + T.box.h, T.sy(hi[i]))).toFixed(1)}`;
+			});
+			for (let i = grid.length - 1; i >= 0; i--)
+				d += `L${T.sx(grid[i]).toFixed(1)},${Math.max(T.box.y, Math.min(T.box.y + T.box.h, T.sy(lo[i]))).toFixed(1)}`;
+			el("path", { d: `${d}Z`, class: "by-band" }, svg);
+			el("path", { d: curve(T, forrester), class: "smp-muted-line" }, svg);
+			el("path", { d: curve(T, at(s.mu), 200), class: "smp-p" }, svg);
+			if (a === "ts") el("path", { d: curve(T, at(s.acq), 200), class: "by-acq" }, svg);
+			const nx = grid[s.next];
+			el("line", { x1: T.sx(nx), x2: T.sx(nx), y1: T.box.y, y2: 400 - 30, class: "by-next-line" }, svg);
+			s.X.forEach((x, i) => {
+				el("circle", { cx: T.sx(x), cy: T.sy(s.y[i]), r: 3.6, class: "by-obs" }, svg);
+			});
+			el("circle", { cx: T.sx(s.bestX), cy: T.sy(s.best), r: 7, class: "by-best" }, svg);
+
+			const acqVals = s.acq;
+			let aMin = Math.min(...acqVals);
+			let aMax = Math.max(...acqVals);
+			if (a === "ei" || a === "pi") aMin = 0;
+			if (aMax - aMin < 1e-9) aMax = aMin + 1;
+			const B = axes(svg, { x: 46, y: 262, w: 578, h: 108 }, [0, 1], [aMin, aMax + 0.08 * (aMax - aMin)], {
+				xLabel: "x",
+				yLabel: a === "ts" ? "sample" : NAMES[a],
+				yTicks: 3,
+			});
+			if (a === "ei" || a === "pi") el("path", { d: area(B, at(acqVals), 200), class: "by-acq-area" }, svg);
+			el("path", { d: curve(B, at(acqVals), 200), class: "by-acq" }, svg);
+			el("circle", { cx: B.sx(nx), cy: B.sy(acqVals[s.next]), r: 4.5, class: "by-next" }, svg);
+			el("circle", { cx: T.sx(nx), cy: T.sy(forrester(nx)), r: 4.5, class: "by-next" }, svg);
+
+			fig.querySelector(".v-p")!.textContent = fmt(Number(pIn.value), 2);
+			fig.querySelector(".v-ell")!.textContent = fmt(Number(ellIn.value), 2);
+			fig.querySelector(".m-n")!.textContent = `${s.X.length} (${k}/${steps.length - 1})`;
+			fig.querySelector(".m-best")!.textContent = `${fmt(s.best, 3)} (${fmt(s.bestX, 3)})`;
+			fig.querySelector(".m-gap")!.textContent = fmt(TRUE_MAX - s.best, 3);
+			fig.querySelector(".m-next")!.textContent = `${fmt(nx, 3)}: ${fmt(s.mu[s.next], 2)}, ${fmt(s.sd[s.next], 2)}`;
+			const what =
+				a === "ts"
+					? `A posterior sample is highest at x = ${fmt(nx, 3)}`
+					: `${NAMES[a]} is largest at x = ${fmt(nx, 3)} (value ${fmt(acqVals[s.next], 3)})`;
+			const result = forrester(nx);
+			fig.querySelector(".smp-narration")!.textContent =
+				`Iteration ${k}: the GP is fitted to ${s.X.length} evaluations, best f = ${fmt(s.best, 3)}. ${what}, ` +
+				`where μ = ${fmt(s.mu[s.next], 2)} and σ = ${fmt(s.sd[s.next], 2)}. Evaluating there gives f = ${fmt(result, 3)}` +
+				(result > s.best ? ", a new best." : ".");
+		}
+
+		bindPlayer(
+			fig,
+			(dir) => {
+				const m = k + dir;
+				if (m < 0 || m >= steps.length) return false;
+				k = m;
+				draw();
+				return k < steps.length - 1;
+			},
+			() => {
+				k = 0;
+				draw();
+			},
+			900,
+		);
+		acqIn.addEventListener("change", () => {
+			const defaults: Record<string, number> = { ei: 0, pi: 0.01, ucb: 2, ts: 0 };
+			configureParam();
+			pIn.value = String(defaults[acqIn.value]);
+			recompute();
+			draw();
+		});
+		for (const input of [pIn, ellIn])
+			input.addEventListener("input", () => {
+				recompute();
+				draw();
+			});
+		configureParam();
+		pIn.value = fig.dataset.param ?? "0";
+		recompute();
+		draw();
+	}
+
+	document.querySelectorAll<HTMLElement>(".by-bo").forEach(attach);
+</script>

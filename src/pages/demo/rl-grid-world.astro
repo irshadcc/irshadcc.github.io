@@ -1,0 +1,27 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import DpSteps from "../../utils/rl/DpSteps.astro";
+import GridWorld from "../../utils/rl/GridWorld.astro";
+import TdLearning from "../../utils/rl/TdLearning.astro";
+import { linearFits } from "../../utils/rl/rlFigures";
+---
+
+<Layout title="Reinforcement-learning grid world figures">
+	<main>
+		<h1>Reinforcement-learning grid world figures</h1>
+		<h2>GridWorld</h2>
+		<GridWorld mode="policy" grid="small" policy={["bv", ">o"]} title="2 × 2 grid, stochastic policy at s1" />
+		<GridWorld mode="policy" policy={[">>>>v", "^^>>v", "^<v>v", "^>o<v", "^>^<<"]} trajectory={[0, 0]} title="A policy with its values and a trajectory" />
+		<GridWorld mode="policy" policy={["*****", "*****", "*****", "*****", "*****"]} title="Uniform policy" />
+		<GridWorld mode="evaluate" policy={[">>>>v", "^^>>v", "^<v>v", "^>o<v", "^>^<<"]} title="Iterative policy evaluation" />
+		<GridWorld mode="optimal" title="Optimal policy with sliders" />
+		<GridWorld mode="optimal" gamma={0.5} controls={false} title="γ = 0.5, no controls" />
+		<GridWorld mode="values" values={linearFits[0].vTd} compare={linearFits[0].v} valueLabel="TD-Linear estimate" compareLabel="true v_π" digits={2} title="Values mode" />
+		<h2>DpSteps</h2>
+		<DpSteps algorithm="vi" />
+		<DpSteps algorithm="tpi" j={5} title="Truncated policy iteration, j = 5" />
+		<h2>TdLearning</h2>
+		<TdLearning algorithm="q-learning" eps={1} />
+		<TdLearning algorithm="sarsa" eps={0.1} title="Sarsa, ε = 0.1" />
+	</main>
+</Layout>

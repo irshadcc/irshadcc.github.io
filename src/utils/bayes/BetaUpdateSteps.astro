@@ -1,0 +1,180 @@
+---
+// Step-through Beta–Bernoulli updating. A Beta(a, b) prior on a coin's heads probability θ is
+// updated one flip at a time: posterior Beta(a + heads, b + tails). The plot shows the prior
+// (dashed), the likelihood θ^h (1 − θ)^t scaled to the posterior's height (dotted), and the
+// posterior with its equal-tailed 95% credible interval shaded; vertical lines mark the
+// maximum-likelihood estimate h / n and the posterior mean. Click a flip chip to jump to it;
+// the prior can be changed with the a and b sliders or a preset.
+// Logic in bayes.ts.
+// Usage in .mdx:
+//   <BetaUpdateSteps flips="HTHHHTHHTH" a={2} b={2} />
+import Player from "../sampling/Player.astro";
+import "../sampling/sampling.css";
+import "./bayes.css";
+
+interface Props {
+	/** Flip sequence as a string of H and T. */
+	flips?: string;
+	a?: number;
+	b?: number;
+	/** Flips shown at the start (default: none, so the figure opens on the prior). */
+	start?: number;
+	title?: string;
+	caption?: string;
+}
+
+const {
+	flips = "HTHHHTHHTH",
+	a = 2,
+	b = 2,
+	start = 0,
+	title,
+	caption,
+} = Astro.props;
+const seq = flips.toUpperCase().replace(/[^HT]/g, "");
+if (!seq.length) throw new Error("BetaUpdateSteps: flips must contain H or T");
+---
+
+<figure class="smp-fig by-beta" data-flips={seq} data-start={start}>
+	{title && <div class="smp-title">{title}</div>}
+	<div class="by-chips">
+		{[...seq].map((c, i) => <button type="button" class={`by-chip ${c === "H" ? "h" : "t"}`} data-i={i + 1} aria-label={`Show the posterior after flip ${i + 1}`}>{c}</button>)}
+	</div>
+	<div class="smp-legend">
+		<span><i class="k-qd"></i>prior</span>
+		<span><i class="by-k-mle"></i>likelihood (scaled)</span>
+		<span><i class="k-p"></i>posterior</span>
+		<span><i class="box by-k-band"></i>95% credible interval</span>
+	</div>
+	<svg class="smp-svg" viewBox="0 0 640 260" role="img" aria-label="Prior, likelihood and posterior of a coin's heads probability"></svg>
+	<div class="smp-controls">
+		<Player />
+		<label class="smp-slider">a = <strong class="v-a"></strong>
+			<input type="range" class="i-a" min="0.5" max="30" step="0.5" value={a} aria-label="Prior a" />
+		</label>
+		<label class="smp-slider">b = <strong class="v-b"></strong>
+			<input type="range" class="i-b" min="0.5" max="30" step="0.5" value={b} aria-label="Prior b" />
+		</label>
+		<label>prior
+			<select class="i-preset" aria-label="Prior preset">
+				<option value="">custom</option>
+				<option value="1,1">uniform Beta(1, 1)</option>
+				<option value="0.5,0.5">Jeffreys Beta(½, ½)</option>
+				<option value="2,2">weak Beta(2, 2)</option>
+				<option value="20,20">strong Beta(20, 20)</option>
+				<option value="2,8">sceptical Beta(2, 8)</option>
+			</select>
+		</label>
+	</div>
+	<div class="smp-metrics">
+		<div><span>flips seen (heads)</span><strong class="m-n"></strong></div>
+		<div><span>posterior</span><strong class="m-post"></strong></div>
+		<div><span>MLE h / n</span><strong class="m-mle"></strong></div>
+		<div><span>posterior mean = P(next H)</span><strong class="m-mean"></strong></div>
+		<div><span>95% credible interval</span><strong class="m-ci"></strong></div>
+	</div>
+	<p class="smp-narration"></p>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import { betaPdf, betaPosterior } from "./bayes";
+	import { area, axes, bindPlayer, curve, el, fmt } from "../sampling/plot";
+
+	function attach(fig: HTMLElement) {
+		const flips = [...(fig.dataset.flips ?? "")].map((c) => (c === "H" ? 1 : 0));
+		const svg = fig.querySelector("svg")!;
+		const aIn = fig.querySelector<HTMLInputElement>(".i-a")!;
+		const bIn = fig.querySelector<HTMLInputElement>(".i-b")!;
+		const preset = fig.querySelector<HTMLSelectElement>(".i-preset")!;
+		const chips = [...fig.querySelectorAll<HTMLButtonElement>(".by-chip")];
+		let n = Number(fig.dataset.start) || 0;
+
+		function draw() {
+			const a0 = Number(aIn.value);
+			const b0 = Number(bIn.value);
+			const s = betaPosterior(a0, b0, flips, n);
+			const t = n - s.heads;
+			const post = (x: number) => betaPdf(x, s.a, s.b);
+			const prior = (x: number) => betaPdf(x, a0, b0);
+			let top = 0;
+			for (let i = 1; i < 200; i++) top = Math.max(top, post(i / 200), prior(i / 200));
+			top = Math.min(Math.max(top * 1.12, 1.5), 12);
+			// Likelihood scaled so its peak matches the posterior's peak.
+			const lik = (x: number) => x ** s.heads * (1 - x) ** t;
+			const mle = n ? s.heads / n : 0.5;
+			const likScale = n ? Math.max(...Array.from({ length: 199 }, (_, i) => post((i + 1) / 200))) / lik(mle) : 0;
+
+			svg.replaceChildren();
+			const A = axes(svg, { x: 46, y: 10, w: 578, h: 210 }, [0, 1], [0, top], { xLabel: "θ = P(heads)", yLabel: "density", yTicks: 4 });
+			el("path", { d: area(A, post, 300, s.lo, s.hi), class: "by-band" }, svg);
+			el("path", { d: curve(A, prior), class: "smp-q-dash" }, svg);
+			if (n) el("path", { d: curve(A, (x) => likScale * lik(x)), class: "smp-muted-line" }, svg);
+			el("path", { d: curve(A, post), class: "smp-p" }, svg);
+			if (n) {
+				el("line", { x1: A.sx(mle), x2: A.sx(mle), y1: A.box.y, y2: A.box.y + A.box.h, class: "smp-muted-line" }, svg);
+				el("text", { x: A.sx(mle) + 4, y: A.box.y + 12, class: "smp-note" }, svg, "MLE");
+			}
+			el("line", { x1: A.sx(s.mean), x2: A.sx(s.mean), y1: A.sy(0), y2: A.sy(post(s.mean)), class: "smp-text-line" }, svg);
+			el("text", { x: A.sx(s.mean) + 4, y: A.sy(post(s.mean)) - 4, class: "smp-text" }, svg, "mean");
+
+			chips.forEach((c, i) => {
+				c.classList.toggle("seen", i < n);
+				c.classList.toggle("last", i === n - 1);
+			});
+			fig.querySelector(".v-a")!.textContent = fmt(a0, 1);
+			fig.querySelector(".v-b")!.textContent = fmt(b0, 1);
+			fig.querySelector(".m-n")!.textContent = `${n} (${s.heads})`;
+			fig.querySelector(".m-post")!.textContent = `Beta(${fmt(s.a, 1)}, ${fmt(s.b, 1)})`;
+			fig.querySelector(".m-mle")!.textContent = n ? fmt(s.mle, 3) : "—";
+			fig.querySelector(".m-mean")!.textContent = fmt(s.mean, 3);
+			fig.querySelector(".m-ci")!.textContent = `[${fmt(s.lo, 3)}, ${fmt(s.hi, 3)}]`;
+			const w = n / (a0 + b0 + n);
+			fig.querySelector(".smp-narration")!.textContent = n
+				? `After ${n} flip${n > 1 ? "s" : ""} (${s.heads} H, ${t} T): Beta(${fmt(a0, 1)} + ${s.heads}, ${fmt(b0, 1)} + ${t}). ` +
+					`The mean ${fmt(s.mean, 3)} = ${fmt(w, 3)} × MLE ${fmt(s.mle, 3)} + ${fmt(1 - w, 3)} × prior mean ${fmt(a0 / (a0 + b0), 3)}.`
+				: `No data yet: the posterior is the prior Beta(${fmt(a0, 1)}, ${fmt(b0, 1)}), with mean ${fmt(s.mean, 3)}. Step forward to observe flips.`;
+		}
+
+		bindPlayer(
+			fig,
+			(dir) => {
+				const m = n + dir;
+				if (m < 0 || m > flips.length) return false;
+				n = m;
+				draw();
+				return n < flips.length;
+			},
+			() => {
+				n = 0;
+				draw();
+			},
+			700,
+		);
+		chips.forEach((c) =>
+			c.addEventListener("click", () => {
+				const i = Number(c.dataset.i);
+				n = n === i ? i - 1 : i;
+				draw();
+			}),
+		);
+		const onSlide = () => {
+			preset.value = "";
+			draw();
+		};
+		aIn.addEventListener("input", onSlide);
+		bIn.addEventListener("input", onSlide);
+		preset.addEventListener("change", () => {
+			if (!preset.value) return;
+			const [pa, pb] = preset.value.split(",");
+			aIn.value = pa;
+			bIn.value = pb;
+			draw();
+		});
+		const match = [...preset.options].find((o) => o.value === `${aIn.value},${bIn.value}`);
+		if (match) preset.value = match.value;
+		draw();
+	}
+
+	document.querySelectorAll<HTMLElement>(".by-beta").forEach(attach);
+</script>

@@ -1,0 +1,200 @@
+---
+// An extensive-form game as a tree: decision nodes coloured by player (first letter inside),
+// chance nodes marked N, payoffs (first player, second player) at the leaves, and nodes in one
+// information set joined by a dashed line. mode="induction" steps through backward induction,
+// deepest decision first: the chosen action turns green, the others fade, and each solved node
+// is labelled with its value. mode="static" draws the tree with the actions in `highlight`
+// (node id → action) marked, e.g. an equilibrium that backward induction cannot find.
+// Logic in gameTheory.ts (`trees`, `backwardInduction`).
+// Usage in .mdx:
+//   <GameTree tree="entry" />
+//   <GameTree tree="signalling" mode="static" highlight={{ H: "e = 1.5", L: "e = 0", H1: "w = 2", L1: "w = 2", H0: "w = 1", L0: "w = 1" }} />
+import Player from "../sampling/Player.astro";
+import "../sampling/sampling.css";
+import "./gametheory.css";
+import { backwardInduction, trees } from "./gameTheory";
+
+interface Props {
+	tree: string;
+	mode?: "induction" | "static";
+	highlight?: Record<string, string>;
+	title?: string;
+	caption?: string;
+}
+
+const {
+	tree,
+	mode = "induction",
+	highlight = {},
+	title,
+	caption,
+} = Astro.props;
+const t = trees[tree];
+if (!t) throw new Error(`GameTree: unknown tree ${tree}`);
+const steps =
+	mode === "induction" ? backwardInduction(t.root, t.players).steps : [];
+const height = t.height ?? 300;
+---
+
+<figure
+	class="smp-fig gt-tree-fig"
+	data-tree={JSON.stringify(t)}
+	data-steps={JSON.stringify(steps)}
+	data-mode={mode}
+	data-highlight={JSON.stringify(highlight)}
+>
+	{title && <div class="smp-title">{title}</div>}
+	<div class="smp-legend">
+		{t.players.map((p, i) => <span><i class:list={["dot", i === 0 ? "k-dot-p" : "gt-k-col-dot"]} style={i === 1 ? "background: var(--gt-col)" : undefined}></i>{p} ({p[0]})</span>)}
+		<span><i class="k-text" style="border-top-style: dashed"></i>information set</span>
+		<span><i style="border-color: var(--gt-ne); border-top-width: 3px"></i>{mode === "induction" ? "chosen by backward induction" : "equilibrium strategies"}</span>
+	</div>
+	<svg class="smp-svg gt-tree" viewBox={`0 0 640 ${height}`} role="img" aria-label="Game tree"></svg>
+	{
+		mode === "induction" && (
+			<>
+				<div class="smp-controls">
+					<Player />
+					<span class="smp-count" />
+				</div>
+				<p class="smp-narration" />
+			</>
+		)
+	}
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import type { InductionStep, TreeNode } from "./gameTheory";
+	import { bindPlayer, el } from "../sampling/plot";
+
+	interface Placed {
+		node: TreeNode;
+		x: number;
+		y: number;
+		parent?: Placed;
+		action?: string;
+	}
+
+	function layout(root: TreeNode, height: number): Placed[] {
+		const out: Placed[] = [];
+		let depth = 0;
+		const leaves: Placed[] = [];
+		const rec = (n: TreeNode, d: number, parent?: Placed, action?: string): Placed => {
+			depth = Math.max(depth, d);
+			const p: Placed = { node: n, x: 0, y: d, parent, action };
+			out.push(p);
+			if (!n.children) leaves.push(p);
+			for (const c of n.children ?? []) rec(c.node, d + 1, p, c.action);
+			return p;
+		};
+		rec(root, 0);
+		const gap = leaves.length > 1 ? 560 / (leaves.length - 1) : 0;
+		leaves.forEach((l, i) => {
+			l.x = leaves.length > 1 ? 40 + i * gap : 320;
+		});
+		// Internal nodes sit above the middle of their children (post-order).
+		for (const p of [...out].reverse()) {
+			const kids = out.filter((q) => q.parent === p);
+			if (kids.length) p.x = kids.reduce((s, q) => s + q.x, 0) / kids.length;
+		}
+		const rowH = (height - 70) / Math.max(1, depth);
+		for (const p of out) {
+			p.y = 28 + p.y * rowH;
+			if (p.node.at) [p.x, p.y] = p.node.at;
+		}
+		return out;
+	}
+
+	function attach(fig: HTMLElement) {
+		const svg = fig.querySelector("svg")!;
+		const t = JSON.parse(fig.dataset.tree!) as { players: string[]; root: TreeNode; height?: number };
+		const steps = JSON.parse(fig.dataset.steps!) as InductionStep[];
+		const hl = JSON.parse(fig.dataset.highlight!) as Record<string, string>;
+		const say = fig.querySelector(".smp-narration");
+		const placed = layout(t.root, t.height ?? 300);
+		const show = (v: number[]) => `(${v.map((x) => String(Number(x.toFixed(2)))).join(", ")})`;
+		let k = 0;
+
+		function draw() {
+			svg.replaceChildren();
+			const done = steps.slice(0, k);
+			const chosen = new Map<string, string>(Object.entries(hl));
+			for (const s of done) if (s.action) chosen.set(s.node, s.action);
+			const solved = new Map(done.map((s) => [s.node, s.value]));
+			const now = k > 0 ? steps[k - 1].node : "";
+			// Information sets.
+			const sets = new Map<string, Placed[]>();
+			for (const p of placed)
+				if (p.node.infoSet) sets.set(p.node.infoSet, [...(sets.get(p.node.infoSet) ?? []), p]);
+			for (const ps of sets.values()) {
+				ps.sort((a, b) => a.x - b.x || a.y - b.y);
+				for (let i = 1; i < ps.length; i++)
+					el("path", { d: `M${ps[i - 1].x},${ps[i - 1].y}L${ps[i].x},${ps[i].y}`, class: "gt-info" }, svg);
+			}
+			// Edges with action labels.
+			for (const p of placed) {
+				if (!p.parent) continue;
+				const pick = chosen.get(p.parent.node.id);
+				const cls = pick === undefined ? "gt-edge" : pick === p.action ? "gt-edge gt-on" : "gt-edge gt-off";
+				el("path", { d: `M${p.parent.x},${p.parent.y}L${p.x},${p.y}`, class: cls }, svg);
+				const mx = (p.parent.x + p.x) / 2;
+				const my = (p.parent.y + p.y) / 2;
+				const prob = p.parent.node.children?.find((c) => c.action === p.action)?.prob;
+				const right = p.x >= p.parent.x;
+				const flat = Math.abs(p.y - p.parent.y) < 4;
+				el(
+					"text",
+					{ x: mx + (flat ? 0 : right ? 6 : -6), y: my + (flat ? -6 : 0), class: "gt-action", "text-anchor": flat ? "middle" : right ? "start" : "end" },
+					svg,
+					p.action + (prob !== undefined && !p.action?.includes("½") ? ` (${prob})` : ""),
+				);
+			}
+			// Nodes and payoffs.
+			for (const p of placed) {
+				const n = p.node;
+				if (!n.children) {
+					const side = n.at ? (p.x < 320 ? "end" : "start") : "middle";
+					el("circle", { cx: p.x, cy: p.y, r: 2.5, class: "gt-point" }, svg);
+					el(
+						"text",
+						{ x: p.x + (side === "end" ? -6 : side === "start" ? 6 : 0), y: p.y + (side === "middle" ? 16 : 4), class: "gt-leaf", "text-anchor": side },
+						svg,
+						show(n.payoff ?? []),
+					);
+					continue;
+				}
+				const who = n.player === "chance" ? "" : ` gt-p${n.player}`;
+				el("circle", { cx: p.x, cy: p.y, r: 10, class: "gt-node" }, svg);
+				el("circle", { cx: p.x, cy: p.y, r: 10, class: `gt-node${who}${n.id === now ? " gt-now" : ""}` }, svg);
+				el(
+					"text",
+					{ x: p.x, y: p.y + 4, class: "smp-text", "text-anchor": "middle" },
+					svg,
+					n.player === "chance" ? "N" : t.players[n.player ?? 0][0],
+				);
+				const v = solved.get(n.id);
+				if (v) el("text", { x: p.x + 14, y: p.y - 9, class: "gt-value" }, svg, show(v));
+			}
+			if (say) {
+				fig.querySelector(".smp-count")!.textContent = `step ${k} of ${steps.length}`;
+				say.textContent = k === 0
+					? "Start at the bottom: each last mover's choice depends only on its own payoffs."
+					: steps[k - 1].text + (k === steps.length ? " Backward induction is complete; the green path is the subgame perfect outcome." : "");
+			}
+		}
+
+		if (fig.dataset.mode === "induction")
+			bindPlayer(fig, (dir) => {
+				k = Math.max(0, Math.min(steps.length, k + dir));
+				draw();
+				return k < steps.length;
+			}, () => {
+				k = 0;
+				draw();
+			}, 1400);
+		draw();
+	}
+
+	document.querySelectorAll<HTMLElement>(".gt-tree-fig").forEach(attach);
+</script>

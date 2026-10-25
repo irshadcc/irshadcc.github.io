@@ -1,0 +1,20 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import BayesOptSteps from "../../utils/bayes/BayesOptSteps.astro";
+import BetaUpdateSteps from "../../utils/bayes/BetaUpdateSteps.astro";
+---
+
+<Layout title="Bayesian statistics figures">
+	<main>
+		<h1>Bayesian statistics figures</h1>
+		<h2>BetaUpdateSteps</h2>
+		<BetaUpdateSteps flips="HTHHHTHHTH" a={2} b={2} />
+		<BetaUpdateSteps flips="HHHHHHHHHHHHHHHHHHHT" a={20} b={20} start={20} title="Strong prior, 19 heads in 20" />
+		<BetaUpdateSteps flips="T" a={0.5} b={0.5} title="Jeffreys prior, one flip" />
+		<h2>BayesOptSteps</h2>
+		<BayesOptSteps acquisition="ei" />
+		<BayesOptSteps acquisition="pi" param={0.01} start={10} title="PI, ξ = 0.01, last iteration" />
+		<BayesOptSteps acquisition="ucb" param={2} ell={0.15} title="UCB, κ = 2, ℓ = 0.15" />
+		<BayesOptSteps acquisition="ts" seed={3} init={[0.2, 0.9]} iterations={15} title="Thompson sampling, two initial points" />
+	</main>
+</Layout>

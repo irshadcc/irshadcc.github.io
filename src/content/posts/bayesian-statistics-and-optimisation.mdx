@@ -1,0 +1,1222 @@
+---
+title: "Bayesian Statistics and Bayesian Optimisation"
+description: "Bayes' theorem, conjugate priors, posterior summaries, MAP and regularisation, posterior predictive distributions, Bayesian linear regression, model evidence and the Laplace approximation, then Bayesian optimisation with Gaussian processes and the EI, PI, UCB and Thompson acquisition functions. Every idea has a proof, a worked example with computed numbers, a figure and exercises."
+date: 2026-10-25
+tags: [Machine learning, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import LineChart from "../../utils/charts/LineChart.astro";
+import ConfidenceChart from "../../utils/charts/ConfidenceChart.astro";
+import BetaUpdateSteps from "../../utils/bayes/BetaUpdateSteps.astro";
+import BayesOptSteps from "../../utils/bayes/BayesOptSteps.astro";
+import {
+	acqComparison,
+	betaLaplace,
+	betaPost,
+	blrLower,
+	blrMean,
+	blrPoints,
+	blrUpper,
+	eiTable,
+	evidenceFair,
+	evidenceUniform,
+	logEvidenceEll,
+	nlLik,
+	nlPost,
+	nlPrior,
+	normalLikelihood,
+	normalPosterior,
+	normalPrior,
+} from "../../utils/bayes/bayesFigures";
+
+## Background
+
+You flip a coin ten times and see seven heads. Is the coin biased? The textbook answer, "the
+best estimate is $0.7$", hides two things a decision needs: how *sure* we are about $0.7$, and
+what we believed about coins before we started. **Bayesian statistics** keeps both. It treats
+an unknown quantity as a random variable, starts from a **prior** distribution that says what
+we believe before seeing data, and uses probability theory, nothing more, to turn it into a
+**posterior** distribution after seeing data. Every answer, an estimate, an interval, a
+prediction or a choice between models, is then read off the posterior.
+
+This matters in machine learning for three reasons. First, it explains tools you already use:
+L2 weight decay is a Gaussian prior, and early stopping, dropout and ensembles are often
+justified as approximations to Bayesian averaging. Second, it gives calibrated uncertainty,
+which you need whenever data is scarce or mistakes are costly. Third, it gives a principled
+way to decide *where to look next*. That last idea is **Bayesian optimisation**: when one
+evaluation of a function costs hours, such as training a network with a given learning rate,
+we fit a probabilistic model to the evaluations so far and use its uncertainty to choose the
+next one.
+
+The post builds up in order:
+
+1. **Bayes' theorem**: prior, likelihood, posterior, evidence, and sequential updating.
+2. **Conjugate priors**: Beta–Bernoulli, Normal–Normal and the exponential-family pattern.
+3. **Summarising a posterior**: point estimates as decisions, MAP as regularisation, credible
+   intervals.
+4. **Prediction**: posterior predictive distributions and Bayesian linear regression.
+5. **Comparing models**: the marginal likelihood, Occam's razor, the Laplace approximation and
+   BIC.
+6. **Bayesian optimisation**: Gaussian-process surrogates, the four common acquisition
+   functions with proofs, a full worked run, and practical advice.
+
+Each section ends with exercises; solutions are folded under each one. Gaussian processes have
+[their own post](/blog/gaussian-process/), and Monte Carlo methods for posteriors without a
+closed form are in [the sampling post](/blog/sampling-methods/); this post links to them rather
+than repeating them.<Sidenote>Every number in this post was computed by a script, using the same
+TypeScript code the figures run (`src/utils/bayes/bayes.ts`), and cross-checked with SciPy 1.18.1
+and scikit-learn 1.9.1: Beta quantiles and evidences agree to $10^{-8}$, Gaussian-process means
+and standard deviations to $10^{-13}$, expected improvement to $10^{-7}$.</Sidenote>
+
+## Bayes' theorem
+
+### Prior, likelihood, posterior
+
+Let $\theta$ be the unknown quantity (the coin's heads probability, a model's weights) and $D$
+the observed data. We need two ingredients.
+
+- The **prior** $p(\theta)$: what we believe about $\theta$ before seeing $D$.
+- The **likelihood** $p(D \mid \theta)$: how probable the data is if the parameter is
+  $\theta$. As a function of $\theta$ with $D$ fixed it is *not* a distribution over $\theta$;
+  it need not integrate to one.
+
+**Theorem (Bayes).** The **posterior** distribution of $\theta$ given $D$ is
+
+$$
+p(\theta \mid D) = \frac{p(D \mid \theta)\, p(\theta)}{p(D)},
+\qquad
+p(D) = \int p(D \mid \theta)\, p(\theta)\, \mathrm{d}\theta .
+$$
+
+The denominator $p(D)$ is the **evidence** or **marginal likelihood**. It does not depend on
+$\theta$, so we often write $p(\theta \mid D) \propto p(D \mid \theta)\, p(\theta)$:
+*posterior ∝ likelihood × prior*.
+
+*Proof.* The product rule of probability writes the joint density two ways:
+$p(\theta, D) = p(\theta \mid D)\, p(D) = p(D \mid \theta)\, p(\theta)$. Divide by $p(D)$,
+which is positive for data we actually observed. The sum rule gives $p(D)$ by marginalising
+the joint over $\theta$: $p(D) = \int p(D, \theta)\,\mathrm{d}\theta = \int p(D \mid
+\theta)\,p(\theta)\,\mathrm{d}\theta$. $\square$
+
+The theorem itself is uncontroversial; it is two lines of probability. What makes statistics
+"Bayesian" is the decision to put a distribution on $\theta$ at all. A **frequentist** treats
+$\theta$ as a fixed unknown constant and reasons about the randomness of the data; a
+**Bayesian** treats $\theta$ as uncertain and conditions on the data actually seen.
+
+### A first example: a medical test
+
+A disease affects $1\%$ of people. A test detects it in $99\%$ of the sick (its
+**sensitivity**) and correctly clears $95\%$ of the healthy (its **specificity**). You test
+positive. How likely are you to be sick?
+
+Here $\theta \in \{\text{sick}, \text{healthy}\}$ with prior $p(\text{sick}) = 0.01$. The
+evidence is the total probability of a positive test:
+
+$$
+p(+) = \underbrace{0.99 \times 0.01}_{\text{sick and positive}} + \underbrace{0.05 \times 0.99}_{\text{healthy and positive}} = 0.0099 + 0.0495 = 0.0594 .
+$$
+
+So $p(\text{sick} \mid +) = 0.0099 / 0.0594 = 1/6 \approx 0.167$. A positive result from a
+"99% accurate" test leaves you five times more likely to be healthy than sick. The reason is
+visible in the two terms: false positives from the large healthy population ($0.0495$)
+outnumber true positives from the small sick one ($0.0099$). The prior matters, and ignoring it
+(the **base-rate fallacy**) is one of the most common errors in reasoning about evidence.
+
+### Sequential updating
+
+Data often arrives in pieces. Bayes' theorem composes: yesterday's posterior is today's prior.
+
+**Proposition.** If $D_1$ and $D_2$ are conditionally independent given $\theta$, then
+
+$$
+p(\theta \mid D_1, D_2) \propto p(D_2 \mid \theta)\; p(\theta \mid D_1).
+$$
+
+*Proof.* By Bayes and conditional independence,
+$p(\theta \mid D_1, D_2) \propto p(D_1, D_2 \mid \theta)\,p(\theta) = p(D_2 \mid \theta)\,
+\big[p(D_1 \mid \theta)\, p(\theta)\big] \propto p(D_2 \mid \theta)\, p(\theta \mid D_1)$,
+since $p(\theta \mid D_1) \propto p(D_1 \mid \theta)\,p(\theta)$. $\square$
+
+So processing the data in one batch, or one point at a time, or in any order, gives the same
+posterior. This is why Bayesian updating suits streaming data, and why the step-through figure
+in the next section can add one coin flip at a time.
+
+#### Exercises
+
+**1.1** You take a second, independent test and it is also positive. What is the probability
+you are sick now?
+
+<details>
+<summary>Solution</summary>
+
+Use the first posterior as the new prior: $p(\text{sick}) = 1/6$. Then
+$p(\text{sick} \mid +, +) = \dfrac{0.99 \cdot \tfrac16}{0.99 \cdot \tfrac16 + 0.05 \cdot \tfrac56}
+= \dfrac{0.165}{0.165 + 0.0417} \approx 0.798$. Two positives move you from $1\%$ to about
+$80\%$. Doing both tests at once gives the same: the likelihood of two positives is $0.99^2$ if
+sick and $0.05^2$ if healthy, and $\frac{0.99^2 \cdot 0.01}{0.99^2 \cdot 0.01 + 0.05^2 \cdot
+0.99} = 0.798$.
+</details>
+
+**1.2** Show that if the prior gives $\theta_0$ probability zero, so does every posterior, no
+matter what data arrive. What does this say about choosing priors?
+
+<details>
+<summary>Solution</summary>
+
+$p(\theta_0 \mid D) \propto p(D \mid \theta_0)\cdot 0 = 0$ for every $D$. A value ruled out by the
+prior can never be revived by evidence (**Cromwell's rule**). Priors should put positive
+probability, or density, on every value you are not certain is impossible.
+</details>
+
+## Conjugate priors
+
+The posterior's normalising integral $p(D)$ is usually intractable. For some pairs of
+likelihood and prior it is not: the posterior lands in the same family as the prior, with
+updated parameters. Such a prior is called **conjugate** to the likelihood. Conjugate pairs
+give exact answers with pencil and paper, and they are the building blocks of larger models.
+
+### Beta–Bernoulli: the coin
+
+Model each flip as $x_i \in \{0, 1\}$ with $p(x_i = 1 \mid \theta) = \theta$, a **Bernoulli**
+likelihood. For $n$ independent flips with $h$ heads and $t = n - h$ tails,
+
+$$
+p(D \mid \theta) = \prod_{i=1}^{n} \theta^{x_i}(1-\theta)^{1-x_i} = \theta^{h}(1-\theta)^{t}.
+$$
+
+Take a **Beta** prior, the distribution on $[0, 1]$ with density
+
+$$
+\mathrm{Beta}(\theta \mid a, b) = \frac{\theta^{a-1}(1-\theta)^{b-1}}{B(a, b)},
+\qquad B(a, b) = \int_0^1 \theta^{a-1}(1-\theta)^{b-1}\,\mathrm{d}\theta = \frac{\Gamma(a)\Gamma(b)}{\Gamma(a+b)}.
+$$
+
+Its mean is $a/(a+b)$ and, for $a, b > 1$, its mode is $(a-1)/(a+b-2)$.
+
+**Theorem.** With a $\mathrm{Beta}(a, b)$ prior and $h$ heads in $n$ flips, the posterior is
+$\mathrm{Beta}(a + h,\ b + t)$.
+
+*Proof.* Multiply likelihood and prior and drop factors that do not involve $\theta$:
+$p(\theta \mid D) \propto \theta^{h}(1-\theta)^{t}\cdot\theta^{a-1}(1-\theta)^{b-1} =
+\theta^{a+h-1}(1-\theta)^{b+t-1}$. This is the kernel of $\mathrm{Beta}(a+h, b+t)$, and a density
+is fixed by its kernel because it must integrate to one, so the constant is $1/B(a+h, b+t)$.
+$\square$
+
+The update is just counting: $a$ and $b$ behave like **pseudo-counts** of heads and tails seen
+before the experiment. A $\mathrm{Beta}(1, 1)$ prior is uniform; $\mathrm{Beta}(20, 20)$ says
+"I have, in effect, already seen 40 flips split evenly".
+
+The posterior mean shows how prior and data combine. With $n$ flips,
+
+$$
+\mathbb{E}[\theta \mid D] = \frac{a + h}{a + b + n}
+= \underbrace{\frac{n}{a + b + n}}_{w}\cdot\frac{h}{n} + (1 - w)\cdot\frac{a}{a+b}.
+$$
+
+It is a weighted average of the **maximum-likelihood estimate** (MLE) $h/n$ and the prior mean,
+with weight $w$ on the data that grows to one as $n \to \infty$. Pulling an estimate towards
+the prior like this is called **shrinkage**.
+
+**Worked example.** Prior $\mathrm{Beta}(2, 2)$, a mild belief that the coin is roughly fair.
+The flips are `H T H H H T H H T H`: $h = 7$, $t = 3$. The posterior is $\mathrm{Beta}(9, 5)$.
+
+| Quantity | Formula | Value |
+| --- | --- | ---: |
+| MLE | $h / n$ | 0.700 |
+| Posterior mean | $(a+h)/(a+b+n) = 9/14$ | 0.643 |
+| Posterior mode | $(a+h-1)/(a+b+n-2) = 8/12$ | 0.667 |
+| Posterior median | numerical | 0.650 |
+| Posterior sd | $\sqrt{ab/((a+b)^2(a+b+1))}$ for $\mathrm{Beta}(9,5)$ | 0.124 |
+| 95% credible interval | 2.5% and 97.5% quantiles | [0.386, 0.861] |
+
+Check the weighted average: $w = 10/14 = 0.714$, and $0.714 \times 0.7 + 0.286 \times 0.5 =
+0.643$. The interval is wide: ten flips cannot tell a fair coin from one with $\theta = 0.8$.
+
+The figure steps through the flips. Watch the dotted likelihood, which peaks at the MLE, and
+the solid posterior, which sits between it and the dashed prior. Then switch the prior to
+"strong Beta(20, 20)": the same ten flips barely move it, because $w$ drops to $10/50 = 0.2$.
+
+<BetaUpdateSteps
+	flips="HTHHHTHHTH"
+	a={2}
+	b={2}
+	title="Updating a Beta(2, 2) prior one flip at a time"
+	caption="Each step multiplies the posterior by θ (heads) or 1 − θ (tails). The shaded region is the equal-tailed 95% credible interval. Try the uniform, strong and sceptical presets to see how much the prior matters with ten flips."
+/>
+
+### Normal–Normal: averaging noisy readings
+
+Now a continuous example. A sensor reads $x_i = \mu + \varepsilon_i$ with Gaussian noise
+$\varepsilon_i \sim \mathcal{N}(0, \sigma^2)$ of *known* variance. We want $\mu$. Take the prior
+$\mu \sim \mathcal{N}(\mu_0, \tau_0^2)$.
+
+It is cleaner to work with **precisions**, inverse variances: $\lambda_0 = 1/\tau_0^2$ for the
+prior and $\lambda = 1/\sigma^2$ for one reading.
+
+**Theorem.** After $n$ readings with mean $\bar x$, the posterior is
+$\mathcal{N}(\mu_n, \tau_n^2)$ with
+
+$$
+\frac{1}{\tau_n^2} = \lambda_0 + n\lambda,
+\qquad
+\mu_n = \tau_n^2\,\big(\lambda_0\,\mu_0 + n\lambda\,\bar x\big).
+$$
+
+Precisions add, and the posterior mean is the precision-weighted average of the prior mean and
+the sample mean.
+
+*Proof.* The log posterior, up to constants that do not involve $\mu$, is
+$$
+\log p(\mu \mid D) = -\frac{\lambda_0}{2}(\mu - \mu_0)^2 - \frac{\lambda}{2}\sum_{i=1}^n (x_i - \mu)^2 + \text{const}.
+$$
+Expand and collect powers of $\mu$: the coefficient of $\mu^2$ is $-\tfrac12(\lambda_0 + n\lambda)$
+and the coefficient of $\mu$ is $\lambda_0\mu_0 + \lambda\sum_i x_i = \lambda_0\mu_0 + n\lambda\bar
+x$. A quadratic $-\tfrac{A}{2}\mu^2 + B\mu$ equals $-\tfrac{A}{2}(\mu - B/A)^2$ plus a constant
+(**completing the square**), which is the log of a Gaussian with precision $A$ and mean $B/A$.
+Here $A = \lambda_0 + n\lambda$ and $B/A = (\lambda_0\mu_0 + n\lambda\bar x)/(\lambda_0 +
+n\lambda)$. $\square$
+
+**Worked example.** Prior $\mathcal{N}(10, 3^2)$, noise $\sigma = 2$, and $n = 4$ readings with
+mean $\bar x = 12$. Then $\lambda_0 = 1/9$ and $n\lambda = 4/4 = 1$, so the posterior precision
+is $1/9 + 1 = 10/9$, the variance $\tau_4^2 = 0.9$, and
+
+$$
+\mu_4 = 0.9 \times \left(\tfrac{1}{9}\times 10 + 1 \times 12\right) = 0.9 \times 13.\overline{1} = 11.8 .
+$$
+
+The data carry nine times the prior's precision, so the mean lands $90\%$ of the way from
+$10$ to $12$. The figure shows the three densities as functions of $\mu$: the posterior is
+narrower than both the prior and the likelihood, because the two sources of information add.
+
+<LineChart
+	x={() => Array.from({ length: 241 }, (_, i) => 2 + i / 15)}
+	series={[
+		{ name: "prior N(10, 9)", fn: normalPrior },
+		{ name: "likelihood of μ: N(x̄ = 12, σ²/n = 1)", fn: normalLikelihood },
+		{ name: "posterior N(11.8, 0.9)", fn: normalPosterior },
+	]}
+	title="Normal–Normal update: prior precision 1/9 plus data precision 1"
+	xLabel="μ"
+	yLabel="density"
+	height={300}
+/>
+
+### The exponential-family pattern
+
+Both examples are instances of one recipe. A likelihood is in the **exponential family** if it
+can be written
+
+$$
+p(x \mid \eta) = h(x)\,\exp\!\big(\eta^\top T(x) - A(\eta)\big),
+$$
+
+with **natural parameter** $\eta$, **sufficient statistic** $T(x)$ and **log-partition function**
+$A(\eta)$. Bernoulli, Gaussian, Poisson, exponential, gamma, categorical and many others fit this
+form.
+
+**Theorem.** The prior $p(\eta \mid \chi, \nu) \propto \exp\!\big(\eta^\top \chi - \nu A(\eta)\big)$
+is conjugate, and after $n$ observations its parameters become $\chi + \sum_i T(x_i)$ and
+$\nu + n$.
+
+*Proof.* $p(\eta \mid D) \propto \prod_i \exp\!\big(\eta^\top T(x_i) - A(\eta)\big)\cdot
+\exp\!\big(\eta^\top\chi - \nu A(\eta)\big) = \exp\!\big(\eta^\top(\chi + \textstyle\sum_i T(x_i)) -
+(\nu + n)A(\eta)\big)$, the same form with updated parameters. $\square$
+
+So a conjugate prior is "$\nu$ imaginary observations whose sufficient statistics sum to
+$\chi$", and updating adds the real ones. For the Bernoulli, $T(x) = x$ and the prior in
+$\theta$ is the Beta, with $a$ and $b$ counting imaginary heads and tails.
+
+| Likelihood | Conjugate prior | Posterior after data |
+| --- | --- | --- |
+| Bernoulli($\theta$), $h$ heads in $n$ | $\mathrm{Beta}(a, b)$ | $\mathrm{Beta}(a + h, b + n - h)$ |
+| Categorical($\boldsymbol\pi$), counts $n_k$ | $\mathrm{Dirichlet}(\boldsymbol\alpha)$ | $\mathrm{Dirichlet}(\boldsymbol\alpha + \mathbf{n})$ |
+| Poisson($\lambda$), counts $x_i$ | $\mathrm{Gamma}(\alpha, \beta)$ (rate $\beta$) | $\mathrm{Gamma}(\alpha + \sum x_i, \beta + n)$ |
+| Normal($\mu$, known $\sigma^2$) | $\mathcal{N}(\mu_0, \tau_0^2)$ | precisions add (above) |
+| Normal(known $\mu$, precision $\lambda$) | $\mathrm{Gamma}(\alpha, \beta)$ | $\mathrm{Gamma}(\alpha + n/2, \beta + \tfrac12\sum (x_i - \mu)^2)$ |
+
+#### Exercises
+
+**2.1** A help desk receives Poisson-distributed calls per hour with unknown rate $\lambda$.
+Prior: $\mathrm{Gamma}(2, 1)$ (shape 2, rate 1). Three hours bring 3, 5 and 4 calls. Derive the
+posterior and its mean.
+
+<details>
+<summary>Solution</summary>
+
+$p(\lambda \mid D) \propto \prod_i \lambda^{x_i}e^{-\lambda}\cdot \lambda^{2-1}e^{-\lambda} =
+\lambda^{12 + 2 - 1}e^{-(3 + 1)\lambda}$, which is $\mathrm{Gamma}(14, 4)$ with mean $14/4 = 3.5$
+calls per hour (95% interval $[1.91, 5.56]$). The MLE is the sample mean, $4$; the prior mean
+$2$ pulls it down by a weight of $1/(1+3) = 0.25$: $0.75 \times 4 + 0.25 \times 2 = 3.5$.
+</details>
+
+**2.2** Show that the posterior mean of the Beta–Bernoulli model always lies between the prior
+mean and the MLE, and find how many flips it takes before the data carry more weight than a
+$\mathrm{Beta}(a, b)$ prior.
+
+<details>
+<summary>Solution</summary>
+
+The posterior mean is $w\,\hat\theta_{\text{MLE}} + (1-w)\,\frac{a}{a+b}$ with $w = n/(a+b+n) \in
+[0, 1)$, a convex combination, so it lies between the two. The data dominate when $w > 1/2$,
+that is when $n > a + b$: the prior is worth $a + b$ flips.
+</details>
+
+**2.3** The **Jeffreys prior** is $p(\theta) \propto \sqrt{I(\theta)}$, where $I(\theta) =
+-\mathbb{E}\big[\partial^2_\theta \log p(x \mid \theta)\big]$ is the **Fisher information**.
+Show that for the Bernoulli it is $\mathrm{Beta}(\tfrac12, \tfrac12)$.
+
+<details>
+<summary>Solution</summary>
+
+$\log p(x \mid \theta) = x\log\theta + (1-x)\log(1-\theta)$, so $\partial^2_\theta \log p =
+-x/\theta^2 - (1-x)/(1-\theta)^2$. Taking the expectation with $\mathbb{E}[x] = \theta$ gives
+$I(\theta) = 1/\theta + 1/(1-\theta) = 1/(\theta(1-\theta))$. Then $\sqrt{I} =
+\theta^{-1/2}(1-\theta)^{-1/2}$, the kernel of $\mathrm{Beta}(\tfrac12, \tfrac12)$. Jeffreys priors
+are invariant to reparametrisation, which is their appeal as "uninformative" defaults; the
+figure above offers it as a preset.
+</details>
+
+## Summarising a posterior
+
+The posterior is the full answer, but a report or a decision often needs a single number or an
+interval. Bayesian decision theory says how to pick one: choose the summary that minimises the
+expected loss under the posterior.
+
+### Point estimates are decisions
+
+A **loss function** $L(\theta, \hat\theta)$ says how bad it is to report $\hat\theta$ when the
+truth is $\theta$. The **Bayes estimator** minimises the **posterior expected loss**
+$\mathbb{E}\big[L(\theta, \hat\theta) \mid D\big]$.
+
+**Theorem.** Under squared loss $L = (\theta - \hat\theta)^2$ the Bayes estimator is the
+posterior mean. Under absolute loss $L = \lvert\theta - \hat\theta\rvert$ it is the posterior
+median. Under 0–1 loss in the limit of a vanishing tolerance it is the posterior mode.
+
+*Proof (squared loss).* Write $m = \mathbb{E}[\theta \mid D]$. Then
+$$
+\mathbb{E}\big[(\theta - \hat\theta)^2 \mid D\big] = \mathbb{E}\big[(\theta - m)^2 \mid D\big] + 2(m - \hat\theta)\,\underbrace{\mathbb{E}[\theta - m \mid D]}_{=\,0} + (m - \hat\theta)^2 ,
+$$
+which is the posterior variance plus $(m - \hat\theta)^2$, minimised at $\hat\theta = m$.
+The median is Exercise 3.1. For the mode, the loss $L = \mathbb{1}[\lvert\theta - \hat\theta\rvert >
+\epsilon]$ has expected value $1 - P(\lvert\theta - \hat\theta\rvert \le \epsilon \mid D)$,
+which is minimised by the centre of the $2\epsilon$-wide window with the most posterior mass;
+as $\epsilon \to 0$ for a continuous unimodal posterior that window centres on the mode.
+$\square$
+
+For the coin, the three estimators are $0.643$ (mean), $0.650$ (median) and $0.667$ (mode).
+They differ because $\mathrm{Beta}(9, 5)$ is skewed. The differences shrink as the posterior
+concentrates.
+
+### MAP estimation is regularisation
+
+The posterior mode has its own name, the **maximum a posteriori** (MAP) estimate:
+
+$$
+\hat\theta_{\text{MAP}} = \arg\max_\theta\; p(\theta \mid D) = \arg\min_\theta\; \big[-\log p(D \mid \theta) - \log p(\theta)\big].
+$$
+
+The evidence drops out because it does not depend on $\theta$. Read the right-hand side as an
+optimisation problem: the negative log-likelihood is the usual training loss, and the negative
+log prior is a **regulariser** added to it.
+
+**Proposition.** For linear regression $t_n = \mathbf{w}^\top\boldsymbol\phi(x_n) + \varepsilon_n$
+with $\varepsilon_n \sim \mathcal{N}(0, \beta^{-1})$ and prior $\mathbf{w} \sim
+\mathcal{N}(\mathbf{0}, \alpha^{-1}\mathbf{I})$, the MAP estimate is **ridge regression** with
+penalty $\lambda = \alpha/\beta$.
+
+*Proof.* $-\log p(\mathbf{t} \mid \mathbf{w}) = \frac{\beta}{2}\sum_n (t_n -
+\mathbf{w}^\top\boldsymbol\phi_n)^2 + \text{const}$ and $-\log p(\mathbf{w}) =
+\frac{\alpha}{2}\lVert\mathbf{w}\rVert^2 + \text{const}$. Dividing the sum by $\beta$ does not move
+the minimiser, so MAP minimises $\frac12\sum_n (t_n - \mathbf{w}^\top\boldsymbol\phi_n)^2 +
+\frac{\alpha}{2\beta}\lVert\mathbf{w}\rVert^2$. $\square$
+
+The same argument with a Laplace prior $p(w_j) \propto e^{-\lvert w_j\rvert/b}$ gives the L1 penalty of
+the **lasso** (Exercise 3.2). Weight decay in deep learning is a Gaussian prior on the weights.
+The figure makes the decomposition concrete for the Normal–Normal example: the two penalties are
+parabolas centred at $10$ (prior) and $12$ (data), and their sum is minimised at
+$11.8$, the MAP estimate, which here equals the posterior mean because the posterior is Gaussian.
+
+<LineChart
+	x={() => Array.from({ length: 161 }, (_, i) => 7 + i / 20)}
+	series={[
+		{ name: "−log prior (μ − 10)²/18", fn: nlPrior },
+		{ name: "−log likelihood (μ − 12)²/2", fn: nlLik },
+		{ name: "sum: minimised at μ = 11.8", fn: nlPost },
+	]}
+	title="MAP = minimise loss + penalty (Normal–Normal example)"
+	xLabel="μ"
+	yLabel="negative log density (up to constants)"
+	height={300}
+/>
+
+MAP is cheap, but it throws away the posterior's width. It also depends on the
+parametrisation: the mode of $p(\theta)$ is not the mode of the induced density of
+$\log\theta$, while the posterior mean and median transform more gracefully (the median is
+invariant under any increasing map).
+
+### Credible intervals
+
+A **credible interval** at level $1 - \alpha$ is any interval $[l, u]$ with $P(l \le \theta \le u
+\mid D) = 1 - \alpha$. Two common choices:
+
+- **Equal-tailed**: put $\alpha/2$ of the posterior mass in each tail. For the coin, the
+  $2.5\%$ and $97.5\%$ quantiles of $\mathrm{Beta}(9, 5)$ give $[0.386, 0.861]$.
+- **Highest posterior density** (HPD): the shortest interval with that mass. Every point inside
+  has higher density than every point outside. It differs from the equal-tailed one when the
+  posterior is skewed.
+
+A credible interval answers the question people usually want answered: "given what I saw, there
+is a $95\%$ probability that $\theta$ is in here." A frequentist **confidence interval** answers a
+different one: "a procedure that, over repeated experiments, covers the fixed true $\theta$ $95\%$
+of the time." For seven heads in ten the usual Wald interval $\hat\theta \pm 1.96\sqrt{\hat\theta(1 -
+\hat\theta)/n}$ is $[0.416, 0.984]$, which differs from the credible interval in both centre and
+width.<Sidenote>The two often agree numerically for large $n$ under flat priors, by the
+Bernstein–von Mises theorem: under regularity conditions the posterior approaches
+$\mathcal{N}\big(\hat\theta_{\text{MLE}}, I(\theta_0)^{-1}/n\big)$, so credible and confidence
+intervals coincide to first order. See van der Vaart, *Asymptotic Statistics*, 1998, §10.2.</Sidenote>
+
+#### Exercises
+
+**3.1** Prove that the posterior median minimises expected absolute loss.
+
+<details>
+<summary>Solution</summary>
+
+Let $F$ be the posterior CDF. $g(\hat\theta) = \mathbb{E}\lvert\theta - \hat\theta\rvert =
+\int_{-\infty}^{\hat\theta}(\hat\theta - \theta)\,p(\theta)\,\mathrm{d}\theta +
+\int_{\hat\theta}^{\infty}(\theta - \hat\theta)\,p(\theta)\,\mathrm{d}\theta$. Differentiating
+(Leibniz rule; the boundary terms vanish because the integrands are zero at $\theta =
+\hat\theta$) gives $g'(\hat\theta) = F(\hat\theta) - (1 - F(\hat\theta)) = 2F(\hat\theta) - 1$.
+This is negative below the median, zero at $F(\hat\theta) = \tfrac12$ and positive above, so the
+median is the minimiser.
+</details>
+
+**3.2** Show that a Laplace prior $p(w) \propto \exp(-\lvert w\rvert/b)$ on each weight makes the
+MAP estimate of linear regression the lasso. Why does the lasso produce exact zeros while ridge
+does not?
+
+<details>
+<summary>Solution</summary>
+
+$-\log p(\mathbf{w}) = \frac{1}{b}\sum_j\lvert w_j\rvert + \text{const}$, so MAP minimises
+$\frac{\beta}{2}\sum_n (t_n - \mathbf{w}^\top\boldsymbol\phi_n)^2 + \frac1b\lVert\mathbf{w}\rVert_1$,
+which is the lasso with $\lambda = 1/(\beta b)$. In one dimension, with a quadratic loss
+$\frac12(w - z)^2$, the minimiser is the soft threshold $\mathrm{sign}(z)\max(\lvert z\rvert -
+\lambda, 0)$: any $\lvert z\rvert \le \lambda$ gives exactly $0$, because the penalty's slope
+$\pm\lambda$ at zero beats the loss's slope. The ridge penalty $\frac\lambda2 w^2$ has slope zero
+at the origin, so it only shrinks, giving $z/(1 + \lambda)$.
+</details>
+
+**3.3** For the Beta–Bernoulli model with a uniform prior, which of mean, median and mode
+coincides with the MLE?
+
+<details>
+<summary>Solution</summary>
+
+The posterior is $\mathrm{Beta}(1 + h, 1 + t)$, whose mode is $h/(h+t) = h/n$, the MLE. With a flat
+prior, MAP equals maximum likelihood. The mean $(h+1)/(n+2)$ does not; it is Laplace's rule of
+succession (next section).
+</details>
+
+## Prediction
+
+### The posterior predictive distribution
+
+Usually we care less about $\theta$ than about the next observation. The **posterior predictive
+distribution** averages the model's predictions over the posterior:
+
+$$
+p(x_{\text{new}} \mid D) = \int p(x_{\text{new}} \mid \theta)\; p(\theta \mid D)\; \mathrm{d}\theta .
+$$
+
+This follows from the sum and product rules, assuming $x_{\text{new}}$ is independent of $D$
+given $\theta$. It differs from plugging in a point estimate, $p(x_{\text{new}} \mid
+\hat\theta)$, because it carries the uncertainty in $\theta$ forward.
+
+For the coin, $p(x_{\text{new}} = 1 \mid D) = \int\theta\,\mathrm{Beta}(\theta \mid a', b')
+\,\mathrm{d}\theta = a'/(a' + b')$, the posterior mean. With $\mathrm{Beta}(9, 5)$ that is
+$9/14 = 0.643$, not the plug-in $0.7$. With a uniform prior it is $(h + 1)/(n + 2)$, **Laplace's
+rule of succession**: after seeing the sun rise $n$ times and never fail, predict a sunrise
+tomorrow with probability $(n+1)/(n+2)$, never exactly $1$. The plug-in MLE would say $1$, and a
+model that is certain cannot learn from a surprise.
+
+The predictive distribution of several future flips is not a product of identical Bernoullis,
+because the flips are dependent through the shared unknown $\theta$. The probability of three
+heads in a row is $\frac{9}{14}\cdot\frac{10}{15}\cdot\frac{11}{16} = 0.295$, more than
+$(9/14)^3 = 0.266$: each head raises the estimate for the next one.
+
+### Bayesian linear regression
+
+The same idea applied to regression gives predictions with honest error bars. Keep the model
+from the MAP section: features $\boldsymbol\phi(x)$, weights $\mathbf{w} \sim \mathcal{N}(\mathbf{0},
+\alpha^{-1}\mathbf{I})$, targets with noise precision $\beta$. Stack the features of the $N$
+training inputs into the **design matrix** $\boldsymbol\Phi$ ($N$ rows).
+
+**Theorem.** The posterior is $\mathbf{w} \mid \mathbf{t} \sim \mathcal{N}(\mathbf{m}_N,
+\mathbf{S}_N)$ with
+
+$$
+\mathbf{S}_N^{-1} = \alpha\mathbf{I} + \beta\boldsymbol\Phi^\top\boldsymbol\Phi,
+\qquad
+\mathbf{m}_N = \beta\,\mathbf{S}_N\boldsymbol\Phi^\top\mathbf{t},
+$$
+
+and the predictive distribution at a new input $x$ is Gaussian with
+
+$$
+\text{mean } \mathbf{m}_N^\top\boldsymbol\phi(x),
+\qquad
+\text{variance } \sigma_N^2(x) = \underbrace{\frac{1}{\beta}}_{\text{noise}} + \underbrace{\boldsymbol\phi(x)^\top\mathbf{S}_N\boldsymbol\phi(x)}_{\text{uncertainty in } \mathbf{w}} .
+$$
+
+*Proof.* The log posterior is $-\frac{\beta}{2}\lVert\mathbf{t} - \boldsymbol\Phi\mathbf{w}\rVert^2 -
+\frac{\alpha}{2}\lVert\mathbf{w}\rVert^2 + \text{const}$. Its quadratic term in $\mathbf{w}$ is
+$-\frac12\mathbf{w}^\top(\alpha\mathbf{I} + \beta\boldsymbol\Phi^\top\boldsymbol\Phi)\mathbf{w}$ and its
+linear term is $\beta\,\mathbf{t}^\top\boldsymbol\Phi\mathbf{w}$. Completing the square as in the
+Normal–Normal proof, now with matrices, gives a Gaussian with precision $\mathbf{S}_N^{-1}$ and
+mean $\mathbf{S}_N\beta\boldsymbol\Phi^\top\mathbf{t}$. For the prediction, $t = \mathbf{w}^\top
+\boldsymbol\phi + \varepsilon$ is a linear function of the Gaussian $\mathbf{w}$ plus independent
+Gaussian noise, so it is Gaussian with mean $\mathbf{m}_N^\top\boldsymbol\phi$ and variance
+$\boldsymbol\phi^\top\mathbf{S}_N\boldsymbol\phi + \beta^{-1}$. $\square$
+
+The posterior mean $\mathbf{m}_N = (\boldsymbol\Phi^\top\boldsymbol\Phi +
+\frac{\alpha}{\beta}\mathbf{I})^{-1}\boldsymbol\Phi^\top\mathbf{t}$ is exactly the ridge solution,
+as the MAP section predicted. What Bayes adds is $\mathbf{S}_N$.
+
+**Worked example.** Six readings with $\boldsymbol\phi(x) = (1, x)$, $\alpha = 2$ and $\beta = 25$
+(noise standard deviation $0.2$):
+
+| $x$ | −0.9 | −0.5 | −0.1 | 0.2 | 0.6 | 0.8 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| $t$ | −0.31 | 0.18 | 0.39 | 0.73 | 0.92 | 1.24 |
+
+The posterior mean is $\mathbf{m}_N = (0.505, 0.817)$, against the least-squares fit $(0.511,
+0.848)$: the prior shrinks the slope slightly towards zero. The posterior covariance is
+$\mathbf{S}_N = \begin{pmatrix} 0.00658 & -0.00030 \\ -0.00030 & 0.01828 \end{pmatrix}$. Check
+the predictive standard deviation at $x = 0$: $\boldsymbol\phi = (1, 0)$, so $\sigma_N^2 = 1/25 +
+0.00658 = 0.04658$ and $\sigma_N = 0.216$, just above the noise floor $0.2$. At $x = -2$, far
+from the data, it grows to $0.348$, because the uncertainty in the slope is multiplied by
+$x^2$. The figure shows the band widening outside $[-0.9, 0.8]$, where there is no data.
+
+<ConfidenceChart
+	x={() => Array.from({ length: 121 }, (_, i) => -2 + i / 30)}
+	mean={blrMean}
+	lower={blrLower}
+	upper={blrUpper}
+	points={blrPoints}
+	meanLabel="predictive mean"
+	bandLabel="±2 predictive sd"
+	pointsLabel="training readings"
+	title="Bayesian linear regression: uncertainty grows away from the data"
+	xLabel="x"
+	yLabel="t"
+	height={320}
+/>
+
+A Gaussian process is the same construction with infinitely many features: replace
+$\boldsymbol\phi(x)^\top\mathbf{S}_0\boldsymbol\phi(x')$ by a kernel $k(x, x')$. That is the model
+Bayesian optimisation uses, below.
+
+#### Exercises
+
+**4.1** Using the Gamma–Poisson posterior of Exercise 2.1, show that the predictive
+distribution of the next hour's count is negative binomial, and compute the probability of zero
+calls.
+
+<details>
+<summary>Solution</summary>
+
+$p(x \mid D) = \int \frac{\lambda^x e^{-\lambda}}{x!}\cdot\frac{\beta^\alpha\lambda^{\alpha-1}e^{-\beta
+\lambda}}{\Gamma(\alpha)}\,\mathrm{d}\lambda = \frac{\Gamma(\alpha + x)}{x!\,\Gamma(\alpha)}
+\Big(\frac{\beta}{\beta+1}\Big)^{\alpha}\Big(\frac{1}{\beta+1}\Big)^{x}$, a negative binomial with
+$r = \alpha$ and success probability $\beta/(\beta + 1)$. With $\alpha = 14$, $\beta = 4$:
+$p(0 \mid D) = 0.8^{14} = 0.044$. The plug-in Poisson with $\lambda = 3.5$ gives $e^{-3.5} = 0.030$;
+the predictive has fatter tails because $\lambda$ is uncertain.
+</details>
+
+**4.2** Show that $\sigma_{N+1}^2(x) \le \sigma_N^2(x)$ for every $x$: one more data point never
+increases predictive uncertainty in Bayesian linear regression.
+
+<details>
+<summary>Solution</summary>
+
+Adding a point $\boldsymbol\phi_{N+1}$ gives $\mathbf{S}_{N+1}^{-1} = \mathbf{S}_N^{-1} +
+\beta\boldsymbol\phi_{N+1}\boldsymbol\phi_{N+1}^\top$. By the Sherman–Morrison formula
+$\mathbf{S}_{N+1} = \mathbf{S}_N - \frac{\beta\mathbf{S}_N\boldsymbol\phi_{N+1}\boldsymbol\phi_{N+1}^\top
+\mathbf{S}_N}{1 + \beta\boldsymbol\phi_{N+1}^\top\mathbf{S}_N\boldsymbol\phi_{N+1}}$, so
+$\boldsymbol\phi^\top\mathbf{S}_{N+1}\boldsymbol\phi = \boldsymbol\phi^\top\mathbf{S}_N\boldsymbol\phi -
+\frac{\beta(\boldsymbol\phi^\top\mathbf{S}_N\boldsymbol\phi_{N+1})^2}{1 +
+\beta\boldsymbol\phi_{N+1}^\top\mathbf{S}_N\boldsymbol\phi_{N+1}} \le
+\boldsymbol\phi^\top\mathbf{S}_N\boldsymbol\phi$. Note that the variance does not depend on the
+targets $\mathbf{t}$ at all, only on where we measured. Bayesian optimisation exploits this.
+</details>
+
+## Comparing models
+
+### The marginal likelihood and Occam's razor
+
+The evidence $p(D) = \int p(D \mid \theta)\,p(\theta)\,\mathrm{d}\theta$ was a normalising constant
+so far. Now make the model explicit, $p(D \mid M)$, and it becomes a score for the model: the
+probability the model assigned to the data *before* seeing it. For two models,
+
+$$
+\frac{p(M_1 \mid D)}{p(M_0 \mid D)} = \underbrace{\frac{p(D \mid M_1)}{p(D \mid M_0)}}_{\text{Bayes factor}}\cdot\frac{p(M_1)}{p(M_0)} .
+$$
+
+The **Bayes factor** turns prior odds into posterior odds.
+
+The evidence has a built-in **Occam's razor**. A flexible model spreads its prior probability
+over many possible datasets, so it gives each one a little. A simple model concentrates on few
+datasets and gives each one more. If the data are among the few, the simple model wins, even
+though the flexible model can fit them at least as well.
+
+**Worked example.** Compare $M_0$: "the coin is fair, $\theta = 0.5$" with $M_1$: "$\theta$ is
+unknown, uniform on $[0, 1]$". For a specific sequence with $h$ heads and $t$ tails,
+
+$$
+p(D \mid M_0) = 0.5^{n},
+\qquad
+p(D \mid M_1) = \int_0^1\theta^h(1-\theta)^t\,\mathrm{d}\theta = B(h + 1, t + 1) = \frac{h!\,t!}{(n+1)!} .
+$$
+
+For our 7 heads in 10: $p(D \mid M_0) = 1/1024 = 0.000977$ and $p(D \mid M_1) = 7!\,3!/11! = 1/1320
+= 0.000758$. The Bayes factor is $0.776$: the data *favour the fair coin*, slightly, even though
+$M_1$ contains $\theta = 0.7$, which fits better than $0.5$. $M_1$ pays for having been willing to
+predict any bias. With 70 heads in 100 the factor becomes $427$ in favour of $M_1$: the evidence
+for bias grows with sample size even though the proportion is the same. The figure plots both
+evidences (on a log scale) for every $h$ out of $n = 10$; the fair coin wins for $3 \le h \le 7$.
+
+<LineChart
+	x={() => Array.from({ length: 11 }, (_, i) => i)}
+	series={[
+		{ name: "log₁₀ p(D | fair coin)", fn: (k) => Math.log10(evidenceFair(k)) },
+		{ name: "log₁₀ p(D | uniform θ)", fn: (k) => Math.log10(evidenceUniform(k)) },
+	]}
+	title="Evidence of a 10-flip sequence with h heads: the simple model wins near h = 5"
+	xLabel="heads h out of 10"
+	yLabel="log₁₀ evidence"
+	height={300}
+/>
+
+The evidence depends on the prior *width*, not just its shape near the best fit: doubling the
+range of a uniform prior roughly halves the evidence if the data only support a small part of
+it. This makes Bayes factors sensitive to priors that barely affect the posterior, so state them
+and check how much they matter.<Sidenote>Kass and Raftery, "Bayes Factors", *JASA* 90(430), 1995,
+review interpretation and computation. Their Table 1 calls $2\ln$ Bayes factors of 2–6
+"positive", 6–10 "strong" and above 10 "very strong" evidence; $2\ln 427 = 12.1$.</Sidenote>
+
+### The Laplace approximation and BIC
+
+Without conjugacy the evidence and posterior are integrals with no closed form. The **Laplace
+approximation** replaces the posterior by a Gaussian at its mode.
+
+**Derivation.** Let $\ell(\theta) = \log\big[p(D \mid \theta)\,p(\theta)\big]$ and let $\hat\theta$ be
+the MAP point, where $\nabla\ell = 0$. A second-order Taylor expansion around it gives
+$$
+\ell(\theta) \approx \ell(\hat\theta) - \tfrac12(\theta - \hat\theta)^\top\mathbf{H}(\theta - \hat\theta),
+\qquad \mathbf{H} = -\nabla^2\ell(\hat\theta).
+$$
+Exponentiating, the posterior is approximately $\mathcal{N}(\hat\theta, \mathbf{H}^{-1})$. Integrating
+the exponentiated approximation (a Gaussian integral) gives the evidence in $d$ dimensions:
+$$
+p(D) \approx p(D \mid \hat\theta)\,p(\hat\theta)\,\frac{(2\pi)^{d/2}}{\lvert\mathbf{H}\rvert^{1/2}} .
+$$
+The last factor is the "volume" of the posterior. The ratio of posterior volume to prior volume is
+the **Occam factor**: how much the data narrowed the parameter down.
+
+**Worked example.** For the $\mathrm{Beta}(9, 5)$ posterior, $\ell(\theta) = 8\log\theta +
+4\log(1-\theta) + \text{const}$, with mode $\hat\theta = 2/3$ and $H = 8/\hat\theta^2 + 4/(1 -
+\hat\theta)^2 = 18 + 36 = 54$. The Laplace approximation is $\mathcal{N}(2/3, 1/54)$, standard
+deviation $0.136$ against the exact $0.124$. The figure shows the price: the Gaussian is
+symmetric and puts mass outside $[0, 1]$, while the Beta is skewed left. For the evidence under a
+uniform prior, Laplace gives $0.000831$ against the exact $0.000758$, about $10\%$ high. Both
+errors shrink as $n$ grows, since the posterior becomes more Gaussian.
+
+<LineChart
+	x={() => Array.from({ length: 201 }, (_, i) => i / 200)}
+	series={[
+		{ name: "exact posterior Beta(9, 5)", fn: betaPost },
+		{ name: "Laplace approximation N(2/3, 1/54)", fn: betaLaplace },
+	]}
+	title="Laplace approximation of the coin posterior"
+	xLabel="θ"
+	yLabel="density"
+	height={280}
+/>
+
+Taking logs and keeping only the terms that grow with $n$ gives the **Bayesian information
+criterion** (BIC). With $n$ i.i.d. points, $\mathbf{H}$ grows like $n$ times a fixed matrix, so
+$\log\lvert\mathbf{H}\rvert = d\log n + O(1)$, and
+
+$$
+\log p(D \mid M) = \log p(D \mid \hat\theta) - \frac{d}{2}\log n + O(1) .
+$$
+
+Model selection by BIC trades fit against the number of parameters $d$. For the coin, $M_1$ scores
+$\log p(D \mid \hat\theta = 0.7) - \tfrac12\log 10 = -6.109 - 1.151 = -7.260$ against $M_0$'s
+$10\log 0.5 = -6.931$, so BIC also prefers the fair coin (the exact log evidence of $M_1$ is
+$-7.185$).<Sidenote>Schwarz, "Estimating the Dimension of a Model", *Annals of Statistics* 6(2),
+1978. BIC is usually written as $-2$ times this quantity, so that lower is better.</Sidenote>
+
+### Beyond conjugacy
+
+Most real models have neither a conjugate prior nor a Gaussian-shaped posterior. The main
+tools, in rough order of cost:
+
+- **Grid evaluation** of $p(D \mid \theta)p(\theta)$, normalised numerically. Exact in one or two
+  dimensions, hopeless in ten.
+- **Laplace** (above): one optimisation and one Hessian.
+- **Variational inference**: pick a tractable family $q(\theta)$ and minimise
+  $\mathrm{KL}\big(q \,\Vert\, p(\cdot \mid D)\big)$, which is equivalent to maximising a lower bound on
+  $\log p(D)$ (the ELBO).
+- **Markov chain Monte Carlo**: draw samples whose distribution converges to the posterior, as in
+  [the sampling post](/blog/sampling-methods/). Asymptotically exact, but slow to mix in high
+  dimensions without gradient-based proposals such as Hamiltonian Monte Carlo.
+
+#### Exercises
+
+**5.1** Compute the Bayes factor of $M_1$ (uniform $\theta$) against $M_0$ (fair) when you see 10
+heads out of 10.
+
+<details>
+<summary>Solution</summary>
+
+$p(D \mid M_1) = B(11, 1) = 10!\,0!/11! = 1/11$ and $p(D \mid M_0) = 1/1024$, so the factor is
+$1024/11 = 93.1$ in favour of a biased coin. For comparison, a specific sequence with 9 heads and
+1 tail has $p(D \mid M_1) = B(10, 2) = 9!\,1!/11! = 1/110$, a factor of $1024/110 = 9.3$: one
+tail cuts the evidence for bias tenfold.
+</details>
+
+**5.2** Derive the Laplace approximation's posterior variance for the Beta–Bernoulli model with
+a uniform prior, $\hat\theta(1-\hat\theta)/n$, and compare it with $I(\hat\theta)^{-1}/n$ from
+Exercise 2.3.
+
+<details>
+<summary>Solution</summary>
+
+$\ell = h\log\theta + t\log(1 - \theta)$, $\hat\theta = h/n$, and $H = h/\hat\theta^2 +
+t/(1-\hat\theta)^2 = n/\hat\theta + n/(1-\hat\theta) = n/(\hat\theta(1 - \hat\theta))$. So the
+variance is $\hat\theta(1-\hat\theta)/n$. Since $I(\theta) = 1/(\theta(1-\theta))$, this is
+$I(\hat\theta)^{-1}/n$, the Bernstein–von Mises variance, and the same quantity that appears in
+the Wald confidence interval.
+</details>
+
+## Bayesian optimisation
+
+### The problem
+
+Suppose we want the maximum of a function $f(x)$ over a box $\mathcal{X}$, but:
+
+- each evaluation is **expensive**: training a model for a day, running a wind-tunnel test, a
+  wet-lab experiment;
+- $f$ is a **black box**: no gradients, no formula, perhaps noisy observations;
+- the dimension is modest, typically under about 20.
+
+Grid search and random search waste evaluations on regions already known to be poor. Gradient
+methods need derivatives. **Bayesian optimisation** (BO) instead keeps a posterior over
+functions, a **surrogate model**, and spends cheap computation on the surrogate to choose each
+expensive evaluation carefully. The loop is:
+
+1. Evaluate $f$ at a few initial points.
+2. Fit the surrogate: compute the posterior $p(f \mid D)$ given all evaluations $D$.
+3. Maximise an **acquisition function** $a(x)$, a cheap function of the posterior that scores how
+   useful evaluating $x$ would be. Call the maximiser $x_{\text{next}}$.
+4. Evaluate $y = f(x_{\text{next}})$, add it to $D$, and go back to step 2.
+
+Step 3 is where the Bayesian posterior earns its place. The acquisition must balance
+**exploitation**, sampling where the surrogate predicts high values, against **exploration**,
+sampling where it is uncertain and the true function might be higher still.
+
+### The surrogate: a Gaussian process
+
+The standard surrogate is a **Gaussian process** (GP): a distribution over functions such that
+any finite set of values $(f(x_1), \dots, f(x_m))$ is jointly Gaussian. It is set by a mean
+function, here $0$ after standardising $y$, and a **kernel** $k(x, x')$ giving the covariance
+between $f(x)$ and $f(x')$. We use the squared-exponential kernel
+
+$$
+k(x, x') = \sigma_f^2\exp\!\left(-\frac{(x - x')^2}{2\ell^2}\right),
+$$
+
+whose **length-scale** $\ell$ says how far apart two inputs can be and still have correlated
+values. Conditioning the joint Gaussian on the $n$ observations $\mathbf{y}$ at inputs $X$, with
+observation noise variance $\sigma_n^2$, gives the posterior at any $x$:
+
+$$
+\mu(x) = \mathbf{k}_x^\top(\mathbf{K} + \sigma_n^2\mathbf{I})^{-1}\mathbf{y},
+\qquad
+\sigma^2(x) = k(x, x) - \mathbf{k}_x^\top(\mathbf{K} + \sigma_n^2\mathbf{I})^{-1}\mathbf{k}_x ,
+$$
+
+where $\mathbf{K}_{ij} = k(x_i, x_j)$ and $(\mathbf{k}_x)_i = k(x_i, x)$. These are the
+conditional-Gaussian formulas derived step by step in [the Gaussian process
+post](/blog/gaussian-process/), and they are Bayesian linear regression with the kernel trick
+(previous section). Two properties matter for BO: $\sigma(x)$ is near zero at evaluated points
+(with little noise) and grows between and beyond them, and like the Bayesian linear regression
+variance, it depends only on *where* we have evaluated, not on the values.
+
+**The running example.** We maximise the negated **Forrester function**,
+
+$$
+f(x) = -(6x - 2)^2\sin(12x - 4), \qquad x \in [0, 1],
+$$
+
+a standard one-dimensional test problem with a local maximum near $x = 0.14$ and the global
+maximum $f(0.7572) = 6.0207$.<Sidenote>Forrester, Sóbester and Keane, *Engineering Design via
+Surrogate Modelling*, Wiley, 2008. The book minimises $(6x-2)^2\sin(12x-4)$; we negate it to
+maximise. The maximiser was located on a $10^5$-point grid.</Sidenote> The initial design is $x =
+0, 0.5, 1$, with values $-3.027$, $-0.909$ and $-15.830$. The GP uses $\ell = 0.1$, $\sigma_f = 1$
+and $\sigma_n = 10^{-3}$, on $y$ standardised by the data's mean ($-6.589$) and standard deviation
+($6.591$). The acquisition is maximised over a 201-point grid.
+
+### Acquisition functions
+
+Write $f^+ = \max_i y_i$ for the best value seen so far, the **incumbent**, and use the GP's
+$\mu(x)$ and $\sigma(x)$. Let $\Phi$ and $\varphi$ be the standard normal CDF and density.
+
+#### Probability of improvement (PI)
+
+The oldest criterion picks the point most likely to beat the incumbent by at least a margin
+$\xi \ge 0$:<Sidenote>Kushner, "A New Method of Locating the Maximum Point of an Arbitrary Multipeak
+Curve in the Presence of Noise", *Journal of Basic Engineering* 86(1), 1964.</Sidenote>
+
+$$
+\mathrm{PI}(x) = P\big(f(x) \ge f^+ + \xi\big) = \Phi\!\left(\frac{\mu(x) - f^+ - \xi}{\sigma(x)}\right).
+$$
+
+*Proof.* Under the posterior $f(x) \sim \mathcal{N}(\mu, \sigma^2)$, so $Z = (f(x) - \mu)/\sigma$ is
+standard normal and $P(f(x) \ge f^+ + \xi) = P\big(Z \ge (f^+ + \xi - \mu)/\sigma\big) = 1 -
+\Phi\big((f^+ + \xi - \mu)/\sigma\big) = \Phi\big((\mu - f^+ - \xi)/\sigma\big)$ by the symmetry of
+$\Phi$. $\square$
+
+PI ignores *how much* a point might improve. A point almost certain to improve by $0.001$ beats a
+point with a $40\%$ chance of improving by $10$. With small $\xi$ it therefore creeps along next to
+the incumbent.
+
+#### Expected improvement (EI)
+
+The **improvement** at $x$ is $I(x) = \max\big(f(x) - f^+, 0\big)$: how much a new evaluation
+would beat the incumbent, or zero. **Expected improvement** is its posterior mean, and it has a
+closed form.<Sidenote>Mockus, Tiesis and Žilinskas, "The Application of Bayesian Methods for
+Seeking the Extremum", 1978; popularised as EGO by Jones, Schonlau and Welch, "Efficient Global
+Optimization of Expensive Black-Box Functions", *Journal of Global Optimization* 13, 1998.</Sidenote>
+
+**Theorem.** With $d = \mu(x) - f^+ - \xi$ and $z = d / \sigma(x)$, for $\sigma(x) > 0$,
+
+$$
+\mathrm{EI}(x) = \mathbb{E}\big[\max(f(x) - f^+ - \xi, 0)\big] = d\,\Phi(z) + \sigma(x)\,\varphi(z),
+$$
+
+and $\mathrm{EI}(x) = \max(d, 0)$ when $\sigma(x) = 0$.
+
+*Proof.* Write $f(x) = \mu + \sigma u$ with $u \sim \mathcal{N}(0, 1)$. Improvement is positive when
+$\mu + \sigma u > f^+ + \xi$, that is when $u > -z$. So
+$$
+\mathrm{EI} = \int_{-z}^{\infty}(d + \sigma u)\,\varphi(u)\,\mathrm{d}u
+= d\int_{-z}^{\infty}\varphi(u)\,\mathrm{d}u + \sigma\int_{-z}^{\infty}u\,\varphi(u)\,\mathrm{d}u .
+$$
+The first integral is $1 - \Phi(-z) = \Phi(z)$. For the second, $\varphi'(u) = -u\,\varphi(u)$, so
+$\int_{-z}^{\infty}u\,\varphi(u)\,\mathrm{d}u = \big[-\varphi(u)\big]_{-z}^{\infty} = \varphi(-z) =
+\varphi(z)$. $\square$
+
+The two terms are exploitation and exploration. $d\,\Phi(z)$ is large where the mean already beats
+the incumbent; $\sigma\varphi(z)$ is large where the uncertainty is large. Exercise 6.1 makes this
+exact: EI increases in both $\mu$ and $\sigma$.
+
+**Worked example: the first EI step.** With the three initial points, $f^+ = -0.909$ (at $x =
+0.5$) and $\xi = 0$. Take three candidates:
+
+| $x$ | $\mu(x)$ | $\sigma(x)$ | $z$ | PI | EI |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0.250 | −6.183 | 6.579 | −0.802 | 0.211 | 0.789 |
+| 0.405 | −2.971 | 5.082 | −0.406 | 0.342 | 1.161 |
+| 0.450 | −1.576 | 3.100 | −0.215 | 0.415 | 0.932 |
+
+Check the middle row: $d = -2.971 + 0.909 = -2.062$, $z = -2.062/5.082 = -0.406$,
+$\Phi(-0.406) = 0.342$ and $\varphi(-0.406) = 0.367$, so $\mathrm{EI} = -2.062 \times 0.342 + 5.082
+\times 0.367 = -0.706 + 1.866 = 1.161$. EI's maximum over the grid is at $x = 0.405$: a compromise
+that is close enough to the incumbent to have a decent mean and far enough to be uncertain. PI
+prefers $x = 0.45$ over $0.405$ in this table, and its own maximum is at $x = 0.485$, hugging the
+incumbent.
+
+#### Upper confidence bound (UCB)
+
+The **upper confidence bound** is an optimistic estimate,
+
+$$
+\mathrm{UCB}(x) = \mu(x) + \kappa\,\sigma(x),
+$$
+
+"optimism in the face of uncertainty": act as if each point were as good as it plausibly could be.
+$\kappa$ sets the trade-off directly; $\kappa = 0$ is pure exploitation.
+The GP-UCB analysis of Srinivas et al. gives it a guarantee. With an increasing schedule
+$\kappa_t = \sqrt{\beta_t}$, where $\beta_t = 2\log\big(\lvert\mathcal{X}\rvert t^2\pi^2/(6\delta)\big)$
+for a finite domain, the **cumulative regret** $R_T = \sum_{t=1}^T\big(f(x^\star) - f(x_t)\big)$
+satisfies $R_T = O\big(\sqrt{T\beta_T\gamma_T}\big)$ with probability at least $1 - \delta$, where
+$\gamma_T$ is the maximum information gain after $T$ evaluations, a kernel-dependent quantity
+($O\big((\log T)^{d+1}\big)$ for the squared-exponential kernel). Since this is sublinear in $T$, the
+average regret goes to zero: GP-UCB finds the optimum.<Sidenote>Srinivas, Krause, Kakade and Seeger,
+"Gaussian Process Optimization in the Bandit Setting: No Regret and Experimental Design", ICML 2010,
+Theorem 1 (finite $\mathcal{X}$) and Theorem 5 (bounds on $\gamma_T$). The constants in practical
+use, such as $\kappa = 2$, are smaller than the theory requires.</Sidenote>
+
+#### Thompson sampling
+
+**Thompson sampling** draws one whole function $\tilde f \sim p(f \mid D)$ from the posterior and
+evaluates where that sample is largest. It needs no parameter. Its key property is **probability
+matching**: it picks each $x$ with exactly the posterior probability that $x$ is the maximiser,
+$P(x_{\text{next}} = x) = P\big(x = \arg\max f \mid D\big)$, because sampling $\tilde f$ and taking
+its argmax is a way of sampling the argmax.<Sidenote>Thompson, "On the Likelihood that One Unknown
+Probability Exceeds Another in View of the Evidence of Two Samples", *Biometrika* 25(3/4), 1933.
+Russo and Van Roy, "Learning to Optimize via Posterior Sampling", *Mathematics of Operations
+Research* 39(4), 2014, show its Bayesian regret matches UCB-style bounds.</Sidenote> Points the
+model is sure are poor are almost never chosen; uncertain points are chosen in proportion to
+their chance of being best. Thompson sampling is random, so the run depends on the seed.
+
+### The loop, step by step
+
+The figure runs the loop. The top panel is the GP: dashed true function (which the algorithm never
+sees), mean and $\pm2\sigma$ band, black evaluations with the incumbent ringed. The bottom panel is
+the acquisition, and the green dot is its maximum, the next evaluation. Step through EI and watch
+the band collapse near each new point, then switch to PI and see it inch towards larger $x$ from
+the incumbent one small step at a time.
+
+<BayesOptSteps
+	acquisition="ei"
+	iterations={10}
+	title="Bayesian optimisation of the negated Forrester function"
+	caption="Squared-exponential GP (ℓ = 0.1, σ_f = 1, σ_n = 10⁻³ on standardised y), initial design 0, 0.5, 1, acquisition maximised on a 201-point grid. ξ is in units of the data's standard deviation. Change the acquisition, its parameter or ℓ and replay."
+/>
+
+The table lists the ten EI evaluations after the initial three. The first three explore the left
+half, where the band was widest, and find the local maximum near $0.14$. At iteration 4 the model
+has learned enough about the left to know it cannot beat $0.964$ by much, and EI switches to the
+unexplored right half. Two steps later it is within $0.03$ of the global maximum, and from
+iteration 7 it refines around $x \approx 0.757$.
+
+<table>
+	<thead>
+		<tr>
+			<th style="text-align:right">iteration</th>
+			<th style="text-align:right">evaluations</th>
+			<th style="text-align:right">x</th>
+			<th style="text-align:right">f(x)</th>
+			<th style="text-align:right">best so far</th>
+		</tr>
+	</thead>
+	<tbody>
+		{eiTable.map((r) => (
+			<tr>
+				<td style="text-align:right">{r.i}</td>
+				<td style="text-align:right">{r.n}</td>
+				<td style="text-align:right">{r.x.toFixed(3)}</td>
+				<td style="text-align:right">{r.f.toFixed(3)}</td>
+				<td style="text-align:right">{r.best.toFixed(3)}</td>
+			</tr>
+		))}
+	</tbody>
+</table>
+
+How fast does each acquisition get there? The next table runs each for 20 iterations on the same
+problem and counts the evaluations, including the initial three, until one lands within $0.01$ of
+the true maximum.
+
+<table>
+	<thead>
+		<tr>
+			<th>acquisition</th>
+			<th style="text-align:right">evaluations to within 0.01</th>
+			<th style="text-align:right">best after 23 evaluations</th>
+		</tr>
+	</thead>
+	<tbody>
+		{acqComparison.map((r) => (
+			<tr>
+				<td>{r.name}</td>
+				<td style="text-align:right">{r.evals ?? "not reached"}</td>
+				<td style="text-align:right">{r.best.toFixed(3)}</td>
+			</tr>
+		))}
+	</tbody>
+</table>
+
+PI with a small margin never gets there. It creeps left from the incumbent in steps of
+$0.015$ (0.485, 0.460, ..., 0.370), then jumps to $0.665$ and creeps right in steps of $0.005$,
+still short of the peak after 23 evaluations. Raising its margin
+to $\xi = 0.5$ forces it to look for big improvements, and it becomes competitive. UCB with a small
+$\kappa = 0.5$ is too greedy: it climbs to the local maximum near $0.14$, evaluates $x = 0.145$ six
+times in a row, and only then explores the right half, taking twice as long as $\kappa = 2$. One run on one function is an
+anecdote, not a benchmark, but the pattern, that pure exploitation stalls and that EI is a robust
+default, matches the literature.<Sidenote>For broader comparisons see Shahriari et al., "Taking the
+Human Out of the Loop: A Review of Bayesian Optimization", *Proceedings of the IEEE* 104(1), 2016,
+and Frazier, "A Tutorial on Bayesian Optimization", arXiv:1807.02811, 2018.</Sidenote>
+
+### Choosing the kernel's hyperparameters
+
+The run above fixed $\ell = 0.1$. In practice the GP's hyperparameters $\psi = (\ell, \sigma_f,
+\sigma_n)$ are themselves unknown, and the comparing-models section says how to choose them:
+maximise the evidence. For a GP the marginal likelihood of the observations is Gaussian and has a
+closed form,
+
+$$
+\log p(\mathbf{y} \mid X, \psi) = -\tfrac12\mathbf{y}^\top\mathbf{K}_\psi^{-1}\mathbf{y} - \tfrac12\log\lvert\mathbf{K}_\psi\rvert - \tfrac{n}{2}\log 2\pi,
+\qquad \mathbf{K}_\psi = \mathbf{K} + \sigma_n^2\mathbf{I} .
+$$
+
+The first term rewards fitting the data; the second penalises a flexible model, one with a large
+"volume" of covariance. This is the Occam's razor of the Bayes factor again, now choosing a
+continuous hyperparameter (**type-II maximum likelihood** or **empirical Bayes**). The figure plots
+it against $\ell$ for the eight evaluations after five EI iterations. It peaks at $\ell = 0.131$:
+shorter length-scales explain the data with a wigglier, less probable function, while longer ones
+cannot bend enough to pass through the points and the evidence collapses. Letting $\sigma_f$ vary
+as well, scikit-learn's optimiser picks $\ell = 0.153$ and $\sigma_f = 1.27$.
+
+<LineChart
+	x={() => Array.from({ length: 91 }, (_, i) => 0.02 + i / 500)}
+	series={[{ name: "log evidence", fn: logEvidenceEll }]}
+	title="GP log marginal likelihood against length-scale (8 evaluations, σ_f = 1)"
+	xLabel="ℓ"
+	yLabel="log p(y | X, ℓ)"
+	height={280}
+/>
+
+With very few points the evidence is flat and its maximum is unreliable, so BO libraries refit
+hyperparameters after every evaluation and often put priors on them, or average over them with
+MCMC rather than optimising.<Sidenote>Snoek, Larochelle and Adams, "Practical Bayesian
+Optimization of Machine Learning Algorithms", NeurIPS 2012, marginalise the GP hyperparameters
+with slice sampling and use a Matérn-5/2 kernel rather than the squared-exponential, which they
+argue is unrealistically smooth for hyperparameter tuning.</Sidenote>
+
+### In practice
+
+- **Noise.** Real evaluations are noisy (validation loss depends on the seed). Keep $\sigma_n$ as a
+  hyperparameter, and replace the incumbent $f^+$, which may be a lucky draw, by the best posterior
+  mean at an evaluated point.
+- **Batches.** With $q$ machines you want $q$ points at once. Heuristics fill the batch by
+  pretending the pending evaluations returned their posterior mean (the "kriging believer") and
+  refitting; principled versions maximise a joint q-EI by Monte Carlo.
+- **Higher dimensions.** The GP's cost is $O(n^3)$ in the number of evaluations, and covering a
+  20-dimensional box needs many. Common remedies: one length-scale per dimension (**automatic
+  relevance determination**), which switches off irrelevant inputs; random low-dimensional
+  embeddings; and trust regions that run local BO around the incumbent.
+- **Optimising the acquisition.** In more than one dimension, grid search is impossible.
+  Acquisitions are cheap and smooth, so use many random starts of a gradient-based optimiser.
+- **Other surrogates.** Random forests (SMAC) and density-ratio estimators (the tree-structured
+  Parzen estimator, TPE) handle categorical and conditional search spaces better than a plain GP.
+
+#### Exercises
+
+**6.1** Show that $\partial\mathrm{EI}/\partial\mu = \Phi(z)$ and $\partial\mathrm{EI}/\partial\sigma =
+\varphi(z)$. Conclude that EI rewards both a higher mean and a higher uncertainty.
+
+<details>
+<summary>Solution</summary>
+
+With $d = \mu - f^+ - \xi$ and $z = d/\sigma$: $\partial z/\partial\mu = 1/\sigma$ and
+$\partial z/\partial\sigma = -d/\sigma^2 = -z/\sigma$. Using $\varphi'(z) = -z\varphi(z)$,
+$\partial_\mu\mathrm{EI} = \Phi(z) + d\,\varphi(z)/\sigma + \sigma(-z\varphi(z))/\sigma = \Phi(z) +
+z\varphi - z\varphi = \Phi(z)$. And $\partial_\sigma\mathrm{EI} = d\,\varphi(z)(-z/\sigma) +
+\varphi(z) + \sigma(-z\varphi(z))(-z/\sigma) = -z^2\varphi + \varphi + z^2\varphi = \varphi(z)$. Both
+are positive, so at equal mean the more uncertain point has higher EI, and at equal uncertainty
+the higher mean wins.
+</details>
+
+**6.2** Show that EI is zero at an evaluated point in the noise-free case, and explain why this
+means noise-free EI never re-evaluates a point.
+
+<details>
+<summary>Solution</summary>
+
+With no noise, $\mu(x_i) = y_i \le f^+$ and $\sigma(x_i) = 0$, so $\mathrm{EI}(x_i) = \max(y_i - f^+, 0) =
+0$. Every unevaluated point has $\sigma > 0$ and hence $\mathrm{EI} > 0$ (because $\sigma\varphi(z) >
+0$ and $d\Phi(z) + \sigma\varphi(z) = \sigma\big(z\Phi(z) + \varphi(z)\big) > 0$ for all $z$). So an
+evaluated point is never the maximiser. With noise, re-evaluating can be useful, and the
+modifications in the practice list handle it.
+</details>
+
+**6.3** Prove that $z\Phi(z) + \varphi(z) > 0$ for all real $z$, the fact used above.
+
+<details>
+<summary>Solution</summary>
+
+Let $g(z) = z\Phi(z) + \varphi(z)$. Then $g'(z) = \Phi(z) + z\varphi(z) - z\varphi(z) = \Phi(z) > 0$, so
+$g$ is increasing. As $z \to -\infty$, $\varphi(z)/\lvert z\rvert \to 0$ and Mills' ratio gives
+$\Phi(z) \approx \varphi(z)/\lvert z\rvert$, so $g(z) \to 0$. An increasing function with limit $0$ at
+$-\infty$ is positive everywhere.
+</details>
+
+**6.4** In the figure, set the acquisition to UCB and $\kappa = 0$. What happens and why? Then try
+$\kappa = 5$.
+
+<details>
+<summary>Solution</summary>
+
+With $\kappa = 0$ UCB is the posterior mean, pure exploitation. With almost no noise the mean is
+largest at the incumbent itself, $x = 0.5$, so UCB re-evaluates $x = 0.5$ at every iteration and
+learns nothing: the best value stays at $-0.909$ for all 20 iterations. With $\kappa = 5$ it is
+close to pure uncertainty sampling: its first evaluations (0.310, 0.700, 0.160, 0.820, 0.605,
+0.400, ...) go wherever $\sigma$ is largest, covering the domain before concentrating near $0.757$.
+It still finds the maximum, here in 13 evaluations, but in more dimensions this covering phase
+would be prohibitively long. Moderate $\kappa$ balances the two.
+</details>
+
+**6.5** Explain why Thompson sampling never chooses a point $x$ for which $P(x = \arg\max f \mid D)
+= 0$, and why this makes it naturally parallel: how would you choose a batch of $q$ points?
+
+<details>
+<summary>Solution</summary>
+
+$x_{\text{next}}$ is the argmax of a posterior sample, so the probability of choosing $x$ is the
+posterior probability that $x$ is the argmax; if that is zero, $x$ is never chosen. For a batch,
+draw $q$ independent posterior samples and take each one's argmax. The draws are different, so the
+points are diverse without any coordination.
+</details>
+
+## Summary
+
+- **Posterior ∝ likelihood × prior.** Bayes' theorem follows from the product rule; yesterday's
+  posterior is today's prior, so sequential and batch updating agree.
+- **Conjugate priors act as pseudo-data.** A $\mathrm{Beta}(a, b)$ prior is worth $a + b$ flips; the
+  posterior mean is a weighted average of the prior mean and the MLE, with the weight on data
+  growing with $n$.
+- **Summaries are decisions.** Squared loss gives the posterior mean, absolute loss the median, 0–1
+  loss the mode. MAP with a Gaussian prior is ridge regression, and with a Laplace prior the lasso.
+- **Predictions average over uncertainty.** The posterior predictive is wider than a plug-in
+  prediction, and in Bayesian linear regression and GPs the variance grows away from the data.
+- **The evidence scores models and picks hyperparameters,** with a built-in Occam's razor.
+  Bayesian optimisation puts all of this to work: a GP posterior, maximised evidence for its
+  kernel, and an acquisition such as EI, $d\,\Phi(z) + \sigma\varphi(z)$, that trades the mean against
+  the uncertainty to choose each expensive evaluation.
+
+## References
+
+- A. Gelman, J. B. Carlin, H. S. Stern, D. B. Dunson, A. Vehtari and D. B. Rubin, *Bayesian Data
+  Analysis*, 3rd ed., CRC Press, 2013. Chapters 2–3 (single- and multi-parameter models) and 4
+  (asymptotics, Laplace).
+- C. M. Bishop, *Pattern Recognition and Machine Learning*, Springer, 2006. §2.1–2.4 (conjugate
+  priors, exponential family), §3.3–3.4 (Bayesian linear regression, evidence), §4.4 (Laplace,
+  BIC).
+- C. E. Rasmussen and C. K. I. Williams, *Gaussian Processes for Machine Learning*, MIT Press,
+  2006. Eq. 2.30 (log marginal likelihood) and chapter 5 (model selection).
+- R. E. Kass and A. E. Raftery, "Bayes Factors", *Journal of the American Statistical Association*
+  90(430), 1995.
+- G. Schwarz, "Estimating the Dimension of a Model", *Annals of Statistics* 6(2), 1978.
+- H. Jeffreys, "An Invariant Form for the Prior Probability in Estimation Problems", *Proceedings
+  of the Royal Society A* 186, 1946.
+- H. J. Kushner, "A New Method of Locating the Maximum Point of an Arbitrary Multipeak Curve in the
+  Presence of Noise", *Journal of Basic Engineering* 86(1), 1964.
+- J. Mockus, V. Tiesis and A. Žilinskas, "The Application of Bayesian Methods for Seeking the
+  Extremum", *Towards Global Optimization* 2, 1978.
+- D. R. Jones, M. Schonlau and W. J. Welch, "Efficient Global Optimization of Expensive Black-Box
+  Functions", *Journal of Global Optimization* 13, 1998.
+- N. Srinivas, A. Krause, S. M. Kakade and M. Seeger, "Gaussian Process Optimization in the Bandit
+  Setting: No Regret and Experimental Design", ICML 2010.
+- W. R. Thompson, "On the Likelihood that One Unknown Probability Exceeds Another in View of the
+  Evidence of Two Samples", *Biometrika* 25(3/4), 1933.
+- J. Snoek, H. Larochelle and R. P. Adams, "Practical Bayesian Optimization of Machine Learning
+  Algorithms", NeurIPS 2012.
+- B. Shahriari, K. Swersky, Z. Wang, R. P. Adams and N. de Freitas, "Taking the Human Out of the
+  Loop: A Review of Bayesian Optimization", *Proceedings of the IEEE* 104(1), 2016.
+- P. I. Frazier, "A Tutorial on Bayesian Optimization", arXiv:1807.02811, 2018.
+- A. Forrester, A. Sóbester and A. Keane, *Engineering Design via Surrogate Modelling*, Wiley, 2008.

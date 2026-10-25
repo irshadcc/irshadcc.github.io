@@ -1,0 +1,131 @@
+---
+// Step-through deferred acceptance (Gale–Shapley). Proposers on the left, receivers on the
+// right, each with its preference list (best first). Each step, the first free proposer proposes
+// to the best receiver it has not tried yet: a dashed blue line if the receiver holds the offer,
+// red if it rejects. Green lines are the offers currently held; letters already tried are struck
+// out, and each receiver's held proposer is in bold. The last step lists the blocking pairs of
+// the result (none: it is stable). Logic in gameTheory.ts (`galeShapley`, `blockingPairs`).
+// Usage in .mdx:
+//   <GaleShapleySteps />
+//   <GaleShapleySteps receiversPropose />
+import Player from "../sampling/Player.astro";
+import "../sampling/sampling.css";
+import "./gametheory.css";
+import { blockingPairs, galeShapley, matchingExample } from "./gameTheory";
+
+interface Props {
+	/** Run the algorithm with the receivers proposing instead. */
+	receiversPropose?: boolean;
+	title?: string;
+	caption?: string;
+}
+
+const { receiversPropose = false, title, caption } = Astro.props;
+const M = matchingExample;
+const [prop, recv, pNames, rNames] = receiversPropose
+	? [M.recv, M.prop, M.rNames, M.pNames]
+	: [M.prop, M.recv, M.pNames, M.rNames];
+const run = galeShapley(prop, recv, pNames, rNames);
+const blocking = blockingPairs(prop, recv, run.match);
+const data = {
+	prop,
+	recv,
+	pNames,
+	rNames,
+	steps: run.steps,
+	match: run.match,
+	blocking,
+};
+---
+
+<figure class="smp-fig gt-gs" data-gs={JSON.stringify(data)}>
+	{title && <div class="smp-title">{title}</div>}
+	<div class="smp-legend">
+		<span><i class="gt-k-row" style="border-top-style: dashed"></i>proposal held</span>
+		<span><i style="border-color: var(--smp-bad); border-top-style: dotted"></i>proposal rejected</span>
+		<span><i style="border-color: var(--gt-ne); border-top-width: 3px"></i>offers held</span>
+	</div>
+	<svg class="smp-svg" viewBox="0 0 640 270" role="img" aria-label="Deferred acceptance step by step"></svg>
+	<div class="smp-controls">
+		<Player />
+		<span class="smp-count"></span>
+	</div>
+	<p class="smp-narration"></p>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import type { GsStep } from "./gameTheory";
+	import { bindPlayer, el } from "../sampling/plot";
+
+	interface Data {
+		prop: number[][];
+		recv: number[][];
+		pNames: string[];
+		rNames: string[];
+		steps: GsStep[];
+		match: number[];
+		blocking: [number, number][];
+	}
+
+	function attach(fig: HTMLElement) {
+		const svg = fig.querySelector("svg")!;
+		const d = JSON.parse(fig.dataset.gs!) as Data;
+		const say = fig.querySelector(".smp-narration")!;
+		const n = d.prop.length;
+		const y = (i: number) => 50 + i * 58;
+		const XL = 230;
+		const XR = 410;
+		let k = 0;
+
+		function draw() {
+			svg.replaceChildren();
+			el("text", { x: XL, y: 20, class: "smp-label", "text-anchor": "middle" }, svg, "proposers");
+			el("text", { x: XR, y: 20, class: "smp-label", "text-anchor": "middle" }, svg, "receivers");
+			el("text", { x: 30, y: 20, class: "smp-label" }, svg, "ranking");
+			el("text", { x: 610, y: 20, class: "smp-label", "text-anchor": "end" }, svg, "ranking");
+			const engaged = k ? d.steps[k - 1].engaged : new Array(n).fill(-1);
+			const tried = new Array(n).fill(0);
+			for (const s of d.steps.slice(0, k)) tried[s.proposer]++;
+			// Held offers.
+			engaged.forEach((p: number, t: number) => {
+				if (p >= 0) el("path", { d: `M${XL + 14},${y(p)}L${XR - 14},${y(t)}`, class: "gt-match" }, svg);
+			});
+			const cur = k ? d.steps[k - 1] : null;
+			if (cur)
+				el("path", { d: `M${XL + 14},${y(cur.proposer)}L${XR - 14},${y(cur.target)}`, class: cur.accepted ? "gt-propose" : "gt-reject" }, svg);
+			for (let i = 0; i < n; i++) {
+				el("circle", { cx: XL, cy: y(i), r: 13, class: "gt-node gt-p0" }, svg);
+				el("text", { x: XL, y: y(i) + 4, class: "smp-text", "text-anchor": "middle" }, svg, d.pNames[i]);
+				d.prop[i].forEach((t, r) => {
+					const cls = r < tried[i] - (engaged.includes(i) ? 1 : 0) ? "gt-pref gt-pref-gone" : engaged[t] === i ? "gt-pref gt-pref-on" : "gt-pref";
+					el("text", { x: 30 + r * 26, y: y(i) + 4, class: cls }, svg, d.rNames[t]);
+				});
+				el("circle", { cx: XR, cy: y(i), r: 13, class: "gt-node gt-p1" }, svg);
+				el("text", { x: XR, y: y(i) + 4, class: "smp-text", "text-anchor": "middle" }, svg, d.rNames[i]);
+				d.recv[i].forEach((p, r) => {
+					el("text", { x: 610 - (n - 1 - r) * 26, y: y(i) + 4, class: engaged[i] === p ? "gt-pref gt-pref-on" : "gt-pref", "text-anchor": "end" }, svg, d.pNames[p]);
+				});
+			}
+			fig.querySelector(".smp-count")!.textContent = `step ${k} of ${d.steps.length}`;
+			let text = k === 0 ? "Everyone is free. Press next: the first free proposer proposes to the top of its list." : (cur?.text ?? "");
+			if (k === d.steps.length) {
+				const pairs = d.match.map((t, p) => `${d.pNames[p]}–${d.rNames[t]}`).join(", ");
+				text += ` Nobody is free: the matching is ${pairs}. Blocking pairs: ${d.blocking.length ? d.blocking.map(([p, t]) => `${d.pNames[p]}–${d.rNames[t]}`).join(", ") : "none, so it is stable"}.`;
+			}
+			say.textContent = text;
+		}
+
+		bindPlayer(fig, (dir) => {
+			k = Math.max(0, Math.min(d.steps.length, k + dir));
+			draw();
+			return k < d.steps.length;
+		}, () => {
+			k = 0;
+			draw();
+		}, 1400);
+		draw();
+	}
+
+	document.querySelectorAll<HTMLElement>(".gt-gs").forEach(attach);
+</script>
