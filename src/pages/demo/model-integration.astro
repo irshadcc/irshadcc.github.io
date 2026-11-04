@@ -1,0 +1,49 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import GraphDispatch from "../../utils/compiler/GraphDispatch.astro";
+import DecodeStepKernels from "../../utils/inference/DecodeStepKernels.astro";
+import KvWriteMap from "../../utils/inference/KvWriteMap.astro";
+---
+
+<Layout title="CUDA graph dispatch and KV write map demo">
+	<h1>CUDA graph dispatch and KV write map demo</h1>
+	<p>
+		<code>GraphDispatch</code> shows which CUDA graph vLLM or SGLang replays for one step of a 3-layer decoder
+		(rules in <code>graphDispatch.ts</code>). <code>KvWriteMap</code> shows which thread of vLLM's
+		<code>reshape_and_cache_flash</code> or SGLang's <code>store_kvcache_kernel</code> copies which 16-byte
+		vector of one token's key and value (logic in <code>kvWriteMap.ts</code>).
+	</p>
+
+	<h2>vLLM, decode batch of 13</h2>
+	<GraphDispatch />
+
+	<h2>vLLM, mixed batch of 13 tokens (piecewise)</h2>
+	<GraphDispatch kind="mixed" tokens={13} title="vLLM piecewise graphs" />
+
+	<h2>vLLM above the largest capture size</h2>
+	<GraphDispatch kind="mixed" tokens={600} title="600 tokens: no graph" />
+
+	<h2>SGLang prefill of 300 tokens (breakable graph)</h2>
+	<GraphDispatch engine="sglang" kind="mixed" tokens={300} title="SGLang breakable prefill graph" />
+
+	<h2>SGLang decode above max_bs</h2>
+	<GraphDispatch engine="sglang" kind="decode" tokens={300} />
+
+	<h2>vLLM write, TP = 4</h2>
+	<KvWriteMap />
+
+	<h2>vLLM write, TP = 1</h2>
+	<KvWriteMap preset="tp1" cacheSlot={5} title="vLLM, 8 KV heads" />
+
+	<h2>SGLang write, TP = 1</h2>
+	<KvWriteMap kernel="sglang" preset="tp1" title="SGLang, 8 KV heads" />
+
+	<h2>Decode step, vLLM, B reads the shared page</h2>
+	<DecodeStepKernels step={7} />
+
+	<h2>Decode step, SGLang Triton backend, at the merge</h2>
+	<DecodeStepKernels engine="sglang" step={8} />
+
+	<h2>Edge case: slot 0</h2>
+	<KvWriteMap kernel="sglang" cacheSlot={0} />
+</Layout>

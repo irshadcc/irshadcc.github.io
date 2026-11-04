@@ -1,0 +1,1013 @@
+---
+title: "How Models Plug into vLLM and SGLang: Attention Layers, Compilation and KV Cache Kernels"
+description: "How a model file in vLLM or SGLang reaches the paged KV cache and the radix cache without ever indexing them, how each engine rewrites or wraps model code (its own layers, the Transformers backend, custom ops, torch.compile and CUDA graphs), and the CUDA and Triton kernels that turn a scheduler's decision into bytes in the cache, read from the source."
+date: 2026-11-01
+tags: [Inference, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import BoxDiagram from "../../utils/payments/BoxDiagram.astro";
+import PagedAddress from "../../utils/inference/PagedAddress.astro";
+import RadixTreeSteps from "../../utils/inference/RadixTreeSteps.astro";
+import KvWriteMap from "../../utils/inference/KvWriteMap.astro";
+import GraphDispatch from "../../utils/compiler/GraphDispatch.astro";
+import DecodeStepKernels from "../../utils/inference/DecodeStepKernels.astro";
+import { integrationNodes, integrationEdges } from "../../utils/inference/modelIntegrationFigures";
+
+## Background
+
+A Hugging Face model file computes attention over a `past_key_values` object that grows by
+concatenation: every request owns its own tensors, padded to the longest request in the batch.
+A serving engine cannot work that way. It keeps one big **KV cache** per layer (the key and value
+vectors of every cached token), carves it into pages, shares pages between requests with a common
+prefix, and runs a batch whose requests have different lengths without padding.
+[The KV cache post](/blog/kv-cache-and-paged-attention/) explains why; the
+[vLLM](/blog/vllm-internals/) and [SGLang](/blog/sglang-internals/) posts follow a request through
+each engine.
+
+This post looks at the seam between the model and the engine. The question is practical: when
+vLLM or SGLang supports a new architecture, what in the model code is new, and what is the
+engine's? How does a `LlamaAttention` module, which only computes `q`, `k` and `v`, end up
+writing into a paged cache or a radix tree's slots? And how do the engines replace pieces of the
+model (linear layers, norms, attention) with their own, at load time, at trace time and at run
+time?
+
+The post has four parts. **The contract** shows what a model file contains in each engine and how
+the engine finds it. **Reaching the KV cache** follows the one layer that touches the cache, and
+the Transformers fallback that lets unmodified Hugging Face models use it. **Compilation** covers
+vLLM's `torch.compile` pipeline and SGLang's CUDA-graph-first approach. **The GPU code** reads the
+kernels that turn the scheduler's block table or radix tree match into bytes in the cache:
+vLLM's `slot_mapping` and `reshape_and_cache_flash`, SGLang's `req_to_token`, paged allocator and
+`store_kvcache_kernel`.<Sidenote>Code links point to vLLM commit
+[`54beee8`](https://github.com/vllm-project/vllm/tree/54beee831b0fd2df2a19967b7dcea661c32044c5)
+and SGLang commit
+[`5eb7018`](https://github.com/sgl-project/sglang/tree/5eb70183472d56326920e70a4dde5cfbabe6f376),
+both from 31 October 2026. Both codebases change weekly; the older posts on this blog were read at
+earlier commits, and a few things (SGLang's CUDA graph backends, its Rust radix tree) have changed
+since. The kernels were read and emulated on a CPU, not run on a GPU.</Sidenote>
+
+## The contract between a model and an engine
+
+Both engines split the work the same way. The **model file** describes the network: its layers,
+their order, how checkpoint weights map onto parameters. The **engine** owns everything about
+batching and memory: which tokens run this step, where each token's keys and values live, which
+attention kernel runs, and how the forward pass is compiled and replayed. The two meet in exactly
+one place, the attention layer.
+
+<BoxDiagram
+	nodes={integrationNodes}
+	edges={integrationEdges}
+	selected="attn"
+	grid={{ cellW: 150, gapX: 56, gapY: 46 }}
+	title="What the model owns (top left) and what the engine owns"
+	hint="Click a box to read what it does."
+/>
+
+Click the boxes from left to right along the top row: the model hands `q`, `k`, `v` to the
+attention layer, which hands them to a backend, which reads and writes the cache. The bottom row
+is the rest of the engine: the scheduler's decisions (right) pass through the model runner and
+reach the attention layer only as per-step metadata (dashed arrow), and the compiler (left) wraps
+the model's `forward` without changing its source.
+
+### What a model file looks like
+
+Neither engine runs the Hugging Face modeling code for its natively supported models. Each keeps
+its own copy of every architecture: vLLM has about 300 files in
+[`vllm/model_executor/models/`](https://github.com/vllm-project/vllm/tree/54beee831b0fd2df2a19967b7dcea661c32044c5/vllm/model_executor/models),
+SGLang about 260 in
+[`python/sglang/srt/models/`](https://github.com/sgl-project/sglang/tree/5eb70183472d56326920e70a4dde5cfbabe6f376/python/sglang/srt/models).
+The reason is that the Hugging Face code is written for one request at a time and for training:
+it pads, it concatenates caches, and its `nn.Linear` layers know nothing about tensor parallelism
+or quantized weights. Rewriting the file is simpler than patching it.
+
+Here is vLLM's Llama attention
+([`llama.py`](https://github.com/vllm-project/vllm/blob/54beee831b0fd2df2a19967b7dcea661c32044c5/vllm/model_executor/models/llama.py#L125)),
+trimmed to the parts that matter:
+
+```python
+class LlamaAttention(nn.Module):
+    def __init__(self, config, hidden_size, num_heads, num_kv_heads, ..., prefix=""):
+        self.qkv_proj = QKVParallelLinear(hidden_size, self.head_dim, self.total_num_heads,
+                                          self.total_num_kv_heads, quant_config=quant_config,
+                                          prefix=f"{prefix}.qkv_proj")
+        self.o_proj = RowParallelLinear(self.total_num_heads * self.head_dim, hidden_size,
+                                        quant_config=quant_config, prefix=f"{prefix}.o_proj")
+        self.rotary_emb = get_rope(...)
+        self.attn = Attention(self.num_heads, self.head_dim, self.scaling,
+                              num_kv_heads=self.num_kv_heads, cache_config=cache_config,
+                              quant_config=quant_config, prefix=f"{prefix}.attn")
+
+    def forward(self, positions, hidden_states):
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k = self.rotary_emb(positions, q, k)
+        attn_output = self.attn(q, k, v)
+        output, _ = self.o_proj(attn_output)
+        return output
+```
+
+And SGLang's
+([`llama.py`](https://github.com/sgl-project/sglang/blob/5eb70183472d56326920e70a4dde5cfbabe6f376/python/sglang/srt/models/llama.py#L160)):
+
+```python
+class LlamaAttention(nn.Module):
+    def __init__(self, config, hidden_size, num_heads, num_kv_heads, layer_id=0, ..., prefix=""):
+        self.qkv_proj = QKVParallelLinear(...)
+        self.o_proj = RowParallelLinear(...)
+        self.rotary_emb = get_rope(...)
+        self.attn = RadixAttention(self.num_heads, self.head_dim, self.scaling,
+                                   num_kv_heads=self.num_kv_heads, layer_id=layer_id,
+                                   quant_config=quant_config, prefix=add_prefix("attn", prefix))
+
+    def forward(self, positions, hidden_states, forward_batch: ForwardBatch):
+        q, k, v = self.forward_prepare_native(positions=positions, hidden_states=hidden_states)
+        attn_output = self.attn(q, k, v, forward_batch)
+        output, _ = self.o_proj(attn_output)
+        return output
+```
+
+Three things are worth noticing.
+
+1. **The input is flat.** `hidden_states` has shape `[num_tokens, hidden_size]`: all requests'
+   new tokens concatenated, with no batch dimension and no padding. `positions` says where each
+   token sits in its own sequence, which is all RoPE needs.
+2. **The layers are the engine's.** `QKVParallelLinear` fuses the three projections into one
+   matrix multiplication and shards it over tensor-parallel ranks (each rank holds
+   `num_heads / tp` query heads); `RowParallelLinear` all-reduces its output. Both take a
+   `quant_config`, so the same model file runs FP8, AWQ or GPTQ checkpoints. The model author
+   writes no parallel or quantization code.
+3. **The cache is not an argument.** The model passes `q`, `k`, `v` to the attention layer and
+   gets the output back. vLLM passes nothing else; SGLang passes one object, `forward_batch`, down
+   every layer. Neither model ever indexes a cache tensor.
+
+The `prefix` string matters more than it looks. It is the module's dotted name in the checkpoint
+(`model.layers.3.self_attn.attn`), and vLLM uses it as the attention layer's identity at run time,
+as the next section shows.
+
+### Weights: fused layers, original names
+
+Fusing `q_proj`, `k_proj` and `v_proj` into one `qkv_proj` means the checkpoint's three tensors
+must be written into slices of one parameter. vLLM declares the mapping on the class
+(`packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"], "gate_up_proj":
+["gate_proj", "up_proj"]}`) and on the model's `WeightsMapper`; at load time each checkpoint
+tensor's name is rewritten (`.q_proj` → `.qkv_proj`, shard `"q"`) and the parameter's
+`weight_loader` copies it into the right rows, after slicing out this rank's shard. SGLang does
+the same with a `stacked_params_mapping` list and `weight_loader` methods on its linear layers.
+The mapping is also what LoRA and quantization configs read, since their checkpoints use the
+original names.
+
+### How the engine finds the model
+
+The checkpoint's `config.json` names an architecture, for example `"architectures":
+["LlamaForCausalLM"]`. Each engine looks it up in a registry.
+
+- **vLLM** keeps a table from architecture name to `(module, class)`
+  ([`registry.py`](https://github.com/vllm-project/vllm/blob/54beee831b0fd2df2a19967b7dcea661c32044c5/vllm/model_executor/models/registry.py#L1447)):
+  `"LlamaForCausalLM": ("llama", "LlamaForCausalLM")`, and so on for every name that reuses the
+  Llama file (InternLM3, several fine-tunes). The module is imported lazily, only when chosen.
+  Out-of-tree models are added with `ModelRegistry.register_model("MyArch",
+  "my_pkg.my_model:MyForCausalLM")`, usually from a plugin's entry point.
+- **SGLang** imports every module in `sglang.srt.models` and reads its `EntryClass`
+  ([`registry.py`](https://github.com/sgl-project/sglang/blob/5eb70183472d56326920e70a4dde5cfbabe6f376/python/sglang/srt/models/registry.py#L118)):
+  `llama.py` ends with `EntryClass = [LlamaForCausalLM, Phi3ForCausalLM, ...]`, and the class
+  name is the architecture name. `SGLANG_EXTERNAL_MODEL_PACKAGE` points it at another package.
+
+When no native class matches, both fall back to a **Transformers backend**: a wrapper that runs
+the Hugging Face model itself, with the engine's attention spliced in. vLLM does this when
+`model_impl` is `"auto"` and the architecture is unknown, or always with `--model-impl
+transformers`; SGLang appends `"TransformersForCausalLM"` to the candidates whenever an
+architecture is missing. How that splice works is the end of the next section.
+
+## Reaching the KV cache from inside the model
+
+The attention layer is the only module that needs the cache, the per-step metadata (which slot
+each new token writes, how long each request is) and the attention kernel. The two engines give it
+those three things in different ways.
+
+### vLLM: a layer registry and a forward context
+
+vLLM's
+[`Attention`](https://github.com/vllm-project/vllm/blob/54beee831b0fd2df2a19967b7dcea661c32044c5/vllm/model_executor/layers/attention/attention.py#L229)
+does three things in its constructor:
+
+```python
+        impl_cls = self.attn_backend.get_impl_cls()
+        self.impl = impl_cls(num_heads, head_size, scale, num_kv_heads, ...)
+        ...
+        compilation_config = vllm_config.compilation_config
+        if prefix in compilation_config.static_forward_context:
+            raise ValueError(f"Duplicate layer name: {prefix}")
+        compilation_config.static_forward_context[prefix] = self
+        ...
+        # use a placeholder kv cache tensor during init, which will be replaced
+        # by bind_kv_cache
+        self.kv_cache = torch.tensor([])
+```
+
+It picks an **attention backend** (FlashAttention, FlashInfer, Triton, ...) for this GPU and
+model, and instantiates its implementation. It registers itself in a dictionary,
+`static_forward_context`, under its prefix: `model.layers.3.self_attn.attn` maps to this module.
+And it holds an empty placeholder where the cache will go, because at construction time nobody
+knows how big the cache can be.
+
+After loading, the worker runs a profiling forward pass, measures the memory left over, and
+allocates the cache. Then
+[`bind_kv_cache`](https://github.com/vllm-project/vllm/blob/54beee831b0fd2df2a19967b7dcea661c32044c5/vllm/v1/worker/utils.py#L811)
+walks the same dictionary and calls `forward_context[layer_name].bind_kv_cache(kv_cache)`, so each
+layer's `self.kv_cache` becomes a view of its own slice of that allocation.
+
+The per-step metadata arrives differently. Before each forward pass the model runner enters
+`set_forward_context(attn_metadata, ..., slot_mapping=...)`, a context manager that publishes a
+`ForwardContext` object holding, per layer name, the backend's metadata (query start offsets,
+sequence lengths, block tables) and the `slot_mapping` tensor (the cache slot each new token
+writes). The attention layer's `forward` reads none of it directly. It reshapes `q`, `k`, `v` and
+calls two custom operators:
+
+```python
+        kv_cache_dummy_dep = torch.ops.vllm.unified_kv_cache_update(key, value, encoded)
+        torch.ops.vllm.unified_attention_with_output(
+            query, key, value, output, encoded, kv_cache_dummy_dep=kv_cache_dummy_dep)
+```
+
+`encoded` is the layer's name. Inside each operator,
+[`get_attention_context`](https://github.com/vllm-project/vllm/blob/54beee831b0fd2df2a19967b7dcea661c32044c5/vllm/model_executor/layers/attention/attention.py#L690)
+looks the name up:
+
+```python
+    forward_context: ForwardContext = get_forward_context()
+    attn_metadata = forward_context.attn_metadata[layer_name]
+    attn_layer = forward_context.no_compile_layers[layer_name]
+    kv_cache = attn_layer.kv_cache
+    layer_slot_mapping = forward_context.slot_mapping.get(layer_name)
+```
+
+and then calls `attn_layer.impl.do_kv_cache_update(...)` (the write) or
+`attn_layer.impl.forward(...)` (the read).
+
+Why route a module call through a string and a global? Because of the compiler. `torch.compile`
+traces the model into a graph, and a graph cannot hold "this module's `self.kv_cache`, which is
+rebound at start-up" or "whatever the scheduler decided this step". By making attention two
+opaque custom operators whose only non-tensor input is a constant string, vLLM gets a graph that
+is the same for every step and every layer shape: the cache and the metadata are found at run
+time, behind the operator boundary. The `kv_cache_dummy_dep` output exists only to give the
+compiler a data dependency, so it cannot reorder the write after the read.<Sidenote>On platforms
+where `current_platform.opaque_attention_op()` is false, `use_direct_call` is set and the layer
+calls the two Python functions directly, letting `torch.compile` trace into the backend. On CUDA,
+ROCm and CPU the operators are opaque.</Sidenote>
+
+### SGLang: pass the batch, index by layer id
+
+SGLang's
+[`RadixAttention`](https://github.com/sgl-project/sglang/blob/5eb70183472d56326920e70a4dde5cfbabe6f376/python/sglang/srt/layers/radix_attention.py#L60)
+is a thin module. It stores the layer's shape and its integer `layer_id`, and its `forward` ends
+with:
+
+```python
+        return get_attn_backend().forward(q, k, v, self, forward_batch, save_kv_cache, **kwargs)
+```
+
+The model passes the `ForwardBatch` down every layer as an argument. It holds what vLLM keeps in
+its forward context: `out_cache_loc` (the slot each new token writes), `req_pool_indices` (each
+request's row in the `req_to_token` table), `seq_lens`, and the forward mode (decode, extend,
+mixed). The backend object comes from a module-level forward context, set once per model runner.
+
+The backend's `forward` dispatches on the mode
+([`base_attn_backend.py`](https://github.com/sgl-project/sglang/blob/5eb70183472d56326920e70a4dde5cfbabe6f376/python/sglang/srt/layers/attention/base_attn_backend.py#L374))
+to `forward_decode` or `forward_extend`. Each of those first writes the new keys and values, then
+runs the kernel. In the FlashAttention backend the write is:
+
+```python
+            self.kv_layers.layer(layer.layer_id).store(
+                layer,
+                KVWriteLoc.for_layer(forward_batch, layer, swa_loc=...),
+                k, v, k_scale, v_scale,
+            )
+```
+
+So SGLang finds the cache by the layer's integer id inside the KV pool, and the metadata by an
+explicit argument. No string lookup is needed, because SGLang does not trace the model with
+`torch.compile` by default, as the compilation section explains.
+
+### The two side by side
+
+| | vLLM | SGLang |
+| --- | --- | --- |
+| Model's attention module | `Attention(num_heads, head_dim, scale, num_kv_heads, prefix=...)` | `RadixAttention(num_heads, head_dim, scale, num_kv_heads, layer_id=...)` |
+| Call from the model | `self.attn(q, k, v)` | `self.attn(q, k, v, forward_batch)` |
+| Layer identity | dotted prefix string | integer `layer_id` |
+| How the layer finds its cache | `self.kv_cache`, bound by `bind_kv_cache` | `token_to_kv_pool`, indexed by `layer_id` |
+| How it finds the step's metadata | `get_forward_context()[layer_name]` | `forward_batch` argument |
+| Where new tokens are written | `slot_mapping[i]` (block × block_size + offset) | `out_cache_loc[i]` (a slot id) |
+| What the compiler sees | two opaque custom ops per layer | the backend's Python, when compiled at all |
+
+The scheduler's data structures (vLLM's block table and block hashes, SGLang's radix tree) do not
+appear anywhere in this table. By the time the model runs, a prefix-cache hit has become nothing
+more than "these tokens are already in the cache, so the attention kernel reads their slots and
+the write kernel skips them". That is why both engines can add prefix caching, cache offloading
+or disaggregated serving without touching any model file.
+
+### Models the engine did not write: the Transformers backend
+
+The fallback for an architecture neither engine has rewritten is the most direct answer to "how do
+they modify model code": they instantiate the Hugging Face model and replace parts of it.
+
+vLLM's
+[`recursive_replace`](https://github.com/vllm-project/vllm/blob/54beee831b0fd2df2a19967b7dcea661c32044c5/vllm/model_executor/models/transformers/base.py#L478)
+builds the model with `AutoModel.from_config` on the `meta` device (no memory allocated), then
+walks its module tree:
+
+```python
+                if isinstance(child_module, nn.Linear):
+                    pattern = next((p for p in tp_plan if re.match(p, qual_name)), None)
+                    style = tp_plan.get(pattern, "replicate")
+                    new_module = replace_linear_class(child_module, style, self.quant_config, prefix=qual_name)
+                elif isinstance(child_module, (nn.Conv2d, nn.Conv3d)):
+                    new_module = replace_conv_class(child_module)
+                elif child_module in vocab_embeddings:
+                    new_module = replace_embedding_class(child_module, self.quant_config, prefix=qual_name)
+                elif isinstance(child_module, nn.LayerNorm):
+                    new_module = replace_layernorm_class(child_module)
+                elif child_module_fusers := fusers[child_module]:
+                    for fuser in child_module_fusers:
+                        new_module = fuser.fuse(new_module, qual_name, self.vllm_config)
+```
+
+Each `nn.Linear` becomes a column-parallel, row-parallel or replicated vLLM linear, chosen by the
+model's own `base_model_tp_plan` (the tensor-parallel plan Hugging Face models now ship in their
+config). **Fusers** recognise patterns by their dataflow: three projections feeding attention
+become one `QKVParallelLinear`, a gate and up projection feeding `act(gate) * up` become one
+`MergedColumnParallelLinear`, an RMSNorm-shaped module becomes vLLM's `RMSNorm`.
+
+Attention is replaced without touching the module tree. Hugging Face models call attention through
+a registry, `ALL_ATTENTION_FUNCTIONS[config._attn_implementation]`, the same mechanism that selects
+`"sdpa"` or `"flash_attention_2"`. vLLM registers its own entry and selects it:
+
+```python
+ALL_ATTENTION_FUNCTIONS.register("vllm", vllm_attention_forward)   # transformers/__init__.py
+self.text_config._attn_implementation = "vllm"                       # transformers/base.py
+```
+
+`vllm_attention_forward(module, query, key, value, attention_mask, **kwargs)` ignores the mask,
+reshapes the `[1, heads, tokens, head_dim]` tensors to vLLM's flat layout, and calls
+`module.attn.forward(q, k, v)`: an ordinary vLLM `Attention` instance that the wrapper created
+per layer and attached to the Hugging Face attention module as `attn`. From there the path is the
+one above. SGLang does the same with `ALL_ATTENTION_FUNCTIONS["sglang"]`, a dictionary of
+`RadixAttention` instances indexed by `module.layer_idx`, and the `forward_batch` passed through
+the Hugging Face model's `**kwargs`
+([`transformers.py`](https://github.com/sgl-project/sglang/blob/5eb70183472d56326920e70a4dde5cfbabe6f376/python/sglang/srt/models/transformers.py#L306)).
+
+The two engines attach the instance differently for a reason vLLM's comment spells out: indexing a
+dictionary by `module.layer_idx`, an `int`, "bakes layer identity into the traced graph and so
+costs one compiled artifact per layer". Reading `module.attn` keeps one graph for all layers.
+SGLang, which does not trace by default, can afford the dictionary.
+
+## Compilation
+
+A decode step of Llama-3.1-8B must at least read its 16 GB of bf16 weights; at an H100's
+3.35 TB/s that takes about 4.8 ms. The step also launches about ten kernels per layer (two norms,
+four matrix multiplications, RoPE, the KV write, attention, the activation), over 300 for 32
+layers. At an assumed 5 µs of CPU time per launch from Python, that is about 1.6 ms of launching,
+a third of the GPU's floor, so at small batch sizes the GPU waits on the CPU. Two tools fix
+this. A **CUDA graph** records a sequence of kernel launches once and replays it with one call, as
+long as every tensor stays at the same address and shape. **torch.compile** traces the model into
+a graph and generates fused Triton kernels for the element-wise parts (norms, activations, RoPE),
+so there are fewer kernels to launch in the first place.
+
+vLLM uses both by default. SGLang uses CUDA graphs by default and `torch.compile` only when asked.
+
+### vLLM: trace once, drop the guards
+
+The decorator on `LlamaModel` is where compilation begins:
+
+```python
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": {0: "b"},
+        "positions": {0: "b"},
+        "intermediate_tensors": {0: "b"},
+        "inputs_embeds": {0: "b"},
+    },
+)
+class LlamaModel(nn.Module): ...
+```
+
+[`_support_torch_compile`](https://github.com/vllm-project/vllm/blob/54beee831b0fd2df2a19967b7dcea661c32044c5/vllm/compilation/decorators.py#L351)
+rewrites the class: it adds `TorchCompileWithNoGuardsWrapper` to its bases and wraps `__init__`
+and `__call__`. On the first call, the wrapper marks dimension 0 of each named input as dynamic
+(the number of tokens, `b`), lets Dynamo trace `forward` into an FX graph, and hands the graph to
+vLLM's own backend.
+
+The important part is in the wrapper's name. Normally `torch.compile` installs **guards**, checks
+run on every call that decide whether the cached graph still applies (same shapes, same Python
+values, same module attributes), and retraces when one fails. vLLM sets the guard filter to
+`torch.compiler.skip_all_guards_unsafe`:
+[`TorchCompileWithNoGuardsWrapper`](https://github.com/vllm-project/vllm/blob/54beee831b0fd2df2a19967b7dcea661c32044c5/vllm/compilation/wrapper.py#L64)
+"ensures that all guards are dropped ... the first time `__call__` is invoked, a single
+compilation is triggered. Dynamo should never be traced again after that". This is safe only
+because of the design in the previous section: everything that changes between steps (the cache,
+the metadata) lives behind the custom operators, so the traced graph really is the same every
+step. It also saves the cost of evaluating guards over a 32-layer model on every call.
+
+### Splitting the graph at attention
+
+The traced graph contains, per layer, the custom operators `unified_kv_cache_update` and
+`unified_attention_with_output`. vLLM's backend cuts the graph at them
+([`split_graph`](https://github.com/vllm-project/vllm/blob/54beee831b0fd2df2a19967b7dcea661c32044c5/vllm/compilation/backends.py#L576)):
+
+```python
+    for node in graph.graph.nodes:
+        ...
+        if should_split(node, splitting_ops):
+            subgraph_id += 1
+            node_to_subgraph_id[node] = subgraph_id
+            split_op_graphs.append(subgraph_id)
+            # keep consecutive splitting ops together
+            if should_split(node.next, splitting_ops):
+                subgraph_id -= 1
+            else:
+                subgraph_id += 1
+        else:
+            node_to_subgraph_id[node] = subgraph_id
+```
+
+Each node gets a subgraph number; a splitting op starts a new number and the node after it
+another, and two splitting ops in a row share one. The default splitting ops are the attention
+operators of every model family (`vllm::unified_attention_with_output`,
+`vllm::unified_mla_attention_with_output`, the Mamba mixers, linear attention, ...) plus the two
+KV-update operators
+([`compilation.py`](https://github.com/vllm-project/vllm/blob/54beee831b0fd2df2a19967b7dcea661c32044c5/vllm/config/compilation.py#L768)).
+For Llama the cache write and the attention sit next to each other, so each layer contributes one
+splitting piece, and a 32-layer model splits into 33 compiled pieces with 32 attention pieces
+between them.
+
+Each compiled piece goes to Inductor separately (a `PiecewiseBackend`), and when CUDA graphs are
+on, each is wrapped in a `CUDAGraphWrapper` that captures one graph per token count. Attention is
+kept out because its kernel's grid and loop bounds depend on the requests' lengths, which change
+every step even when the token count does not.
+
+### Swapping kernels: `CustomOp`
+
+Layers such as `RMSNorm`, `SiluAndMul` and `RotaryEmbedding` exist in two versions: a pure PyTorch
+`forward_native` and a hand-written kernel in `forward_cuda` (`forward_hip`, `forward_xpu`, ...).
+vLLM's
+[`CustomOp`](https://github.com/vllm-project/vllm/blob/54beee831b0fd2df2a19967b7dcea661c32044c5/vllm/model_executor/custom_op.py#L102)
+base class picks one when the layer is constructed:
+
+```python
+        enabled = self._enforce_enable or self.enabled()
+        if not enabled:
+            return self.maybe_compile(self.forward_native, enable=compile_native)
+        if current_platform.is_rocm():
+            return self.forward_hip
+        ...
+        else:
+            return self.forward_cuda
+```
+
+`enabled()` reads `compilation_config.custom_ops`, whose default is `"none"` when Inductor is
+the backend and `"all"` otherwise. So under `torch.compile` the norm is traced as ordinary PyTorch
+operations and Inductor fuses it with its neighbours (the residual add before it, a quantization
+after it) into one generated Triton kernel; in eager mode (`--enforce-eager`) the hand-written
+CUDA kernel runs instead. `+rms_norm` or `-silu_and_mul` in `custom_ops` overrides the default
+per op.
+
+Fusions that Inductor cannot find by itself are FX **pattern-matching passes**, run as Inductor's
+post-grad custom pass: `fuse_norm_quant` (RMSNorm followed by FP8 quantization into one kernel),
+`fuse_act_quant`, `fuse_attn_quant`, `fuse_allreduce_rms` (the tensor-parallel all-reduce and the
+following norm), `enable_qk_norm_rope_fusion`, `fuse_rope_kvcache` and others in `PassConfig`.
+Each registers a `pattern` function and a `replacement` function with Inductor's pattern matcher,
+which then rewrites every match in the traced graph. This is the third way vLLM changes model code:
+not in the source, not at load time, but in the traced graph.
+
+### CUDA graphs: which graph runs this step
+
+The CUDA graph mode defaults to `FULL_AND_PIECEWISE`. The two halves of the name are two kinds of
+graph, captured for the same list of token counts,
+`[1, 2, 4] + range(8, 256, 8) + range(256, 513, 16)`: 51 sizes up to
+`max_cudagraph_capture_size = 512` (1024 on data-center Blackwell).
+
+- A **FULL** graph covers the whole forward, attention included. `FULL_AND_PIECEWISE` uses it
+  for uniform decode batches (every request has one new token). The attention backend must
+  support capture: each declares a level, and FlashAttention 3 declares
+  `AttentionCGSupport.ALWAYS`, the highest.
+- **PIECEWISE** graphs are the per-piece graphs from the split above. A batch with prefill tokens
+  replays them one after another and runs the 32 attention pieces eagerly in between.
+- A batch with more than 512 tokens runs the compiled pieces without any graph.
+
+A batch whose token count is not a captured size is **padded** to the next one: 13 decode tokens
+replay the graph captured for 16, and the three dummy tokens get slot `-1`, which the cache-write
+kernel skips. Try it in the figure (3 layers instead of 32, to stay readable):
+
+<GraphDispatch />
+
+Set the batch to "with prefill tokens" and the single graph splits into four (G1 to G4) around
+three eager attention pieces; move the slider past 512 and every op is launched one by one. Switch
+the engine to SGLang for the next section.
+
+### SGLang: graphs first, compile on request
+
+SGLang does not trace the model by default (`enable_torch_compile = False`). Its speed in eager
+mode comes from hand-written kernels for each fused operation, and its launch overhead is removed by
+CUDA graphs captured from the model as written. The configuration has one backend per phase
+([`cuda_graph_config.py`](https://github.com/sgl-project/sglang/blob/5eb70183472d56326920e70a4dde5cfbabe6f376/python/sglang/srt/model_executor/cuda_graph_config.py#L146)):
+
+```python
+class CudaGraphConfig:
+    decode: PhaseConfig = field(default_factory=lambda: PhaseConfig(backend=Backend.FULL))
+    prefill: PhaseConfig = field(default_factory=lambda: PhaseConfig(backend=default_prefill_backend()))
+```
+
+`default_prefill_backend()` returns `"breakable"` on CUDA and `"disabled"` elsewhere.
+
+- **Decode** uses full graphs, one per batch size in `[1, 2, 4, 8, 12] + range(16, 257, 8) + ...`
+  up to `max_bs`, which the server sets from the GPU's memory: 256 on an 80 GB H100 at TP below 4,
+  512 at TP 4 or more, 32 on a 40 GB A100 at TP below 4. Before a replay the attention backend
+  copies this step's metadata into the graph's static buffers.
+- **Prefill** uses a **breakable CUDA graph**
+  ([`breakable_cuda_graph.py`](https://github.com/sgl-project/sglang/blob/5eb70183472d56326920e70a4dde5cfbabe6f376/python/sglang/srt/model_executor/runner_backend_utils/breakable_cuda_graph/breakable_cuda_graph.py#L239)):
+  a capture split into several `torch.cuda.CUDAGraph` segments at **break points**, functions
+  decorated with `@eager_on_graph`. During capture the decorated call is recorded but not
+  captured; during replay the segments replay and the break runs eagerly in between.
+  `RadixAttention._eager_attention` is such a break, so attention (and with it the KV write)
+  runs eagerly on the real tokens while everything else replays. Buckets are token counts from 4
+  to 2048.
+
+So SGLang's prefill graph has the same shape as vLLM's piecewise graph (graph, attention, graph,
+...), reached without a compiler: vLLM cuts an FX graph at custom operators, SGLang cuts a CUDA
+graph capture at decorated Python functions. SGLang's earlier piecewise backend built on
+`torch.compile` (`tc_piecewise`) has been removed; asking for it now raises "tc_piecewise was
+removed; select breakable, full, or disabled".
+
+With `--enable-torch-compile`, the decode graph runner compiles the model's forward for batch sizes
+up to `torch_compile_max_bs` (default 32) before capturing them
+([`patch_model`](https://github.com/sgl-project/sglang/blob/5eb70183472d56326920e70a4dde5cfbabe6f376/python/sglang/srt/compilation/torch_compile_decoration.py#L43)):
+
+```python
+        if enable_compile:
+            _to_torch(model, reverse=False, num_tokens=num_tokens)
+            yield torch.compile(torch.no_grad()(model.forward),
+                                mode=os.environ.get("SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"))
+```
+
+`_to_torch` walks the model and calls `enter_torch_compile` on every
+[`BaseFusedOp`](https://github.com/sgl-project/sglang/blob/5eb70183472d56326920e70a4dde5cfbabe6f376/python/sglang/kernels/fused_op.py#L327),
+SGLang's counterpart of `CustomOp`. That switches each fused operator to its `forward_native`
+(pure PyTorch) so Inductor can trace and fuse it, and `leave_torch_compile` switches it back after
+capture. Some operators (top-k, fused MoE) override `_torch_compile_forward` to keep their kernel,
+because compiling the native path is slower for them.
+
+### The two pipelines compared
+
+| | vLLM (defaults) | SGLang (defaults) |
+| --- | --- | --- |
+| `torch.compile` | on: Dynamo traces once, guards dropped, Inductor per piece | off; `--enable-torch-compile` compiles decode sizes ≤ 32 |
+| Element-wise ops (norm, act, RoPE) | traced `forward_native`, fused by Inductor | hand-written kernels (`BaseFusedOp`) |
+| Graph rewrites | FX pattern passes (norm + quant, all-reduce + norm, ...) | none by default; fusion is in the kernels |
+| Decode CUDA graph | FULL, 51 sizes up to 512 tokens | full, sizes up to `max_bs` (256 on an 80 GB H100, TP below 4) |
+| Prefill / mixed CUDA graph | PIECEWISE: FX split at attention ops | breakable: capture split at `eager_on_graph` |
+| Above the largest size | compiled pieces, no graph | eager |
+| Padding tokens write to | slot `-1` (skipped) | slot 0, a reserved padding slot (skipped) |
+
+Pick SGLang in the figure above and compare a 300-token prefill (a breakable graph padded to 320)
+with a 300-request decode (eager, since 300 is above `max_bs = 256`).
+
+## The GPU code
+
+The model is now out of the picture. What remains is the path from the scheduler's decision on the
+CPU to bytes in the cache on the GPU, and it has the same three stages in both engines.
+
+1. The scheduler (CPU) decides where each token's keys and values live: vLLM's KV cache manager
+   assigns blocks and finds cached prefixes by hashing blocks; SGLang's radix tree finds the
+   longest cached prefix and its allocator hands out free slots.
+2. A small Triton kernel turns that decision into one destination per new token: vLLM's
+   `slot_mapping`, SGLang's `out_cache_loc` plus the `req_to_token` rows the attention kernel
+   reads.
+3. In every layer, a CUDA kernel scatters the new keys and values to those destinations, and the
+   attention kernel reads the whole sequence back by the same indices.
+
+### vLLM: from block table to `slot_mapping`
+
+A request's **block table** lists the physical blocks that hold its tokens, in order: logical block
+`j` of the request lives in physical block `block_table[j]`. A token at position `p` therefore
+lives in slot
+
+$$
+\text{slot}(p) = \text{block\_table}[\lfloor p / B \rfloor] \cdot B + (p \bmod B)
+$$
+
+where $B$ is the block size, 16 by default. Hover the tokens below to follow one through the table
+(4-token blocks here, to keep the figure small).
+
+<PagedAddress blockSize={4} tokens={9} blockTable={[5, 2, 7]} numBlocks={8} selected={6} title="Request 0: nine tokens in blocks 5, 2, 7" />
+
+The model runner computes this for every new token of the batch at once
+([`_compute_slot_mappings_kernel`](https://github.com/vllm-project/vllm/blob/54beee831b0fd2df2a19967b7dcea661c32044c5/vllm/v1/worker/gpu/block_table.py#L334)),
+one Triton program per request, plus one extra program that pads the rest of the buffer:
+
+```python
+    if batch_idx == tl.num_programs(1) - 1:
+        # Pad remaining slots to -1. This is needed for CUDA graphs.
+        actual_num_tokens = tl.load(query_start_loc + batch_idx)
+        for i in range(actual_num_tokens, max_num_tokens, TRITON_BLOCK_SIZE):
+            offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
+            tl.store(slot_mapping_ptr + offset, PAD_ID, mask=offset < max_num_tokens)
+        return
+    req_state_idx = tl.load(idx_mapping + batch_idx)
+    start_idx = tl.load(query_start_loc + batch_idx)
+    end_idx = tl.load(query_start_loc + batch_idx + 1)
+    for i in range(start_idx, end_idx, TRITON_BLOCK_SIZE):
+        offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
+        positions = tl.load(pos + offset, mask=offset < end_idx, other=0)
+        block_indices = positions // kv_block_size
+        block_offsets = positions % kv_block_size
+        block_numbers = tl.load(block_table_ptr + req_state_idx * block_table_stride + block_indices, ...)
+        slot_ids = block_numbers * kv_block_size + block_offsets
+        tl.store(slot_mapping_ptr + offset, slot_ids, mask=offset < end_idx)
+```
+
+Work through a batch of two requests with 4-token blocks. Request 0 (blocks 5, 2, 7) is
+prefilling a chunk of three tokens at positions 6, 7 and 8; request 1 (blocks 3, 6) is decoding
+its token at position 5. So `query_start_loc = [0, 3, 4]` and `positions = [6, 7, 8, 5]`.
+Program 0 computes position 6 → block index 1 → physical block 2 → slot $2 \cdot 4 + 2 = 10$,
+then 11, then position 8 → block index 2 → block 7 → slot 28. Program 1 computes position 5 →
+block index 1 → block 6 → slot $6 \cdot 4 + 1 = 25$. If the batch is padded to a CUDA graph of 8
+tokens, program 2 writes `-1` into entries 4 to 7, giving `slot_mapping = [10, 11, 28, 25, -1, -1,
+-1, -1]`.<Sidenote>Computed with a NumPy port of the kernel (CP size 1, one KV cache group). With
+context parallelism the same kernel maps positions to a rank-local slot and writes `-1` for tokens
+another rank owns.</Sidenote>
+
+A prefix-cache hit shows up here only as an absence. If request 0's first six tokens were found in
+the cache, they are not in this batch at all: their slots are already in the block table, the
+attention kernel reads them, and nothing writes them again.
+
+### vLLM: `reshape_and_cache_flash`
+
+Each layer then calls `do_kv_cache_update`, which for the FlashAttention backend is
+([`flash_attn.py`](https://github.com/vllm-project/vllm/blob/54beee831b0fd2df2a19967b7dcea661c32044c5/vllm/v1/attention/backends/flash_attn.py#L1432)):
+
+```python
+        # (B, H, N, 2*D) -> ((B, N, H, D), (B, N, H, D))
+        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+        reshape_and_cache_flash(key, value, key_cache, value_cache, slot_mapping,
+                                self.kv_cache_dtype, layer._k_scale, layer._v_scale)
+```
+
+The layout of `kv_cache` decides what this kernel does. vLLM describes layouts as a permutation
+of the logical axes `[L, B, H, N, C]`: layer, block, KV head, slot within the block, content.
+With no backend asking otherwise, the default is **LBNHC**
+([`kv_cache_layout.py`](https://github.com/vllm-project/vllm/blob/54beee831b0fd2df2a19967b7dcea661c32044c5/vllm/v1/kv_cache_layout.py#L15)):
+in memory, a block is 16 **pages**, one per token slot; a page holds every KV head; and a head's
+content `C` is its key followed by its value, `2 × D` elements. For Llama-3.1-8B on one GPU
+(8 KV heads, head size 128, bf16) a page is $8 \times 2 \times 128 \times 2 = 4096$ bytes and a
+block 64 KiB.
+
+The `split` therefore yields views whose strides, in elements, are
+`(32768, 2048, 256, 1)` for `[block, slot, head, element]`: consecutive heads are 256 elements
+apart, not 128, because each head's value sits between it and the next head's key. The kernel
+([`cache_kernels.cu`](https://github.com/vllm-project/vllm/blob/54beee831b0fd2df2a19967b7dcea661c32044c5/csrc/cache_kernels.cu#L336))
+launches one thread block per token with `min(num_heads * head_size, 512)` threads and checks
+exactly that stride:
+
+```cpp
+  const int64_t token_idx = blockIdx.x;
+  const int64_t slot_idx = slot_mapping[token_idx];
+  if (slot_idx < 0) return;                       // padded token
+  const int64_t block_idx = slot_idx / block_size;
+  const int64_t block_offset = slot_idx % block_size;
+  const scalar_t* key_src = key + token_idx * key_stride;
+  cache_t* key_dst = key_cache + block_idx * block_stride + block_offset * page_stride;
+  cache_t* value_dst = value_cache + block_idx * block_stride + block_offset * page_stride;
+  const bool is_contiguous_heads = (head_stride == head_size);
+  constexpr int VEC_SIZE = (sizeof(scalar_t) == 2) ? 8 : 4;
+
+  if (is_contiguous_heads && kv_scale_stride == 0) {
+    // NHD with one scale: the whole token row is one contiguous copy
+    vectorize_with_alignment<VEC_SIZE>(key_src, key_dst, n_elems, threadIdx.x, blockDim.x, k_op);
+    vectorize_with_alignment<VEC_SIZE>(value_src, value_dst, n_elems, threadIdx.x, blockDim.x, v_op);
+  } else {
+    // heads are strided: one warp per head, 32 lanes copy that head's vectors
+    const int lane = threadIdx.x & 31;
+    const int warp_id = threadIdx.x >> 5;
+    const int warps_per_block = blockDim.x >> 5;
+    for (int head = warp_id; head < num_heads; head += warps_per_block) {
+      ...
+      vectorize_with_alignment<VEC_SIZE>(k_src_h, k_dst_h, head_size, lane, 32, k_op);
+      vectorize_with_alignment<VEC_SIZE>(v_src_h, v_dst_h, head_size, lane, 32, v_op);
+    }
+  }
+```
+
+`vectorize_with_alignment` copies `len` elements as 16-byte vectors (8 bf16 values), thread
+`tid` taking vectors `tid, tid + stride, ...`, converting each element through `k_op` (a plain
+cast, or an FP8 conversion with the layer's scale). With head stride 256 ≠ 128, the default layout
+takes the strided branch: warp `w` copies head `w`, and inside it lane `l` copies vector `l` of the
+head's 16 vectors.
+
+Work it out for Llama-3.1-8B at TP = 1, slot 37 (block 2, offset 5). The block has 512 threads in
+16 warps. Warps 0 to 7 each take one head; warps 8 to 15 find no head and do nothing. Inside a
+working warp, lanes 0 to 15 each copy one key vector and one value vector; lanes 16 to 31 idle. So
+128 of the 512 threads write the token's 2 × 4096 bytes. Thread 33 (warp 1, lane 1) copies bytes
+272 to 287 of the input key row (head 1, vector 1) to cache byte
+$2 \cdot 65536 + 5 \cdot 4096 + 1 \cdot 512 + 1 \cdot 16 = 152{,}080$ of the layer's tensor, and the
+matching value vector 256 bytes further on. Hover the threads below to check others; switch to the
+TP = 4 shard (2 KV heads), where only 32 of 256 threads work.
+
+<KvWriteMap preset="tp1" title="Writing slot 37: Llama-3.1-8B, one GPU" />
+
+The idle threads cost less than it seems: the kernel is limited by memory traffic, not by threads,
+and every byte is still moved with 16-byte loads and stores. What the layout buys is on the read
+side: a head's key and value for one token sit in one contiguous 512-byte run, which suits the
+attention kernel's loads.<Sidenote>Counts from a NumPy/PyTorch emulation that builds the LBNHC
+view exactly as `create_kv_cache_views` and `do_kv_cache_update` do and reads the strides off it,
+then replays the kernel's branch and loop bounds. With `VLLM_KV_CACHE_LAYOUT=HND`-style layouts or
+the FlashInfer backend the strides, and so the branch, can differ.</Sidenote>
+
+### SGLang: the radix tree has no CUDA code
+
+SGLang's prefix cache is a **radix tree** over token ids: each node holds a run of tokens and the
+KV slots that store them, children are keyed by their first token (or first page of tokens), and a
+request's longest cached prefix is a walk from the root. Step through it below; the figure is from
+[the SGLang post](/blog/sglang-internals/), with `page_size = 1`.
+
+<RadixTreeSteps />
+
+The tree lives entirely on the CPU. By default it is now a Rust implementation, the "TreeCore"
+behind `UnifiedRadixCache`
+(`SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND = "rust"`, falling back to a Python core for unsupported
+features or platforms). Its match is the same walk as the Python one
+([`match_prefix_helper_`](https://github.com/sgl-project/sglang/blob/5eb70183472d56326920e70a4dde5cfbabe6f376/rust/sglang-radix-tree/src/unified_tree_core.rs#L1481)):
+
+```rust
+        while offset < aligned_key_len {
+            let Some(child_id) = self.arena.child_on_page_in_namespace(
+                node_id, namespace, key.page_at(offset, self.page_size),
+            ) else { break; };
+            let child = self.arena.node(child_id);
+            if child.evicted() && !child.backuped() { break; }
+            let prefix_len = key.match_len(offset, &child.key, self.page_size);
+            if prefix_len < child.key.atom_len() {
+                let (split_node_id, split_action) = self.split_node_(child_id, prefix_len);
+                node_id = split_node_id;
+                ...
+                value.push(node.device_value(FULL).shallow_clone());
+                break;
+            }
+            value.push(child.device_value(FULL).shallow_clone());
+            node_id = child_id;
+            offset += prefix_len;
+        }
+```
+
+The only GPU object in it is each node's `device_value`: a small int64 tensor on the GPU listing
+the KV slots of that node's tokens. A match returns the list of those tensors, one per node on the
+path, without reading them. Splitting a node divides that tensor between the two halves
+(`redistribute_child_device_value`). No kernel runs until the scheduler builds the batch.<Sidenote>The
+namespace in the child lookup is the request's `extra_key` (a caller-defined key, to which the LoRA
+adapter's id is appended) and its `cache_salt`, so two requests with the same tokens but different
+adapters or salts never share KV.</Sidenote>
+
+### SGLang: from a match to `req_to_token`
+
+SGLang's attention backends read a request's KV through `req_to_token`, a table with one row per
+running request and one column per position, holding slot ids. When a prefill batch is scheduled,
+[`write_cache_indices`](https://github.com/sgl-project/sglang/blob/5eb70183472d56326920e70a4dde5cfbabe6f376/python/sglang/srt/mem_cache/allocation.py#L67)
+fills each request's row from two sources: the matched prefix (the tree's slot tensors,
+concatenated into one per request) and the freshly allocated slots in `out_cache_loc`. It passes
+the prefix tensors as raw pointers, one per request, to
+[`write_req_to_token_pool_triton`](https://github.com/sgl-project/sglang/blob/5eb70183472d56326920e70a4dde5cfbabe6f376/python/sglang/kernels/ops/memory/common.py#L9),
+one program per request:
+
+```python
+    pid = tl.program_id(0)
+    req_pool_index = tl.load(req_pool_indices + pid)
+    pre_len = tl.load(pre_lens + pid)
+    seq_len = tl.load(seq_lens + pid)
+    prefix_tensor = tl.load(prefix_tensors + pid).to(tl.pointer_type(tl.int64))
+    # write prefix
+    for i in range(tl.cdiv(pre_len, BLOCK_SIZE)):
+        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
+        value = tl.load(prefix_tensor + offset, mask=offset < pre_len)
+        tl.store(req_to_token_ptr + req_pool_index * stride + offset, value, mask=offset < pre_len)
+    # NOTE: This can be slow for large bs
+    cumsum_start = 0
+    for i in range(pid):
+        cumsum_start += tl.load(extend_lens + i)
+    # write the new tokens' slots after the prefix
+    for i in range(tl.cdiv(seq_len - pre_len, BLOCK_SIZE)):
+        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
+        value = tl.load(out_cache_loc + cumsum_start + offset, mask=offset < seq_len - pre_len)
+        tl.store(req_to_token_ptr + req_pool_index * stride + offset + pre_len, value, ...)
+```
+
+The prefix tensor is read through a pointer loaded from memory, a Triton idiom for "a list of
+tensors of different lengths". Each program finds where its new slots start in `out_cache_loc` by
+summing the earlier requests' extend lengths, a loop over `pid` that the comment admits is slow
+for large batches.
+
+A small case: request A sits in row 2 of `req_to_token`, matched a 4-token prefix in slots
+`[17, 18, 19, 40]` and extends by 3 tokens; request B in row 0 has no prefix and 3 tokens.
+`out_cache_loc = [51, 52, 53, 60, 61, 62]`. Program 0 writes row 2 as
+`[17, 18, 19, 40, 51, 52, 53]`; program 1 sums `extend_lens[0] = 3`, so it starts at
+`out_cache_loc[3]` and writes row 0 as `[60, 61, 62]`. The slots 17 to 40 are the cache hit: the
+attention kernel will read them, and nothing in this step writes them.
+
+### SGLang: allocating pages, `alloc_extend_kernel`
+
+With `page_size = 1` (the default on CUDA for most models and backends) the new slots in `out_cache_loc` are just the next free
+slots. With larger pages, a request first fills the unused tail of its last page, then takes whole
+new pages, then part of one more.
+[`alloc_extend_kernel`](https://github.com/sgl-project/sglang/blob/5eb70183472d56326920e70a4dde5cfbabe6f376/python/sglang/kernels/ops/memory/allocator.py#L116)
+computes all of this in parallel, one program per request, from the sorted list of free pages:
+
+```python
+    # where this request's outputs and new pages start: prefix sums over earlier requests
+    sum_extend_lens = tl.sum(extend_lens)              # over requests 0..pid
+    output_start_loc = sum_extend_lens - extend_len
+    num_new_pages = num_pages_after - num_pages_before  # per request, 0..pid
+    new_page_start_loc = tl.sum(num_new_pages) - num_page_start_loc_self
+    # Part 1: fill the old partial page
+    num_part1 = min(seq_len, (pre_len + page_size - 1) // page_size * page_size) - pre_len
+    tl.store(out_indices + output_start_loc + offset_one_page, last_loc + 1 + offset_one_page,
+             mask=offset_one_page < num_part1)
+    # Part 2: fill the new full pages
+    num_part2 = seq_len // page_size * page_size - (pre_len + page_size - 1) // page_size * page_size
+    page_start = tl.load(free_page_ptr + new_page_start_loc + offset // page_size, mask=mask)
+    tl.store(out_indices + output_start_loc + num_part1 + offset,
+             page_start * page_size + offset % page_size, mask=mask)
+    # Part 3: fill the new partial page
+    num_part3 = seq_len - seq_len // page_size * page_size
+    start_loc = tl.load(free_page_ptr + new_page_start_loc + num_page_start_loc_self - 1)
+    tl.store(out_indices + output_start_loc + num_part1 + num_part2 + offset_one_page,
+             start_loc * page_size + offset_one_page, mask=offset_one_page < num_part3)
+```
+
+Instead of a prefix-sum pass, every program loads the lengths of all requests up to itself (a
+masked `tl.arange(0, bs_upper)` load) and sums them: wasteful in theory, cheap for batches of a few
+hundred, and it keeps the allocator to one launch.
+
+Work through three requests with `page_size = 4` and free pages `[11, 2, 9, 5, 14]`:
+
+| request | already cached | new tokens | part 1 (old page) | part 2 (full pages) | part 3 (new partial) | slots written |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 0 | 6 (last slot 29) | 7 | 2 | 4 (page 11) | 1 (page 2) | 30, 31, 44–47, 8 |
+| 1 | 0 | 5 | 0 | 4 (page 9) | 1 (page 5) | 36–39, 20 |
+| 2 | 9 (last slot 12) | 1 | 1 | 0 | 0 | 13 |
+
+Check request 0 by hand. Its cached tokens end at position 5, in slot 29 (page 7, offset 1), so
+positions 6 and 7 complete page 7 at slots 30 and 31 (part 1). Positions 8 to 11 fill a whole new
+page; request 0 is first, so `new_page_start_loc = 0` and it takes free page 11, slots 44 to 47
+(part 2). Position 12 starts another page, the next free one, page 2, at slot 8 (part 3). Request 1
+needs two new pages; the two before it went to request 0, so it starts at index 2 of the free list
+and takes pages 9 and 5. The resulting
+`out_cache_loc = [30, 31, 44, 45, 46, 47, 8, 36, 37, 38, 39, 20, 13]`.<Sidenote>Checked against
+SGLang's `alloc_extend_naive`, a vectorized PyTorch version of the same allocation, ported to
+NumPy: identical outputs on this example and on 2,000 random batches with page sizes 1 to 16. A
+non-page-aligned "already cached" length like request 0's arises for a chunked prefill continuing
+its own earlier chunk; radix-tree matches themselves are page-aligned.</Sidenote>
+
+### SGLang: `store_kvcache_kernel`
+
+Finally each layer writes `k` and `v` at `out_cache_loc`. SGLang's pool keeps a separate
+`k_buffer` and `v_buffer` per layer, each with one row of `num_kv_heads × head_dim` elements per
+slot, so the write is a row scatter with no head striding at all.
+`_set_kv_buffer_impl` sends it to the JIT-compiled
+[`store_kvcache_kernel`](https://github.com/sgl-project/sglang/blob/5eb70183472d56326920e70a4dde5cfbabe6f376/python/sglang/kernels/jit/csrc/elementwise/kvcache.cuh#L45),
+compiled once per row size, which the [SGLang post](/blog/sglang-internals/) walks through line
+by line. In short: a heuristic starts at one warp per token and doubles while each lane would
+still copy at least 64 bytes of key and value together. For Llama-3.1-8B at TP = 1 (2,048-byte
+rows) that gives 4 warps per token, each warp copying 512 bytes of the key and 512 of the value,
+each lane one 16-byte vector of each, and every thread busy. At TP = 4 (512-byte rows) it is one
+warp per token, again with every lane busy. Writes to slot 0, the slot CUDA-graph padding tokens
+point at, are loaded and then skipped.
+
+Switch the figure above to "SGLang store_kvcache_kernel" to compare: the same bytes, a quarter as
+many threads per token for TP = 1, no idle lanes, and the key and value landing in two different
+buffers instead of side by side.
+
+| | vLLM `reshape_and_cache_flash` | SGLang `store_kvcache_kernel` |
+| --- | --- | --- |
+| Destination index | `slot_mapping[i]` = block · 16 + offset | `out_cache_loc[i]`, a slot id |
+| Cache layout (default) | page per slot: each head's K then V (LBNHC) | `k_buffer[slot]`, `v_buffer[slot]` rows |
+| Threads per token (Llama-3.1-8B, TP = 1) | 512, of which 128 copy | 128, all copy |
+| Shapes known at compile time | no, runtime arguments | row bytes are template parameters (JIT) |
+| Skipped writes | slot `-1` | slot 0 |
+
+### One decode step, end to end: write, then attend
+
+The kernels above each do one job. To see how they fit together, follow one decode step of two
+requests through all of them, on a cache shrunk until every number fits on screen: one KV head
+of size 2, 4-token pages, 32 slots. Requests A and B began with the same 4-token prompt (P0 to
+P3), so the prefix cache stores those tokens once. A has 7 tokens cached and decodes its 8th
+(A7); B has 4 and decodes its 5th (B4).
+
+A decode step has four parts:
+
+1. **Schedule** (CPU). Each request gets a slot for its new token.
+2. **Slot ids** (one small kernel). The scheduler's decision becomes a GPU tensor with one
+   destination per new token.
+3. **Write** (every layer). The new token's `k` and `v` go into that slot *before* attention runs,
+   so the token attends to itself.
+4. **Attend** (every layer). One query per request reads every cached key and value of its
+   request through the index table, never through a contiguous per-request buffer.
+
+Attention reads the sequence in **tiles**, a few keys at a time, and never holds the whole score
+row. It keeps three running values per query: the largest score so far $m$, the softmax
+denominator so far $\ell$, and the unnormalised output $\text{acc} = \sum_j e^{s_j - m} v_j$.
+When a tile brings a larger maximum $m'$, the old $\ell$ and $\text{acc}$ are multiplied by
+$e^{m - m'}$ before the tile's terms are added. This is the **online softmax** of
+FlashAttention, and it is what lets a tile come from any page in any order of memory: the
+kernel only needs the index table to find the next tile's keys.
+
+In vLLM the attention kernel is FlashAttention called with the request's block table, so a tile
+here is one page:
+
+<DecodeStepKernels engine="vllm" title="vLLM: one decode step through slot_mapping, reshape_and_cache_flash and paged FlashAttention" />
+
+Step to "B: page 0" and compare it with "A: page 0": both programs read physical block 5. That is
+prefix caching at the kernel level: two block tables point at the same page, and nothing else
+in the kernel knows. At "B: page 1" only one of the four slots holds a token; `seqused_k = 5`
+masks the rest. Check A's output by hand from the tables. Page 0 sets $m = 0.764$ (from P2).
+Page 1 has no larger score, so nothing is rescaled, and it ends with $\ell = 4.996$ and
+$\text{acc} = (1.013, -1.970)$. The output is $(1.013 / 4.996, -1.970 / 4.996) = (0.203, -0.394)$,
+which is what dense softmax attention over all 8 tokens gives. B's second page shows the other
+case: B4's score $0.827$ beats the running max $-0.021$, so the old $\ell$ and $\text{acc}$ are
+first multiplied by $e^{-0.021 - 0.827} = 0.428$.<Sidenote>Outputs checked against `torch.nn.functional.scaled_dot_product_attention`
+in float64 on the same vectors: A gives (0.2028, −0.3944), B (−0.1957, 0.1432). The online
+update was also checked with tiles of 1 to 5 tokens: all agree with the dense result to 1e-12.
+The values are seeded random numbers, not from a real model.</Sidenote>
+
+SGLang on Hopper also calls FlashAttention 3, with `page_table = req_to_token[req_pool_indices,
+:max_seq_len_k]` and pages of one token, so its default path looks like the figure above with
+1-token pages. Its **Triton backend**, the fallback when neither FlashAttention 3 nor FlashInfer
+fits, shows a second idea more plainly: **split-KV** (also called flash decoding). A decode batch has one
+query per request. Giving each (request, head) pair one program leaves most of the GPU idle when
+the batch is small and the contexts are long. `_fwd_kernel_stage1` therefore launches a grid of
+(request, head, split): each split runs the online softmax over its own share of the sequence
+and writes a partial output and its **log-sum-exp** $\text{lse} = m + \ln \ell$.
+`_fwd_kernel_stage2` then merges the splits, weighting each partial output by
+$e^{\text{lse}_i - \max \text{lse}}$, its share of the full softmax denominator.
+
+<DecodeStepKernels engine="sglang" title="SGLang (Triton backend): req_to_token, store_kvcache and split-KV decode attention" />
+
+The split boundaries come from the kernel's formula
+`per = cdiv(cdiv(seq_len, splits), MIN_BLOCK_KV) * MIN_BLOCK_KV`. In the figure `MIN_BLOCK_KV`
+is 4; the real value is 32, and `splits` is chosen per request up to
+`triton_attention_num_kv_splits = 8`. Check A's merge at "stage 2 merge": the
+log-sum-exps are 1.745 and 1.609, so the weights are $1$ and $e^{1.609 - 1.745} = 0.873$. The
+first output entry is $(0.059 + 0.873 \cdot 0.368) / 1.873 = 0.203$, the same answer as vLLM's
+single pass. vLLM's FlashAttention does the same internally: it takes `num_splits` (up to 32
+under full CUDA graphs, `flash_attn_max_num_splits_for_cuda_graph`) and merges with the LSE in
+the same way.
+
+## Writing a model for both engines
+
+Putting the pieces together, this is what porting an architecture involves, and what it does not.
+
+- **Write the model with the engine's layers.** Use the parallel linear layers, the engine's
+  `RMSNorm` and activation modules (so they can switch between native and fused kernels), and the
+  engine's rotary embedding. Keep the input flat, `[num_tokens, hidden]`, with `positions`.
+- **Use the engine's attention layer and give it a unique identity.** In vLLM that is the
+  `prefix`, which must be the module's real dotted name; in SGLang the `layer_id`. Do not touch the
+  cache yourself.
+- **Map the checkpoint's names.** Declare the stacked mappings for fused projections and implement
+  `load_weights`, or reuse `AutoWeightsLoader` (vLLM) and the standard QKV mapping (SGLang).
+- **Keep `forward` traceable for vLLM.** No Python branching on tensor values or on per-step
+  state, because the graph is traced once and guards are dropped: anything that varies between
+  steps must come in as a tensor or through the forward context.
+- **Register it.** An entry in vLLM's `_TEXT_GENERATION_MODELS` table or `register_model`; an
+  `EntryClass` in SGLang.
+- **Or do nothing.** If the Hugging Face implementation supports `ALL_ATTENTION_FUNCTIONS` and
+  ships a `base_model_tp_plan`, both engines' Transformers backends run it with paged attention,
+  prefix caching and tensor parallelism, at some cost in fusion.
+
+What the model author never writes: block tables, slot indices, prefix matching, cache
+allocation, CUDA graph capture. Those changed substantially in both engines over the last year
+(vLLM's layout descriptors and model runner V2, SGLang's Rust tree and breakable graphs) without
+changes to the Llama files.
+
+## Summary
+
+- A model file in either engine computes `q`, `k`, `v` on a flat batch of tokens and hands them to
+  the engine's attention layer; it never sees the KV cache, the block table or the radix tree.
+- vLLM's attention layer registers itself under its module name and runs as two opaque custom
+  operators that look up the cache and the step's metadata by that name. This keeps the traced
+  graph identical every step, which is what lets vLLM compile once, drop all guards and split the
+  graph at attention into piecewise CUDA graphs.
+- SGLang passes a `ForwardBatch` through the model and indexes the KV pool by `layer_id`; it relies
+  on hand-written fused kernels and on CUDA graphs captured from eager code (full for decode,
+  breakable at `eager_on_graph` for prefill), with `torch.compile` optional.
+- Engines change model code at four levels: their own model files, load-time module replacement
+  (the Transformers backend's `recursive_replace` and its registered attention function), run-time
+  kernel selection (`CustomOp`, `BaseFusedOp`) and trace-time FX pattern passes.
+- The scheduler's decision reaches the GPU through two small Triton kernels (vLLM's
+  `slot_mapping`, SGLang's `req_to_token` writer and page allocator) and one scatter kernel per
+  layer; the radix tree itself is CPU code whose nodes merely hold GPU tensors of slot ids.
+
+## References
+
+- vLLM source at commit [`54beee8`](https://github.com/vllm-project/vllm/tree/54beee831b0fd2df2a19967b7dcea661c32044c5): `vllm/model_executor/models/` (Llama, registry, Transformers backend), `vllm/model_executor/layers/attention/attention.py`, `vllm/compilation/`, `vllm/config/compilation.py`, `vllm/model_executor/custom_op.py`, `vllm/v1/kv_cache_layout.py`, `vllm/v1/worker/gpu/block_table.py`, `csrc/cache_kernels.cu`.
+- SGLang source at commit [`5eb7018`](https://github.com/sgl-project/sglang/tree/5eb70183472d56326920e70a4dde5cfbabe6f376): `python/sglang/srt/models/`, `srt/layers/radix_attention.py`, `srt/model_executor/cuda_graph_config.py` and `runner_backend_utils/breakable_cuda_graph/`, `srt/compilation/torch_compile_decoration.py`, `kernels/fused_op.py`, `kernels/ops/memory/`, `kernels/jit/csrc/elementwise/kvcache.cuh`, `rust/sglang-radix-tree/`.
+- W. Kwon et al., [Efficient Memory Management for Large Language Model Serving with PagedAttention](https://arxiv.org/abs/2309.06180), SOSP 2023.
+- L. Zheng et al., [SGLang: Efficient Execution of Structured Language Model Programs](https://arxiv.org/abs/2312.07104), NeurIPS 2024.
+- vLLM documentation, [torch.compile integration](https://docs.vllm.ai/en/latest/design/torch_compile.html) and [CUDA graphs](https://docs.vllm.ai/en/latest/design/cuda_graphs.html).
+- Hugging Face Transformers, [attention interface](https://huggingface.co/docs/transformers/attention_interface) (`ALL_ATTENTION_FUNCTIONS`).

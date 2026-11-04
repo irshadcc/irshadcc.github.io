@@ -1,0 +1,49 @@
+---
+// Step-through of the classic order book layout (W. K. Selph's "tree of limits"): a binary tree
+// of price levels per side (drawn sideways, depth to the right, rows sorted by price), each level
+// owning an intrusive doubly linked FIFO of orders, and an order id -> pool slot index along the
+// bottom. The default steps cancel two orders and add one; states in orderBookFigures.ts.
+// Usage in .mdx:
+//   <BookIndexSteps />
+//   <BookIndexSteps step={3} title="Cancelling an order" />
+import StepControls from "../compiler/StepControls.astro";
+import "./orderBook.css";
+import { type IndexState, drawIndexes } from "./orderBookDraw";
+import { INDEX_STATES } from "./orderBookFigures";
+
+interface Props {
+	states?: IndexState[];
+	step?: number;
+	title?: string;
+}
+
+const {
+	states = INDEX_STATES,
+	step = 0,
+	title = "Tree of limits, order FIFOs and the id index",
+} = Astro.props;
+const at = Math.max(0, Math.min(states.length - 1, step));
+---
+
+<figure class="obk obk-is" data-step={at} tabindex="-1">
+	<figcaption class="obk-title">{title}</figcaption>
+	<StepControls labels={states.map((s) => s.label)} step={at} />
+	<div class="obk-canvas">
+		{states.map((s, i) => <div class="obk-frame" hidden={i !== at} set:html={drawIndexes(s)} />)}
+	</div>
+	<div class="obk-notes">
+		{states.map((s, i) => <p hidden={i !== at}>{s.note}</p>)}
+	</div>
+</figure>
+
+<script>
+	import { bindStepper } from "../compiler/stepper";
+	for (const fig of document.querySelectorAll<HTMLElement>(".obk-is")) {
+		const frames = [...fig.querySelectorAll<HTMLElement>(".obk-frame")];
+		const notes = [...fig.querySelectorAll<HTMLElement>(".obk-notes p")];
+		bindStepper(fig, frames.length, (i) => {
+			frames.forEach((f, k) => { f.hidden = k !== i; });
+			notes.forEach((n, k) => { n.hidden = k !== i; });
+		});
+	}
+</script>

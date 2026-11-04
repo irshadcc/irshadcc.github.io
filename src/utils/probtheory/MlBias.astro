@@ -1,0 +1,140 @@
+---
+// Bias of maximum likelihood (Bishop & Bishop, Section 2.3.3, Figure 2.10). Data sets of N
+// points are drawn one at a time from the true Gaussian N(0, 1). Top: the true density (red),
+// the latest data set (green points) and the Gaussian fitted to it by maximum likelihood (blue),
+// with earlier fits faint. Bottom: the running average of σ²_ML over the data sets so far,
+// which settles at (N − 1)/N rather than at the true σ² = 1, and of the corrected estimate
+// N/(N − 1) σ²_ML (2.63), which settles at 1. Play adds data sets; "+100" adds a hundred.
+// Logic in probTheory.ts (seeded, so the same N and seed give the same data sets).
+// Usage in .mdx:
+//   <MlBias n={2} seed={11} />
+import Player from "../sampling/Player.astro";
+import "../sampling/sampling.css";
+import "./probTheory.css";
+
+interface Props {
+	n?: number;
+	seed?: number;
+	/** Data sets shown at the start. */
+	start?: number;
+	title?: string;
+	caption?: string;
+}
+
+const { n = 2, seed = 11, start = 3, title, caption } = Astro.props;
+---
+
+<figure class="smp-fig pt-ml-bias" data-n={n} data-seed={seed} data-start={start}>
+	{title && <div class="smp-title">{title}</div>}
+	<div class="smp-legend">
+		<span><i class="k-q"></i>true N(x | 0, 1)</span>
+		<span><i class="dot pt-k-green-dot"></i>latest data set</span>
+		<span><i class="k-p"></i>its ML fit</span>
+		<span><i class="k-model"></i>running mean of σ²_ML</span>
+		<span><i class="pt-k-green"></i>running mean of N σ²_ML /(N − 1)</span>
+	</div>
+	<svg class="smp-svg s-top" viewBox="0 0 640 190" role="img" aria-label="True Gaussian with the maximum-likelihood fits to small data sets"></svg>
+	<svg class="smp-svg s-bot" viewBox="0 0 640 170" role="img" aria-label="Running average of the variance estimates"></svg>
+	<div class="smp-controls">
+		<Player />
+		<button type="button" class="smp-btn b-100">+100</button>
+		<label class="smp-slider">N = <strong class="v-n"></strong>
+			<input type="range" class="i-n" min="2" max="20" step="1" value={n} aria-label="Points per data set" />
+		</label>
+	</div>
+	<div class="smp-metrics">
+		<div><span>data sets</span><strong class="m-k"></strong></div>
+		<div><span>mean of µ_ML</span><strong class="m-mu"></strong></div>
+		<div><span>mean of σ²_ML</span><strong class="m-s2"></strong></div>
+		<div><span>(N − 1)/N</span><strong class="m-th"></strong></div>
+		<div><span>mean of N σ²_ML/(N − 1)</span><strong class="m-unb"></strong></div>
+	</div>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import { biasRuns, gauss, type BiasRun } from "./probTheory";
+	import { axes, bindPlayer, curve, el, fmt } from "../sampling/plot";
+
+	const MAX = 1000;
+
+	function attach(fig: HTMLElement) {
+		const top = fig.querySelector<SVGSVGElement>(".s-top")!;
+		const bot = fig.querySelector<SVGSVGElement>(".s-bot")!;
+		const nIn = fig.querySelector<HTMLInputElement>(".i-n")!;
+		const seed = Number(fig.dataset.seed) || 11;
+		let k = Number(fig.dataset.start) || 0;
+		let run: BiasRun = biasRuns(Number(nIn.value), MAX, seed);
+
+		function draw() {
+			const n = Number(nIn.value);
+			top.replaceChildren();
+			const A = axes(top, { x: 40, y: 8, w: 585, h: 150 }, [-3.5, 3.5], [0, 1.2], { xLabel: "x", yTicks: 3 });
+			for (let i = Math.max(0, k - 25); i < k - 1; i++)
+				el("path", { d: curve(A, (x) => gauss(x, run.muMl[i], run.s2Ml[i]), 200), class: "pt-faint-curve" }, top);
+			el("path", { d: curve(A, (x) => gauss(x, 0, 1)), class: "smp-q" }, top);
+			if (k > 0) {
+				const i = k - 1;
+				el("path", { d: curve(A, (x) => gauss(x, run.muMl[i], run.s2Ml[i])), class: "smp-p" }, top);
+				for (const x of run.sets[i]) el("circle", { cx: A.sx(x), cy: A.sy(0) - 5, r: 4, class: "pt-green" }, top);
+			}
+
+			bot.replaceChildren();
+			const kMax = Math.max(10, k);
+			const B = axes(bot, { x: 40, y: 8, w: 585, h: 125 }, [0, kMax], [0, 1.6], { xLabel: "number of data sets", yTicks: 4 });
+			const th = (n - 1) / n;
+			el("line", { x1: B.sx(0), x2: B.sx(kMax), y1: B.sy(1), y2: B.sy(1), class: "smp-muted-line" }, bot);
+			el("text", { x: B.sx(kMax) - 4, y: B.sy(1) - 4, class: "smp-note", "text-anchor": "end" }, bot, "σ² = 1");
+			el("line", { x1: B.sx(0), x2: B.sx(kMax), y1: B.sy(th), y2: B.sy(th), class: "smp-muted-line" }, bot);
+			el("text", { x: B.sx(kMax) - 4, y: B.sy(th) + 12, class: "smp-note", "text-anchor": "end" }, bot, `(N − 1)/N = ${fmt(th, 3)}`);
+			let s = 0;
+			let d1 = "";
+			let d2 = "";
+			for (let i = 0; i < k; i++) {
+				s += run.s2Ml[i];
+				const m = s / (i + 1);
+				d1 += `${i ? "L" : "M"}${B.sx(i + 1).toFixed(1)},${B.sy(Math.min(1.6, m)).toFixed(1)}`;
+				d2 += `${i ? "L" : "M"}${B.sx(i + 1).toFixed(1)},${B.sy(Math.min(1.6, (m * n) / (n - 1))).toFixed(1)}`;
+			}
+			if (k) {
+				el("path", { d: d1, class: "smp-model" }, bot);
+				el("path", { d: d2, class: "pt-green-line" }, bot);
+			}
+			const meanMu = k ? run.muMl.slice(0, k).reduce((a, b) => a + b, 0) / k : 0;
+			const meanS2 = k ? s / k : 0;
+			fig.querySelector(".v-n")!.textContent = String(n);
+			fig.querySelector(".m-k")!.textContent = String(k);
+			fig.querySelector(".m-mu")!.textContent = k ? fmt(meanMu, 3) : "—";
+			fig.querySelector(".m-s2")!.textContent = k ? fmt(meanS2, 3) : "—";
+			fig.querySelector(".m-th")!.textContent = fmt(th, 3);
+			fig.querySelector(".m-unb")!.textContent = k ? fmt((meanS2 * n) / (n - 1), 3) : "—";
+		}
+
+		bindPlayer(
+			fig,
+			(dir) => {
+				const m = k + dir;
+				if (m < 0 || m > MAX) return false;
+				k = m;
+				draw();
+				return k < MAX;
+			},
+			() => {
+				k = 0;
+				draw();
+			},
+			250,
+		);
+		fig.querySelector(".b-100")!.addEventListener("click", () => {
+			k = Math.min(MAX, k + 100);
+			draw();
+		});
+		nIn.addEventListener("input", () => {
+			run = biasRuns(Number(nIn.value), MAX, seed);
+			draw();
+		});
+		draw();
+	}
+
+	document.querySelectorAll<HTMLElement>(".pt-ml-bias").forEach(attach);
+</script>

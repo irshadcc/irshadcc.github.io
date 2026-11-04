@@ -1,0 +1,212 @@
+/* Extra marks for the Probabilities figures (src/utils/probtheory). They build on
+   ../sampling/sampling.css (.smp-fig frame, axes, controls, legend, player); every class here
+   starts with pt-. SVG content is created by scripts, so the rules are global. */
+
+.smp-fig {
+	--pt-sick: #c0392b;
+	--pt-sick-soft: rgba(192, 57, 43, 0.35);
+	--pt-well: rgba(120, 120, 110, 0.28);
+	--pt-pos: var(--text);
+	--pt-x: #c2674c;
+	--pt-y: #8e44ad;
+	--pt-green: #2e7d5b;
+	--pt-sel: rgba(31, 79, 120, 0.12);
+	--pt-mi: #d4a017;
+}
+@media (prefers-color-scheme: dark) {
+	.smp-fig {
+		--pt-sick: #f08070;
+		--pt-sick-soft: rgba(240, 128, 112, 0.35);
+		--pt-well: rgba(200, 200, 190, 0.22);
+		--pt-x: #e8a07a;
+		--pt-y: #c79be0;
+		--pt-green: #6fcf9f;
+		--pt-sel: rgba(141, 187, 227, 0.14);
+		--pt-mi: #f2c94c;
+	}
+}
+
+/* Population of people (screening) */
+.smp-fig .pt-person {
+	fill: var(--pt-well);
+	stroke: none;
+}
+.smp-fig .pt-person.sick {
+	fill: var(--pt-sick);
+}
+.smp-fig .pt-person.pos {
+	stroke: var(--pt-pos);
+	stroke-width: 1.4;
+}
+.smp-fig .pt-person.dim {
+	opacity: 0.15;
+}
+.smp-legend .pt-k-well {
+	background: var(--pt-well);
+}
+.smp-legend .pt-k-sick {
+	background: var(--pt-sick);
+}
+.smp-legend .pt-k-pos {
+	background: transparent;
+	outline: 1.5px solid var(--pt-pos);
+	outline-offset: -1.5px;
+}
+
+/* Count grid and bars */
+.smp-fig .pt-cell {
+	fill: var(--bg);
+	stroke: var(--faint);
+	cursor: pointer;
+}
+.smp-fig .pt-cell.sel {
+	fill: var(--pt-sel);
+}
+.smp-fig .pt-cell.hot {
+	stroke: var(--text);
+	stroke-width: 2;
+}
+.smp-fig .pt-pt {
+	fill: var(--smp-p);
+	pointer-events: none;
+}
+.smp-fig .pt-bar {
+	fill: var(--smp-hist);
+	stroke: var(--smp-p);
+	stroke-width: 0.8;
+}
+.smp-fig .pt-bar.hot {
+	fill: var(--smp-p);
+}
+.smp-fig .pt-bar-y {
+	fill: var(--pt-sel);
+	stroke: var(--pt-y);
+	stroke-width: 0.8;
+}
+.smp-fig .pt-bar-y.hot {
+	fill: var(--pt-y);
+}
+.smp-fig .pt-clickable {
+	cursor: pointer;
+}
+
+/* Lines and points */
+.smp-fig .pt-x-line {
+	fill: none;
+	stroke: var(--pt-x);
+	stroke-width: 2;
+}
+.smp-fig .pt-y-line {
+	fill: none;
+	stroke: var(--pt-y);
+	stroke-width: 2;
+}
+.smp-fig .pt-green-line {
+	fill: none;
+	stroke: var(--pt-green);
+	stroke-width: 2;
+}
+.smp-fig .pt-green {
+	fill: var(--pt-green);
+}
+.smp-fig .pt-x {
+	fill: var(--pt-x);
+}
+.smp-fig .pt-faint-curve {
+	fill: none;
+	stroke: var(--smp-p);
+	stroke-width: 1;
+	opacity: 0.25;
+}
+.smp-fig .pt-stem {
+	stroke: var(--smp-p);
+	stroke-width: 1.2;
+	stroke-dasharray: 2 2;
+}
+.smp-fig .pt-heat {
+	stroke: none;
+}
+.smp-fig .pt-pos-area {
+	fill: var(--smp-hist);
+	stroke: none;
+}
+.smp-fig .pt-neg-area {
+	fill: var(--pt-sick-soft);
+	stroke: none;
+}
+.smp-fig .pt-drag {
+	cursor: ns-resize;
+}
+.smp-legend .pt-k-x {
+	border-color: var(--pt-x);
+}
+.smp-legend .pt-k-y {
+	border-color: var(--pt-y);
+}
+.smp-legend .pt-k-green {
+	border-color: var(--pt-green);
+}
+.smp-legend .pt-k-green-dot {
+	background: var(--pt-green);
+}
+.smp-legend .pt-k-neg {
+	background: var(--pt-sick-soft);
+}
+
+/* Information bars */
+.smp-fig .pt-info-hx {
+	fill: var(--smp-hist);
+	stroke: var(--smp-p);
+}
+.smp-fig .pt-info-hy {
+	fill: var(--pt-sel);
+	stroke: var(--pt-y);
+}
+.smp-fig .pt-info-mi {
+	fill: var(--pt-mi);
+	opacity: 0.75;
+}
+.smp-fig .pt-info-joint {
+	fill: var(--smp-shade);
+	stroke: var(--muted);
+}
+
+/* Small editable tables */
+.pt-table-wrap {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.6rem 1.2rem;
+	align-items: flex-start;
+}
+.pt-joint {
+	border-collapse: collapse;
+	font: 0.82rem var(--sans);
+	font-variant-numeric: tabular-nums;
+}
+.pt-joint th,
+.pt-joint td {
+	padding: 0.25rem 0.5rem;
+	border: 1px solid var(--faint);
+	text-align: right;
+	color: var(--text);
+}
+.pt-joint th {
+	color: var(--muted);
+	font-weight: 500;
+}
+.pt-joint input {
+	width: 4.2rem;
+	border: 1px solid var(--faint);
+	border-radius: 3px;
+	padding: 0.1rem 0.25rem;
+	background: var(--bg);
+	color: var(--text);
+	font: inherit;
+	text-align: right;
+}
+.pt-codes {
+	font: 0.8rem var(--mono, ui-monospace, monospace);
+}
+.pt-codes td:last-child {
+	text-align: left;
+}

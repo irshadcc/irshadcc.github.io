@@ -1,0 +1,121 @@
+---
+// A table of layout conversions: for each source / destination pair, the conversion layout that
+// Triton's minimalCvtLayout computes (dst.invertAndCompose(src), then the trivial slowest dims
+// quotiented away) and the lowering ConvertLayoutOpToLLVM picks from the input dims that remain:
+// none, a register permutation, warp shuffles or shared memory. Logic in conversionLayout /
+// conversionKind (linearLayout.ts); cases in linearLayoutFigures.ts.
+// Usage in .mdx:
+//   import ConversionTable from "../../utils/layout/ConversionTable.astro";
+//   import { conversionCases } from "../../utils/layout/linearLayoutFigures";
+//   <ConversionTable cases={conversionCases} />
+import { conversionKind, conversionLayout, fmtBasis } from "./linearLayout";
+import type { ConversionCase } from "./linearLayoutFigures";
+
+interface Props {
+	cases: ConversionCase[];
+	caption?: string;
+}
+
+const { cases, caption } = Astro.props;
+const kindText = {
+	none: "no-op",
+	register: "register permutation",
+	shuffle: "warp shuffles",
+	shared: "shared memory",
+};
+const rows = cases.map((c) => {
+	const cvt = conversionLayout(c.src, c.dst);
+	const names = cvt.outs.map((o) => o.name);
+	const lines = cvt.ins.map(
+		(d) => `${d.name} → [${d.bases.map(fmtBasis).join(", ")}]`,
+	);
+	return {
+		c,
+		kind: kindText[conversionKind(cvt)],
+		lines,
+		names: names.length ? `(${names.join(", ")})` : "",
+	};
+});
+---
+
+<figure class="cvt">
+	<div class="cvt-scroll">
+		<table>
+			<thead>
+				<tr>
+					<th>Source</th>
+					<th>Destination</th>
+					<th>Lowering</th>
+					<th>Conversion C (dst input → src input)</th>
+				</tr>
+			</thead>
+			<tbody>
+				{
+					rows.map((r) => (
+						<tr>
+							<td>{r.c.srcText}</td>
+							<td>{r.c.dstText}</td>
+							<td>{r.kind}</td>
+							<td class="cvt-mono">
+								{r.lines.length ? (
+									<>
+										{r.names && <span class="cvt-names">outputs {r.names}</span>}
+										{r.lines.map((l) => (
+											<div>{l}</div>
+										))}
+									</>
+								) : (
+									<span class="cvt-names">empty: every dim is the identity</span>
+								)}
+							</td>
+						</tr>
+					))
+				}
+			</tbody>
+		</table>
+	</div>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<style>
+	.cvt {
+		margin: 1.5rem 0;
+		font-family: var(--sans);
+	}
+	.cvt-scroll {
+		overflow-x: auto;
+	}
+	.cvt table {
+		width: 100%;
+		border-collapse: collapse;
+		margin: 0;
+		font-size: 0.75rem;
+	}
+	.cvt th,
+	.cvt td {
+		padding: 0.35rem 0.5rem;
+		text-align: left;
+		vertical-align: top;
+		border-bottom: 1px solid var(--faint);
+	}
+	.cvt th {
+		font-weight: 600;
+		color: var(--muted);
+	}
+	.cvt-mono {
+		font-family: var(--mono);
+		font-size: 0.66rem;
+		overflow-wrap: anywhere;
+	}
+	.cvt-names {
+		color: var(--muted);
+		font-family: var(--sans);
+		font-size: 0.68rem;
+	}
+	.cvt figcaption {
+		margin-top: 0.4rem;
+		font-size: 0.78rem;
+		color: var(--muted);
+		text-align: center;
+	}
+</style>

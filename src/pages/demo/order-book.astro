@@ -1,0 +1,43 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import BookBench from "../../utils/orderbook/BookBench.astro";
+import BookIndexSteps from "../../utils/orderbook/BookIndexSteps.astro";
+import MatchingSteps from "../../utils/orderbook/MatchingSteps.astro";
+import TickSearch from "../../utils/orderbook/TickSearch.astro";
+import VectorSearch from "../../utils/orderbook/VectorSearch.astro";
+import { ASK_KEYS } from "../../utils/orderbook/orderBookFigures";
+---
+
+<Layout title="Order book figures demo">
+	<h1>Order book figures demo</h1>
+	<p>
+		Figures for the order book post (logic in <code>src/utils/orderbook/orderBook.ts</code>, drawing in
+		<code>orderBookDraw.ts</code>, benchmark data in <code>orderBookBench.json</code>).
+	</p>
+
+	<h2>MatchingSteps</h2>
+	<MatchingSteps />
+	<h2>MatchingSteps, starting at the sweep</h2>
+	<MatchingSteps step={8} title="A buy order sweeps two levels" />
+
+	<h2>BookIndexSteps</h2>
+	<BookIndexSteps />
+
+	<h2>VectorSearch: linear, near the top</h2>
+	<VectorSearch target={98} kind="linear" />
+	<h2>VectorSearch: linear, deep</h2>
+	<VectorSearch target={85} kind="linear" />
+	<h2>VectorSearch: lower_bound</h2>
+	<VectorSearch target={98} kind="binary" />
+	<h2>VectorSearch: branchless, asks as negative keys</h2>
+	<VectorSearch keys={ASK_KEYS} target={-103} kind="branchless" caption="ask levels stored as −price" />
+
+	<h2>TickSearch</h2>
+	<TickSearch />
+	<TickSearch bitmap />
+
+	<h2>BookBench</h2>
+	<BookBench chart="ns" title="ns per message" />
+	<BookBench chart="depth" title="Where adds land" />
+	<BookBench chart="gap" title="Walk vs bitmap" />
+</Layout>

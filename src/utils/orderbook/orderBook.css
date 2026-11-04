@@ -1,0 +1,121 @@
+/* Shared look of the order book figures (classes emitted by orderBookDraw.ts). Global on
+   purpose: the SVG is built as a string, so Astro's scoped styles would not reach it. */
+.obk {
+	--obk-bid: #2f7a3a;
+	--obk-bid-soft: #dcefdd;
+	--obk-ask: #b3392f;
+	--obk-ask-soft: #f7dfdc;
+	--obk-hot: #d88a00;
+	--obk-hot-soft: #fbe9c4;
+	margin: 1.75rem 0;
+	font-family: var(--sans);
+	outline: none;
+}
+@media (prefers-color-scheme: dark) {
+	.obk {
+		--obk-bid: #7cc488;
+		--obk-bid-soft: #1d3322;
+		--obk-ask: #ec8a80;
+		--obk-ask-soft: #3d2220;
+		--obk-hot: #f1b54a;
+		--obk-hot-soft: #3b2e14;
+	}
+}
+.obk-title { text-align: center; font-size: 0.9rem; font-weight: 600; }
+.obk-canvas { overflow-x: auto; padding: 0.6rem; border: 1px solid var(--faint); border-radius: 10px; background: var(--surface); }
+.obk-frame[hidden], .obk-notes p[hidden] { display: none; }
+.obk-frame svg { display: block; max-width: none; margin: 0 auto; }
+.obk-notes { min-height: 3.2em; margin-top: 0.55rem; padding: 0.55rem 0.75rem; border-left: 3px solid var(--accent); background: var(--surface); font-size: 0.82rem; line-height: 1.5; }
+.obk-notes p { margin: 0; }
+.obk-msg { margin: 0 0 0.4rem; font: 600 0.8rem var(--mono); text-align: center; }
+.obk-msg .buy { color: var(--obk-bid); }
+.obk-msg .sell { color: var(--obk-ask); }
+.obk-trades { margin: 0.35rem 0 0; font: 0.72rem var(--mono); text-align: center; color: var(--muted); min-height: 1.2em; }
+.obk-legend { margin: 0.4rem 0 0; font-size: 0.72rem; color: var(--muted); text-align: center; }
+
+.obk svg text { font-family: var(--sans); }
+.obk .obk-head { font-size: 11px; font-weight: 600; fill: var(--muted); }
+.obk .obk-idx { font: 10px var(--mono); fill: var(--muted); }
+.obk .obk-order { font: 600 10px var(--mono); fill: var(--obk-hot); }
+.obk .obk-slot { font: 8px var(--mono); fill: var(--muted); }
+
+/* ladder */
+.obk .obk-row { fill: transparent; }
+.obk .obk-row.odd { fill: var(--bg); opacity: 0.55; }
+.obk .obk-row.spread { fill: var(--accent-soft); opacity: 1; }
+.obk .obk-price { font: 600 12px var(--mono); fill: var(--muted); }
+.obk .obk-price.best-bid { fill: var(--obk-bid); font-size: 13px; }
+.obk .obk-price.best-ask { fill: var(--obk-ask); font-size: 13px; }
+.obk .obk-total { font: 10px var(--mono); fill: var(--muted); }
+.obk .obk-chip rect { stroke-width: 1.2; }
+.obk .obk-chip.bid rect { fill: var(--obk-bid-soft); stroke: var(--obk-bid); }
+.obk .obk-chip.ask rect { fill: var(--obk-ask-soft); stroke: var(--obk-ask); }
+.obk .obk-chip.ghost rect, .obk .obk-chip.cancel rect { fill: none; stroke-dasharray: 3 2; opacity: 0.7; }
+.obk .obk-chip.ghost .obk-chip-t, .obk .obk-chip.cancel .obk-chip-t { fill: var(--muted); text-decoration: line-through; }
+.obk .obk-chip.added rect, .obk .obk-chip.partial rect { stroke: var(--obk-hot); stroke-width: 2.4; }
+.obk .obk-chip-t { font: 600 10px var(--mono); fill: var(--text); }
+
+/* sorted vector */
+.obk .obk-cell { fill: var(--bg); stroke: var(--faint); }
+.obk .obk-cell.back { stroke: var(--accent); }
+.obk .obk-cell.seen { fill: var(--obk-hot-soft); }
+.obk .obk-cell.probe { fill: var(--obk-hot-soft); stroke: var(--obk-hot); stroke-width: 2.4; }
+.obk .obk-cell-t { font: 600 11px var(--mono); fill: var(--text); }
+.obk .obk-range { fill: none; stroke: var(--accent); stroke-dasharray: 4 3; }
+.obk .obk-hit { fill: none; stroke: var(--obk-bid); stroke-width: 2.5; }
+.obk .obk-insert { stroke: var(--obk-ask); stroke-width: 3; }
+.obk .obk-insert-t { font: 600 10px var(--sans); fill: var(--obk-ask); }
+
+/* ticks and bitmap */
+.obk .obk-tick { fill: var(--bg); stroke: var(--faint); }
+.obk .obk-tick.on { fill: var(--obk-bid-soft); stroke: var(--obk-bid); }
+.obk .obk-tick.emptied { stroke: var(--obk-ask); stroke-width: 2; }
+.obk .obk-tick.seen { fill: var(--obk-hot-soft); }
+.obk .obk-tick.probe { fill: var(--obk-hot-soft); stroke: var(--obk-hot); stroke-width: 2; }
+.obk .obk-tick.found { fill: var(--obk-bid); stroke: var(--obk-hot); stroke-width: 2.5; }
+.obk .obk-bit { fill: var(--bg); stroke: var(--faint); }
+.obk .obk-bit.on { fill: var(--obk-bid-soft); stroke: var(--obk-bid); }
+.obk .obk-bit.probe { stroke: var(--obk-hot); stroke-width: 2.4; }
+.obk .obk-bit-t { font: 8px var(--mono); fill: var(--muted); text-anchor: middle; }
+.obk .obk-word { fill: none; stroke: var(--obk-hot); stroke-width: 2; stroke-dasharray: 4 2; }
+.obk .obk-link { stroke: var(--faint); fill: none; }
+.obk .obk-link.hot { stroke: var(--obk-hot); stroke-width: 1.8; }
+
+/* tree of limits */
+.obk .obk-sep { stroke: var(--faint); stroke-dasharray: 5 4; }
+.obk .obk-tree-e { stroke: var(--muted); stroke-width: 1.4; fill: none; }
+.obk .obk-tree-e.hot { stroke: var(--obk-hot); stroke-width: 2.6; }
+.obk .obk-tree-n { fill: var(--bg); stroke: var(--muted); stroke-width: 1.4; }
+.obk .obk-tree-n.hot { fill: var(--obk-hot-soft); stroke: var(--obk-hot); stroke-width: 2.4; }
+.obk .obk-tree-n.insert { fill: var(--obk-hot); stroke: var(--obk-hot); }
+.obk .obk-tree-n.erase { fill: none; stroke: var(--obk-ask); stroke-dasharray: 2 2; }
+.obk .obk-dot-link { stroke: var(--faint); stroke-dasharray: 2 3; }
+.obk .obk-level rect { stroke-width: 1.3; }
+.obk .obk-level.bid rect { fill: var(--obk-bid-soft); stroke: var(--obk-bid); }
+.obk .obk-level.ask rect { fill: var(--obk-ask-soft); stroke: var(--obk-ask); }
+.obk .obk-level.hot rect, .obk .obk-level.insert rect { stroke: var(--obk-hot); stroke-width: 2.6; }
+.obk .obk-level.erase rect { fill: none; stroke-dasharray: 3 2; }
+.obk .obk-lv-p { font: 700 12px var(--mono); fill: var(--text); }
+.obk .obk-lv-t { font: 10px var(--mono); fill: var(--muted); }
+.obk .obk-node rect { fill: var(--bg); stroke-width: 1.2; }
+.obk .obk-node.bid rect { stroke: var(--obk-bid); }
+.obk .obk-node.ask rect { stroke: var(--obk-ask); }
+.obk .obk-node.hot rect { fill: var(--obk-hot-soft); stroke: var(--obk-hot); stroke-width: 2.4; }
+.obk .obk-node.ghost rect { fill: none; stroke-dasharray: 3 2; opacity: 0.7; }
+.obk .obk-node.ghost .obk-chip-t { fill: var(--muted); text-decoration: line-through; }
+.obk .obk-ll { stroke: var(--muted); stroke-width: 1.2; fill: none; }
+.obk .obk-ll.cut { stroke: var(--obk-ask); stroke-dasharray: 2 2; }
+.obk .obk-idcell { fill: var(--bg); stroke: var(--faint); }
+.obk .obk-idcell.on { stroke: var(--muted); }
+.obk .obk-idcell.hot { fill: var(--obk-hot-soft); stroke: var(--obk-hot); stroke-width: 2.4; }
+.obk .obk-arrow { fill: none; stroke: var(--obk-hot); stroke-width: 2; marker-end: none; }
+
+/* charts */
+.obk .obk-bar { fill: var(--accent); opacity: 0.8; }
+.obk .obk-bar.hot { fill: var(--obk-hot); opacity: 1; }
+.obk .obk-bar-l { font-size: 11px; fill: var(--text); }
+.obk .obk-bar-v { font: 10px var(--mono); fill: var(--muted); }
+.obk .obk-grid { stroke: var(--faint); }
+.obk .obk-col.a { fill: var(--obk-ask); opacity: 0.8; }
+.obk .obk-col.b { fill: var(--accent); }
+.obk .obk-col.c { fill: var(--obk-bid); opacity: 0.8; }

@@ -1,0 +1,381 @@
+---
+title: "Linear Layouts: Tensor Layouts as Matrices over F₂"
+description: "How Triton describes where every element of a tile lives (registers, threads, warps, shared memory) as a binary matrix, and what that buys the compiler: vector widths, broadcasting, layout conversions by register permutation, warp shuffles or provably optimal swizzled shared memory. Based on Zhou et al., ASPLOS '26, and Triton 3.8.0's source."
+date: 2026-11-04
+tags: [Compilers, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import MarginNote from "../../components/MarginNote.astro";
+import LinearLayoutExplorer from "../../utils/layout/LinearLayoutExplorer.astro";
+import ConversionTable from "../../utils/layout/ConversionTable.astro";
+import ShuffleSteps from "../../utils/layout/ShuffleSteps.astro";
+import SwizzleBanks from "../../utils/layout/SwizzleBanks.astro";
+import { conversionCases, shuffleSrc, shuffleDst } from "../../utils/layout/linearLayoutFigures";
+
+## Background
+
+A Triton kernel works on tiles: a `tl.load` returns, say, a 128 × 64 block of a matrix. On the GPU that block does not live in one place. Each of the CTA's threads holds a few elements in its registers, and the tile may also be copied into shared memory. A **layout** is the rule that says which element sits in which register of which thread of which warp, or at which shared-memory offset. The [Triton JIT post](/blog/triton-jit/) showed the simplest one, the blocked layout that `tl.load` gets.
+
+Every operation wants a different layout. A coalesced global load wants each thread to own a run of contiguous elements. A tensor-core `mma` wants the exact fragment the instruction defines (see the [PTX post](/blog/ptx/) and the [warp MMA post](/blog/cute-dsl-warp-and-warpgroup-mma/)). A reduction leaves a layout with one dimension removed. So the compiler constantly converts between layouts, and every conversion moves data: inside a thread, between threads of a warp, or through shared memory. Until 2025 Triton described each layout family as its own class, with hand-written indexing and hand-written conversions for each pair. The paper this post follows counts 12% of the bugs filed against Triton as layout bugs, and legacy Triton sent every conversion through shared memory.<Sidenote>Keren Zhou, Mario Lezcano-Casado, Adam P. Goucher et al., "Linear Layouts: Robust Code Generation of Efficient Tensor Computation Using F₂", ASPLOS '26 ([arXiv 2505.23819](https://arxiv.org/abs/2505.23819), v5). Triton's header credits the idea to Adam P. Goucher.</Sidenote>
+
+**Linear layouts** replace all of this with one object. Because every size involved is a power of two, the map from a hardware location to a tensor coordinate acts on bits, and on bits it is linear: a binary matrix over the two-element field $\mathbb{F}_2$. The post covers, in order:
+
+1. the motivating example and arithmetic in $\mathbb{F}_2$;
+2. the definition, and how Triton's blocked, MMA, sliced and shared layouts become matrices;
+3. what the compiler reads off a matrix: vector widths, broadcast copies, instruction tiles;
+4. layout conversions: the conversion map and the three ways to lower it, with the paper's warp-shuffle and optimal-swizzling algorithms;
+5. the paper's results, a comparison with CuTe and the limits.
+
+Code references are to Triton [v3.8.0](https://github.com/triton-lang/triton/tree/c01b6774b1865984607d89d89d3a10833de92037) (`include/triton/Tools/LinearLayout.h`, `lib/Dialect/TritonGPU/IR/LinearLayoutConversions.cpp`). Every figure is computed by a TypeScript port of those functions, checked against the expected layouts in Triton's own unit tests (`LinearLayoutConversionsTest.cpp`). I could not run kernels: there is no GPU in this setup, so the shared-memory figures count bank conflicts with a model of the hardware rather than a profiler.
+
+## Why powers of two make layouts linear
+
+### The motivating example
+
+The paper's running example, **layout A**, spreads a 16 × 16 tensor over 2 warps of 32 threads. Each thread owns a 2 × 2 block (4 registers), a warp arranges its threads 4 rows by 8 columns, and the two warps sit one above the other. In Triton's terms it is a blocked layout with `sizePerThread = [2, 2]`, `threadsPerWarp = [4, 8]`, `warpsPerCTA = [2, 1]` and `order = [1, 0]` (columns move fastest).
+
+Write every index in binary and the layout falls apart into independent pieces. Take register 1 of thread 9 of warp 0:
+
+| Piece | Index | Binary | Contributes (row, col) |
+| ----- | ----: | -----: | ---------------------: |
+| register | 1 | `01` | (0, 1) |
+| thread | 9 | `01001` | (0, 2) ⊕ (2, 0) = (2, 2) |
+| warp | 0 | `0` | (0, 0) |
+| total | | | (2, 3) |
+
+Register bit 0 moves one column, register bit 1 one row. Thread bits 0–2 move 2, 4 and 8 columns; thread bits 3–4 move 2 and 4 rows; the warp bit moves 8 rows. Each set bit adds a fixed offset, and because the offsets never overlap in bits, adding them is the same as XOR-ing them (⊕). So the whole layout is fixed by one coordinate per input bit, 8 of them here.
+
+The figure draws layout A as a grid (each cell names the thread and register that hold it; the lower warp is darker) and as an 8 × 8 matrix. Hover a cell, or click a column header to flip that input bit. The highlighted columns are the set bits of the hardware index; their XOR is the cell's coordinate. The figure opens on register 1 of thread 9: columns `r1`, `t1` and `t8` are lit, and $(0,1) \oplus (0,2) \oplus (2,0) = (2,3)$.
+
+<LinearLayoutExplorer presets={["blockedA", "blockedColMajor"]} select="r1 t9 w0" title="Layout A: grid and F₂ matrix" />
+
+Rows `j0`–`j3` are the column bits of the coordinate and `i0`–`i3` the row bits. Each column of the matrix has exactly one 1: every input bit moves exactly one output bit. Switch to the column-major variant (the same pieces with `order = [0, 1]`, like the paper's layout B) and only the columns get shuffled: it is a different permutation of the same identity.
+
+### Arithmetic in $\mathbb{F}_2$
+
+$\mathbb{F}_2$ is the field with two elements, 0 and 1. Addition is XOR and multiplication is AND:
+
+$$
+a \oplus b = (a + b) \bmod 2, \qquad a \cdot b = (a \times b) \bmod 2 .
+$$
+
+A matrix–vector product works as usual, with $\oplus$ for the sum. Read each column of the matrix as an integer and the vector as a bitmask: the product is the XOR of the columns whose bit is set. Triton's header gives this example. The columns are 1, 2, 14, 12 and the vector is $6 = 0\text{b}0110$, which selects the second and third columns:
+
+$$
+\begin{bmatrix} 1 & 2 & 14 & 12 \end{bmatrix} \cdot 6 = 2 \oplus 14 = 0\text{b}0010 \oplus 0\text{b}1110 = 0\text{b}1100 = 12 .
+$$
+
+That is all a layout evaluation costs: one XOR per set input bit. Generated code does the same thing with `xor`, `and` and shifts on the thread id.
+
+## The definition
+
+### A linear map between labelled spaces
+
+A **linear layout** is a linear map between labelled vector spaces over $\mathbb{F}_2$ (the paper's Definition 4.1). The input space is split into named pieces, here $\text{Reg} \times \text{Thr} \times \text{Wrp} = \mathbb{F}_2^2 \times \mathbb{F}_2^5 \times \mathbb{F}_2^1$, and so is the output, $\mathbb{F}_2^4 \times \mathbb{F}_2^4$ for the row and column of a 16 × 16 tensor. The labels let the compiler ask questions such as "which part of this map involves lanes?".
+
+Triton stores a layout as its **bases**: for each input dimension, the image of each power of two.
+
+```cpp
+// include/triton/Tools/LinearLayout.h (v3.8.0)
+// bases[inDim][i] = L(0, ..., inDim=2^i, ..., 0).  All other values of L are
+// computed by xor'ing bases together, using the linearity rule.
+llvm::MapVector<StringAttr /*inDim*/,
+                std::vector<std::vector<int32_t>> /*size=getInDimSizeLog2(inDim)*/>
+    bases;
+```
+
+Layout A is
+
+```
+register = [(0, 1), (1, 0)]
+lane     = [(0, 2), (0, 4), (0, 8), (2, 0), (4, 0)]
+warp     = [(8, 0)]
+```
+
+which is exactly what Triton prints, and what a `#ttg.linear` attribute spells out in TTGIR: `#ttg.linear<{register = [[0, 1], [1, 0]], lane = [...], warp = [[8, 0]], block = []}>`.<Sidenote>Gluon, Triton's lower-level frontend, takes the same bases directly: `ttgl.DistributedLinearLayout(reg_bases, lane_bases, warp_bases, block_bases, shape)` in `python/triton/experimental/gluon/language/_layouts.py`.</Sidenote>
+
+### Why hardware → tensor and not the reverse
+
+The map goes from hardware location to tensor coordinate. One element can live in several places (two warps may both hold a copy), so the reverse direction would not be a function. Going this way, a layout is always a function, it need not be injective, and it should be **surjective**: every element of the tensor lives somewhere. Triton asserts surjectivity unless a layout is built otherwise on purpose.
+
+## Triton's layouts as matrices
+
+The paper proves that every layout Triton had, "distributed" (in registers) or "memory" (in shared memory), is a linear layout, and gives the constructions. Two operations build all of them.
+
+### Product: tiling one layout inside another
+
+The **product** of $L_1 : U_1 \to V_1$ and $L_2 : U_2 \to V_2$ acts on the pair, $(u_1, u_2) \mapsto (L_1(u_1), L_2(u_2))$. Its matrix is block diagonal (Definition 4.3):
+
+$$
+L_1 \times L_2 = \begin{bmatrix} M_1 & 0 \\ 0 & M_2 \end{bmatrix} .
+$$
+
+In Triton this is `operator*`. When both layouts use the same output dimension, the inner one owns its low bits and the outer one's bases are shifted above them. So `identity1D(4, "i", "o") * identity1D(2, "i", "o")` is `identity1D(8, "i", "o")`, and `identity1D(4, "i", "o") * zeros1D(2, "i", "o")` is $L(x) = x \bmod 4$ on $[0, 8)$: the third input bit maps to zero.
+
+A blocked layout is then three identity maps in a row, registers inside lanes inside warps, each laid out along `order`:
+
+```cpp
+// lib/Dialect/TritonGPU/IR/LinearLayoutConversions.cpp (v3.8.0)
+LinearLayout BlockedEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
+  MLIRContext *ctx = getContext();
+  auto order = getOrder();
+  LinearLayout ctaLayout =
+      identityStandardND(S("register"), getSizePerThread(), order) *
+      identityStandardND(S("lane"), getThreadsPerWarp(), order) *
+      identityStandardND(S("warp"), getWarpsPerCTA(), order);
+  return combineCtaCgaWithShape(ctaLayout, getCGALayout(), shape);
+}
+```
+
+That is the paper's Proposition 4.6 ("blocked layouts are linear layouts") in four lines. `identityStandardND` multiplies one `identity1D` per dimension, fastest first, which is why layout A's register bases come out as (0, 1) before (1, 0).
+
+### Tiles that do not match the tensor
+
+The product of `sizePerThread`, `threadsPerWarp` and `warpsPerCTA` is a tile, and the tensor may be bigger or smaller. `combineCtaCgaWithShape` handles both cases with two small functions in `lib/Tools/LayoutUtils.cpp`:
+
+- **Tile smaller than the tensor** (`ensureLayoutNotSmallerThan`): multiply by one more identity on registers. The extra register bases repeat the tile, so each thread holds more elements.
+- **Tile larger than the tensor** (`ensureLayoutNotLargerThan`): any basis that points outside the tensor becomes zero. A zero column means that input bit does not change the element, so the threads or warps that differ in that bit hold copies.
+
+The second case is **broadcasting**, and the matrix shows it as zero columns. The next figure puts layout A on an 8 × 8 tensor. The lane basis that moved 8 columns and the warp basis that moved 8 rows have both become zero, so each element is held 4 times: thread $t$ and $t \oplus 4$ hold the same values, and so do the two warps. The `×4` badge counts the copies. The second preset is a **slice**: the layout of `tl.sum(x, axis=0)` with x in layout A. Triton drops the row bits of the parent (`SliceEncodingAttr::toLinearLayout` removes the dimension, then drops register bases that became zero), which leaves the lane and warp bases that moved along rows as zero columns.
+
+<LinearLayoutExplorer presets={["broadcast", "slice"]} select="t5" title="Zero columns are broadcast copies" />
+
+Legacy Triton had to work out "which threads hold duplicates" separately for every layout, a long-running source of bugs in reductions and scans (the paper cites Triton issues 3017, 4310 and 4362). With linear layouts the answer is the list of zero columns.
+
+### MMA layouts
+
+Tensor-core layouts are products too, just of smaller pieces. For Ampere's `mma.sync` (Triton's `NvidiaMmaEncoding` version 2), `nvidiaMmaTile` builds the m16n8 fragment one identity at a time:
+
+```cpp
+// lib/Dialect/TritonGPU/IR/LinearLayoutConversions.cpp (v3.8.0)
+// The relative order of registers and lanes is given by:
+// - Inner dim: kWidth registers
+// - Inner dim: 4 lanes
+// - Outer dim: 8 lanes
+// - Outer dim: repeat m / 8 times
+// - Inner dim: repeat n / (kWidth * 4) times
+ctaLayout = ctaLayout *
+            LinearLayout::identity1D(kWidth, S("register"), dimNames[inner]) *
+            LinearLayout::identity1D(4, S("lane"), dimNames[inner]) *
+            LinearLayout::identity1D(8, S("lane"), dimNames[outer]) *
+            LinearLayout::identity1D(m / 8, S("register"), dimNames[outer]) *
+            LinearLayout::identity1D(n / (kWidth * 4), S("register"),
+                                     dimNames[inner]);
+```
+
+For the accumulator, kWidth is 2 and the tile is 16 × 8. On a 16 × 16 tensor a second register bit repeats it to the right, giving
+
+```
+register = [(0, 1), (8, 0), (0, 8)]
+lane     = [(0, 2), (0, 4), (1, 0), (2, 0), (4, 0)]
+```
+
+which matches Triton's `MMAv2_16x16` unit test. Check it against the PTX ISA's fragment for `mma.m16n8`: lane $l$ has group id $g = \lfloor l/4 \rfloor$ and holds $c_0, c_1$ at row $g$, columns $2(l \bmod 4)$ and $2(l \bmod 4)+1$, and $c_2, c_3$ eight rows lower. Lane 5, register 3: the lane bases give $(0,2) \oplus (1,0) = (1,2)$ and registers 1 and 2 add $(0,1) \oplus (8,0)$, so the element is $(9, 3)$. PTX says $g = 1$, $c_3$ at row $1 + 8 = 9$, column $2 \cdot 1 + 1 = 3$. The same.
+
+<LinearLayoutExplorer presets={["mma", "dotB"]} select="r3 t5" title="mma.sync fragments: accumulator and B operand" />
+
+The operand layouts come from the same function with the tile shape of the operand (`nvidiaDotToLinearLayout`). For fp16 the A fragment on 16 × 16 turns out to be the same matrix as the accumulator above. The B fragment (second preset, k down and n across) is its transpose: each thread holds two consecutive k values of one column. The paper's Proposition 4.7 states this in general: the inputs and outputs of `mma` and `wgmma` are linear layouts.
+
+### Composition and inversion
+
+**Composition** chains two layouts, $(L_2 \circ L_1)(u) = L_2(L_1(u))$, and its matrix is the product $M_2 M_1$ over $\mathbb{F}_2$ (Definition 4.2). **Inversion** goes from tensor coordinate back to hardware. A surjective layout has a right inverse, which Gaussian elimination over $\mathbb{F}_2$ finds (Definition 4.5).<Sidenote>When the layout is not injective there are many right inverses. Triton's `invertAndCompose` picks the one with free variables set to zero, the minimum Hamming weight solution, so every copy of an element is read from the lowest-numbered register, lane and warp that holds it. Dimensions that are identical in both layouts are mapped as the identity first, so a conversion leaves them alone.</Sidenote> The two together answer the question every lowering asks: given where an element is now, where must it go?
+
+### Shared memory and swizzling
+
+A **memory layout** maps a shared-memory offset (counted in elements) to a tensor coordinate. The plain row-major one is the identity: offset $8i + j$ holds element $(i, j)$ of an 8-column tile. Reading such a buffer column by column makes every thread hit the same memory bank, so Triton uses **swizzled** layouts. The paper's Definition 4.11 writes the classic MMA swizzle, with parameters `vec`, `per_phase` and `max_phase`, as the offset of element $(i, j)$:
+
+$$
+\left( \left( \left\lfloor \tfrac{i}{\text{per\_phase}} \right\rfloor \bmod \text{max\_phase} \right) \oplus \left\lfloor \tfrac{j}{\text{vec}} \right\rfloor \right) \cdot \text{vec} \;\oplus\; (j \bmod \text{vec}) .
+$$
+
+Every operation on the bits there is a XOR, a shift or a mask, so the map is linear (Proposition 4.12). Triton builds it directly as bases: the column bases are the identity, and the basis for row $2^k$ also XORs a column offset into it.
+
+```cpp
+// swizzledSharedToLinearLayout (v3.8.0)
+for (int row = 1; row < numRows; row *= 2) {
+  int vec = shared.getVec();
+  int perPhase = shared.getPerPhase();
+  int maxPhase = shared.getMaxPhase();
+  bases2D.push_back({row, (vec * ((row / perPhase) % maxPhase)) % numCols});
+}
+```
+
+I checked that these bases reproduce Definition 4.11 at every offset of a 16 × 32 tile for five parameter sets. The matrix has the block shape the paper gives, $\begin{bmatrix} I_n & C \\ 0 & I_m \end{bmatrix}$, where row $k$ of $C$ is $\text{vec} \cdot (\lfloor 2^k / \text{per\_phase} \rfloor \bmod \text{max\_phase}) \bmod 2^n$.
+
+<LinearLayoutExplorer presets={["swizzled", "unswizzled"]} select="o30" title="Shared memory: offset → element, swizzled and plain" />
+
+In the swizzled figure (vec 1, per_phase 1, max_phase 8) each cell shows the offset that holds it, tinted by the offset's position in its 8-element row. Row $i$'s bases carry an extra 1 in column bit $i$, so offset $8i + c$ holds element $(i, c \oplus i)$. Check one entry: offset 30 = `0b011110` has column bits 6 and row bits 3, so it holds $(3, 6 \oplus 3) = (3, 5)$, the cell the figure opens on. Every tensor column now uses all 8 tints: no two elements of a column share a position in their row, which is what keeps a column read free of bank conflicts.
+
+### Two families, two characterisations
+
+The constructions give the paper two clean definitions in place of Triton's old informal ones:
+
+- A **distributed layout** (Definition 4.10) is a surjective linear layout from registers, lanes and warps to the tensor whose matrix columns each have at most one 1, with no two non-zero columns equal. In other words, a permutation matrix with zero columns mixed in.
+- A **memory layout** (Definition 4.14) is an invertible linear layout whose columns have one or two 1s. In the swizzled matrix above, every column for a row bit has two.
+
+The property line under each figure checks these. There is a theorem behind them too (Theorem 9.3 in the appendix): the distributed family is closed under Triton's shape operations, `tt.trans`, `tt.reshape`, `tt.join`, `tt.split`, `tt.expand_dims` and `tt.broadcast`. For any input layout there is an output layout that makes the operation a no-op (it only renames bits), and the family is the smallest with that property. Legacy layouts were not closed: the transpose of an MMA layout had no name, so a `tt.trans` after a dot needed a real conversion.
+
+## What the compiler reads off the matrix
+
+### Contiguity and vector width
+
+To vectorise a global load or store, the compiler needs the number of contiguous elements a thread owns. Legacy Triton guessed it from the fastest-moving dimension, and gave up when that dimension had size 1, as in a `[128, 1]` tensor. With a linear layout it is the largest $u$ such that the inverse layout maps the first $u$ elements to the first $u$ registers as the identity. Triton's `getNumConsecutiveInOut` counts how many leading register bases are $1, 2, 4, \ldots$ along the fastest dimension and checks that no other basis touches those bits.
+
+The paper's load/store benchmark shows what the old heuristic missed (Table 3, element bit widths per instruction):
+
+| Tensor | Legacy Triton | Linear layouts |
+| ------ | ------------: | -------------: |
+| [512, 2] × fp8 | 16 (`v1.b16`) | 128 (`v4.b32`) |
+| [512, 4] × fp8 | 32 | 128 |
+| [512, 8] × fp8 | 64 | 128 |
+| [512, 2] × fp16 | 32 | 128 |
+| [512, 4] × fp16 | 64 | 128 |
+
+The legacy code looked for contiguity along the last dimension only. A thread's run can continue from one row of a narrow tensor into the next, and the inverse layout sees that as one run of consecutive elements: up to 7× wider accesses.
+
+### Broadcasting
+
+Zero columns tell a reduction or a store which threads hold copies, so only one of them writes. In the paper's reduction benchmark over five shapes and seven layout families, legacy Triton failed every case for MMA-input, sliced-MMA, sliced-MMA-input and custom layouts (0 of 10 each), and the linear version passed them all while cutting shared-memory instructions by 76% for blocked layouts (5888 to 1388), 40% for MMA and 30% for sliced blocked layouts.
+
+### Instruction tiles and left division
+
+Hardware instructions move fixed tiles: `ld.shared.v4.b32` moves 128 contiguous bits per thread, `ldmatrix` has 8 groups of 4 threads each move a 16-byte row. The paper models each instruction as a small layout $T$ and asks whether a layout "contains" it. **Left division** (Definition 4.4) does that: $M$ is divisible on the left by $M_1$ when
+
+$$
+M = \begin{bmatrix} M_1 & 0 \\ 0 & M_2 \end{bmatrix},
+$$
+
+and then $M /_\ell M_1 = M_2$ is what is left. Theorem 5.1: an instruction with tile $T$ can lower layout $L$ if $L /_\ell T$ exists. For a shared-memory store, $L$ is $A^{-1} \circ B$ (distributed layout $B$ to shared layout $A$, then to offsets). The vector tile of $2^n$ bits is the identity from registers to offsets, and the `ldmatrix` tile for element width $w$ bytes is $\text{id}^{\text{Reg},\text{Off}}_k \times \text{id}^{\text{Thr},\text{Off}}_2$ with $k = \log_2(4/w)$. If the division fails only because registers are in the wrong order, permuting registers ($L' = P_{\text{Reg}} L$) fixes it, and the division algorithm finds $P_{\text{Reg}}$ as it goes.
+
+## Layout conversions
+
+### The conversion map
+
+To convert a value from layout $A$ to layout $B$, compose one with the inverse of the other. The paper writes $B^{-1} \circ A$: for each source location, its destination. Triton computes the reverse direction, `dst.invertAndCompose(src)` $= A^{-1} \circ B$: for each destination register, the source location that holds the same element, which is what the generated code needs to fetch it. Then it removes the dimensions on which the map is the identity, starting from the slowest:
+
+```cpp
+// lib/Analysis/Utility.cpp (v3.8.0), minimalCvtLayout
+auto comp = dstLayout.invertAndCompose(srcLayout);
+// We try to quotient by the slowers moving subspace first
+for (auto dim : dims) {
+  auto quotient = comp.quotient(dim);
+  if (!quotient.has_value()) break;
+  comp = *quotient;
+}
+```
+
+Whatever input dimensions are left decide the lowering in `ConvertLayoutOpToLLVM.cpp`. If warp (or block) is still there, data crosses warps, which needs shared memory. If only lane and register remain, it stays in a warp and can use shuffles. If only register remains, each thread already has its data and just renames registers. If nothing remains the conversion is a no-op. The table runs four conversions on a 16 × 16 tensor with 2 warps through the same functions:
+
+<ConversionTable cases={conversionCases} caption="Conversion layouts computed as in Triton's minimalCvtLayout, 16 × 16 tensor, 2 warps of 32 threads." />
+
+The second row swaps layout A's two register bases. The tensor is held by the same threads, only numbered differently, so the conversion is a permutation of registers ([2, 1] means register 1 takes source register 2's value and vice versa), which costs nothing at run time. The third row changes `sizePerThread` from [1, 2] to [1, 4] with the warp basis unchanged, so the warp dimension cancels out and the data moves between lanes only. The fourth goes from layout A to an MMA layout with warps [2, 1]. Its two stacked 16 × 8 warp tiles would cover 32 rows, more than the tensor, so its warp basis is zero and each warp needs all 16 rows, half of which the other warp holds in layout A. Warp survives, and the conversion goes through shared memory. Legacy Triton could not even compare a blocked layout with a sliced one, so it could not tell that a conversion between two "different" layouts was a no-op. The paper credits that check for part of the `welford` benchmark's speedup.
+
+### Inside a warp: warp shuffles
+
+`shfl.sync.idx` lets each lane read a 32-bit register from any other lane of its warp, with no shared memory and no barrier. The paper builds a schedule of shuffles from the bases (Section 5.4), for a conversion with no broadcasting:
+
+1. $V = A_{\text{Reg}} \cap B_{\text{Reg}}$: register bases both layouts share. Elements along them stay together, so one shuffle can carry up to 32 bits of them.
+2. $I = A_{\text{Thr}} \cap B_{\text{Thr}}$: lane bases both share; no exchange is needed along them.
+3. $E = A_{\text{Thr}} \setminus I$ and $F = B_{\text{Thr}} \setminus I$, sorted, have the same size. Let $G = \{ e_i \oplus f_i \}$.
+4. Extend $V \cup I \cup G$ with vectors $R$ to a basis of the whole tensor.
+
+Each element of $\operatorname{span}(V \cup I \cup G)$ sits in a different lane of $A$ and in a different lane of $B$, so the set can move in one round. Round $r$ moves the coset $R(r) \oplus \operatorname{span}(V \cup I \cup G)$, and there are $2^{|R|}$ rounds.
+
+The figure is the paper's Figure 4. Eight elements over four threads: in $A$ thread $t$ holds $2t$ and $2t + 1$ (register basis 1, lane bases 2 and 4); in $B$ it holds $t$ and $t + 4$ (register basis 4, lane bases 1 and 2). Step through the rounds.
+
+<ShuffleSteps src={shuffleSrc} dst={shuffleDst} step={0} title="Warp-shuffle conversion, the paper's Figure 4" />
+
+Work it by hand. $A_{\text{Reg}} = \{1\}$ and $B_{\text{Reg}} = \{4\}$ share nothing, so $V = \varnothing$ and each shuffle carries one element. $I = \{2\}$, $E = \{4\}$, $F = \{1\}$ and $G = \{4 \oplus 1\} = \{5\}$. So $\operatorname{span}(I \cup G) = \{0, 2, 5, 7\}$, written $[0\,0\,0], [0\,1\,0], [1\,0\,1], [1\,1\,1]$ least significant bit first, as in the paper. Element 5 is in thread 2 of $A$ and thread 1 of $B$, element 2 in thread 1 and thread 2, and 0 and 7 stay in threads 0 and 3. Each thread sends one element and receives one, so the round is one shuffle. $R = \{4\}$ completes the basis, so round 1 moves $4 \oplus \{0, 2, 5, 7\} = \{1, 3, 4, 6\}$. Two shuffles in total, against a store, a barrier and a load through shared memory.<Sidenote>Which register a lane sends depends on the lane (in round 0, threads 0 and 1 send register 0, threads 2 and 3 register 1), so each round also needs a select before the shuffle. The paper's figure picks $R(1) = [1\,0\,0]$, the same coset written with a different representative.</Sidenote>
+
+On the paper's GH200 benchmark, converting layouts with shuffles instead of shared memory was up to 3.93× faster. The `tl.gather` lowering uses the same idea (Section 5.5): when the gathered axis has no warp bits ($L^{\text{axis}}_{\text{Wrp}}$ all zero), each lane fetches its value with $2^{|L^{\text{axis}}_{\text{Thr}}|}$ rounds of shuffles. That was up to 14.20× faster than going through shared memory, with the gain dropping for wide axes such as [512, 32] where the rounds add up.
+
+Triton 3.8.0 has moved past the paper's version. `getWarpLayoutConvertDecomposition` writes the conversion as a permutation $P$ of register and lane bits and factors it as $P = P_{\text{mixed}} \circ P_{\text{lane}} \circ P_{\text{reg}}$, where $P_{\text{mixed}}$ is a product of disjoint transpositions of one register bit with one lane bit. `cvtNeedsWarpShuffle` takes the shuffle path only when there are fewer than two such transpositions; otherwise the conversion still goes through shared memory.
+
+### Through shared memory: bank conflicts
+
+Shared memory has 32 **banks**, each 4 bytes wide; consecutive 4-byte words go to consecutive banks, so one 128-byte line covers every bank once. A warp's request is served in **wavefronts**: in each one a bank can deliver one word (any number of lanes reading the same word share it). Two lanes that want different words in the same bank force a second wavefront, a **bank conflict**. Accesses wider than 4 bytes per lane are split into 128-byte phases first: 16-byte vectors go 8 lanes at a time.
+
+The paper's Lemma 9.4 counts the cost with the bases. Describe shared memory as a map $S : \text{Vec} \times \text{Bank} \times \text{Seg} \to$ tensor, where Vec is the vector one lane moves, Bank is the rest of one 128-byte line and Seg (segment) picks the line. If each vector covers $n \geq 1$ banks and the lanes of one phase are $L_{\text{Thr}}$, the access takes exactly $n \cdot c$ wavefronts, with
+
+$$
+c = \left| \operatorname{span}(S_{\text{Vec}} \cup S_{\text{Seg}}) \cap \operatorname{span}(L_{\text{Thr}}) \right| .
+$$
+
+The intuition: two lanes conflict when they differ only by a vector that changes the line but not the bank. My simulator, which just counts words per bank, gives exactly $n \cdot c$ for every instruction in all 74 configurations with vectors of at least 32 bits that I tried (out of five shared layouts × five register layouts × two shapes × fp32 and fp16).
+
+The classic bad case is a transpose. A warp stores a 32 × 32 fp32 tile with lane $j$ holding column $j$, then loads it back with lane $i$ holding row $i$. Choose the access, shared layout and instruction below; outlined cells are the ones that instruction touches, labelled with the lane, and red ones sit in a conflicting bank.
+
+<SwizzleBanks example="transpose32" option={0} access="load" title="fp32 transpose: lane = column on store, lane = row on load" />
+
+With the plain row-major buffer the store is free (32 lanes write 32 consecutive words of one line), but on the load the lanes read rows. Each lane reads 4 contiguous elements of its row (16 bytes), so the load is split into phases of 8 lanes, and in each phase 8 lanes ask the same 4 banks for words in 8 different lines: 8 wavefronts per phase, 32 per instruction, 256 for the 8 loads where 32 would do. The XOR swizzle (vec 1, per_phase 1, max_phase 32) fixes the conflicts: both directions take one wavefront per instruction. It also scatters each row's 4-element groups, so the load drops to 32 scalar instructions. The vec 4 swizzle (vec 4, per_phase 1, max_phase 8) keeps the groups whole and is conflict-free with 8 vector loads: 32 wavefronts either way.
+
+### Optimal swizzling
+
+Legacy Triton chose shared layouts with heuristics: swizzle parameters for known MMA cases, padding otherwise. The paper derives the shared layout from the two distributed layouts, for any pair (Section 5.4 and Appendix 9.2). In the language above, the steps are:
+
+1. **Vector.** $V$ = bases of $A_{\text{Reg}} \cap B_{\text{Reg}}$, up to 128 bits. Both sides can move these together.
+2. **Lanes per wavefront.** $A_{\text{Bank}}$ and $B_{\text{Bank}}$ are the lane bases of one 128-byte phase (drop the top $\log_2 \max(1, 2^v w / 4)$ lane bases, $w$ the element width in bytes).
+3. **Segments.** Choose $S_{\text{Seg}}$ with as little overlap as possible with $\operatorname{span}(V \cup A_{\text{Bank}})$ and $\operatorname{span}(V \cup B_{\text{Bank}})$. First take vectors $C$ that neither access touches. Then take $H = \{ e_i \oplus f_i \}$ for $E = A_{\text{Bank}} \setminus B_{\text{Bank}}$, $F = B_{\text{Bank}} \setminus A_{\text{Bank}}$: such a vector is in neither span. Only if these run out, take plain lane bases, which costs conflicts.
+4. **Banks.** $S_{\text{Bank}}$ completes $V \cup S_{\text{Seg}}$ to a basis.
+
+Lemma 9.5 shows this is the best possible: the largest subspace meeting the union of two subspaces $U$ and $V$ only in 0 has dimension $d - \max(\dim U, \dim V)$, and the construction reaches it. So the layout has the fewest conflicts any layout can have at the chosen vector width. Triton implements it in `lib/Tools/GenericSwizzling.cpp` (`optimalSwizzlingLdSt`, with the segment choice in `computeSegment`), and my port follows that code.<Sidenote>The port skips one branch: when the shared vector is narrower than 32 bits, Triton pads it with warp bases. Neither example here takes that branch (both have 32-bit vectors). Ties may also break differently, since I flatten the tensor row-major.</Sidenote>
+
+For the transpose, work it by hand. The tile has $d = 10$ bits ($x = 32i + j$). $A$'s lanes are the column bits $\{1, 2, 4, 8, 16\}$ and $B$'s are the row bits $\{32, \ldots, 512\}$; with fp32 and no shared register bases, $V = \varnothing$ and a line holds 32 elements, so there are 5 bank bits and 5 segment bits. Every unit vector is a lane of one side, so $C$ is empty. $H$ pairs them up: $\{1 \oplus 32, 2 \oplus 64, \ldots\} = \{33, 66, 132, 264, 528\}$, which is exactly 5 segment bases, and the bank bases complete them as $\{32, \ldots, 512\}$. Solving for the offset gives element $(i, j)$ at
+
+$$
+\text{offset}(i, j) = 32\,j + (i \oplus j),
+$$
+
+the transpose of the XOR swizzle: line $j$, bank $i \oplus j$. On the store, the lanes vary $j$ and so pick different lines' banks $i \oplus j$, all distinct; on the load they vary $i$ inside one line, also distinct. Pick "linear-layout optimum" in the figure above: every instruction takes one wavefront.
+
+The second example is where a fixed swizzle family runs out. A warp stores a 64 × 32 fp16 tile row-major (8 contiguous elements per thread) and reads it back column-major (8 contiguous elements down a column per thread).
+
+<SwizzleBanks example="fp16cm" option={2} access="load" title="fp16 row-major to column-major" />
+
+The plain buffer stores in 8 full-width instructions but loads with 8 wavefronts per instruction (512 against 64). The XOR swizzle that fixed the transpose breaks the store's 16-byte vectors (64 scalar stores) and still leaves 2-way conflicts on the load (128 against 64). The computed layout finds the one register basis the two sides share, a step of 4 columns: a storing thread's 8 columns include $j$ and $j + 4$, and a loading thread's tile is 4 columns wide, so it repeats at $+4$. Every access moves those 2 fp16 values together (32 bits), and both directions are conflict-free: 32 stores and 32 loads, one wavefront each.<Sidenote>"Optimal" is with respect to that shared vector width. In the transpose, the vec 4 swizzle loads with 8 vector instructions instead of the optimum's 32 scalar ones, also conflict-free, because the load side alone can vectorise. Triton's source notes that asymmetric vectorisation without bank conflicts is not implemented yet.</Sidenote>
+
+## Mixed precision at the language level
+
+Low-precision matmuls stress layouts most. For `mxfp4 × bf16` emulated on Hopper, the fp4 values are upcast to bf16 before `wgmma`, and every group of 32 values shares an 8-bit scale, which in the MMA layout means each row of 8 threads shares one scale. With legacy layouts this would need a new layout and conversions to every other layout. With linear layouts the scales are loaded with ordinary `tt.reshape`, `tt.trans` and `tt.broadcast`, and the layout engine propagates a layout through them for free (Theorem 9.3).
+
+The paper also pre-shuffles the bf16 operand in HBM so the fp4 operand can be loaded with wide vectors, a trick that the Machete kernels implemented in several thousand lines on top of CUTLASS. With shape operations it is five lines of Python. On GH200 the MXFP4 matmuls ran up to 1.87× faster (the fp16 series also gained from a fix that let Triton use `wgmma` there). On correctness, legacy Triton passed 46.6% of 784 mixed-precision matmul cases across 14 data-type pairs, mostly failing small shapes and low-precision types; the linear version passed all of them.
+
+## Results
+
+The paper compares Triton with and without linear layouts on 21 TritonBench benchmarks, 265 input cases in all:
+
+| GPU | Speedup range | Largest gains |
+| --- | ------------: | ------------- |
+| GH200 | 0.96–1.40× | `int4_gemm`, `gemm`, `flex_attention` |
+| RTX 4090 | 0.97–1.37× | `template_attention` |
+| MI250 | 1.00–1.03× | (no `ldmatrix`-like instructions) |
+
+The average is 1.07× and the maximum 1.40×; results below 1 come from noise on small inputs. On NVIDIA the gains come from `ldmatrix`/`stmatrix` in conversions and shared-memory accesses, which the generic division test now finds. `template_attention` gains more on the RTX 4090 because `mma` reads both operands from registers through `ldmatrix`, where Hopper's `wgmma` reads one straight from shared memory.
+
+## How this compares with CuTe
+
+CuTe, the layout algebra in CUTLASS 3 (see the [CuTe layout post](/blog/mathematical-foundations-cute-layout/) and [composition post](/blog/cute-layout-composition/)), solves the same problem with different trade-offs. Triton's header and the paper list them:
+
+- CuTe layouts are shapes and strides over integers, so they handle any size, including padding. Linear layouts need powers of two.
+- In CuTe, swizzling is a separate functor applied after a layout. In a linear layout it is part of the matrix.
+- CuTe dimensions are numbered and may nest; linear-layout dimensions are named (register, lane, warp) and flat.
+- CuTe is meant for people writing kernels by hand and is compiled into the kernel with C++ templates. Linear layouts live in the compiler, which can search over them: the optimal swizzle above is such a search.
+
+## Limits
+
+The main limit is the power-of-two restriction. A tensor of another size is handled by rounding up and masking the extra elements, as Triton already does for `tl.arange`. Some useful maps are not linear at all: flipping an axis ($x \mapsto 2^n - 1 - x$) or taking a slice at an offset both need a constant. The paper suggests **affine layouts**, $y = Ax \oplus b$, as the extension.
+
+## Summary
+
+- Because every size is a power of two, a layout acts on bits, and the map from (register, lane, warp) or shared-memory offset to tensor coordinate is a linear map over $\mathbb{F}_2$: one basis vector per input bit, XORed together.
+- Triton's blocked, MMA, sliced and swizzled layouts are all products of small identity maps, plus zero columns for broadcasting and extra 1s for swizzles. Distributed layouts are permutation matrices with zero columns; memory layouts are invertible with one or two 1s per column.
+- Questions that used to need code per layout become matrix questions: vector width is the identity block at the start, duplicates are the zero columns, an instruction fits when left division succeeds.
+- A conversion is $A^{-1} \circ B$. The input dimensions it still involves pick the lowering: register renaming, warp shuffles (scheduled from $V$, $I$, $E$, $F$, $G$, $R$) or shared memory.
+- For shared memory the swizzle can be computed instead of chosen, and Lemmas 9.4–9.5 prove the computed one has the fewest bank conflicts possible at its vector width.
+
+## References
+
+- Keren Zhou, Mario Lezcano-Casado, Adam P. Goucher, Akhmed Rakhmati, Jeff Niu, Justin Lebar, Pawel Szczerbuk, Peter Bell, Phil Tillet, Thomas Raoux, Zahi Moudallal. [Linear Layouts: Robust Code Generation of Efficient Tensor Computation Using F₂](https://arxiv.org/abs/2505.23819). ASPLOS '26 (arXiv v5, March 2026).
+- Triton v3.8.0 ([c01b677](https://github.com/triton-lang/triton/tree/c01b6774b1865984607d89d89d3a10833de92037)): [`LinearLayout.h`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/include/triton/Tools/LinearLayout.h), [`LinearLayoutConversions.cpp`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/lib/Dialect/TritonGPU/IR/LinearLayoutConversions.cpp), [`GenericSwizzling.cpp`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/lib/Tools/GenericSwizzling.cpp), [`ConvertLayoutOpToLLVM.cpp`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/lib/Conversion/TritonGPUToLLVM/ConvertLayoutOpToLLVM.cpp), [`Utility.cpp`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/lib/Analysis/Utility.cpp), and the unit tests in [`LinearLayoutConversionsTest.cpp`](https://github.com/triton-lang/triton/blob/c01b6774b1865984607d89d89d3a10833de92037/unittest/Dialect/TritonGPU/LinearLayoutConversionsTest.cpp).
+- NVIDIA, [PTX ISA: matrix fragments for `mma.m16n8`](https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-fragment-mma-1688).

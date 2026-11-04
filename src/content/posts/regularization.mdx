@@ -1,0 +1,521 @@
+---
+title: "Regularization: Inductive Bias, Weight Decay, Early Stopping, Ensembles, and Dropout"
+description: "Chapter 9 of Bishop and Bishop, from ill-posed inverse problems through invariant models, norm penalties, early stopping, parameter sharing, ensembles, dropout, and every worked exercise."
+date: 2026-11-04
+tags: [Machine learning, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import LineChart from "../../utils/charts/LineChart.astro";
+import SurfacePlot from "../../utils/charts/3DSurfacePlot.astro";
+
+## Background
+
+A sufficiently large neural network can memorize its training set. That does not make it useful:
+we care about unseen inputs. **Regularization** is any mechanism that biases learning toward
+solutions expected to generalize, even when many parameter settings fit the observed data.
+
+This post follows Chapter 9 of Bishop and Bishop's *Deep Learning: Foundations and Concepts*. It
+covers inductive bias, invariance and equivariance, weight decay and generalized norms, early
+stopping, parameter sharing, soft weight sharing, residual connections, ensembles, and dropout.
+It ends with worked derivations for every exercise. It completes a series with
+[Gradient Descent](/blog/gradient-descent/) and [Backpropagation](/blog/backpropagation/).
+
+## Inductive bias
+
+Learning a distribution from finitely many samples is an **inverse problem**. Infinitely many
+distributions assign nonzero probability to the observed points, so data alone cannot select one.
+An **inductive bias** is the preference that resolves this ambiguity: smoothness, locality,
+translation symmetry, sparse parameters, or a particular architecture.
+
+The no-free-lunch theorem says that, averaged uniformly over all possible target functions, no
+learner is better than another. It does *not* say learning is futile. Real problems are not
+uniformly random; useful learning comes precisely from choosing biases that match their structure.
+
+### Inverse problems
+
+The forward problem starts with a distribution $p(\mathbf t\mid\mathbf x)$ and draws observations.
+The learning problem runs in reverse: from finitely many observed pairs, infer behaviour at inputs
+that were not observed. This inverse is not unique. A high-degree interpolating polynomial, a
+piecewise constant lookup table, and a smooth low-degree curve can all pass through the same finite
+training set.
+
+An inverse problem is **ill posed** when a solution need not exist, need not be unique, or is not
+stable under small changes to the data. Neural-network training commonly faces the latter two.
+Regularization makes the problem better posed by ranking the many data-fitting solutions. A
+smoothness prior, for example, says that two nearby inputs should usually have nearby outputs.
+
+### No free lunch
+
+Imagine averaging a learner's error uniformly over every possible assignment of labels to inputs.
+Whenever one algorithm's bias helps on one assignment, an opposite assignment makes that same bias
+hurt by the same amount. Averaged over this artificial universe, all learners tie. The theorem
+therefore denies a universally best bias; it does not deny useful, domain-specific biases.
+
+Choosing a convolutional network for images assumes locality and shared translation structure.
+Choosing an unrestricted lookup table assumes no relation between nearby pixels. Neither is
+universally correct, but natural images strongly favour the first. Model choice is consequently a
+claim about the data-generating process.
+
+### Invariance, equivariance, and groups
+
+A set of transformations is a **group** when it is closed under composition, composition is
+associative, there is an identity, and every element has an inverse. A predictor $f$ is invariant
+to $T$ when $f(Tx)=f(x)$. A mapping is equivariant when
+
+$$
+f(Tx)=T_e f(x).
+$$
+
+Classification should often be translation invariant; segmentation should be translation
+equivariant because moving the image should move the mask. We can encode these facts in features,
+an architecture such as convolution, a penalty, or data augmentation. Augmentation is valid only
+when the transformation really preserves the target relationship.
+
+More formally, let a group $G$ act on inputs through transformations $T_g$ and on outputs through
+$S_g$. Equivariance requires
+
+$$
+f(T_g\mathbf x)=S_gf(\mathbf x)\qquad\text{for every }g\in G.
+$$
+
+Invariance is the special case $S_g=I$. The group law matters because applying transformations
+$g_1$ then $g_2$ must agree with the representation of their composition. Without this consistency,
+the model could obey the desired relationship for individual transformations but contradict itself
+when they are composed.
+
+There are three different ways to supply the same bias. An invariant feature map discards the
+transformation before learning. An equivariant architecture restricts every representable
+function. Data augmentation leaves the architecture unrestricted but adds evidence that transformed
+examples should agree. These are not equivalent with finite data and finite optimization: a hard
+architectural constraint guarantees the property, while augmentation only encourages it at sampled
+transformations.
+
+## Weight decay
+
+The simplest explicit regularizer adds a quadratic penalty:
+
+$$
+\widetilde E(\mathbf w)=E(\mathbf w)+\frac\lambda2\mathbf w^T\mathbf w,qquad
+\nabla\widetilde E=\nabla E+\lambda\mathbf w.
+$$
+
+Under gradient descent,
+$\mathbf w\leftarrow(1-\eta\lambda)\mathbf w-\eta\nabla E$: unsupported weights shrink on every
+step, hence **weight decay**. From a probabilistic view, this is maximum a posteriori estimation
+with an isotropic zero-mean Gaussian prior.
+
+For a quadratic data error with Hessian eigenvalue $h_i$ and unregularized optimum component
+$w_i^\star$, the regularized optimum is
+
+$$
+\widetilde w_i=\frac{h_i}{h_i+\lambda}w_i^\star.
+$$
+
+Flat, weakly determined directions ($h_i\ll\lambda$) shrink strongly; well-determined directions
+barely move.
+
+<LineChart
+	x={() => Array.from({ length: 161 }, (_, i) => -4 + i * 0.05)}
+	series={[
+		{ name: "data error ½(w−3)²", fn: (w) => 0.5 * (w - 3) ** 2 },
+		{ name: "regularized, λ=1", fn: (w) => 0.5 * (w - 3) ** 2 + 0.5 * w * w },
+	]}
+	title="A quadratic penalty moves the optimum from w=3 to w=1.5"
+	xLabel="weight w"
+	yLabel="objective"
+/>
+
+### Consistent regularizers
+
+Reparameterizations can leave a network function unchanged. Scaling inputs and compensating in
+first-layer weights, or scaling outputs and compensating in the last layer, should not arbitrarily
+change the strength of the prior. A single global $\lambda\|\mathbf w\|^2$ does change. Separate
+coefficients per layer and appropriate treatment of biases can preserve the intended transformation
+properties. The lesson is that a penalty is a prior over *parameters*, and parameterization matters.
+
+To see the inconsistency algebraically, consider a two-layer network
+
+$$
+z_j=h\!\left(\sum_iw_{ji}^{(1)}x_i+w_{j0}^{(1)}\right),\qquad
+y_k=\sum_jw_{kj}^{(2)}z_j+w_{k0}^{(2)}.
+$$
+
+Rescale inputs as $\widetilde x_i=ax_i+b$. The same function is recovered by
+$\widetilde w_{ji}^{(1)}=w_{ji}^{(1)}/a$ and
+$\widetilde w_{j0}^{(1)}=w_{j0}^{(1)}-(b/a)\sum_iw_{ji}^{(1)}$. A single penalty on every weight
+and bias changes under this harmless choice of units, even though the represented mapping does not.
+The regularizer is then expressing a preference for metres versus centimetres, not a preference
+among functions.
+
+A more consistent construction uses separate coefficients for weight groups and does not penalize
+biases in the same way. From the Bayesian view, this means placing distinct priors on parameters
+with different transformation roles. It also explains the common practice of excluding biases and
+normalization offsets from weight decay.
+
+### Bayesian reading of weight decay
+
+Suppose the data likelihood is $p(\mathcal D\mid\mathbf w)$ and the prior is isotropic Gaussian,
+
+$$
+p(\mathbf w)=\left(\frac{\lambda}{2\pi}\right)^{W/2}
+\exp\!\left(-\frac\lambda2\mathbf w^T\mathbf w\right).
+$$
+
+Maximum a posteriori estimation maximizes
+$p(\mathbf w\mid\mathcal D)\propto p(\mathcal D\mid\mathbf w)p(\mathbf w)$. Taking a negative log
+turns the product into
+
+$$
+-\log p(\mathbf w\mid\mathcal D)
+=E_D(\mathbf w)+\frac\lambda2\mathbf w^T\mathbf w+\text{constant}.
+$$
+
+Thus weight decay is not merely an optimization trick: it is the parameter-space preference of a
+Gaussian prior. The caution is equally important. In a neural network, many parameter vectors can
+represent the same function, so a simple isotropic prior over parameters need not correspond to a
+simple or invariant prior over functions.
+
+### Generalized weight decay and sparsity
+
+Consider
+
+$$
+\Omega_q(\mathbf w)=\frac\lambda2\sum_j|w_j|^q.
+$$
+
+$q=2$ has circular contours and smooth shrinkage. $q=1$ has corners on the axes; a tangent error
+contour often touches at a corner, giving exact zeros. $q<1$ promotes sparsity even more strongly
+but is nonconvex. $q>2$ penalizes large coordinates strongly but does not prefer axes. The
+penalized problem is equivalent, for a corresponding Lagrange multiplier, to minimizing $E$ under
+$\sum_j|w_j|^q\leq\eta$.
+
+Rotate the $L_1$ surface below and then look down from above. Its level sets are diamonds, and the
+surface has creases along the coordinate axes. A smooth data-error contour often first touches the
+feasible diamond at a corner; that geometric contact is why an $L_1$ solution often contains exact
+zeros rather than merely small values.
+
+<SurfacePlot
+	fn={(w1, w2) => Math.abs(w1) + Math.abs(w2)}
+	x={[-2, 2]}
+	y={[-2, 2]}
+	title="The L₁ penalty has axis-aligned creases"
+	xLabel="w₁"
+	yLabel="w₂"
+	zLabel="|w₁| + |w₂|"
+	height={370}
+/>
+
+Adding zero-mean Gaussian noise of variance $\sigma^2$ to the inputs of linear least squares gives
+
+$$
+\mathbb E_\epsilon[\widetilde E]
+=E_D+\frac{N\sigma^2}{2}\sum_i w_i^2,
+$$
+
+up to whether $E_D$ is defined as a sum or mean. Noise injection is therefore exactly weight decay
+in this case and approximately a smoothness penalty for nonlinear models.
+
+## Learning curves and early stopping
+
+A **learning curve** plots a metric against training progress. Training error usually falls;
+validation error can fall and then rise as the model begins fitting sample-specific detail.
+**Early stopping** saves the parameters at the lowest validation error, not merely those from the
+last iteration.
+
+For quadratic error and initialization at zero, eigen-coordinate $j$ evolves as
+
+$$
+w_j^{(\tau)}=\left[1-(1-\rho h_j)^\tau\right]w_j^\star.
+$$
+
+Large-curvature components are learned early; small-curvature components remain suppressed for
+$h_j\ll1/(\rho\tau)$. Compare this with weight decay's filter $h_j/(h_j+\lambda)$: training time
+$\rho\tau$ behaves roughly like $1/\lambda$. Early stopping is thus an implicit spectral
+regularizer, not merely a time-saving trick. The validation set must not also be used for the final
+unbiased performance estimate; keep a separate test set.
+
+This small teaching curve is illustrative rather than measured. Training error decreases
+monotonically. Validation error initially follows it, reaches a minimum, and then rises as later
+updates fit training-specific detail. Early stopping keeps the checkpoint at that validation
+minimum even though later checkpoints have lower training error.
+
+<LineChart
+	x={() => Array.from({ length: 101 }, (_, i) => i)}
+	series={[
+		{ name: "training error", fn: (t) => 0.08 + 0.92 * Math.exp(-t / 25) },
+		{ name: "validation error", fn: (t) => 0.18 + 0.75 * Math.exp(-t / 18) + 0.000055 * t * t },
+	]}
+	title="Early stopping chooses the validation minimum"
+	xLabel="training step"
+	yLabel="error"
+	height={300}
+/>
+
+### Double descent
+
+The classical bias--variance picture predicts a U-shaped test-error curve as model complexity
+increases. Modern overparameterized models often show **double descent** instead. Test error first
+falls, then rises sharply near the point where the model can just interpolate the training data,
+and finally falls again as the number of parameters grows far beyond the number needed to fit it.
+
+Why can the interpolation threshold be dangerous? Near that threshold, fitting every target—noise
+included—may require a solution with very large parameter norm. Small perturbations of the data can
+then cause large changes in the fitted function. In linear least squares, the effect appears when
+the smallest singular values of the design matrix approach zero: inversion multiplies residual
+components by $1/\sigma_i$, so weakly supported directions explode.
+
+Past the threshold there are infinitely many interpolating solutions. Gradient-based training from
+small initialization tends to select a particular low-complexity member—for linear regression, the
+minimum-Euclidean-norm interpolant. Adding more features can allow that selected solution to spread
+the fit across more coordinates and reduce its norm, so test error can fall again. This selection
+by the optimizer is **implicit regularization**.
+
+Double descent can be plotted against parameter count, training time, or data-set size. It is not a
+promise that “larger is always better.” Its shape depends on label noise, architecture, optimizer,
+regularization, and how complexity is measured. Explicit weight decay and early stopping often
+smooth or suppress the interpolation peak.
+
+The schematic curve separates the regimes. Before interpolation, capacity reduces approximation
+bias. Around normalized complexity $1$, the model can just fit every target and instability creates
+a peak. Far beyond interpolation, the optimizer's preferred interpolating solution can become
+smoother again. The curve is explicitly illustrative: its shape depends on the data, architecture,
+optimizer, and regularization.
+
+<LineChart
+	x={() => Array.from({ length: 240 }, (_, i) => 0.05 + i * 0.0125)}
+	series={[{
+		name: "illustrative test error",
+		fn: (c) => 0.18 + 0.55 / (c + 0.35) + 0.5 * Math.exp(-Math.pow((c - 1) / 0.13, 2)),
+	}]}
+	title="Schematic double descent around the interpolation threshold c=1"
+	xLabel="normalized model complexity c"
+	yLabel="test error"
+	height={300}
+/>
+
+## Sharing and compressing parameters
+
+**Parameter sharing** forces several connections to use one value $\lambda$. The chain rule gives
+$\partial E/\partial\lambda=\sum_k\partial E/\partial w_k$. Convolutions use this idea to express
+translation equivariance while using far fewer independent parameters.
+
+To derive the shared gradient, temporarily regard the tied copies as independent variables
+$w_1,\ldots,w_K$, then impose $w_k(\lambda)=\lambda$. The total derivative is
+
+$$
+\frac{dE}{d\lambda}
+=\sum_{k=1}^K\frac{\partial E}{\partial w_k}\frac{dw_k}{d\lambda}
+=\sum_{k=1}^K\frac{\partial E}{\partial w_k}.
+$$
+
+Thus sharing does not average the evidence from uses of a parameter; it accumulates it. Whether an
+implementation later divides a batch loss by the number of examples is a separate convention.
+
+**Soft weight sharing** uses a mixture-of-Gaussians prior over weights. Each weight is pulled toward
+each centre $\mu_j$ in proportion to its posterior responsibility
+
+$$
+\gamma_j(w_i)=\frac{\pi_j\mathcal N(w_i\mid\mu_j,\sigma_j^2)}
+{\sum_k\pi_k\mathcal N(w_i\mid\mu_k,\sigma_k^2)}.
+$$
+
+Learning centres, widths, and mixing coefficients clusters weights into a small codebook. Hard
+quantization can then store a cluster index instead of a full-precision number.
+
+The complete regularizer is the negative log probability of every weight under the mixture:
+
+$$
+\Omega(\mathbf w)=-\sum_i\log\left[
+\sum_{j=1}^K\pi_j\mathcal N(w_i\mid\mu_j,\sigma_j^2)
+\right].
+$$
+
+Differentiate with respect to a weight. Factoring the mixture responsibility gives
+
+$$
+\frac{\partial\Omega}{\partial w_i}
+=\sum_j\gamma_j(w_i)\frac{w_i-\mu_j}{\sigma_j^2}.
+$$
+
+Each component behaves like a spring pulling $w_i$ toward $\mu_j$. Its force is stronger for a
+narrow component and is weighted by the probability that the component owns the weight. The
+centres are learnable too:
+
+$$
+\frac{\partial\Omega}{\partial\mu_j}
+=\sum_i\gamma_j(w_i)\frac{\mu_j-w_i}{\sigma_j^2}.
+$$
+
+At a stationary point, $\mu_j$ is the responsibility-weighted mean of its assigned weights. The
+width update makes $\sigma_j^2$ their responsibility-weighted squared deviation. Parameterizing
+$\sigma_j=e^{\xi_j}$ keeps every width positive. Finally, softmax logits for $\pi_j$ lead to a
+gradient proportional to $\pi_j-\gamma_j(w_i)$, moving each mixture mass toward its average
+responsibility. Soft weight sharing is therefore a differentiable clustering algorithm trained
+jointly with the predictive model.
+
+## Residual connections
+
+A residual block computes $z_{l+1}=F_l(z_l)+z_l$. Repeated substitution shows a direct identity
+path from early representations to later ones. Its Jacobian is $I+J_{F_l}$, so gradients have a
+route that does not require multiplying only through learned nonlinear maps. Residual connections
+change optimization and the function class; they are an architectural inductive bias rather than a
+penalty added to the loss.
+
+For $L$ residual blocks, repeated substitution gives
+
+$$
+z_L=z_0+\sum_{l=0}^{L-1}F_l(z_l).
+$$
+
+This does not mean the network is merely a sum of independent functions, because each $F_l$ is
+evaluated at a state containing all earlier residual updates. It does show that the identity signal
+is preserved additively. Backpropagation multiplies by
+$\partial z_{l+1}/\partial z_l=I+J_{F_l}$ rather than only $J_{F_l}$. When the residual branch is
+small, the Jacobian is near the identity and gradients can propagate without repeated severe
+contraction or expansion.
+
+## Ensembles and dropout
+
+For $M$ predictors $y_m=y+\epsilon_m$ with zero-mean, uncorrelated, equal-variance errors, their
+average has error variance
+
+$$
+\mathbb E\left[\left(\frac1M\sum_m\epsilon_m\right)^2\right]
+=\frac1M\mathbb E[\epsilon_m^2].
+$$
+
+Correlation limits the gain: with pairwise correlation $c$, the factor becomes
+$c+(1-c)/M$. Diversity, not the count alone, is what helps. Jensen's inequality also proves that
+for convex loss the loss of the averaged prediction is no greater than the average member loss.
+
+The plot quantifies the price of correlated mistakes. Ten independent members reduce variance to
+$1/10$ of one member's variance. At correlation $0.5$, the factor is already $0.55$; at correlation
+$1$, all members make the same error and averaging gives no reduction.
+
+<LineChart
+	x={() => Array.from({ length: 101 }, (_, i) => i / 100)}
+	series={[
+		{ name: "M=10", fn: (c) => c + (1 - c) / 10 },
+		{ name: "M=2", fn: (c) => c + (1 - c) / 2 },
+	]}
+	title="Ensemble variance reduction disappears as errors correlate"
+	xLabel="pairwise error correlation c"
+	yLabel="variance / member variance"
+	height={300}
+/>
+
+**Dropout** samples Bernoulli masks and trains many thinned networks with shared weights. For a
+linear model with keep probability $\rho$, averaging over masks produces the ordinary error for
+the scaled predictor plus
+
+$$
+\rho(1-\rho)\sum_{n,k,i}w_{ki}^2x_{ni}^2,
+$$
+
+an input-dependent quadratic regularizer. At inference, inverted dropout has already divided kept
+activations by $\rho$, so no further scaling is needed. Dropout's exact equivalence to an ensemble
+or $L_2$ penalty does not extend unchanged to deep nonlinear networks, but both views explain part
+of its effect.
+
+For the linear mapping $y_{nk}=\sum_iw_{ki}R_{ni}x_{ni}$ with independent
+$R_{ni}\sim\operatorname{Bernoulli}(\rho)$,
+
+$$
+\mathbb E[R_{ni}]=\rho,qquad
+\mathbb E[R_{ni}R_{nj}]=
+\begin{cases}
+\rho,&i=j,\\
+\rho^2,&i\ne j.
+\end{cases}
+$$
+
+Expanding squared error and applying these two moments separates it into
+
+$$
+\mathbb E_R[E]
+=\sum_{n,k}\left(t_{nk}-\rho\sum_iw_{ki}x_{ni}\right)^2
++\rho(1-\rho)\sum_{n,k,i}w_{ki}^2x_{ni}^2.
+$$
+
+The first term trains the mean scaled network. The second is a feature-dependent quadratic
+penalty: a weight connected to a feature with large empirical squared magnitude is regularized more
+strongly. Standardizing inputs makes this closer to ordinary isotropic $L_2$ decay. In a deep
+nonlinear network masks alter later activations, so this exact decomposition no longer holds; that
+is why the linear result should be treated as an explanation, not a universal identity.
+
+## Worked exercises
+
+The solutions below emphasize the proof step that does the work.<Sidenote>Exercise numbering follows
+the book. The authors' Version 1.0 solutions manual contains eighteen Chapter 9 solutions, despite
+some older third-party indexes listing fewer.</Sidenote>
+
+### Exercises 9.1--9.5: groups, noise, decay, and constraints
+
+Multiples of $90^\circ$ satisfy closure, associativity, the $0^\circ$ identity, and inverse
+$360^\circ-a$; image-axis translations form a group under vector addition (9.1). Expanding
+$\widetilde y_n=y_n+\sum_iw_i\epsilon_{ni}$ and taking expectations removes linear cross terms and
+leaves the quadratic penalty $N\sigma^2\sum_iw_i^2/2$ (9.2). The continuous-time limit of weight
+decay is $d\mathbf w/dt=-\widetilde\eta\mathbf w$, whose solution is
+$\mathbf w(t)=\mathbf w(0)e^{-\widetilde\eta t}$ (9.3).
+
+Substitution of transformed inputs $\widetilde x=ax+b$, first-layer weights
+$\widetilde w=w/a$, and adjusted bias cancels $a,b$; the analogous output transformation cancels
+$c,d$, proving functional invariance (9.4). Adding the constraint
+$\sum_j|w_j|^q-\eta\leq0$ with multiplier $\lambda/2$ gives the generalized penalty after the
+constant $-\lambda\eta/2$ is dropped (9.5).
+
+### Exercises 9.6--9.7: early stopping and shared gradients
+
+Projecting quadratic gradient descent onto Hessian eigenvector $j$ yields
+$w_j^{(\tau)}=(1-\rho h_j)w_j^{(\tau-1)}+\rho h_jw_j^\star$. Induction gives the closed form above;
+expanding for small $\rho h_j$ proves flat directions stay suppressed (9.6). If
+$w_1=\cdots=w_K=\lambda$, the chain rule gives
+$\partial E/\partial\lambda=\sum_k\partial E/\partial w_k$ (9.7).
+
+### Exercises 9.8--9.12: soft weight sharing
+
+Bayes' rule applied to mixture prior $p(w)=\sum_j\pi_j\mathcal N_j(w)$ gives $\gamma_j(w)$ (9.8).
+Differentiating $-\sum_i\log p(w_i)$ gives
+$\sum_j\gamma_j(w_i)(w_i-\mu_j)/\sigma_j^2$ (9.9). Differentiating instead by $\mu_j$ pulls the
+centre toward its responsibility-weighted weights (9.10); differentiating by
+$\xi_j=\log\sigma_j$ drives $\sigma_j^2$ toward their weighted squared deviations (9.11).
+Finally $\partial\pi_k/\partial\eta_j=\pi_k(\delta_{jk}-\pi_j)$ for softmax logits, so
+$\partial\widetilde E/\partial\eta_j=\lambda\sum_i[\pi_j-\gamma_j(w_i)]$ (9.12).
+
+### Exercises 9.13--9.18: residuals, committees, and dropout
+
+Repeated substitution into $z_{l+1}=F_l(z_l)+z_l$ expands the three-block residual mapping and
+exhibits the direct $x$ term (9.13). With uncorrelated member errors, all $m\ne l$ cross terms
+vanish, leaving $E_{COM}=E_{AV}/M$ (9.14). Convexity of $x^2$ and Jensen give
+$(M^{-1}\sum_m\epsilon_m)^2\leq M^{-1}\sum_m\epsilon_m^2$, so averaging never increases squared
+error even without independence (9.15); applying Jensen to any convex loss proves the analogous
+claim (9.16).
+
+A weighted prediction stays between every possible set's minimum and maximum iff its coefficients
+are nonnegative and sum to one: sufficiency is the convex-hull property; necessity follows by
+choosing one member as $1$ and the rest $0$, then choosing all members equal (9.17). For Bernoulli
+dropout masks, $\mathbb E[R_i]=\rho$ and
+$\mathbb E[R_iR_j]=\delta_{ij}\rho+(1-\delta_{ij})\rho^2$; expansion of squared error then yields the
+scaled linear predictor plus the data-dependent $L_2$ term shown above (9.18).
+
+## Summary
+
+- Generalization is impossible without inductive bias; regularization makes that bias explicit or
+  builds it into the training process and architecture.
+- Quadratic weight decay shrinks poorly determined Hessian directions most, while $L_1$-like
+  penalties promote exact sparsity.
+- Early stopping is a spectral filter, parameter sharing encodes known symmetries, and residual
+  paths improve signal and gradient flow.
+- Ensembles help when their errors differ; convexity guarantees that averaging predictions is safe
+  for convex losses.
+- Dropout averages stochastic subnetworks and, in the linear case, induces an exact
+  feature-dependent quadratic penalty.
+
+## References
+
+- C. M. Bishop and H. Bishop. [*Deep Learning: Foundations and Concepts*, Chapter 9](https://doi.org/10.1007/978-3-031-45468-4_9). Springer, 2024.
+- C. M. Bishop and H. Bishop. [*Solutions to Exercises, Chapters 2--10*, Version 1.0](https://www.bishopbook.com/Concepts_in_Deep_Learning_Solutions_v1.0.pdf), 2024.
+- N. Srivastava et al. [Dropout: A Simple Way to Prevent Neural Networks from Overfitting](https://jmlr.org/papers/v15/srivastava14a.html), 2014.
+- K. He et al. [Deep Residual Learning for Image Recognition](https://arxiv.org/abs/1512.03385), 2015.
+

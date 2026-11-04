@@ -1,0 +1,66 @@
+---
+// Step-through of finding the next best bid in a flat array of price levels (one per tick) after
+// the best level empties: walk one tick at a time (`bitmap={false}`, the QuantCup design) or use
+// a two-level bitmap, drawn with 8-bit words (64-bit in the post's code), where a masked word, the
+// summary word and one more word answer for any gap.
+// Usage in .mdx:
+//   <TickSearch />
+//   <TickSearch bitmap title="The same search with a bitmap" />
+import StepControls from "../compiler/StepControls.astro";
+import "./orderBook.css";
+import { bitmapSteps, walkSteps } from "./orderBook";
+import { drawTicks } from "./orderBookDraw";
+import { TICKS_FROM, TICKS_LO, TICKS_OCCUPIED } from "./orderBookFigures";
+
+interface Props {
+	occupied?: boolean[];
+	from?: number;
+	lo?: number;
+	bitmap?: boolean;
+	wordBits?: number;
+	step?: number;
+	title?: string;
+}
+
+const {
+	occupied = TICKS_OCCUPIED,
+	from = TICKS_FROM,
+	lo = TICKS_LO,
+	bitmap = false,
+	wordBits = 8,
+	step = 0,
+	title = bitmap
+		? "Next best bid with a two-level bitmap"
+		: "Next best bid by walking the array",
+} = Astro.props;
+const steps = bitmap
+	? bitmapSteps(occupied, from, wordBits, lo)
+	: walkSteps(occupied, from, lo);
+const at = Math.max(0, Math.min(steps.length - 1, step));
+const labels = steps.map((_, i) =>
+	i === steps.length - 1 ? "found" : `${i + 1}`,
+);
+---
+
+<figure class="obk obk-ts" data-step={at} tabindex="-1">
+	<figcaption class="obk-title">{title}</figcaption>
+	<StepControls labels={labels} step={at} />
+	<div class="obk-canvas">
+		{steps.map((_, i) => <div class="obk-frame" hidden={i !== at} set:html={drawTicks(occupied, steps, i, { lo, wordBits, bitmap, from })} />)}
+	</div>
+	<div class="obk-notes">
+		{steps.map((s, i) => <p hidden={i !== at}>{s.note}</p>)}
+	</div>
+</figure>
+
+<script>
+	import { bindStepper } from "../compiler/stepper";
+	for (const fig of document.querySelectorAll<HTMLElement>(".obk-ts")) {
+		const frames = [...fig.querySelectorAll<HTMLElement>(".obk-frame")];
+		const notes = [...fig.querySelectorAll<HTMLElement>(".obk-notes p")];
+		bindStepper(fig, frames.length, (i) => {
+			frames.forEach((f, k) => { f.hidden = k !== i; });
+			notes.forEach((n, k) => { n.hidden = k !== i; });
+		}, 400);
+	}
+</script>

@@ -1,0 +1,693 @@
+---
+title: "How PyTorch Lowers FlexAttention to a Triton Kernel"
+description: "FlexAttention lets you write an attention variant as two small Python functions and get a fused kernel. This post follows those functions from Python through Dynamo, AOTAutograd and Inductor into the Triton template, with the block-sparse mask, the generated forward and backward kernels, and the split-KV decoding path."
+date: 2026-10-27
+tags: [Compilers, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import MarginNote from "../../components/MarginNote.astro";
+import BlockMaskExplorer from "../../utils/attention/BlockMaskExplorer.astro";
+import FlexKernelSteps from "../../utils/attention/FlexKernelSteps.astro";
+import CodeStages from "../../utils/compiler/CodeStages.astro";
+import BoxDiagram from "../../utils/payments/BoxDiagram.astro";
+import {
+	decodeEdges,
+	decodeNodes,
+	pipelineEdges,
+	pipelineNodes,
+	scoreModStages,
+	scoreModTags,
+} from "../../utils/attention/flexFigures";
+
+## Background
+
+[FlashAttention](/blog/flash-attention/) computes attention in one kernel, without writing the
+$N \times N$ score matrix to memory. It is fast because everything is fused: the two matrix
+multiplies, the softmax and any masking happen in registers and shared memory. The price is that
+each attention variant needs its own kernel. Causal masking, sliding windows, ALiBi position
+biases, document masking for packed sequences, prefix-LM masks and soft-capping each had to be
+written into some CUDA kernel by hand, and a combination nobody had written fell back to the slow
+path that materializes the scores.
+
+**FlexAttention** (Dong et al., 2024) removes that trade-off. The user writes the variant as two
+tiny Python functions: a **`score_mod`** that edits one attention score, and a **`mask_mod`** that
+says whether one query may attend to one key. `torch.compile` then generates a fused
+FlashAttention-style kernel with those functions inlined, and skips whole blocks of the score
+matrix that the mask rules out. Every variant above is a few lines of Python.
+
+This post follows the two functions through the compiler, reading the code in PyTorch at commit
+[`2b2898d`](https://github.com/pytorch/pytorch/tree/2b2898d361d9aa6ad55bd6875fa8a3639f940e7b).
+It covers, in order: the API and the **BlockMask** data structure; how Dynamo captures the
+functions as graphs and how autograd differentiates them; the Inductor lowering that turns them
+into IR and inlines them into a Triton template; the forward kernel tile by tile; the backward
+kernel; and the separate decoding kernel for short queries. It assumes the
+[Inductor](/blog/torch-inductor/) and [higher-order operator](/blog/higher-order-operators/)
+posts, or at least the idea that `torch.compile` turns Python into an FX graph and Inductor turns
+that graph into Triton.<Sidenote>Graphs and kernels shown here were produced by torch 2.13.0
+(git `cf30153c`) on a Mac without a GPU: the graphs by a custom `torch.compile` backend, the
+kernels by rendering Inductor's templates with a stubbed Triton backend. The kernels were
+generated, not run. That version's FlexAttention sources match `2b2898d` except that its
+templates pass extra dtype and shape hints to `modification()`; the lowering file is
+identical.</Sidenote>
+
+The whole path, from the call to the kernel, is below. Click a box to read what that stage does;
+the rest of the post takes them one at a time.
+
+<BoxDiagram
+	nodes={pipelineNodes}
+	edges={pipelineEdges}
+	grid={{ cellW: 168, cellH: 50, gapX: 44, gapY: 34 }}
+	selected="lowering"
+	title="From a flex_attention call to a kernel"
+/>
+
+## The API in one example
+
+### score_mod and mask_mod
+
+Attention for one head computes scores $S = QK^\top \cdot s$, with scale $s = 1/\sqrt{d}$, takes a
+softmax over each row and multiplies by $V$. FlexAttention adds two hooks to that recipe. For a
+batch index $b$, head $h$, query index $m$ and key index $n$:
+
+$$
+S'_{mn} = \begin{cases} \texttt{score\_mod}(S_{mn}, b, h, m, n) & \text{if } \texttt{mask\_mod}(b, h, m, n) \\ -\infty & \text{otherwise} \end{cases}
+\qquad O = \text{softmax}(S')\,V
+$$
+
+Both hooks are written for a *single* score. The running example of this post is an
+**ALiBi** bias (a penalty that grows linearly with the distance between query and key, with one
+slope per head) combined with a causal mask:
+
+```python
+import torch
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+
+slopes = torch.tensor([0.5, 0.25], device="cuda", requires_grad=True)
+
+def alibi(score, b, h, q_idx, kv_idx):
+    return score + slopes[h] * (kv_idx - q_idx)
+
+def causal(b, h, q_idx, kv_idx):
+    return q_idx >= kv_idx
+
+q, k, v = (torch.randn(1, 2, 256, 64, device="cuda", dtype=torch.float16) for _ in range(3))
+block_mask = create_block_mask(causal, B=None, H=None, Q_LEN=256, KV_LEN=256)
+out = torch.compile(flex_attention)(q, k, v, score_mod=alibi, block_mask=block_mask)
+```
+
+Two details matter later. First, `alibi` reads `slopes`, a tensor that is not one of its
+arguments; it is **captured** from the enclosing scope, and it requires grad, so the backward pass
+must produce a gradient for it. Second, the mask is not passed as a function but as a
+`BlockMask`, built once by `create_block_mask`. The mask function travels inside it.
+
+### The BlockMask
+
+A causal mask rules out half the score matrix, and a sliding window far more. A kernel that
+computed those scores and then threw them away would waste that work. FlexAttention therefore
+summarizes the mask at the granularity of the kernel's tiles. It cuts the $Q \times KV$ mask into
+blocks of `BLOCK_SIZE` × `BLOCK_SIZE` (128 by default) and classifies each block:
+
+- an **empty** block has no allowed pair, so the kernel skips it;
+- a **full** block has only allowed pairs, so the kernel computes it without calling `mask_mod`;
+- a **partial** block has some of each, so the kernel computes it and applies `mask_mod`.
+
+The [`BlockMask`](https://github.com/pytorch/pytorch/blob/2b2898d361d9aa6ad55bd6875fa8a3639f940e7b/torch/nn/attention/flex_attention.py#L785)
+stores this in a compressed-row format, one row per query block. `kv_num_blocks[i]` counts the
+partial blocks in row $i$ and `kv_indices[i]` lists their column numbers;
+`full_kv_num_blocks` and `full_kv_indices` do the same for full blocks. Empty blocks are not
+stored at all. The backward pass also needs to walk the mask by column, so `create_block_mask`
+stores the transposed version too, as `q_num_blocks`, `q_indices` and their `full_` twins.
+
+The figure below builds a BlockMask for a scaled-down case: 16 tokens, blocks of 4 (instead of
+thousands of tokens and blocks of 128), with a causal sliding window of 9 tokens. Amber blocks are
+partial, green ones full, blank ones empty. The table under the legend holds the tensors; greyed
+entries lie past `kv_num_blocks` and are never read. Hover a row of blocks to select it.
+
+<BlockMaskExplorer preset="sliding" len={16} block={4} tile={4} line={3} title="A sliding-window BlockMask, 16 tokens in blocks of 4" />
+
+Read row 3 (queries 12–15). Its partial blocks are 1 and 3, so `kv_num_blocks[3] = 2` and
+`kv_indices[3] = [1, 3, 0, 2]`; its one full block is 2, so `full_kv_num_blocks[3] = 1` and
+`full_kv_indices[3] = [2, 0, 1, 3]`. Check one block by hand: block (3, 1) pairs queries 12–15
+with keys 4–7. Query 12 may see key 7 ($12 - 7 = 5 < 9$), but query 15 may not see key 4
+($15 - 4 = 11 \ge 9$), so the block is partial. Block (3, 0) is empty: its closest pair is query 12
+and key 3, nine apart. Of the 16 blocks, 7 are empty, which is what `block_mask.sparsity()`
+reports as 43.75%.<Sidenote>Every number in this section is what `create_block_mask` returns for
+`(q_idx >= kv_idx) & (q_idx - kv_idx < 9)` with `BLOCK_SIZE=4`. The figure's TypeScript builds
+the same tensors and was checked against `create_block_mask` for eight configurations, including
+lengths that are not a multiple of the block size.</Sidenote>
+
+How does `create_block_mask` get there? It is plain PyTorch, in three steps
+([source](https://github.com/pytorch/pytorch/blob/2b2898d361d9aa6ad55bd6875fa8a3639f940e7b/torch/nn/attention/flex_attention.py#L1838)):
+
+1. `create_mask` calls `mask_mod` on every $(b, h, m, n)$, using `vmap` over four index ranges,
+   to build a dense boolean tensor of shape `[B, H, Q_LEN, KV_LEN]`.
+2. `_convert_mask_to_block_mask` pads that tensor with `False` to a multiple of the block size,
+   reshapes it to `[B, H, Q/BLOCK, KV/BLOCK, BLOCK, BLOCK]` and sums the last two dimensions. A
+   block whose sum is 0 is empty; one whose sum is `BLOCK × BLOCK` is full.
+3. `_dense_to_ordered` turns each row of block flags into the compressed format with a stable,
+   descending `argsort`. That puts the set columns first, in ascending order, followed by the
+   unset ones. This is why the padding in `kv_indices` is the unused column numbers, not zeros.
+
+Step 1 is the expensive one. For 8192 tokens it creates a 64 MiB boolean tensor per batch element
+and head, while the result, `kv_indices`, is $64 \times 64$ `int32`s, or 16 KiB. That is why the
+docs suggest compiling it, `torch.compile(create_block_mask)`, and building the mask once per
+shape rather than once per layer. A causal mask at that length has 64 partial blocks (the
+diagonal), 2016 full blocks and 2016 empty ones: the kernel skips 49% of the work and runs
+`mask_mod` on only 3% of the blocks it does visit.
+
+## From a Python call to a graph
+
+### Capturing the two functions
+
+`flex_attention` itself is ordinary Python
+([source](https://github.com/pytorch/pytorch/blob/2b2898d361d9aa6ad55bd6875fa8a3639f940e7b/torch/nn/attention/flex_attention.py#L2236)).
+It validates shapes, fills in a default scale and an empty block mask if none was given, and sets
+**kernel options**, a dictionary of switches the kernel template reads (`BACKEND`,
+`PRESCALE_QK`, `OUTPUT_LOGSUMEXP`, ...). Then it calls `flex_attention_hop`, a
+**higher-order operator** (HOP): an operator that takes functions, not just tensors, as
+arguments.
+
+Under `torch.compile`, Dynamo meets that call and hands it to
+[`FlexAttentionHigherOrderVariable`](https://github.com/pytorch/pytorch/blob/2b2898d361d9aa6ad55bd6875fa8a3639f940e7b/torch/_dynamo/variables/higher_order_ops.py#L4534).
+For each of `score_mod` and `mask_mod` it creates **0-d tensors**, scalars that are still tensors:
+an `f32[]` score with the query's dtype and four `i32[]` indices. It then traces the function on
+them with `speculate_subgraph` and installs the result as a submodule of the graph. Tracing on
+scalars is the central trick: what comes out is a graph of a *scalar* function, which the kernel
+can later run on any tile shape.
+
+Tracing also finds `slopes`. A tensor the function reads but does not receive is **lifted**: it
+becomes an extra input of the subgraph, and the HOP call passes it in a tuple called
+`score_mod_other_buffers`. Step through the figure to follow `alibi` from Python to the Dynamo
+graph; the later stages are covered below.
+
+<CodeStages
+	stages={scoreModStages}
+	tags={scoreModTags}
+	step={1}
+	maxLines={20}
+	title="alibi and causal, from Python to Triton"
+/>
+
+The main graph now holds a single call, shown here with the block mask's tensors abbreviated:
+
+```python
+flex_attention = torch.ops.higher_order.flex_attention(
+    l_query_, l_key_, l_value_, score_mod_0,
+    (256, 256, kv_num_blocks, kv_indices, full_kv_num_blocks, full_kv_indices,
+     q_num_blocks, q_indices, full_q_num_blocks, full_q_indices,
+     None, None, None, None, 128, 128, mask_fn_0),
+    0.25,
+    {'BACKEND': 'AUTO', 'PRESCALE_QK': False, 'ROWS_GUARANTEED_SAFE': False,
+     'BLOCKS_ARE_CONTIGUOUS': False, 'WRITE_DQ': True, 'OUTPUT_LOGSUMEXP': False, 'OUTPUT_MAX': False},
+    (g_import_main_slopes,), ())
+out = flex_attention[0]
+```
+
+The block mask has become a flat tuple: the two sequence lengths, the eight index tensors, four
+optional tensors for deterministic backward, the two block sizes and, last, the traced
+`mask_fn_0`. The scale is $1/\sqrt{16} = 0.25$ because this capture used a head dimension of 16.
+<Sidenote>This capture ran on the CPU with `flex_attention`'s device check stubbed out, since CPU
+inputs that require grad are rejected. On the CPU `OUTPUT_LOGSUMEXP` is forced to `False`; on a
+GPU with grad enabled it is `True`, because the backward pass needs the log-sum-exp.</Sidenote>
+Dynamo also marks the head dimension and number of heads static, so a change in either recompiles.
+
+### The flex_attention operator
+
+The HOP itself,
+[`FlexAttentionHOP`](https://github.com/pytorch/pytorch/blob/2b2898d361d9aa6ad55bd6875fa8a3639f940e7b/torch/_higher_order_ops/flex_attention.py#L96),
+is a dispatcher entry with one Python rule per **dispatch key** (the dispatcher's way of choosing a
+behaviour by context: autograd, tracing, fake tensors, plain execution):
+
+| Dispatch key | Rule | What it does |
+| --- | --- | --- |
+| `CompositeExplicitAutograd` | `sdpa_dense` | Runs `math_attention`, the eager reference |
+| `ProxyTorchDispatchMode` | `trace_flex_attention` | Re-traces both functions with `make_fx` and records one node |
+| `Autograd` | `flex_attention_autograd` | Wraps the call in `FlexAttentionAutogradOp` |
+| fake tensor | `flex_attention_fake_impl` | Returns empty `out`, `lse`, `max` with the right shapes |
+
+**`math_attention`** is the reference implementation. It computes the full score matrix, applies
+`score_mod` and `mask_mod` with `vmap` over all four index dimensions, and takes a softmax. It is
+correct but materializes $B \times H \times Q \times KV$ scores. It is what runs when you call
+`flex_attention` *without* `torch.compile`: the function then warns once and compiles only the
+HOP with the `"eager"` backend, which ends up in this rule.
+
+**`trace_flex_attention`** is what AOTAutograd's tracer hits. It traces `score_mod` and `mask_mod`
+again with `make_fx`, this time into ATen ops, inside a `TransformGetItemToIndex` mode. That mode
+matters for `slopes[h]`: normally indexing with a 0-d tensor converts the index to a Python int
+and specializes the graph on its value, one head. The mode turns it into `aten.index` with a
+tensor index, which is what step 3 of the figure above shows.
+
+### Autograd and the joint graph
+
+Training needs the gradient of the attention output with respect to $Q$, $K$, $V$ and every
+captured tensor that requires grad. The
+[`Autograd` rule](https://github.com/pytorch/pytorch/blob/2b2898d361d9aa6ad55bd6875fa8a3639f940e7b/torch/_higher_order_ops/flex_attention.py#L909)
+handles this with an `autograd.Function`, `FlexAttentionAutogradOp`. Its forward runs the HOP and
+saves `query`, `key`, `value`, `out`, the **log-sum-exp** (LSE, $\log \sum_n e^{S'_{mn}}$ for each
+row, which lets the backward pass recompute the softmax without storing it) and the block mask.
+Its backward calls a second HOP, `flex_attention_backward`.
+
+The backward kernel needs one more function: the derivative of `score_mod`.
+[`create_fw_bw_graph`](https://github.com/pytorch/pytorch/blob/2b2898d361d9aa6ad55bd6875fa8a3639f940e7b/torch/_higher_order_ops/flex_attention.py#L646)
+builds it with AOTAutograd's `create_joint`, again on 0-d fake tensors. The result is a **joint
+graph**: given the score, the indices and the incoming gradient of the new score, it returns the
+gradient for the old score and for each captured buffer. For `alibi` it is:
+
+```python
+class joint_graph0(torch.nn.Module):
+    def forward(self, arg0_1: "f32[]", arg1_1: "i32[]", arg2_1: "i32[]", arg3_1: "i32[]", arg4_1: "i32[]", arg5_1: "f32[]", arg6_1: "f32[2]"):
+        sub: "i32[]" = torch.ops.aten.sub.Tensor(arg4_1, arg3_1)
+        mul_1: "f32[]" = torch.ops.aten.mul.Tensor(arg5_1, sub)
+        zeros_and_scatter: "f32[2]" = torch.ops.flex_lib.zeros_and_scatter.default([2], [arg2_1], mul_1)
+        return [arg5_1, None, None, None, None, zeros_and_scatter]
+```
+
+`arg5_1` is the incoming gradient $g$. Since $\partial(\text{score} + c)/\partial\,\text{score} = 1$,
+the score's gradient is $g$ itself (the first output). The derivative with respect to `slopes[h]`
+is $g \cdot (n - m)$, and since `slopes[h]` was a gather, its gradient is a scatter:
+`zeros_and_scatter` puts $g(n - m)$ into a zero vector of `slopes`' shape at index $h$. This op
+comes from `ModIndex`, the autograd function `TransformGetItemToIndex` used for `slopes[h]`.
+
+The backward graph that AOTAutograd produces then contains one node,
+`higher_order.flex_attention_backward(q, k, v, out, lse, grad_out, None, fw_graph0, joint_graph0, block_mask, ...)`,
+carrying three subgraphs: the forward `score_mod` (to recompute scores), the joint graph and the
+mask.
+
+## The Inductor lowering
+
+Inductor walks the post-AOTAutograd graph and calls a **lowering** for each node: a function that
+turns the node into Inductor IR. The HOP's lowering is in
+[`kernel/flex/flex_attention.py`](https://github.com/pytorch/pytorch/blob/2b2898d361d9aa6ad55bd6875fa8a3639f940e7b/torch/_inductor/kernel/flex/flex_attention.py#L110),
+registered with `@register_lowering(torch.ops.higher_order.flex_attention)`.
+
+### Choosing an implementation
+
+The lowering first picks one of five implementations:
+
+| Condition | Implementation | Kernel |
+| --- | --- | --- |
+| query on CPU | `lower_cpu` | C++ template, inference only |
+| query on MPS | `lower_mps` | Metal shader, inference only |
+| `BACKEND="TRITON_DECODE"`, or `"AUTO"` and `_use_flex_decoding` | `create_flex_decoding_kernel` | split-KV Triton template |
+| `BACKEND="FLASH"` | `create_flex_flash_attention_kernel` | CuTe DSL template calling `flash_attn.cute` |
+| otherwise | the main path | `flex_attention` Triton template |
+
+`_use_flex_decoding` returns true when there are fewer than 128 queries, the batch size and head
+count are static, and (with grouped-query attention) the number of query heads per KV head is a
+power of two; the [decoding section](#decoding-splitting-the-keys) explains why. FLASH is never
+chosen automatically. On the GPU paths the head dimension must be at least 16, because
+`tl.dot` does not support smaller inner dimensions.
+
+### Lowering the subgraphs
+
+The interesting work is turning `score_mod` and `mask_mod` into something a template can inline.
+The lowering creates one placeholder input per argument, `InputBuffer`s with empty shapes named
+`score`, `b`, `h`, `m` and `n`, and passes them, together with the captured buffers, to
+[`build_subgraph_buffer`](https://github.com/pytorch/pytorch/blob/2b2898d361d9aa6ad55bd6875fa8a3639f940e7b/torch/_inductor/kernel/flex/common.py#L112).
+
+That function runs the subgraph through `PointwiseSubgraphLowering`, an FX interpreter that calls
+Inductor's normal lowerings for each op (`aten.index`, `aten.sub`, `aten.mul`, `aten.add`) but
+refuses to create buffers. The output is a `ComputedBuffer` holding a pointwise node whose
+`inner_fn` is the whole scalar function in Inductor's define-by-run IR: a Python function that,
+when called, issues `ops.load("score", ...)`, `ops.load("h", ...)`, `ops.sub(...)` and so on.
+That buffer is never realized. It is a recipe the template will replay.
+
+The refusal to create buffers is also the rule for what `score_mod` may contain. Anything that
+lowers to pointwise IR is fine: arithmetic, comparisons, `torch.where`, `tanh`, loads from
+captured tensors at computed indices. A reduction or a matrix multiply would need its own buffer,
+and the lowering raises `SubgraphLoweringException` instead.
+
+### Kernel options and configs
+
+Next the lowering fixes the template's compile-time constants. Most come from the shapes, which
+must be static except for the sequence lengths:
+
+| Option | Running example | Meaning |
+| --- | --- | --- |
+| `SM_SCALE` | 0.125 | $1/\sqrt{64}$ |
+| `GQA_SHARED_HEADS` | 1 | query heads per KV head, `Hq // Hkv` |
+| `IS_DIVISIBLE` | True | both lengths are multiples of 128, so loads need no bounds masks |
+| `HAS_FULL_BLOCKS` | True | the BlockMask has `full_kv_*` tensors |
+| `QK_HEAD_DIM`, `V_HEAD_DIM` | 64, 64 | and `_ROUNDED` to the next power of two |
+| `SAFE_HEAD_DIM` | True | head dims are powers of two, so no masking on the head dimension |
+| `SPARSE_Q_BLOCK_SIZE`, `SPARSE_KV_BLOCK_SIZE` | 128, 128 | the BlockMask's block size, guarded as constants |
+
+The tile sizes `BLOCK_M` (queries per program) and `BLOCK_N` (keys per loop step), together with
+`num_warps` and `num_stages`, come from a **config**. Without `max_autotune`,
+[`get_flex_attn_fwd_configs`](https://github.com/pytorch/pytorch/blob/2b2898d361d9aa6ad55bd6875fa8a3639f940e7b/torch/_inductor/template_heuristics/triton.py#L1381)
+returns one default per GPU generation, dtype and head dimension. For example, on an H100 (compute
+capability 9.0) with `float16` and head dimension 64 it is `BLOCK_M = 128`, `BLOCK_N = 128`, 3
+stages, 4 warps; on an A100 the same case gets `BLOCK_N = 64`. With `max_autotune` six more
+configs are added, and with `max_autotune_flex_search_space="EXHAUSTIVE"` the lowering tries 144.
+A config is dropped if `BLOCK_M` does not divide `SPARSE_Q_BLOCK_SIZE` or `BLOCK_N` does not divide
+`SPARSE_KV_BLOCK_SIZE`, because a tile must never straddle two sparse blocks.
+
+Kernel options passed by the user override all of this, and a `fwd_` or `bwd_` prefix
+(`fwd_BLOCK_M`, `bwd_num_warps`) targets only one of the two kernels.
+
+Each surviving config becomes a **choice**, a rendered template, and
+`autotune_select_algorithm` picks one. With a single choice there is nothing to benchmark. With
+several, each is compiled and timed. Because the timing runs on stand-in inputs, the lowering
+supplies `input_gen_fns` that fill the block-mask tensors with plausible values instead of
+zeros.<Sidenote>The docstring of `create_num_blocks_fake_generator` says it uses
+`min(16, max_block)` blocks per row; the code fills `kv_num_blocks` with `kv_indices.shape[-1]`,
+the full number of key blocks, so autotuning times a dense mask.</Sidenote>
+
+### Rendering the template
+
+The template,
+[`flex_attention.py.jinja`](https://github.com/pytorch/pytorch/blob/2b2898d361d9aa6ad55bd6875fa8a3639f940e7b/torch/_inductor/kernel/flex/templates/flex_attention.py.jinja)
+with helpers from `common.py.jinja` and `utilities.py.jinja`, is a Triton kernel with Jinja holes.
+Most holes print sizes and strides. Two are calls to `modification()`, at the point where the
+kernel holds a tile of scores:
+
+```python
+{{ modification(
+    subgraph_number=0,
+    output_name="post_mod_scores",
+    score="qk", b="off_z", h="off_h", m="m", n="n",
+    out="qk"
+) | indent_except_first(1) }}
+```
+
+[`modification`](https://github.com/pytorch/pytorch/blob/2b2898d361d9aa6ad55bd6875fa8a3639f940e7b/torch/_inductor/select_algorithm.py#L1065)
+calls the subgraph's `inner_fn` with Inductor's ops handler replaced by a
+[`ModificationWrapper`](https://github.com/pytorch/pytorch/blob/2b2898d361d9aa6ad55bd6875fa8a3639f940e7b/torch/_inductor/select_algorithm.py#L387).
+Every op is passed through to the normal Triton code generator, except `load`:
+
+- a load of a placeholder named in the call (`score`, `b`, `h`, `m`, `n`) returns the template
+  variable it is mapped to: `qk`, `off_z`, `off_h`, `m`, `n`;
+- a load of anything else, here the captured `slopes`, registers it as a new kernel argument and
+  emits a real `tl.load` from it.
+
+Because `qk` is a `[BLOCK_M, BLOCK_N]` tile and `m`, `n` are `[BLOCK_M, 1]` and `[1, BLOCK_N]`
+index vectors, the scalar function written for one score now computes a whole tile, with Triton
+broadcasting the operands. Step 4 of the figure shows what Inductor generated for the running
+example:
+
+<CodeStages
+	stages={scoreModStages}
+	tags={scoreModTags}
+	step={3}
+	maxLines={20}
+	title="alibi and causal, from Python to Triton"
+/>
+
+`slopes[h]` became `tl.load(in_ptr9 + off_h)`, a gather of one value per program, since a program
+handles a single head. `kv_idx - q_idx` became `n - m`, a `[BLOCK_M, BLOCK_N]` tile of distances.
+The causal mask became `m >= n`, placed by the template inside `if not IS_FULL_BLOCKS:`.
+
+The rendered kernel's signature makes the plumbing visible:
+
+```python
+def triton_flex_attention(arg_Q, arg_K, arg_V, arg_LSE, arg_MAX, arg_KV_NUM_BLKS, arg_KV_IDX,
+                          arg_FULL_KV_NUM_BLKS, arg_FULL_KV_IDX, in_ptr9, out_ptr0):
+```
+
+The nine named arguments come from the template's `def_kernel(...)`. `in_ptr9` was added by
+`ModificationWrapper` when it met `slopes`, and `out_ptr0` is the output. The rest of the kernel
+is the template with constants filled in, which the next section reads.
+
+## Inside the forward kernel
+
+### The grid
+
+The forward grid is
+
+$$
+\left(\left\lceil \frac{Q\_LEN}{\texttt{BLOCK\_M}} \right\rceil,\; B,\; H_q\right)
+$$
+
+so one **program** (a Triton thread block) owns `BLOCK_M` query rows of one head of one batch
+element. For the running example, rendered with `BLOCK_M = 128`, the wrapper launches
+`triton_tem_fused_flex_attention_0.run(..., 2, 1, 2)`: two query blocks, one batch element, two
+heads. With grouped-query attention the program finds its KV head as `off_hkv = off_hq // GQA_SHARED_HEADS`,
+so query heads that share a KV head read the same $K$ and $V$.
+
+A program loads its queries once and keeps them in registers. It then streams over keys in tiles
+of `BLOCK_N`, keeping three running values per query row, exactly as in
+[FlashAttention](/blog/flash-attention/#online-softmax): the row maximum `m_i`, the sum of
+exponentials `l_i`, and the unnormalized output `acc`.
+
+### Two loops over the block mask
+
+The program reads its row of the BlockMask and runs the inner loop
+[`forward_inner`](https://github.com/pytorch/pytorch/blob/2b2898d361d9aa6ad55bd6875fa8a3639f940e7b/torch/_inductor/kernel/flex/templates/common.py.jinja#L123)
+twice: once over the partial blocks with `IS_FULL_BLOCKS=False`, then over the full blocks with
+`IS_FULL_BLOCKS=True`. `IS_FULL_BLOCKS` is a `constexpr`, so Triton compiles two versions of the
+loop body, and the full-block version contains no `mask_mod` code at all. That is the whole saving
+of storing full blocks separately. The `BlockMask` docstring puts it at about 15% for causal
+masks.
+
+A sparse block of 128 keys is usually several tiles of `BLOCK_N`. Within a block the loop
+advances by `BLOCK_N`; after the last tile of a block it jumps to the next listed block.
+[`get_offset_for_next_block`](https://github.com/pytorch/pytorch/blob/2b2898d361d9aa6ad55bd6875fa8a3639f940e7b/torch/_inductor/kernel/flex/templates/utilities.py.jinja#L5)
+computes the step. Write $c_i$ for `kv_indices[i]`, $S$ for `SPARSE_KV_BLOCK_SIZE`, $b$ for
+`BLOCK_N`, $r = S / b$ for the tiles per block and $j$ for the loop counter. Then
+
+$$
+\text{offset}_j = \begin{cases} (c_{i+1} - c_i)\,S - (r - 1)\,b & \text{if } (j + 1) \bmod r = 0, \text{ with } i = \lfloor j/r \rfloor \\ b & \text{otherwise} \end{cases}
+$$
+
+The subtraction undoes the $r - 1$ in-block steps already taken. In the figure below, row 3 of the
+sliding-window mask uses tiles of 2 keys, so $r = 2$. The partial loop visits keys 4–5 and 6–7
+(block 1), then jumps by $(3 - 1) \cdot 4 - 1 \cdot 2 = 6$ to keys 12–13 and 14–15 (block 3). The
+full loop starts again from `full_kv_indices[3][0] = 2` and visits keys 8–9 and 10–11. Switch the
+pass to "backward" to see the transposed walk used for dK and dV, or change the mask and sizes.
+
+<BlockMaskExplorer preset="sliding" len={16} block={4} tile={2} line={3} title="The tiles one program visits, in order" />
+
+Two kernel options trade generality for speed here. `BLOCKS_ARE_CONTIGUOUS=True` promises that the
+listed blocks are consecutive, so the offset is always `BLOCK_N` and the two indirect loads per
+step disappear. `ROWS_GUARANTEED_SAFE=True` promises that no query row is fully masked, which
+removes a check described below.
+
+### One tile
+
+For each tile, `forward_block_mn` loads `BLOCK_N` keys, computes `qk = tl.dot(q, k) * SM_SCALE`,
+runs the inlined `score_mod`, and, in the partial loop only, the inlined `mask_mod` followed by
+`tl.where(mask_mod_output, post_mod_scores, -inf)`. Then it does the online-softmax update.
+
+One detail differs from textbook FlashAttention: the softmax is done in **base 2**. The kernel
+multiplies the modified scores by `RCP_LN2` $= 1/\ln 2 \approx 1.4427$ and uses `exp2`, because
+$e^x = 2^{x/\ln 2}$ and `exp2` is a single fast hardware instruction on NVIDIA GPUs. The scaling
+has to come *after* `score_mod`, since `score_mod` expects scores in natural units. (With
+`PRESCALE_QK=True` the kernel instead folds the scale and `RCP_LN2` into `q` once, which saves a
+multiply per score but runs `score_mod` on rescaled scores; the template's comment estimates about
+20% more numerical error.)
+
+Step through one program on a scaled-down example: 8 tokens with head dimension 4 (so the
+default scale is exactly $1/\sqrt 4 = 0.5$), value dimension 2, sparse blocks of 4,
+`BLOCK_M = 4` and `BLOCK_N = 2`, with the same ALiBi `score_mod` (slope 0.5) and causal mask. The
+program is the second one, query rows 4–7. Its row of the block mask has one partial block (block
+1, on the diagonal) and one full block (block 0), so it runs two tiles in the partial loop and
+two in the full loop.
+
+<FlexKernelSteps step={2} title="One program of the forward template, 8 tokens" />
+
+Check the first tile by hand. Query 4 is $(-1, -1, 1, -1)$ and key 4 is $(1, 0, 0, 1)$, so
+$q \cdot k = -2$, times the scale gives $-1$, and ALiBi adds $0.5 \cdot (4 - 4) = 0$. Key 5 is in
+the future for query 4, so `mask_mod` sets it to $-\infty$. In base 2 the score is
+$-1 \times 1.4427 = -1.443$, which becomes `m_i` for row 4, with `l_i` $= 2^0 = 1$. In tile 2,
+rows 4 and 5 see only masked keys: their maxima stay put, `alpha` is $2^0 = 1$ and nothing is
+added. Tiles 3 and 4 come from the full block, and the `mask_mod` line is gone from the code.
+
+The update also handles a row whose scores so far are all $-\infty$. Then $m_{ij} = -\infty$ and
+`exp2(m_i - m_ij)` would be `exp2(-inf + inf)`, which is NaN. Unless `ROWS_GUARANTEED_SAFE` is set,
+the kernel replaces such an $m_{ij}$ with 0 before exponentiating, so `alpha` and `p` come out as
+0 instead.
+
+### The epilogue
+
+After both loops the program divides `acc` by `l_i` and stores the tile through `store_output`,
+the hook that lets Inductor fuse a following pointwise op into the template. A row that never saw
+an allowed key has `l_i = 0`, which the kernel replaces by 1 so that its output is 0, not NaN.
+
+If `OUTPUT_LOGSUMEXP` is set, the program also stores `lse = m_i + log2(l_i)`. That LSE is in
+base 2. The kernel's callers know it: `flex_attention` multiplies it by $\ln 2$ before returning
+it to the user (`_finalize_outputs` with `stats_are_log2`), and the backward kernel uses it in
+base 2 directly. In the example, row 4 ends with $m = -1.443$ and $l = 4.213$, so the base-2 LSE
+is $-1.443 + \log_2 4.213 = 0.632$, and $0.632 \cdot \ln 2 = 0.438$, the natural-log LSE of the
+row.<Sidenote>The figure's numbers come from a TypeScript transcription of the template's loop.
+Its output and LSE agree with FlexAttention's own `math_attention` to $5 \times 10^{-10}$; the
+small difference is the template's 9-digit `RCP_LN2`. A Python transcription of the same loop
+also matched `math_attention` to $10^{-9}$ on 512 tokens for causal, sliding-window and document
+masks with three tile shapes.</Sidenote>
+
+## The backward kernel
+
+### Two kinds of program
+
+The backward pass needs $dQ$, $dK$ and $dV$. With $P = \text{softmax}(S')$ and $dO$ the incoming
+gradient of the output, FlashAttention's backward recomputes $P$ tile by tile from the saved LSE
+and uses
+
+$$
+dV = P^\top dO, \qquad dS'_{mn} = P_{mn}\left(dP_{mn} - \Delta_m\right) \text{ with } dP = dO\,V^\top,\; \Delta_m = \sum_d O_{md}\, dO_{md}
+$$
+
+followed by $dQ = dS\,K \cdot s$ and $dK = dS^\top Q \cdot s$, where $dS$ is $dS'$ pushed back
+through `score_mod`. The lowering computes $\Delta$ (called `delta`) first with ordinary Inductor
+lowerings, `sum(out * grad_out, -1)`, which become a small reduction kernel before the template.
+
+$dQ$ is a reduction over keys, and $dK$, $dV$ are reductions over queries. The
+[backward template](https://github.com/pytorch/pytorch/blob/2b2898d361d9aa6ad55bd6875fa8a3639f940e7b/torch/_inductor/kernel/flex/templates/flex_backwards.py.jinja)
+does both in one launch, with two kinds of program. Its grid is
+
+$$
+\left(\left\lceil \frac{KV\_LEN}{\texttt{BLOCK\_N1}} \right\rceil + \left\lceil \frac{Q\_LEN}{\texttt{BLOCK\_M2}} \right\rceil \cdot \frac{H_q}{H_{kv}},\; B,\; H_{kv}\right)
+$$
+
+A program whose index is below $\lceil KV\_LEN / \texttt{BLOCK\_N1} \rceil$ owns `BLOCK_N1` keys
+and walks down their column of the mask, using the transposed `q_num_blocks` and `q_indices`. It
+loops over every query head in its GQA group itself, so it can accumulate $dK$ and $dV$ in
+registers without atomics. The other programs own `BLOCK_M2` queries of one query head and walk
+their row with `kv_indices` to accumulate $dQ$. For the running example, rendered with 16 × 16
+tiles, the wrapper launches `(32, 1, 2)`: 16 dK/dV programs plus 16 dQ programs per KV head.
+Both kinds run the partial loop first and the full loop second, like the forward kernel.
+<Sidenote>In the dQ branch of the template the two loops' comments are swapped: the loop under
+"fully unmasked blocks" is called with `IS_FULL_BLOCKS=False`. The code is right; the comments
+are not.</Sidenote>
+
+In the explorer above, switch the pass to backward to see a dK/dV program's walk: the sliding
+window's column 1 visits query blocks 1 and 3 (partial) and then 2 (full), which happens to match
+row 3 in the forward pass.
+
+### Gradients of captured tensors
+
+Inside both kinds of program, the template inlines three subgraphs: the forward `score_mod` to
+recompute the scores, the mask, and the joint graph, which turns $dS'$ (the variable `ds`) into
+$dS$ (`grad_scores`). Captured buffers that require grad add a fourth: the joint graph's
+`zeros_and_scatter` outputs. Step through the last two stages:
+
+<CodeStages
+	stages={scoreModStages}
+	tags={scoreModTags}
+	step={5}
+	maxLines={20}
+	title="alibi and causal, from Python to Triton"
+/>
+
+The lowering registers a special lowering for `zeros_and_scatter`
+([`zeros_and_scatter_lowering`](https://github.com/pytorch/pytorch/blob/2b2898d361d9aa6ad55bd6875fa8a3639f940e7b/torch/_inductor/kernel/flex/common.py#L52)):
+it allocates a zero-filled `float32` buffer of the captured tensor's shape and returns a `Scatter`
+node with `scatter_mode="atomic_add"`. When the template replays that node,
+`ModificationWrapper.store` emits a `tl.atomic_add`, because every program in the grid adds into
+the same two `slopes` entries. In the wrapper this shows up as a small kernel that zero-fills a
+2-element buffer before the backward template runs, and as the buffer being passed into the
+template as `in_ptr17`.
+
+Two consequences follow. First, gradients of captured tensors cost an atomic per score element,
+so a `score_mod` with a learnable bias is slower in the backward pass than one without. Second,
+the joint graph may contain each `zeros_and_scatter` only as an output.
+[`validate_joint_graph`](https://github.com/pytorch/pytorch/blob/2b2898d361d9aa6ad55bd6875fa8a3639f940e7b/torch/_inductor/kernel/flex/flex_attention.py#L567)
+rejects a `score_mod` that indexes the same grad-requiring tensor twice, such as
+`bias[q_idx] + bias[kv_idx]`, and its error message suggests indexing a clone the second time.
+
+## Decoding: splitting the keys
+
+During autoregressive generation each new token is one query against thousands of cached keys. The
+main kernel would launch $\lceil 1/\texttt{BLOCK\_M} \rceil \cdot B \cdot H_q$ programs, a handful,
+each walking all the keys alone, while most of the GPU's streaming multiprocessors (SMs) sit idle.
+The **flex decoding** kernel parallelizes over the keys instead, the **split-KV** scheme of
+FlashDecoding.
+
+[`create_flex_decoding_kernel`](https://github.com/pytorch/pytorch/blob/2b2898d361d9aa6ad55bd6875fa8a3639f940e7b/torch/_inductor/kernel/flex/flex_decoding.py#L139)
+makes three changes. It packs the query heads that share a KV head into one program, viewing the
+query as `[B, Hkv, G, Q_LEN, D]` so a program's `BLOCK_M` rows are $G \times$ `Q_LEN` query rows
+and each $K$/$V$ tile is loaded once for all of them. It adds a third grid dimension, `SPLIT_KV`,
+from `get_split_k`:
+
+$$
+\texttt{SPLIT\_KV} = 2 \cdot \left\lfloor \frac{\text{number of SMs}}{B \cdot H_{kv}} \right\rfloor
+$$
+
+which is why the batch size and head count must be static. And each program writes a partial
+result, its row maximum, row sum and unnormalized output, to fp32 buffers, which ordinary
+Inductor lowerings then merge: the global maximum over splits, `exp2` rescaling, two sums and a
+division.
+
+For a concrete case, take 8 query heads sharing 2 KV heads, one query, 1024 cached keys and head
+dimension 64, on a 132-SM H100. Then $G = 4$, `BLOCK_M` $= \max(\text{next power of 2 of } 4, 16) = 16$,
+and `SPLIT_KV` $= 2 \cdot \lfloor 132/2 \rfloor = 132$. Click the boxes to follow the data:
+
+<BoxDiagram
+	nodes={decodeNodes}
+	edges={decodeEdges}
+	grid={{ cellW: 168, cellH: 50, gapX: 44, gapY: 34 }}
+	selected="split"
+	title="Split-KV decoding for 8 query heads, 2 KV heads, 1024 keys"
+/>
+
+The generated wrapper for this case (rendered with `get_split_k` patched to report 132 SMs)
+launches the decoding template on the grid `(1, 2, 132)` and follows it with five reduction
+kernels that merge the 132 partial results.
+
+How the keys are divided among the splits depends on the block mask, and one case deserves care.
+Each split takes `TILE_KV` keys, rounded up to a multiple of `BLOCK_N`, where `TILE_KV` is
+`cdiv(KV_LEN, SPLIT_KV)` if the mask has full blocks and `cdiv(kv_num_blocks * SPARSE_KV_BLOCK_SIZE, SPLIT_KV)`
+otherwise. With `block_mask=None`, `flex_attention` builds an empty mask with one partial block of
+$2^{30}$ keys and no full blocks, so `TILE_KV` becomes $\lceil 2^{30} / 132 \rceil = 8{,}134{,}408$:
+the first split of each KV head gets all 16 tiles of 64 keys and the other 131 get none. With a mask
+from `create_block_mask(noop_mask, 1, 1, 1, 1024)`, which has (empty) full-block tensors,
+`TILE_KV` is $\lceil 1024 / 132 \rceil = 8$, rounded up to 64, so 16 splits get one tile
+each.<Sidenote>This follows from reading `flex_decode.py.jinja`; a Python transcription of its
+partitioning gave the tile counts above. It was not measured on a GPU.</Sidenote> For decoding,
+it is worth passing a real BlockMask even when nothing is masked.
+
+## Practical considerations
+
+- **Compile it.** Without `torch.compile`, `flex_attention` runs `math_attention` and
+  materializes every score; it warns about this once. Set
+  `torch.nn.attention.flex_attention._FLEX_ATTENTION_DISABLE_COMPILE_DEBUG = True` to run
+  `score_mod` eagerly so that `print` and breakpoints work inside it.
+- **Build the BlockMask once.** `create_block_mask` evaluates `mask_mod` densely. Build it once
+  per shape and reuse it across layers, and compile it for long sequences.
+- **Recompilation.** Head count, head dimension, block sizes and kernel options are baked into
+  the kernel as constants. Changing any of them compiles a new kernel. The sequence lengths can
+  stay dynamic.
+- **Pick block sizes that tile.** `BLOCK_SIZE` must be a multiple of the kernel's `BLOCK_M` and
+  `BLOCK_N`; a config that does not divide it is skipped, and if it was the only one, the lowering
+  raises an error. Larger sparse blocks make the BlockMask smaller but coarser.
+- **Mark structure you know.** `BLOCKS_ARE_CONTIGUOUS` and `ROWS_GUARANTEED_SAFE` remove work when
+  true; they give wrong results when false.
+- **Learnable biases cost atomics.** A captured tensor that requires grad adds a `tl.atomic_add`
+  per score element in the backward pass.
+- **Inspect what you got.** `TORCH_LOGS=output_code` prints the wrapper and the rendered kernels,
+  with your `score_mod` visible inside `forward_block_mn`.
+
+## Summary
+
+- FlexAttention compiles an attention variant written as two scalar functions, `score_mod` and
+  `mask_mod`, into one fused kernel, by inlining them into a FlashAttention-style Triton template.
+- Dynamo traces each function on 0-d tensors, so it becomes a graph of a scalar function; captured
+  tensors are lifted into extra inputs, and AOTAutograd derives a scalar joint graph for the
+  backward pass.
+- Inductor lowers each subgraph to a pointwise IR node that is never realized. The template's
+  `modification()` replays it with placeholders mapped to tile variables, so the scalar code runs
+  on a whole `[BLOCK_M, BLOCK_N]` tile, and captured tensors become `tl.load`s (forward) or
+  `tl.atomic_add`s (gradients).
+- The BlockMask summarizes the mask per 128 × 128 block. The kernel skips empty blocks, runs two
+  loops over partial and full blocks with `mask_mod` compiled out of the second, and jumps between
+  listed blocks with `get_offset_for_next_block`. The softmax and LSE are kept in base 2.
+- Short queries go to a split-KV decoding kernel whose partial results are merged by ordinary
+  Inductor ops; how evenly it splits depends on the BlockMask passed in.
+
+## References
+
+- Juechu Dong, Boyuan Feng, Driss Guessous, Yanbo Liang and Horace He,
+  [FlexAttention: A Programming Model for Generating Optimized Attention Kernels](https://arxiv.org/abs/2412.05496),
+  2024.
+- PyTorch source at commit `2b2898d`:
+  [`torch/nn/attention/flex_attention.py`](https://github.com/pytorch/pytorch/blob/2b2898d361d9aa6ad55bd6875fa8a3639f940e7b/torch/nn/attention/flex_attention.py)
+  (API, BlockMask),
+  [`torch/_higher_order_ops/flex_attention.py`](https://github.com/pytorch/pytorch/blob/2b2898d361d9aa6ad55bd6875fa8a3639f940e7b/torch/_higher_order_ops/flex_attention.py)
+  (the operators),
+  [`torch/_inductor/kernel/flex/`](https://github.com/pytorch/pytorch/tree/2b2898d361d9aa6ad55bd6875fa8a3639f940e7b/torch/_inductor/kernel/flex)
+  (lowerings and templates),
+  [`torch/_inductor/select_algorithm.py`](https://github.com/pytorch/pytorch/blob/2b2898d361d9aa6ad55bd6875fa8a3639f940e7b/torch/_inductor/select_algorithm.py)
+  (`TritonTemplateKernel.modification`, `ModificationWrapper`).
+- Tri Dao, [FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning](https://arxiv.org/abs/2307.08691), 2023.
+- On this blog: [FlashAttention](/blog/flash-attention/), [Inside TorchInductor](/blog/torch-inductor/),
+  [Higher-order operators](/blog/higher-order-operators/), [Triton's JIT](/blog/triton-jit/).

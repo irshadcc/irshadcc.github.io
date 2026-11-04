@@ -1,0 +1,145 @@
+---
+// Transformation of a density and its mode (Bishop & Bishop, Section 2.4, Figure 2.12). Main
+// panel: the change of variable y = g⁻¹(x) (blue), the density p_x(x) = N(x | µ, σ²) along the
+// x axis (red) and dashed guides from its mode through the curve. Side panel, sharing the y
+// axis: the function p_x(g(y)) obtained by plain substitution (green), the true density
+// p_y(y) = p_x(g(y)) |g'(y)| from (2.71) (magenta) and a histogram of y for samples of x pushed
+// through g⁻¹. The histogram follows magenta, and the modes differ (dotted lines) unless the
+// map is linear. Sliders set µ and σ; the select switches between the logistic map (2.74)–(2.75)
+// and a linear one. Logic in probTheory.ts.
+// Usage in .mdx:
+//   <DensityTransform mu={6} sigma={1} samples={50000} />
+import "../sampling/sampling.css";
+import "./probTheory.css";
+
+interface Props {
+	mu?: number;
+	sigma?: number;
+	samples?: number;
+	seed?: number;
+	title?: string;
+	caption?: string;
+}
+
+const {
+	mu = 6,
+	sigma = 1,
+	samples = 50000,
+	seed = 5,
+	title,
+	caption,
+} = Astro.props;
+---
+
+<figure class="smp-fig pt-transform" data-samples={samples} data-seed={seed}>
+	{title && <div class="smp-title">{title}</div>}
+	<div class="smp-legend">
+		<span><i class="k-p"></i>y = g⁻¹(x)</span>
+		<span><i class="pt-k-x"></i>p_x(x)</span>
+		<span><i class="pt-k-green"></i>p_x(g(y)), substituted</span>
+		<span><i class="pt-k-y"></i>p_y(y) = p_x(g(y)) |g′(y)|</span>
+		<span><i class="box k-hist"></i>histogram of transformed samples</span>
+	</div>
+	<svg class="smp-svg" viewBox="0 0 640 300" role="img" aria-label="A Gaussian density pushed through a sigmoid, with the transformed density and its mode"></svg>
+	<div class="smp-controls">
+		<label>map
+			<select class="i-map" aria-label="Change of variable">
+				<option value="logit">logistic, x = ln y − ln(1 − y) + 5</option>
+				<option value="linear">linear, x = 10 y</option>
+			</select>
+		</label>
+		<label class="smp-slider">µ = <strong class="v-mu"></strong>
+			<input type="range" class="i-mu" min="2" max="8" step="0.1" value={mu} aria-label="Mean of p_x" />
+		</label>
+		<label class="smp-slider">σ = <strong class="v-s"></strong>
+			<input type="range" class="i-s" min="0.3" max="2.5" step="0.05" value={sigma} aria-label="Standard deviation of p_x" />
+		</label>
+	</div>
+	<div class="smp-metrics">
+		<div><span>mode of p_x: x̂</span><strong class="m-x"></strong></div>
+		<div><span>g⁻¹(x̂) = mode of p_x(g(y))</span><strong class="m-gy"></strong></div>
+		<div><span>mode of p_y: ŷ</span><strong class="m-y"></strong></div>
+		<div><span>g(ŷ)</span><strong class="m-gx"></strong></div>
+	</div>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import { argmax, gauss, gLogit, mulberry32, normals, sigmoid5 } from "./probTheory";
+	import { axes, curve, el, fmt, histogram } from "../sampling/plot";
+
+	function attach(fig: HTMLElement) {
+		const svg = fig.querySelector("svg")!;
+		const mapIn = fig.querySelector<HTMLSelectElement>(".i-map")!;
+		const muIn = fig.querySelector<HTMLInputElement>(".i-mu")!;
+		const sIn = fig.querySelector<HTMLInputElement>(".i-s")!;
+		const N = Number(fig.dataset.samples) || 50000;
+		const z = normals(mulberry32(Number(fig.dataset.seed) || 5));
+		const base = Array.from({ length: N }, () => z());
+
+		function draw() {
+			const mu = Number(muIn.value);
+			const s = Number(sIn.value);
+			const s2 = s * s;
+			const linear = mapIn.value === "linear";
+			const g = linear ? (y: number) => 10 * y : gLogit;
+			const ginv = linear ? (x: number) => x / 10 : sigmoid5;
+			const dg = linear ? () => 10 : (y: number) => 1 / (y * (1 - y));
+			const px = (x: number) => gauss(x, mu, s2);
+			const sub = (y: number) => (y <= 0 || y >= 1 ? 0 : px(g(y)));
+			const py = (y: number) => (y <= 0 || y >= 1 ? 0 : px(g(y)) * dg(y));
+			const ys = base.map((e) => ginv(mu + s * e));
+			const yMode = argmax(py, 1e-6, 1 - 1e-6);
+			const gyMode = ginv(mu);
+
+			svg.replaceChildren();
+			const A = axes(svg, { x: 40, y: 8, w: 400, h: 255 }, [0, 10], [0, 1], { xLabel: "x", yLabel: "y" });
+			// p_x along the bottom, scaled to 30% of the height.
+			const pxPeak = px(mu);
+			el("path", { d: curve(A, (x) => (0.3 * px(x)) / pxPeak), class: "pt-x-line" }, svg);
+			el("path", { d: curve(A, ginv), class: "smp-p" }, svg);
+			el("path", { d: `M${A.sx(mu)},${A.sy(0)}L${A.sx(mu)},${A.sy(gyMode)}L${A.sx(10)},${A.sy(gyMode)}`, class: "smp-guide" }, svg);
+			el("text", { x: A.sx(mu) + 4, y: A.sy(0.33), class: "smp-note" }, svg, "x̂");
+
+			// Side panel: densities over y drawn horizontally.
+			const bins = 50;
+			const hist = histogram(ys, 0, 1, bins);
+			const top = Math.max(...hist, py(yMode)) * 1.08;
+			const B = axes(svg, { x: 460, y: 8, w: 165, h: 255 }, [0, top], [0, 1], { xLabel: "density over y", xTicks: 3, noYLabels: true });
+			const bw = 1 / bins;
+			hist.forEach((v, i) => {
+				if (v <= 0) return;
+				const y0 = B.sy(i * bw);
+				const y1 = B.sy((i + 1) * bw);
+				el("rect", { x: B.sx(0), y: y1 + 0.3, width: B.sx(v) - B.sx(0), height: Math.max(0, y0 - y1 - 0.6), class: "smp-hist" }, svg);
+			});
+			const side = (f: (y: number) => number, scale: number, cls: string) => {
+				let d = "";
+				for (let i = 1; i < 400; i++) {
+					const y = i / 400;
+					const v = Math.min(top, f(y) * scale);
+					d += `${i > 1 ? "L" : "M"}${B.sx(v).toFixed(1)},${B.sy(y).toFixed(1)}`;
+				}
+				el("path", { d, class: cls }, svg);
+			};
+			// The substituted function is not a density; scale it to the same peak height as p_y.
+			const subPeak = sub(gyMode);
+			side(sub, subPeak ? py(yMode) / subPeak : 1, "pt-green-line");
+			side(py, 1, "pt-y-line");
+			el("line", { x1: B.sx(0), x2: B.sx(top), y1: B.sy(yMode), y2: B.sy(yMode), class: "smp-muted-line" }, svg);
+			el("line", { x1: B.sx(0), x2: B.sx(top), y1: B.sy(gyMode), y2: B.sy(gyMode), class: "smp-muted-line" }, svg);
+			el("text", { x: B.sx(top) - 3, y: B.sy(yMode) - 3, class: "smp-note", "text-anchor": "end" }, svg, "ŷ");
+
+			fig.querySelector(".v-mu")!.textContent = fmt(mu, 1);
+			fig.querySelector(".v-s")!.textContent = fmt(s, 2);
+			fig.querySelector(".m-x")!.textContent = fmt(mu, 3);
+			fig.querySelector(".m-gy")!.textContent = fmt(gyMode, 4);
+			fig.querySelector(".m-y")!.textContent = fmt(yMode, 4);
+			fig.querySelector(".m-gx")!.textContent = fmt(g(yMode), 3);
+		}
+		for (const i of [mapIn, muIn, sIn]) i.addEventListener("input", draw);
+		draw();
+	}
+
+	document.querySelectorAll<HTMLElement>(".pt-transform").forEach(attach);
+</script>

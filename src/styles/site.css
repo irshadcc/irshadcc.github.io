@@ -601,6 +601,15 @@ td {
 	overflow-y: hidden;
 	padding: 0.25rem 0;
 }
+/* On narrow screens KaTeX's right-pinned \tag sits on top of a wide equation; put the number on
+   its own line below the equation instead. */
+@media (max-width: 700px) {
+	.katex-display > .katex > .katex-html > .tag {
+		position: static;
+		display: block;
+		text-align: right;
+	}
+}
 
 /* ---------- Footer ---------- */
 

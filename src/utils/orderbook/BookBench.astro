@@ -1,0 +1,92 @@
+---
+// Charts of the order book benchmark in orderBookBench.json (C++, synthetic ITCH-like stream,
+// every book cross-checked against the std::map one after every message).
+//   chart="ns"    mean ns per message for each book design, one group per scenario
+//   chart="gap"   ns to find the next best level after the best empties, array walk vs bitmap
+//   chart="depth" share of adds by the number of better levels on their side, per scenario
+// Usage in .mdx:
+//   <BookBench chart="ns" />
+import "./orderBook.css";
+import { drawBars, drawColumns } from "./orderBookDraw";
+import { bench } from "./orderBookFigures";
+
+interface Props {
+	chart: "ns" | "gap" | "depth";
+	title?: string;
+	caption?: string;
+}
+
+const { chart, title, caption } = Astro.props;
+const names: Record<string, string> = {
+	map: "std::map + std::list",
+	selph: "tree of limits (Selph)",
+	vectorLinear: "vector, linear",
+	vectorBinary: "vector, lower_bound",
+	vectorBranchless: "vector, branchless",
+	array: "flat array (QuantCup)",
+	bitmap: "flat array + bitmap",
+};
+const scen = bench.scenarios as Record<
+	string,
+	{
+		nsPerMsg: Record<string, number>;
+		levelsPerSide: number;
+		addDepth: number[];
+		adds: number;
+	}
+>;
+const label: Record<string, string> = {
+	touch: "touch",
+	deep: "deep",
+	sparse: "sparse",
+};
+let svg = "";
+if (chart === "ns") {
+	svg = drawBars(
+		Object.entries(scen).map(([k, s]) => ({
+			name: `${label[k]}: ${s.levelsPerSide.toFixed(0)} levels per side on average`,
+			bars: Object.entries(s.nsPerMsg).map(([b, v]) => ({
+				label: names[b],
+				value: v,
+				hot: b === "map",
+			})),
+		})),
+		"ns",
+		40,
+	);
+} else if (chart === "gap") {
+	const g = bench.gap as { gap: number; array: number; bitmap: number }[];
+	svg = drawColumns(
+		g.map((r) => `${r.gap}`),
+		[
+			{ name: "walk the array", values: g.map((r) => r.array), cls: "a" },
+			{ name: "two-level bitmap", values: g.map((r) => r.bitmap), cls: "b" },
+		],
+		"ns per add + cancel (log scale), by gap in ticks",
+		true,
+	);
+} else {
+	const xs = ["0", "1", "2", "3", "4", "5", "6", "7", "8–15", "16+"];
+	const bucket = (d: number[]) => [
+		...d.slice(0, 8),
+		d.slice(8, 16).reduce((a, b) => a + b, 0),
+		d.slice(16).reduce((a, b) => a + b, 0),
+	];
+	const cls = ["c", "b", "a"];
+	svg = drawColumns(
+		xs,
+		Object.entries(scen).map(([k, s], i) => ({
+			name: label[k],
+			values: bucket(s.addDepth).map((v) => +((100 * v) / s.adds).toFixed(1)),
+			cls: cls[i],
+		})),
+		"% of adds, by number of better levels on the same side",
+	);
+}
+---
+
+<figure class="obk obk-bench">
+	{title && <figcaption class="obk-title">{title}</figcaption>}
+	<div class="obk-canvas"><div class="obk-frame" set:html={svg} /></div>
+	{caption && <p class="obk-legend">{caption}</p>}
+</figure>

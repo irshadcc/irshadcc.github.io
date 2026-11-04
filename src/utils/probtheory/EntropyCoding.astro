@@ -1,0 +1,140 @@
+---
+// Entropy of a discrete distribution and the code that achieves it (Bishop & Bishop, Sections
+// 2.5.1–2.5.2, Figure 2.14). Bars show p(x_i) for M states; drag a bar up or down to change it
+// (the others are renormalised). Readouts give H in bits and nats, the maximum ln M reached by
+// the uniform distribution, and the average length of a Huffman code. For M ≤ 8 a table lists
+// each state's code word, its length and −log₂ p. Presets: uniform over 8, the Cover–Thomas
+// example from the book, and a peaked and a broad distribution over 30 bins.
+// Logic in probTheory.ts.
+// Usage in .mdx:
+//   <EntropyCoding preset="cover-thomas" />
+import "../sampling/sampling.css";
+import "./probTheory.css";
+
+interface Props {
+	preset?: "uniform8" | "cover-thomas" | "peaked30" | "broad30" | "uniform30";
+	title?: string;
+	caption?: string;
+}
+
+const { preset = "cover-thomas", title, caption } = Astro.props;
+---
+
+<figure class="smp-fig pt-entropy" data-preset={preset}>
+	{title && <div class="smp-title">{title}</div>}
+	<svg class="smp-svg pt-drag" viewBox="0 0 640 220" role="img" aria-label="Bar chart of a discrete distribution; drag bars to edit"></svg>
+	<div class="smp-controls">
+		<label>distribution
+			<select class="i-preset" aria-label="Preset distribution">
+				<option value="uniform8">uniform over 8 states</option>
+				<option value="cover-thomas">Cover–Thomas (½, ¼, ⅛, 1/16, 4 × 1/64)</option>
+				<option value="peaked30">peaked, 30 bins</option>
+				<option value="broad30">broad, 30 bins</option>
+				<option value="uniform30">uniform, 30 bins</option>
+			</select>
+		</label>
+		<span>drag a bar to change it</span>
+	</div>
+	<div class="smp-metrics">
+		<div><span>H [bits]</span><strong class="m-bits"></strong></div>
+		<div><span>H [nats]</span><strong class="m-nats"></strong></div>
+		<div><span>maximum ln M [nats]</span><strong class="m-max"></strong></div>
+		<div><span>Huffman average length [bits]</span><strong class="m-huff"></strong></div>
+	</div>
+	<table class="smp-table pt-codes"></table>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import { entropy, huffman, normalise } from "./probTheory";
+	import { el, fmt } from "../sampling/plot";
+
+	const binned = (centre: number, width: number) =>
+		normalise(Array.from({ length: 30 }, (_, i) => Math.exp(-(((i - centre) / width) ** 2) / 2)));
+	const presets: Record<string, number[]> = {
+		uniform8: Array(8).fill(1 / 8),
+		"cover-thomas": [1 / 2, 1 / 4, 1 / 8, 1 / 16, 1 / 64, 1 / 64, 1 / 64, 1 / 64],
+		peaked30: binned(14.5, 1.42), // H = 1.77 nats, as in Figure 2.14
+		broad30: binned(14.5, 5.49), // H = 3.09 nats
+		uniform30: Array(30).fill(1 / 30),
+	};
+	const letters = "abcdefgh";
+
+	function attach(fig: HTMLElement) {
+		const svg = fig.querySelector<SVGSVGElement>("svg")!;
+		const sel = fig.querySelector<HTMLSelectElement>(".i-preset")!;
+		const table = fig.querySelector(".pt-codes")!;
+		sel.value = fig.dataset.preset ?? "cover-thomas";
+		let p = [...presets[sel.value]];
+		const box = { x: 40, y: 10, w: 585, h: 175 };
+
+		function draw() {
+			const M = p.length;
+			const top = Math.max(0.55, Math.max(...p) * 1.1);
+			svg.replaceChildren();
+			el("rect", { x: box.x, y: box.y, width: box.w, height: box.h, class: "smp-plotbox" }, svg);
+			for (const t of [0, 0.25, 0.5]) {
+				if (t > top) continue;
+				const y = box.y + box.h - (t / top) * box.h;
+				el("line", { x1: box.x, x2: box.x + box.w, y1: y, y2: y, class: "smp-grid" }, svg);
+				el("text", { x: box.x - 5, y: y + 3.5, class: "smp-tick", "text-anchor": "end" }, svg, fmt(t, 2));
+			}
+			const bw = box.w / M;
+			p.forEach((v, i) => {
+				const h = (v / top) * box.h;
+				el("rect", { x: box.x + i * bw + bw * 0.12, y: box.y + box.h - h, width: bw * 0.76, height: h, class: "pt-bar" }, svg);
+				if (M <= 8) {
+					el("text", { x: box.x + (i + 0.5) * bw, y: box.y + box.h - h - 4, class: "smp-note", "text-anchor": "middle" }, svg, fmt(v, 3));
+					el("text", { x: box.x + (i + 0.5) * bw, y: box.y + box.h + 14, class: "smp-tick", "text-anchor": "middle" }, svg, letters[i]);
+				}
+			});
+			el("text", { x: box.x + box.w / 2, y: box.y + box.h + 30, class: "smp-label", "text-anchor": "middle" }, svg, M <= 8 ? "state" : `${M} bins`);
+
+			const codes = huffman(p);
+			const avg = p.reduce((s, v, i) => s + v * codes[i].length, 0);
+			fig.querySelector(".m-bits")!.textContent = fmt(entropy(p, 2), 3);
+			fig.querySelector(".m-nats")!.textContent = fmt(entropy(p), 3);
+			fig.querySelector(".m-max")!.textContent = fmt(Math.log(M), 3);
+			fig.querySelector(".m-huff")!.textContent = fmt(avg, 3);
+			table.innerHTML =
+				M <= 8
+					? `<tr><th>state</th><th>p</th><th>−log₂ p</th><th>length</th><th>code word</th></tr>${p
+							.map((v, i) => `<tr><td>${letters[i]}</td><td>${fmt(v, 4)}</td><td>${v > 0 ? fmt(-Math.log2(v), 2) : "∞"}</td><td>${codes[i].length}</td><td>${codes[i]}</td></tr>`)
+							.join("")}`
+					: "";
+		}
+
+		const drag = (ev: PointerEvent) => {
+			const m = svg.getScreenCTM();
+			if (!m) return;
+			const pt = new DOMPoint(ev.clientX, ev.clientY).matrixTransform(m.inverse());
+			const M = p.length;
+			const i = Math.floor(((pt.x - box.x) / box.w) * M);
+			if (i < 0 || i >= M) return;
+			const top = Math.max(0.55, Math.max(...p) * 1.1);
+			const target = Math.min(0.98, Math.max(0, ((box.y + box.h - pt.y) / box.h) * top));
+			// Set p_i to the target and scale the others to keep the total at one.
+			const rest = 1 - p[i];
+			p = p.map((v, k) => (k === i ? target : rest > 1e-12 ? (v * (1 - target)) / rest : (1 - target) / (M - 1)));
+			sel.value = "";
+			draw();
+		};
+		let down = false;
+		svg.addEventListener("pointerdown", (ev) => {
+			down = true;
+			svg.setPointerCapture(ev.pointerId);
+			drag(ev);
+		});
+		svg.addEventListener("pointermove", (ev) => down && drag(ev));
+		svg.addEventListener("pointerup", () => {
+			down = false;
+		});
+		sel.addEventListener("change", () => {
+			if (presets[sel.value]) p = [...presets[sel.value]];
+			draw();
+		});
+		draw();
+	}
+
+	document.querySelectorAll<HTMLElement>(".pt-entropy").forEach(attach);
+</script>

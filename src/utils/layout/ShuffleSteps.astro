@@ -1,0 +1,291 @@
+---
+// Step through a layout conversion inside one warp done with warp shuffles, built as in Section
+// 5.4 of the linear-layouts paper. Top: the source layout A as a lanes × registers table (each
+// cell is the tensor element that register holds); bottom: the destination layout B. The first
+// step lists the paper's sets: V = A_Reg ∩ B_Reg (elements moved together), I = A_Thr ∩ B_Thr
+// (lane bits both agree on), E and F (the lane bases that differ), G = {e_i ⊕ f_i} and R, which
+// completes V ∪ I ∪ G to a basis. Round r moves the elements R(r) ⊕ span(V ∪ I ∪ G): arrows join
+// each element's source register to its destination register, and the panel checks that every
+// lane sends and receives exactly 2^|V| elements, so one shfl.sync.idx per round suffices.
+// Logic in shufflePlan (linearLayout.ts).
+// Usage in .mdx:
+//   import ShuffleSteps from "../../utils/layout/ShuffleSteps.astro";
+//   import { shuffleSrc, shuffleDst } from "../../utils/layout/linearLayoutFigures";
+//   <ShuffleSteps src={shuffleSrc} dst={shuffleDst} step={1} />
+import StepControls from "../compiler/StepControls.astro";
+import {
+	type LinearLayout,
+	apply,
+	flatBases,
+	inLog2,
+	shufflePlan,
+	totalOutLog2,
+} from "./linearLayout";
+
+interface Props {
+	src: LinearLayout;
+	dst: LinearLayout;
+	elemBits?: number;
+	step?: number;
+	title?: string;
+}
+
+const { src, dst, elemBits = 32, step = 0, title } = Astro.props;
+const plan = shufflePlan(src, dst, elemBits);
+const d = totalOutLog2(src);
+const lanes = 1 << inLog2(src, "lane");
+const regsA = 1 << inLog2(src, "register");
+const regsB = 1 << inLog2(dst, "register");
+const bits = (x: number) =>
+	`[${Array.from({ length: d }, (_, k) => (x >> k) & 1).join(" ")}]`;
+const vec = (name: string, xs: number[]) =>
+	`${name} = {${xs.map((x) => `${x} ${bits(x)}`).join(", ")}}`;
+// Which round moves each element.
+const roundOf = new Map<number, number>();
+plan.rounds.forEach((r, k) => {
+	for (const m of r) roundOf.set(m.element, k);
+});
+const elemAt = (L: LinearLayout, lane: number, reg: number) =>
+	apply(L, { lane, register: reg })[0];
+
+const cw = 46;
+const ch = 26;
+const left = 64;
+const topA = 34;
+const gap = 96;
+const topB = topA + regsA * ch + gap;
+const width = left + lanes * cw + 8;
+const height = topB + regsB * ch + 10;
+const cellX = (lane: number) => left + lane * cw;
+const labels = ["A and B", ...plan.rounds.map((_, k) => `round ${k}`)];
+const sets = [
+	vec("A_Reg", flatBases(src, "register")),
+	vec("A_Thr", flatBases(src, "lane")),
+	vec("B_Reg", flatBases(dst, "register")),
+	vec("B_Thr", flatBases(dst, "lane")),
+	vec("V", plan.V),
+	vec("I", plan.I),
+	vec("E", plan.E),
+	vec("F", plan.F),
+	vec("G", plan.G),
+	vec("R", plan.R),
+];
+const roundText = plan.rounds.map((r, k) => {
+	let off = 0;
+	plan.R.forEach((b, i) => {
+		if ((k >> i) & 1) off ^= b;
+	});
+	const reads = Array.from({ length: lanes }, (_, t) => {
+		const m = r.filter((x) => x.dstLane === t);
+		return `t${t} ← ${m.map((x) => `t${x.srcLane}`).join(", ")}`;
+	});
+	const sendCount = new Set(r.map((m) => m.srcLane)).size;
+	const recvCount = new Set(r.map((m) => m.dstLane)).size;
+	return {
+		head: `R(${k}) = ${off} ${bits(off)}; elements R(${k}) ⊕ span(V ∪ I ∪ G) = {${r
+			.map((m) => m.element)
+			.sort((a, b) => a - b)
+			.join(", ")}}`,
+		reads: reads.join("   "),
+		check: `${sendCount} of ${lanes} lanes send and ${recvCount} of ${lanes} receive, ${2 ** plan.V.length} element${plan.V.length ? "s" : ""} each`,
+	};
+});
+---
+
+<figure class="shs" data-step={step} tabindex="0">
+	{title && <figcaption class="shs-title">{title}</figcaption>}
+	<StepControls labels={labels} step={step} />
+	<div class="shs-scroll">
+		<svg viewBox={`0 0 ${width} ${height}`} width={width} role="img" aria-label="Source and destination register tables with shuffle arrows">
+			<defs>
+				<marker id="shs-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+					<path d="M0 0 8 4 0 8z" class="shs-head" />
+				</marker>
+			</defs>
+			<text class="shs-cap" x="4" y={topA - 18}>A (source)</text>
+			<text class="shs-cap" x="4" y={topB - 18}>B (destination)</text>
+			{
+				Array.from({ length: lanes }, (_, t) => (
+					<>
+						<text class="shs-lane" x={cellX(t) + cw / 2} y={topA - 5}>
+							t{t}
+						</text>
+						<text class="shs-lane" x={cellX(t) + cw / 2} y={topB - 5}>
+							t{t}
+						</text>
+					</>
+				))
+			}
+			{
+				[
+					{ L: src, top: topA, regs: regsA },
+					{ L: dst, top: topB, regs: regsB },
+				].map(({ L, top, regs }) =>
+					Array.from({ length: regs }, (_, r) => (
+						<>
+							<text class="shs-reg" x={left - 8} y={top + r * ch + ch / 2 + 4}>
+								r{r}
+							</text>
+							{Array.from({ length: lanes }, (_, t) => {
+								const e = elemAt(L, t, r);
+								return (
+									<g class="shs-cell" data-round={roundOf.get(e)}>
+										<rect x={cellX(t) + 2} y={top + r * ch + 2} width={cw - 4} height={ch - 4} rx="4" />
+										<text x={cellX(t) + cw / 2} y={top + r * ch + ch / 2 + 4}>
+											{e}
+										</text>
+									</g>
+								);
+							})}
+						</>
+					)),
+				)
+			}
+			{
+				plan.rounds.map((r, k) => (
+					<g class="shs-moves" data-round={k}>
+						{r.map((m) => {
+							const x1 = cellX(m.srcLane) + cw / 2;
+							const y1 = topA + m.srcReg * ch + ch - 2;
+							const x2 = cellX(m.dstLane) + cw / 2;
+							const y2 = topB + m.dstReg * ch + 2;
+							return <path d={`M${x1} ${y1} C${x1} ${y1 + gap / 2}, ${x2} ${y2 - gap / 2}, ${x2} ${y2}`} marker-end="url(#shs-arrow)" />;
+						})}
+					</g>
+				))
+			}
+		</svg>
+	</div>
+	<div class="shs-panel" data-k="0">
+		<ul class="shs-sets">
+			{sets.map((s) => <li>{s}</li>)}
+		</ul>
+		<p class="shs-text">
+			{plan.rounds.length} round{plan.rounds.length > 1 ? "s" : ""} of {2 ** plan.V.length} element{plan.V.length ? "s" : ""} per lane ({elemBits}-bit elements; vectors are written least significant bit first).
+		</p>
+	</div>
+	{
+		roundText.map((t, k) => (
+			<div class="shs-panel" data-k={k + 1} hidden>
+				<p class="shs-text">{t.head}</p>
+				<p class="shs-text shs-mono">{t.reads}</p>
+				<p class="shs-text">{t.check}</p>
+			</div>
+		))
+	}
+</figure>
+
+<script>
+	import { bindStepper } from "../compiler/stepper";
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".shs")) {
+		const panels = [...fig.querySelectorAll<HTMLElement>(".shs-panel")];
+		const cells = [...fig.querySelectorAll<SVGGElement>(".shs-cell")];
+		const moves = [...fig.querySelectorAll<SVGGElement>(".shs-moves")];
+		bindStepper(fig, panels.length, (k) => {
+			for (const p of panels) p.hidden = Number(p.dataset.k) !== k;
+			for (const c of cells) {
+				const r = Number(c.dataset.round);
+				c.classList.toggle("now", k > 0 && r === k - 1);
+				c.classList.toggle("dim", k > 0 && r !== k - 1);
+			}
+			for (const m of moves) m.classList.toggle("show", k > 0 && Number(m.dataset.round) === k - 1);
+		});
+	}
+</script>
+
+<style>
+	.shs {
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+		outline: none;
+	}
+	.shs-title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.3rem;
+	}
+	.shs-scroll {
+		overflow-x: auto;
+		display: flex;
+		justify-content: center;
+	}
+	.shs-scroll svg {
+		display: block;
+		max-width: 100%;
+		height: auto;
+	}
+	.shs-cap {
+		font-size: 11px;
+		font-weight: 600;
+		fill: var(--text);
+	}
+	.shs-lane,
+	.shs-reg {
+		font-size: 10px;
+		font-family: var(--mono);
+		fill: var(--muted);
+		text-anchor: middle;
+	}
+	.shs-reg {
+		text-anchor: end;
+	}
+	.shs-cell rect {
+		fill: var(--surface);
+		stroke: var(--faint);
+		transition:
+			fill 150ms ease,
+			opacity 150ms ease;
+	}
+	.shs-cell text {
+		font-size: 11px;
+		font-family: var(--mono);
+		fill: var(--text);
+		text-anchor: middle;
+	}
+	.shs-cell.now rect {
+		fill: color-mix(in oklch, var(--accent) 28%, var(--bg));
+		stroke: var(--accent);
+	}
+	.shs-cell.dim {
+		opacity: 0.35;
+	}
+	.shs-moves path {
+		fill: none;
+		stroke: var(--accent);
+		stroke-width: 1.4;
+	}
+	.shs-moves {
+		display: none;
+	}
+	.shs-moves.show {
+		display: inline;
+	}
+	.shs-head {
+		fill: var(--accent);
+	}
+	.shs-panel[hidden] {
+		display: none;
+	}
+	.shs-sets {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+		gap: 0.15rem 1rem;
+		margin: 0.5rem 0 0;
+		padding: 0;
+		list-style: none;
+		font-family: var(--mono);
+		font-size: 0.7rem;
+	}
+	.shs-text {
+		margin: 0.35rem 0 0;
+		font-size: 0.78rem;
+		text-align: center;
+		color: var(--muted);
+	}
+	.shs-mono {
+		font-family: var(--mono);
+		color: var(--text);
+	}
+</style>

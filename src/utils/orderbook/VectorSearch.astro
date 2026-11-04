@@ -1,0 +1,57 @@
+---
+// Step-through search for a price in a sorted vector of price levels stored best-at-the-back
+// (David Gross's "reverse" vector): linear scan from the back, std::lower_bound, or the
+// branchless lower bound. Probed cells are numbered in order, the dashed box is the range a
+// binary search still considers, and the last step shows the hit or the insertion point.
+// Usage in .mdx:
+//   <VectorSearch target={98} kind="linear" />
+//   <VectorSearch keys={[-104, -102, -101]} target={-103} kind="binary" />
+import StepControls from "../compiler/StepControls.astro";
+import "./orderBook.css";
+import { type SearchKind, searchSteps } from "./orderBook";
+import { drawVector } from "./orderBookDraw";
+import { BID_KEYS } from "./orderBookFigures";
+
+interface Props {
+	keys?: number[];
+	target: number;
+	kind?: SearchKind;
+	step?: number;
+	title?: string;
+	caption?: string;
+}
+
+const {
+	keys = BID_KEYS,
+	target,
+	kind = "linear",
+	step = 0,
+	title = `Finding ${target}: ${kind} search`,
+	caption = "bid levels, ascending, best at the back",
+} = Astro.props;
+const steps = searchSteps(keys, target, kind);
+const at = Math.max(0, Math.min(steps.length - 1, step));
+---
+
+<figure class="obk obk-vs" data-step={at} tabindex="-1">
+	<figcaption class="obk-title">{title}</figcaption>
+	<StepControls labels={steps.map((s, i) => (s.probe === null ? "result" : `${i + 1}`))} step={at} />
+	<div class="obk-canvas">
+		{steps.map((_, i) => <div class="obk-frame" hidden={i !== at} set:html={drawVector(keys, steps, i, { target, caption })} />)}
+	</div>
+	<div class="obk-notes">
+		{steps.map((s, i) => <p hidden={i !== at}>{s.note}</p>)}
+	</div>
+</figure>
+
+<script>
+	import { bindStepper } from "../compiler/stepper";
+	for (const fig of document.querySelectorAll<HTMLElement>(".obk-vs")) {
+		const frames = [...fig.querySelectorAll<HTMLElement>(".obk-frame")];
+		const notes = [...fig.querySelectorAll<HTMLElement>(".obk-notes p")];
+		bindStepper(fig, frames.length, (i) => {
+			frames.forEach((f, k) => { f.hidden = k !== i; });
+			notes.forEach((n, k) => { n.hidden = k !== i; });
+		}, 1400);
+	}
+</script>

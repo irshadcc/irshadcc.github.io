@@ -1,0 +1,126 @@
+---
+// Kullback–Leibler divergence between two univariate Gaussians (Bishop & Bishop, Section 2.5.5
+// and Exercise 2.27). Top: p(x) = N(x | µ, σ²) (blue) and q(x) = N(x | m, s²) (red). Bottom: the
+// integrand p(x) ln{p(x)/q(x)} of KL(p‖q), with positive area shaded blue and negative area red;
+// the net area is KL(p‖q) ⩾ 0. The readouts compare the closed form
+// ln(s/σ) + (σ² + (µ − m)²)/(2s²) − ½ with numerical integration, and show KL(q‖p) to make the
+// asymmetry visible. Logic in probTheory.ts.
+// Usage in .mdx:
+//   <GaussianKl mu={0} sigma={1} m={1} s={2} />
+import "../sampling/sampling.css";
+import "./probTheory.css";
+
+interface Props {
+	mu?: number;
+	sigma?: number;
+	m?: number;
+	s?: number;
+	title?: string;
+	caption?: string;
+}
+
+const { mu = 0, sigma = 1, m = 1, s = 2, title, caption } = Astro.props;
+---
+
+<figure class="smp-fig pt-kl">
+	{title && <div class="smp-title">{title}</div>}
+	<div class="smp-legend">
+		<span><i class="k-p"></i>p = N(µ, σ²)</span>
+		<span><i class="k-q"></i>q = N(m, s²)</span>
+		<span><i class="box k-hist"></i>p ln(p/q) &gt; 0</span>
+		<span><i class="box pt-k-neg"></i>p ln(p/q) &lt; 0</span>
+	</div>
+	<svg class="smp-svg s-top" viewBox="0 0 640 170" role="img" aria-label="Two Gaussian densities"></svg>
+	<svg class="smp-svg s-bot" viewBox="0 0 640 150" role="img" aria-label="Integrand of the KL divergence"></svg>
+	<div class="smp-controls">
+		<label class="smp-slider">µ = <strong class="v-mu"></strong>
+			<input type="range" class="i-mu" min="-3" max="3" step="0.05" value={mu} aria-label="Mean of p" />
+		</label>
+		<label class="smp-slider">σ = <strong class="v-sig"></strong>
+			<input type="range" class="i-sig" min="0.2" max="3" step="0.05" value={sigma} aria-label="Standard deviation of p" />
+		</label>
+		<label class="smp-slider">m = <strong class="v-m"></strong>
+			<input type="range" class="i-m" min="-3" max="3" step="0.05" value={m} aria-label="Mean of q" />
+		</label>
+		<label class="smp-slider">s = <strong class="v-s"></strong>
+			<input type="range" class="i-s" min="0.2" max="3" step="0.05" value={s} aria-label="Standard deviation of q" />
+		</label>
+	</div>
+	<div class="smp-metrics">
+		<div><span>KL(p‖q), closed form</span><strong class="m-kl"></strong></div>
+		<div><span>KL(p‖q), numerical</span><strong class="m-num"></strong></div>
+		<div><span>KL(q‖p)</span><strong class="m-rev"></strong></div>
+		<div><span>H[p] = ½(1 + ln 2πσ²)</span><strong class="m-h"></strong></div>
+		<div><span>cross-entropy −∫p ln q</span><strong class="m-ce"></strong></div>
+	</div>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import { gauss, klGauss, klNumeric } from "./probTheory";
+	import { axes, curve, el, fmt } from "../sampling/plot";
+
+	function attach(fig: HTMLElement) {
+		const top = fig.querySelector<SVGSVGElement>(".s-top")!;
+		const bot = fig.querySelector<SVGSVGElement>(".s-bot")!;
+		const ins = ["mu", "sig", "m", "s"].map((k) => fig.querySelector<HTMLInputElement>(`.i-${k}`)!);
+
+		function draw() {
+			const [mu, sig, m, s] = ins.map((i) => Number(i.value));
+			const p = (x: number) => gauss(x, mu, sig * sig);
+			const q = (x: number) => gauss(x, m, s * s);
+			const integrand = (x: number) => {
+				const px = p(x);
+				return px > 1e-300 ? px * Math.log(px / q(x)) : 0;
+			};
+			const X: [number, number] = [-7, 7];
+			top.replaceChildren();
+			const peak = Math.max(p(mu), q(m)) * 1.1;
+			const A = axes(top, { x: 40, y: 8, w: 585, h: 132 }, X, [0, peak], { xLabel: "x", yTicks: 3 });
+			el("path", { d: curve(A, q, 500), class: "smp-q" }, top);
+			el("path", { d: curve(A, p, 500), class: "smp-p" }, top);
+
+			bot.replaceChildren();
+			let lo = 0;
+			let hi = 0;
+			for (let i = 0; i <= 600; i++) {
+				const v = integrand(X[0] + (14 * i) / 600);
+				lo = Math.min(lo, v);
+				hi = Math.max(hi, v);
+			}
+			const pad = (hi - lo) * 0.08 || 0.05;
+			const B = axes(bot, { x: 40, y: 8, w: 585, h: 112 }, X, [lo - pad, hi + pad], { xLabel: "x", yTicks: 3 });
+			const pos = (x: number) => Math.max(0, integrand(x));
+			const neg = (x: number) => Math.min(0, integrand(x));
+			const fill = (f: (x: number) => number, cls: string) => {
+				let d = `M${B.sx(X[0])},${B.sy(0)}`;
+				for (let i = 0; i <= 600; i++) {
+					const x = X[0] + (14 * i) / 600;
+					d += `L${B.sx(x).toFixed(1)},${B.sy(f(x)).toFixed(1)}`;
+				}
+				el("path", { d: `${d}L${B.sx(X[1])},${B.sy(0)}Z`, class: cls }, bot);
+			};
+			fill(pos, "pt-pos-area");
+			fill(neg, "pt-neg-area");
+			el("line", { x1: B.sx(X[0]), x2: B.sx(X[1]), y1: B.sy(0), y2: B.sy(0), class: "smp-muted-line" }, bot);
+			el("path", { d: curve(B, integrand, 600), class: "smp-text-line" }, bot);
+			el("text", { x: B.sx(X[0]) + 6, y: B.box.y + 14, class: "smp-note" }, bot, "p(x) ln{p(x) / q(x)}");
+
+			const kl = klGauss(mu, sig, m, s);
+			const h = 0.5 * (1 + Math.log(2 * Math.PI * sig * sig));
+			fig.querySelector(".v-mu")!.textContent = fmt(mu, 2);
+			fig.querySelector(".v-sig")!.textContent = fmt(sig, 2);
+			fig.querySelector(".v-m")!.textContent = fmt(m, 2);
+			fig.querySelector(".v-s")!.textContent = fmt(s, 2);
+			fig.querySelector(".m-kl")!.textContent = fmt(kl, 4);
+			fig.querySelector(".m-num")!.textContent = fmt(klNumeric(p, q, mu - 12 * sig, mu + 12 * sig, 6000), 4);
+			fig.querySelector(".m-rev")!.textContent = fmt(klGauss(m, s, mu, sig), 4);
+			fig.querySelector(".m-h")!.textContent = fmt(h, 4);
+			fig.querySelector(".m-ce")!.textContent = fmt(h + kl, 4);
+		}
+		for (const i of ins) i.addEventListener("input", draw);
+		draw();
+	}
+
+	document.querySelectorAll<HTMLElement>(".pt-kl").forEach(attach);
+</script>

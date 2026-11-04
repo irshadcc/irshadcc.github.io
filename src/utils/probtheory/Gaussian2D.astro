@@ -1,0 +1,140 @@
+---
+// A two-dimensional Gaussian (Bishop & Bishop, Section 3.2). Left: 400 seeded samples, the
+// contours at Mahalanobis distance 1 and 2 (ellipses), and the eigenvectors u1, u2 of Σ drawn
+// with length √λ (3.28)–(3.33). A vertical line marks the observed value x1 = a. Right: the
+// marginal p(x2) = N(µ2, σ2²) (blue) and the conditional p(x2 | x1 = a) from (3.65)–(3.66)
+// (red), whose mean moves linearly with a and whose variance σ2²(1 − ρ²) does not depend on a.
+// Sliders set σ1, σ2, the correlation ρ and a. Logic in probTheory.ts (gauss2).
+// Usage in .mdx:
+//   <Gaussian2D s1={1.5} s2={0.8} rho={0.6} a={1.5} />
+import "../sampling/sampling.css";
+import "./probTheory.css";
+
+interface Props {
+	s1?: number;
+	s2?: number;
+	rho?: number;
+	a?: number;
+	seed?: number;
+	title?: string;
+	caption?: string;
+}
+
+const {
+	s1 = 1.5,
+	s2 = 0.8,
+	rho = 0.6,
+	a = 1.5,
+	seed = 9,
+	title,
+	caption,
+} = Astro.props;
+---
+
+<figure class="smp-fig pt-gauss2" data-seed={seed}>
+	{title && <div class="smp-title">{title}</div>}
+	<div class="smp-legend">
+		<span><i class="dot k-dot-p"></i>samples</span>
+		<span><i class="k-text"></i>Δ = 1 and Δ = 2 contours, eigenvectors √λ u</span>
+		<span><i class="k-p"></i>marginal p(x₂)</span>
+		<span><i class="k-q"></i>conditional p(x₂ | x₁ = a)</span>
+	</div>
+	<div class="smp-row">
+		<svg class="smp-svg s-joint" viewBox="0 0 320 300" role="img" aria-label="Samples and contour ellipses of a two-dimensional Gaussian"></svg>
+		<svg class="smp-svg s-cond" viewBox="0 0 320 300" role="img" aria-label="Marginal and conditional distributions of the second coordinate"></svg>
+	</div>
+	<div class="smp-controls">
+		<label class="smp-slider">σ₁ = <strong class="v-s1"></strong>
+			<input type="range" class="i-s1" min="0.3" max="2" step="0.05" value={s1} aria-label="Standard deviation of x1" />
+		</label>
+		<label class="smp-slider">σ₂ = <strong class="v-s2"></strong>
+			<input type="range" class="i-s2" min="0.3" max="2" step="0.05" value={s2} aria-label="Standard deviation of x2" />
+		</label>
+		<label class="smp-slider">ρ = <strong class="v-rho"></strong>
+			<input type="range" class="i-rho" min="-0.95" max="0.95" step="0.05" value={rho} aria-label="Correlation" />
+		</label>
+		<label class="smp-slider">a = <strong class="v-a"></strong>
+			<input type="range" class="i-a" min="-3" max="3" step="0.1" value={a} aria-label="Observed x1" />
+		</label>
+	</div>
+	<div class="smp-metrics">
+		<div><span>eigenvalues λ₁, λ₂</span><strong class="m-l"></strong></div>
+		<div><span>|Σ| = λ₁λ₂</span><strong class="m-det"></strong></div>
+		<div><span>E[x₂ | x₁ = a]</span><strong class="m-cm"></strong></div>
+		<div><span>var[x₂ | x₁], var[x₂]</span><strong class="m-cv"></strong></div>
+	</div>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import { gauss, gauss2, mulberry32, normals } from "./probTheory";
+	import { axes, curve, el, fmt } from "../sampling/plot";
+
+	function attach(fig: HTMLElement) {
+		const joint = fig.querySelector<SVGSVGElement>(".s-joint")!;
+		const cond = fig.querySelector<SVGSVGElement>(".s-cond")!;
+		const ins = ["s1", "s2", "rho", "a"].map((k) => fig.querySelector<HTMLInputElement>(`.i-${k}`)!);
+		const z = normals(mulberry32(Number(fig.dataset.seed) || 9));
+		const base = Array.from({ length: 400 }, () => [z(), z()]);
+
+		function draw() {
+			const [s1, s2, rho, a] = ins.map((i) => Number(i.value));
+			const g = gauss2(s1, s2, rho);
+			joint.replaceChildren();
+			const R: [number, number] = [-4, 4];
+			const A = axes(joint, { x: 46, y: 8, w: 264, h: 255 }, R, R, { xLabel: "x₁", yLabel: "x₂", xTicks: 4, yTicks: 4 });
+			// Samples x = L e with the Cholesky factor of Σ.
+			const l21 = rho * s2;
+			const l22 = s2 * Math.sqrt(1 - rho * rho);
+			for (const [e1, e2] of base) {
+				const x1 = s1 * e1;
+				const x2 = l21 * e1 + l22 * e2;
+				if (Math.abs(x1) < 4 && Math.abs(x2) < 4) el("circle", { cx: A.sx(x1), cy: A.sy(x2), r: 1.6, class: "smp-faint-dot" }, joint);
+			}
+			const c = Math.cos(g.angle);
+			const s = Math.sin(g.angle);
+			for (const k of [1, 2]) {
+				let d = "";
+				for (let i = 0; i <= 120; i++) {
+					const t = (2 * Math.PI * i) / 120;
+					const y1 = k * Math.sqrt(g.l1) * Math.cos(t);
+					const y2 = k * Math.sqrt(g.l2) * Math.sin(t);
+					d += `${i ? "L" : "M"}${A.sx(c * y1 - s * y2).toFixed(1)},${A.sy(s * y1 + c * y2).toFixed(1)}`;
+				}
+				el("path", { d, class: "smp-text-line" }, joint);
+			}
+			for (const [l, ux, uy, name] of [
+				[g.l1, c, s, "u₁"],
+				[g.l2, -s, c, "u₂"],
+			] as [number, number, number, string][]) {
+				const ex = Math.sqrt(l) * ux;
+				const ey = Math.sqrt(l) * uy;
+				el("line", { x1: A.sx(0), y1: A.sy(0), x2: A.sx(ex), y2: A.sy(ey), class: "smp-p" }, joint);
+				el("text", { x: A.sx(ex * 1.15), y: A.sy(ey * 1.15) + 4, class: "smp-text", "text-anchor": "middle" }, joint, name);
+			}
+			el("line", { x1: A.sx(a), x2: A.sx(a), y1: A.box.y, y2: A.box.y + A.box.h, class: "smp-q-dash" }, joint);
+			el("text", { x: A.sx(a) + 4, y: A.box.y + 12, class: "smp-note" }, joint, "x₁ = a");
+
+			cond.replaceChildren();
+			const m = g.k * a;
+			const top = Math.max(gauss(0, 0, s2 * s2), gauss(0, 0, g.condVar)) * 1.1;
+			const B = axes(cond, { x: 52, y: 8, w: 258, h: 255 }, R, [0, top], { xLabel: "x₂", yLabel: "density", xTicks: 4, yTicks: 4 });
+			el("path", { d: curve(B, (x) => gauss(x, 0, s2 * s2)), class: "smp-p" }, cond);
+			el("path", { d: curve(B, (x) => gauss(x, m, g.condVar)), class: "smp-q" }, cond);
+			el("line", { x1: B.sx(m), x2: B.sx(m), y1: B.sy(0), y2: B.sy(gauss(m, m, g.condVar)), class: "smp-muted-line" }, cond);
+
+			fig.querySelector(".v-s1")!.textContent = fmt(s1, 2);
+			fig.querySelector(".v-s2")!.textContent = fmt(s2, 2);
+			fig.querySelector(".v-rho")!.textContent = fmt(rho, 2);
+			fig.querySelector(".v-a")!.textContent = fmt(a, 1);
+			fig.querySelector(".m-l")!.textContent = `${fmt(g.l1, 3)}, ${fmt(g.l2, 3)}`;
+			fig.querySelector(".m-det")!.textContent = fmt(g.det, 3);
+			fig.querySelector(".m-cm")!.textContent = fmt(m, 3);
+			fig.querySelector(".m-cv")!.textContent = `${fmt(g.condVar, 3)}, ${fmt(s2 * s2, 3)}`;
+		}
+		for (const i of ins) i.addEventListener("input", draw);
+		draw();
+	}
+
+	document.querySelectorAll<HTMLElement>(".pt-gauss2").forEach(attach);
+</script>

@@ -1,0 +1,606 @@
+---
+// A linear layout drawn two ways: the tensor as a grid, each element labelled with the hardware
+// location that holds it (thread and register for distributed layouts, offset for shared ones),
+// and the layout's matrix over F2, one column per input bit (grouped register | lane | warp, or
+// offset; a column is headed by the input it is the image of, so t8 is L(lane = 8)) and one row
+// per output bit (column bits j first, then row bits i). Hover or tap a cell:
+// the columns of its set input bits light up, the rows of its set output bits light up, and the
+// readout shows the XOR of those columns. Click a column header to flip that input bit instead.
+// The property line says whether the layout is injective, which bases are zero (broadcast copies),
+// whether its matrix has the distributed form of the paper's Definition 4.10, and the vector width
+// along the columns. Several presets can share one figure via a select. Logic in linearLayout.ts,
+// presets in linearLayoutFigures.ts.
+// Usage in .mdx:
+//   import LinearLayoutExplorer from "../../utils/layout/LinearLayoutExplorer.astro";
+//   <LinearLayoutExplorer presets={["blockedA", "mma"]} select="r1 t9" />
+import {
+	apply,
+	inLog2,
+	isDistributedForm,
+	numConsecutive,
+	totalInLog2,
+	transposeOuts,
+	zeroBases,
+} from "./linearLayout";
+import { explorerPresets } from "./linearLayoutFigures";
+
+interface Props {
+	/** Keys from explorerPresets; the first is shown on load. */
+	presets: string[];
+	title?: string;
+	/** Initial hardware index on the first preset, e.g. "r1 t9 w0" or "o9". */
+	select?: string;
+}
+
+const { presets, title, select } = Astro.props;
+const shortName: Record<string, string> = {
+	register: "r",
+	lane: "t",
+	warp: "w",
+	offset: "o",
+};
+
+const panels = presets.map((key) => {
+	const p = explorerPresets.find((x) => x.key === key);
+	if (!p) throw new Error(`unknown preset ${key}`);
+	const L = p.layout;
+	const twoD = p.shape.length === 2;
+	const rows = twoD ? p.shape[0] : 1;
+	const cols = twoD ? p.shape[1] : p.shape[0];
+	const shared = L.ins.some((d) => d.name === "offset");
+	// Output dims in display order: column bits (dim1, or dim0 in 1-D) first, then row bits.
+	const colDim = twoD ? "dim1" : "dim0";
+	const rowDim = twoD ? "dim0" : null;
+	const outIdx = (n: string) => L.outs.findIndex((o) => o.name === n);
+	const colBits = Math.log2(cols);
+	const rowBits = Math.log2(rows);
+	const outRows = [
+		...Array.from({ length: colBits }, (_, b) => ({
+			dim: colDim,
+			bit: b,
+			label: twoD ? `j${b}` : `x${b}`,
+		})),
+		...(rowDim
+			? Array.from({ length: rowBits }, (_, b) => ({
+					dim: rowDim,
+					bit: b,
+					label: `i${b}`,
+				}))
+			: []),
+	];
+	const inCols = L.ins.flatMap((d) =>
+		d.bases.map((b, bit) => ({
+			dim: d.name,
+			bit,
+			label: `${shortName[d.name] ?? d.name}${1 << bit}`,
+			basis: twoD
+				? `(${b[outIdx("dim0")]}, ${b[outIdx("dim1")]})`
+				: String(b[0]),
+			entries: outRows.map((r) => (b[outIdx(r.dim)] >> r.bit) & 1),
+		})),
+	);
+	const groups = L.ins
+		.filter((d) => d.bases.length > 0)
+		.map((d) => ({ name: d.name, n: d.bases.length }));
+	// Every hardware index and the cell it lands on.
+	const nIn = totalInLog2(L);
+	const cells: {
+		h: number[];
+		label: string;
+		sub: string;
+		hue: number;
+		dark: boolean;
+	}[] = Array.from({ length: rows * cols }, () => ({
+		h: [],
+		label: "",
+		sub: "",
+		hue: 0,
+		dark: false,
+	}));
+	for (let h = 0; h < 1 << nIn; h++) {
+		const input: Record<string, number> = {};
+		let shift = 0;
+		for (const d of L.ins) {
+			input[d.name] = (h >> shift) & ((1 << d.bases.length) - 1);
+			shift += d.bases.length;
+		}
+		const out = apply(L, input);
+		const i = rowDim ? out[outIdx(rowDim)] : 0;
+		const j = out[outIdx(colDim)];
+		const c = cells[i * cols + j];
+		c.h.push(h);
+		if (c.h.length === 1) {
+			if (shared) {
+				c.label = String(input.offset);
+				c.hue = (input.offset % cols) * (360 / cols);
+			} else {
+				c.label = `t${input.lane ?? 0}`;
+				c.sub = `r${input.register ?? 0}`;
+				c.hue = ((input.lane ?? 0) * 360) / Math.max(1, 1 << inLog2(L, "lane"));
+				c.dark = (input.warp ?? 0) % 2 === 1;
+			}
+		}
+	}
+	const zero = zeroBases(L);
+	const zeroText = Object.entries(zero)
+		.filter(([, v]) => v.length)
+		.map(([n, v]) => v.map((b) => `${shortName[n] ?? n}${b}`).join(", "))
+		.join(", ");
+	const copies = (1 << nIn) / (rows * cols);
+	const consec = twoD
+		? numConsecutive(transposeOuts(L, ["dim1", "dim0"]))
+		: numConsecutive(L);
+	const props = [
+		copies === 1
+			? "injective: every element has one home"
+			: `not injective: each element is held ${copies} times`,
+		zeroText ? `zero bases (broadcast): ${zeroText}` : "no zero bases",
+		shared
+			? isDistributedForm(L)
+				? "matrix is a permutation"
+				: "some columns have 2 bits (swizzle)"
+			: isDistributedForm(L)
+				? "distributed form: one bit per column, no repeats"
+				: "not of distributed form",
+		shared
+			? ""
+			: `${consec} consecutive register${consec > 1 ? "s" : ""} along ${colDim}`,
+	].filter(Boolean);
+	return {
+		key,
+		p,
+		rows,
+		cols,
+		shared,
+		outRows,
+		inCols,
+		groups,
+		cells,
+		props,
+		bases: L.ins.map((d) => ({
+			name: d.name,
+			bases: d.bases.map((b) =>
+				outRows.map((r) => (b[outIdx(r.dim)] >> r.bit) & 1),
+			),
+		})),
+		meta: JSON.stringify({
+			ins: L.ins.map((d) => ({
+				name: d.name,
+				short: shortName[d.name] ?? d.name,
+				n: d.bases.length,
+				bases: d.bases.map((b) =>
+					twoD ? [b[outIdx("dim0")], b[outIdx("dim1")]] : [b[0]],
+				),
+			})),
+			cols,
+			rowBits,
+			twoD,
+			cells: Object.fromEntries(
+				cells.flatMap((c, k) => c.h.map((h) => [h, k])),
+			),
+		}),
+	};
+});
+
+const cell = 26;
+const parseSel = (
+	s: string | undefined,
+	ins: { name: string; n: number }[],
+) => {
+	if (!s) return 0;
+	let h = 0;
+	let shift = 0;
+	for (const d of ins) {
+		const m = s.match(new RegExp(`${shortName[d.name] ?? d.name}(\\d+)`));
+		if (m) h |= Number(m[1]) << shift;
+		shift += d.n;
+	}
+	return h;
+};
+const initial = parseSel(
+	select,
+	panels[0].p.layout.ins.map((d) => ({ name: d.name, n: d.bases.length })),
+);
+---
+
+<figure class="llx" data-initial={initial}>
+	{title && <figcaption class="llx-title">{title}</figcaption>}
+	{
+		panels.length > 1 && (
+			<div class="llx-controls">
+				<label>
+					Layout
+					<select name="preset">
+						{panels.map((pn, k) => (
+							<option value={k}>{pn.p.label}</option>
+						))}
+					</select>
+				</label>
+			</div>
+		)
+	}
+	{
+		panels.map((pn, k) => (
+			<div class="llx-panel" data-k={k} data-meta={pn.meta} hidden={k !== 0}>
+				<div class="llx-body">
+					<div class="llx-grid-wrap">
+						<svg
+							class="llx-grid"
+							viewBox={`-18 -16 ${pn.cols * cell + 20} ${pn.rows * cell + 18}`}
+							width={pn.cols * cell + 20}
+							role="img"
+							aria-label={`${pn.p.label}: ${pn.rows} by ${pn.cols} tensor`}
+						>
+							{Array.from({ length: pn.cols }, (_, j) => (
+								<text class="llx-axis" x={j * cell + cell / 2} y={-5}>
+									{j}
+								</text>
+							))}
+							{pn.rows > 1 &&
+								Array.from({ length: pn.rows }, (_, i) => (
+									<text class="llx-axis" x={-9} y={i * cell + cell / 2 + 3}>
+										{i}
+									</text>
+								))}
+							{pn.cells.map((c, idx) => {
+								const i = Math.floor(idx / pn.cols);
+								const j = idx % pn.cols;
+								return (
+									<g class:list={["llx-cell", { dark: c.dark }]} data-cell={idx} data-h={c.h[0]} style={`--h: ${c.hue}`}>
+										<rect x={j * cell + 1} y={i * cell + 1} width={cell - 2} height={cell - 2} rx="3" />
+										<text class="llx-lab" x={j * cell + cell / 2} y={i * cell + (c.sub ? 11 : 16)}>
+											{c.label}
+										</text>
+										{c.sub && (
+											<text class="llx-sub" x={j * cell + cell / 2} y={i * cell + 21}>
+												{c.sub}
+											</text>
+										)}
+										{c.h.length > 1 && (
+											<text class="llx-copies" x={j * cell + cell - 3} y={i * cell + 8}>
+												×{c.h.length}
+											</text>
+										)}
+									</g>
+								);
+							})}
+						</svg>
+					</div>
+					<div class="llx-matrix-wrap">
+						<table class="llx-matrix">
+							<thead>
+								<tr>
+									<th />
+									{pn.groups.map((g) => (
+										<th class="llx-group" colspan={g.n}>
+											{g.name}
+										</th>
+									))}
+								</tr>
+								<tr>
+									<th />
+									{pn.inCols.map((c, ci) => (
+										<th class="llx-bit" data-col={ci}>
+											<button type="button" data-col={ci} aria-label={`flip input bit ${c.label}`}>
+												{c.label}
+											</button>
+										</th>
+									))}
+								</tr>
+							</thead>
+							<tbody>
+								{pn.outRows.map((r, ri) => (
+									<tr data-row={ri}>
+										<th class="llx-out">{r.label}</th>
+										{pn.inCols.map((c, ci) => (
+											<td data-col={ci} class:list={{ one: c.entries[ri] === 1 }}>
+												{c.entries[ri]}
+											</td>
+										))}
+									</tr>
+								))}
+							</tbody>
+							<tfoot>
+								<tr>
+									<th class="llx-out">L(e)</th>
+									{pn.inCols.map((c, ci) => (
+										<td data-col={ci} class="llx-basis">
+											{c.basis}
+										</td>
+									))}
+								</tr>
+							</tfoot>
+						</table>
+					</div>
+				</div>
+				<p class="llx-readout" aria-live="polite" />
+				<p class="llx-note">{pn.p.note}</p>
+				<ul class="llx-props">
+					{pn.props.map((t) => (
+						<li>{t}</li>
+					))}
+				</ul>
+			</div>
+		))
+	}
+</figure>
+
+<script>
+	interface Meta {
+		ins: { name: string; short: string; n: number; bases: number[][] }[];
+		cols: number;
+		rowBits: number;
+		twoD: boolean;
+		cells: Record<string, number>;
+	}
+	for (const fig of document.querySelectorAll<HTMLElement>(".llx")) {
+		const panels = [...fig.querySelectorAll<HTMLElement>(".llx-panel")];
+		const states = panels.map((_, k) => (k === 0 ? Number(fig.dataset.initial ?? 0) : 0));
+		const render = (k: number) => {
+			const panel = panels[k];
+			const meta: Meta = JSON.parse(panel.dataset.meta ?? "{}");
+			const h = states[k];
+			// Which flat input bits are set, and the XOR of their bases.
+			const parts: string[] = [];
+			const terms: string[] = [];
+			let flat = 0;
+			let shift = 0;
+			const out = meta.twoD ? [0, 0] : [0];
+			const setCols: number[] = [];
+			for (const d of meta.ins) {
+				const v = (h >> shift) & ((1 << d.n) - 1);
+				parts.push(`${d.short}${v}`);
+				for (let b = 0; b < d.n; b++)
+					if ((v >> b) & 1) {
+						setCols.push(flat + b);
+						const basis = d.bases[b];
+						terms.push(meta.twoD ? `(${basis[0]}, ${basis[1]})` : String(basis[0]));
+						out.forEach((_, q) => {
+							out[q] ^= basis[q];
+						});
+					}
+				flat += d.n;
+				shift += d.n;
+			}
+			const cellIdx = meta.cells[String(h)];
+			const outBits: number[] = [];
+			const j = meta.twoD ? out[1] : out[0];
+			const i = meta.twoD ? out[0] : 0;
+			const colBits = Math.log2(meta.cols);
+			for (let b = 0; b < colBits; b++) if ((j >> b) & 1) outBits.push(b);
+			for (let b = 0; b < meta.rowBits; b++) if ((i >> b) & 1) outBits.push(colBits + b);
+			panel.querySelectorAll<HTMLElement>("[data-col]").forEach((el) => {
+				el.classList.toggle("on", setCols.includes(Number(el.dataset.col)));
+			});
+			panel.querySelectorAll<HTMLElement>("tr[data-row]").forEach((el) => {
+				el.classList.toggle("on", outBits.includes(Number(el.dataset.row)));
+			});
+			panel.querySelectorAll<SVGGElement>(".llx-cell").forEach((el) => {
+				el.classList.toggle("sel", Number(el.dataset.cell) === cellIdx);
+			});
+			const where = meta.twoD ? `(${i}, ${j})` : `${j}`;
+			const readout = panel.querySelector(".llx-readout");
+			if (readout)
+				readout.textContent = `L(${parts.join(", ")}) = ${terms.length ? terms.join(" ⊕ ") : "0"} = ${where}`;
+		};
+		panels.forEach((panel, k) => {
+			panel.querySelectorAll<SVGGElement>(".llx-cell").forEach((el) => {
+				const pick = () => {
+					states[k] = Number(el.dataset.h);
+					render(k);
+				};
+				el.addEventListener("pointerenter", pick);
+				el.addEventListener("click", pick);
+			});
+			panel.querySelectorAll<HTMLButtonElement>("button[data-col]").forEach((btn) => {
+				btn.addEventListener("click", () => {
+					states[k] ^= 1 << Number(btn.dataset.col);
+					render(k);
+				});
+			});
+			render(k);
+		});
+		fig.querySelector<HTMLSelectElement>("select[name=preset]")?.addEventListener("change", (e) => {
+			const k = Number((e.target as HTMLSelectElement).value);
+			panels.forEach((p, q) => {
+				p.hidden = q !== k;
+			});
+			render(k);
+		});
+	}
+</script>
+
+<style>
+	.llx {
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+		--cell-l: 0.9;
+		--cell-l2: 0.78;
+		--cell-c: 0.07;
+	}
+	@media (prefers-color-scheme: dark) {
+		.llx {
+			--cell-l: 0.34;
+			--cell-l2: 0.25;
+			--cell-c: 0.06;
+		}
+	}
+	.llx-title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.4rem;
+	}
+	.llx-controls {
+		display: flex;
+		justify-content: center;
+		margin-bottom: 0.5rem;
+		font-size: 0.8rem;
+	}
+	.llx-controls label {
+		display: flex;
+		gap: 0.4rem;
+		align-items: center;
+		color: var(--muted);
+	}
+	.llx-controls select {
+		font: inherit;
+		color: var(--text);
+		background: var(--bg);
+		border: 1px solid var(--faint);
+		border-radius: 6px;
+		padding: 0.15rem 0.4rem;
+	}
+	.llx-panel[hidden] {
+		display: none;
+	}
+	.llx-body {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 1rem;
+		justify-content: center;
+		align-items: flex-start;
+	}
+	.llx-grid-wrap,
+	.llx-matrix-wrap {
+		max-width: 100%;
+		overflow-x: auto;
+	}
+	.llx-grid {
+		display: block;
+		max-width: 100%;
+		height: auto;
+	}
+	.llx-axis {
+		font-size: 8px;
+		fill: var(--muted);
+		text-anchor: middle;
+	}
+	.llx-cell rect {
+		fill: oklch(var(--cell-l) var(--cell-c) var(--h));
+		stroke: color-mix(in oklch, var(--faint) 80%, transparent);
+		stroke-width: 0.5;
+		transition: stroke 120ms ease;
+	}
+	.llx-cell.dark rect {
+		fill: oklch(var(--cell-l2) var(--cell-c) var(--h));
+	}
+	.llx-cell {
+		cursor: pointer;
+	}
+	.llx-cell.sel rect {
+		stroke: var(--text);
+		stroke-width: 2;
+	}
+	.llx-lab {
+		font-size: 8.5px;
+		font-family: var(--mono);
+		fill: var(--text);
+		text-anchor: middle;
+		pointer-events: none;
+	}
+	.llx-sub {
+		font-size: 7px;
+		font-family: var(--mono);
+		fill: var(--muted);
+		text-anchor: middle;
+		pointer-events: none;
+	}
+	.llx-copies {
+		font-size: 5.5px;
+		fill: var(--muted);
+		text-anchor: end;
+		pointer-events: none;
+	}
+	.llx-matrix {
+		border-collapse: collapse;
+		margin: 0;
+		font-family: var(--mono);
+		font-size: 0.68rem;
+	}
+	.llx-matrix th,
+	.llx-matrix td {
+		padding: 0.1rem 0.25rem;
+		text-align: center;
+		border: none;
+		min-width: 1.4rem;
+	}
+	.llx-matrix td {
+		color: var(--faint);
+	}
+	.llx-matrix td.one {
+		color: var(--text);
+		font-weight: 600;
+	}
+	.llx-group {
+		font-family: var(--sans);
+		font-weight: 600;
+		font-size: 0.66rem;
+		color: var(--muted);
+		border-bottom: 1px solid var(--faint) !important;
+	}
+	.llx-out {
+		color: var(--muted);
+		font-weight: 400;
+		text-align: right !important;
+	}
+	.llx-bit button {
+		font: inherit;
+		color: var(--muted);
+		background: none;
+		border: 1px solid transparent;
+		border-radius: 4px;
+		padding: 0 0.15rem;
+		cursor: pointer;
+	}
+	.llx-bit button:hover {
+		border-color: var(--faint);
+	}
+	.llx-matrix td.on,
+	.llx-matrix th.on {
+		background: color-mix(in oklch, var(--accent) 14%, transparent);
+	}
+	.llx-matrix th.on button {
+		color: var(--accent);
+		font-weight: 700;
+	}
+	.llx-matrix tr.on .llx-out {
+		color: var(--accent);
+		font-weight: 700;
+	}
+	.llx-matrix tr.on td.on.one {
+		background: color-mix(in oklch, var(--accent) 32%, transparent);
+	}
+	.llx-basis {
+		color: var(--muted) !important;
+		font-size: 0.58rem;
+		white-space: nowrap;
+		writing-mode: vertical-rl;
+		transform: rotate(180deg);
+		padding-top: 0.3rem !important;
+	}
+	.llx-readout {
+		margin: 0.6rem 0 0.2rem;
+		text-align: center;
+		font-family: var(--mono);
+		font-size: 0.75rem;
+		min-height: 1.2em;
+	}
+	.llx-note {
+		margin: 0.2rem 0;
+		font-size: 0.78rem;
+		color: var(--muted);
+		text-align: center;
+	}
+	.llx-props {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.3rem 1rem;
+		margin: 0.2rem 0 0;
+		padding: 0;
+		list-style: none;
+		font-size: 0.72rem;
+		color: var(--muted);
+	}
+</style>

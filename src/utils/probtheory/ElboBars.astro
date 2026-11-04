@@ -1,0 +1,97 @@
+---
+// The evidence lower bound (Bishop & Bishop, Section 16.3) on the smallest possible latent
+// variable model: z ∈ {0, 1} with p(z = 1) = 0.3 and p(x | z) = N(x | µ_z, 1), µ0 = −1, µ1 = 2.
+// Top: the two weighted components and the observed x. Bottom: a number line of log
+// probabilities on which ln p(x) is fixed and splits into ELBO(q) + KL(q ‖ p(z | x)) (16.57) for
+// the chosen q(z = 1); the KL gap closes when q equals the posterior ("Set q to posterior").
+// Logic in probTheory.ts (elboParts).
+// Usage in .mdx:
+//   <ElboBars x={1} q={0.2} />
+import "../sampling/sampling.css";
+import "./probTheory.css";
+
+interface Props {
+	x?: number;
+	q?: number;
+	title?: string;
+	caption?: string;
+}
+
+const { x = 1, q = 0.2, title, caption } = Astro.props;
+---
+
+<figure class="smp-fig pt-elbo">
+	{title && <div class="smp-title">{title}</div>}
+	<div class="smp-legend">
+		<span><i class="k-p"></i>0.7 N(x | −1, 1), z = 0</span>
+		<span><i class="k-q"></i>0.3 N(x | 2, 1), z = 1</span>
+		<span><i class="box k-hist"></i>ELBO</span>
+		<span><i class="box pt-k-neg"></i>KL(q ‖ p(z | x)) gap</span>
+	</div>
+	<svg class="smp-svg s-mix" viewBox="0 0 640 150" role="img" aria-label="Two weighted Gaussian components and the observed point"></svg>
+	<svg class="smp-svg s-bar" viewBox="0 0 640 90" role="img" aria-label="Log evidence split into ELBO and KL divergence"></svg>
+	<div class="smp-controls">
+		<label class="smp-slider">observed x = <strong class="v-x"></strong>
+			<input type="range" class="i-x" min="-3" max="4" step="0.1" value={x} aria-label="Observed x" />
+		</label>
+		<label class="smp-slider">q(z = 1) = <strong class="v-q"></strong>
+			<input type="range" class="i-q" min="0" max="1" step="0.01" value={q} aria-label="q of z equals one" />
+		</label>
+		<button type="button" class="smp-btn b-post">Set q to posterior</button>
+	</div>
+	<div class="smp-metrics">
+		<div><span>ln p(x)</span><strong class="m-e"></strong></div>
+		<div><span>ELBO(q)</span><strong class="m-l"></strong></div>
+		<div><span>KL(q ‖ p(z | x))</span><strong class="m-k"></strong></div>
+		<div><span>posterior p(z = 1 | x)</span><strong class="m-p"></strong></div>
+	</div>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import { elboParts, gauss } from "./probTheory";
+	import { axes, curve, el, fmt } from "../sampling/plot";
+
+	function attach(fig: HTMLElement) {
+		const mix = fig.querySelector<SVGSVGElement>(".s-mix")!;
+		const bar = fig.querySelector<SVGSVGElement>(".s-bar")!;
+		const xIn = fig.querySelector<HTMLInputElement>(".i-x")!;
+		const qIn = fig.querySelector<HTMLInputElement>(".i-q")!;
+
+		function draw() {
+			const x = Number(xIn.value);
+			const q = Number(qIn.value);
+			const r = elboParts(x, q);
+			mix.replaceChildren();
+			const A = axes(mix, { x: 40, y: 8, w: 585, h: 110 }, [-4, 5], [0, 0.32], { xLabel: "x", yTicks: 3 });
+			el("path", { d: curve(A, (t) => 0.7 * gauss(t, -1, 1)), class: "smp-p" }, mix);
+			el("path", { d: curve(A, (t) => 0.3 * gauss(t, 2, 1)), class: "smp-q" }, mix);
+			el("line", { x1: A.sx(x), x2: A.sx(x), y1: A.box.y, y2: A.box.y + A.box.h, class: "smp-text-line" }, mix);
+			el("text", { x: A.sx(x) + 4, y: A.box.y + 12, class: "smp-text" }, mix, "observed x");
+
+			bar.replaceChildren();
+			const lo = Math.min(-8, r.elbo - 0.5);
+			const B = axes(bar, { x: 40, y: 8, w: 585, h: 38 }, [lo, 0], [0, 1], { xLabel: "log probability (nats)", noYLabels: true, xTicks: 8 });
+			el("rect", { x: B.sx(lo), y: B.sy(0.85), width: B.sx(r.elbo) - B.sx(lo), height: B.sy(0.15) - B.sy(0.85), class: "pt-pos-area" }, bar);
+			el("rect", { x: B.sx(r.elbo), y: B.sy(0.85), width: Math.max(0, B.sx(r.logEvidence) - B.sx(r.elbo)), height: B.sy(0.15) - B.sy(0.85), class: "pt-neg-area" }, bar);
+			el("line", { x1: B.sx(r.logEvidence), x2: B.sx(r.logEvidence), y1: B.box.y - 2, y2: B.box.y + B.box.h + 2, class: "smp-text-line" }, bar);
+			el("text", { x: B.sx(r.logEvidence) + 4, y: B.box.y + 12, class: "smp-text" }, bar, "ln p(x)");
+
+			fig.querySelector(".v-x")!.textContent = fmt(x, 1);
+			fig.querySelector(".v-q")!.textContent = fmt(q, 2);
+			fig.querySelector(".m-e")!.textContent = fmt(r.logEvidence, 4);
+			fig.querySelector(".m-l")!.textContent = fmt(r.elbo, 4);
+			fig.querySelector(".m-k")!.textContent = fmt(r.kl, 4);
+			fig.querySelector(".m-p")!.textContent = fmt(r.posterior1, 4);
+		}
+		xIn.addEventListener("input", draw);
+		qIn.addEventListener("input", draw);
+		fig.querySelector(".b-post")!.addEventListener("click", () => {
+			qIn.value = String(elboParts(Number(xIn.value), 0).posterior1);
+			draw();
+		});
+		draw();
+	}
+
+	document.querySelectorAll<HTMLElement>(".pt-elbo").forEach(attach);
+</script>

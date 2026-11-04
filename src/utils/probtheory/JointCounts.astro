@@ -1,0 +1,183 @@
+---
+// The sum and product rules from counts (Bishop & Bishop, Figures 2.4 and 2.5). N samples of
+// two discrete variables X (columns) and Y (rows) are drawn as dots in an L × M grid of cells,
+// so a cell holds n_ij points, column i holds c_i and row j holds r_j. Below the grid are
+// histogram estimates of the marginal p(X) = c_i / N and of the conditional p(X | Y = y_j) =
+// n_ij / r_j for the selected row; on the right is p(Y) = r_j / N. Hover a cell to see the
+// sum rule (2.4) and product rule (2.7) evaluated with its counts; click a row (or a cell) to
+// pick the conditional. "Resample" draws a fresh data set; the N slider changes its size.
+// Logic in probTheory.ts.
+// Usage in .mdx:
+//   <JointCounts n={60} seed={3} />
+import "../sampling/sampling.css";
+import "./probTheory.css";
+import { figure25Joint } from "./probTheory";
+
+interface Props {
+	/** Joint weights, rows = values of Y from top (y_M) to bottom (y_1), columns = values of X. */
+	joint?: number[][];
+	n?: number;
+	seed?: number;
+	/** Row index (0 = top) selected at the start. */
+	row?: number;
+	title?: string;
+	caption?: string;
+}
+
+const {
+	joint = figure25Joint,
+	n = 60,
+	seed = 3,
+	row,
+	title,
+	caption,
+} = Astro.props;
+const init = { joint, n, seed, row: row ?? joint.length - 1 };
+---
+
+<figure class="smp-fig pt-joint-counts">
+	{title && <div class="smp-title">{title}</div>}
+	<svg class="smp-svg" viewBox="0 0 640 400" role="img" aria-label="Samples of two discrete variables with marginal and conditional histograms"></svg>
+	<div class="smp-controls">
+		<label class="smp-slider">N = <strong class="v-n"></strong>
+			<input type="range" class="i-n" min="10" max="2000" step="10" value={n} aria-label="Number of samples" />
+		</label>
+		<button type="button" class="smp-btn b-resample">Resample</button>
+	</div>
+	<p class="smp-narration"></p>
+	{caption && <figcaption>{caption}</figcaption>}
+	<script type="application/json" class="pt-init" set:html={JSON.stringify(init)}></script>
+</figure>
+
+<script>
+	import { mulberry32, sampleCounts } from "./probTheory";
+	import { el, fmt } from "../sampling/plot";
+
+	function attach(fig: HTMLElement) {
+		const init = JSON.parse(fig.querySelector(".pt-init")!.textContent ?? "{}");
+		const joint: number[][] = init.joint;
+		const M = joint.length;
+		const L = joint[0].length;
+		const svg = fig.querySelector("svg")!;
+		const nIn = fig.querySelector<HTMLInputElement>(".i-n")!;
+		const narr = fig.querySelector(".smp-narration")!;
+		let seed: number = init.seed;
+		let sel: number = init.row;
+		let hot: [number, number] | null = null;
+		let counts: number[][] = [];
+
+		// Geometry
+		const gx = 80;
+		const gw = 410;
+		const cw = gw / L;
+		const gy = 14;
+		const ch = Math.min(60, 150 / M);
+		const gh = ch * M;
+		const yLabel = (j: number) => `Y = ${M - j}`;
+
+		function narrate() {
+			const N = counts.flat().reduce((a, b) => a + b, 0);
+			const r = counts.map((row) => row.reduce((a, b) => a + b, 0));
+			if (!hot) {
+				narr.textContent = `N = ${N}: hover a cell to evaluate the sum and product rules with its counts; click a row to choose the conditional p(X | ${yLabel(sel)}).`;
+				return;
+			}
+			const [j, i] = hot;
+			const nij = counts[j][i];
+			const ci = counts.reduce((a, row) => a + row[i], 0);
+			narr.textContent =
+				`Cell (X = ${i + 1}, ${yLabel(j)}): n = ${nij}, column c = ${ci}, row r = ${r[j]}. ` +
+				`Joint p = n/N = ${nij}/${N} = ${fmt(nij / N, 3)}; product rule p(Y|X) p(X) = (${nij}/${ci}) × (${ci}/${N}) = ${fmt(ci ? (nij / ci) * (ci / N) : 0, 3)}; ` +
+				`sum rule p(X = ${i + 1}) = Σ_j n_ij / N = ${ci}/${N} = ${fmt(ci / N, 3)}.`;
+		}
+
+		function draw() {
+			const N = counts.flat().reduce((a, b) => a + b, 0);
+			const c = Array.from({ length: L }, (_, i) => counts.reduce((a, row) => a + row[i], 0));
+			const r = counts.map((row) => row.reduce((a, b) => a + b, 0));
+			svg.replaceChildren();
+			const rng = mulberry32(seed * 7 + 1);
+			const dotR = N > 400 ? 1 : N > 150 ? 1.5 : 2.6;
+			for (let j = 0; j < M; j++) {
+				el("text", { x: gx - 8, y: gy + j * ch + ch / 2 + 4, class: "smp-text pt-clickable", "text-anchor": "end" }, svg, yLabel(j));
+				for (let i = 0; i < L; i++) {
+					el("rect", { x: gx + i * cw, y: gy + j * ch, width: cw, height: ch, class: `pt-cell${j === sel ? " sel" : ""}${hot && hot[0] === j && hot[1] === i ? " hot" : ""}` }, svg);
+					for (let k = 0; k < counts[j][i]; k++)
+						el("circle", { cx: gx + i * cw + 4 + rng() * (cw - 8), cy: gy + j * ch + 4 + rng() * (ch - 8), r: dotR, class: "pt-pt" }, svg);
+				}
+			}
+			for (let i = 0; i < L; i++) el("text", { x: gx + (i + 0.5) * cw, y: gy + gh + 13, class: "smp-tick", "text-anchor": "middle" }, svg, String(i + 1));
+			el("text", { x: gx + gw / 2, y: gy + gh + 26, class: "smp-label", "text-anchor": "middle" }, svg, "X");
+
+			// p(Y) on the right
+			const px0 = gx + gw + 20;
+			const pw = 620 - px0;
+			el("text", { x: px0 + pw / 2, y: gy - 3 + gh + 26, class: "smp-label", "text-anchor": "middle" }, svg, "p(Y)");
+			r.forEach((v, j) => {
+				const w = N ? (v / N) * pw : 0;
+				el("rect", { x: px0, y: gy + j * ch + ch * 0.2, width: w, height: ch * 0.6, class: `pt-bar-y${j === sel ? " hot" : ""}` }, svg);
+				el("text", { x: px0 + w + 3, y: gy + j * ch + ch / 2 + 4, class: "smp-note" }, svg, fmt(N ? v / N : 0, 2));
+			});
+
+			// Histograms under the grid: p(X) and p(X | Y = sel)
+			const panel = (y0: number, h: number, vals: number[], label: string, hotI: number | null) => {
+				const top = Math.max(...vals, 0.05);
+				el("line", { x1: gx, x2: gx + gw, y1: y0 + h, y2: y0 + h, class: "smp-plotbox" }, svg);
+				el("text", { x: gx - 8, y: y0 + h / 2 + 4, class: "smp-label", "text-anchor": "end" }, svg, label);
+				vals.forEach((v, i) => {
+					const bh = (v / top) * (h - 12);
+					el("rect", { x: gx + i * cw + cw * 0.15, y: y0 + h - bh, width: cw * 0.7, height: bh, class: `pt-bar${hotI === i ? " hot" : ""}` }, svg);
+					el("text", { x: gx + (i + 0.5) * cw, y: y0 + h - bh - 3, class: "smp-note", "text-anchor": "middle" }, svg, fmt(v, 2));
+				});
+			};
+			const hotI = hot ? hot[1] : null;
+			panel(gy + gh + 40, 110, c.map((v) => (N ? v / N : 0)), "p(X)", hotI);
+			panel(gy + gh + 170, 110, counts[sel].map((v) => (r[sel] ? v / r[sel] : 0)), `p(X|Y=${M - sel})`, hot && hot[0] === sel ? hotI : null);
+			const total = gy + gh + 290;
+			svg.setAttribute("viewBox", `0 0 640 ${total}`);
+			fig.querySelector(".v-n")!.textContent = String(N);
+			narrate();
+		}
+
+		function resample() {
+			counts = sampleCounts(joint, Number(nIn.value), seed);
+			draw();
+		}
+		// Which cell (row j, column i) is under the pointer; row labels count as column -1.
+		const cellAt = (ev: PointerEvent | MouseEvent): [number, number] | null => {
+			const m = svg.getScreenCTM();
+			if (!m) return null;
+			const p = new DOMPoint(ev.clientX, ev.clientY).matrixTransform(m.inverse());
+			const j = Math.floor((p.y - gy) / ch);
+			const i = Math.floor((p.x - gx) / cw);
+			if (j < 0 || j >= M || p.x < 0 || i >= L) return null;
+			return [j, Math.max(i, -1)];
+		};
+		svg.addEventListener("pointermove", (ev) => {
+			const c = cellAt(ev);
+			const next = c && c[1] >= 0 ? c : null;
+			if (next?.[0] === hot?.[0] && next?.[1] === hot?.[1]) return;
+			hot = next;
+			draw();
+		});
+		svg.addEventListener("pointerleave", () => {
+			hot = null;
+			draw();
+		});
+		svg.addEventListener("click", (ev) => {
+			const c = cellAt(ev);
+			if (!c) return;
+			sel = c[0];
+			hot = c[1] >= 0 ? c : null;
+			draw();
+		});
+		nIn.addEventListener("input", resample);
+		fig.querySelector(".b-resample")!.addEventListener("click", () => {
+			seed++;
+			resample();
+		});
+		resample();
+	}
+
+	document.querySelectorAll<HTMLElement>(".pt-joint-counts").forEach(attach);
+</script>

@@ -1,0 +1,126 @@
+---
+// One token's key and value being written into the KV cache, thread by thread: vLLM's
+// reshape_and_cache_flash (default LBNHC layout with FlashAttention, K and V of a head side by
+// side in a page) or SGLang's store_kvcache_kernel (separate k_buffer and v_buffer rows). Left:
+// the threads that handle the token, coloured by the head they copy, grey when idle. Right: the
+// token's input k and v rows as 16-byte vectors. Below: where those vectors land. Hover or tap a
+// thread or a vector to see its source and destination byte offsets (logic in kvWriteMap.ts).
+// Usage in .mdx:
+//   <KvWriteMap />
+//   <KvWriteMap kernel="sglang" preset="tp1" cacheSlot={37} title="SGLang, TP = 1" />
+// (The prop is cacheSlot, not slot: Astro reserves `slot` for named slots.)
+import {
+	KV_PRESETS,
+	type Kernel,
+	describeThread,
+	drawWrite,
+	planWrite,
+} from "./kvWriteMap";
+
+interface Props {
+	kernel?: Kernel;
+	preset?: keyof typeof KV_PRESETS;
+	/** Destination slot of the token (vLLM: block * 16 + offset; SGLang: row). */
+	cacheSlot?: number;
+	title?: string;
+}
+
+const {
+	kernel = "vllm",
+	preset = "tp4",
+	cacheSlot = 37,
+	title = "Who writes which bytes of one token's KV",
+} = Astro.props;
+const plan = planWrite(kernel, KV_PRESETS[preset].cfg, cacheSlot);
+const svg = drawWrite(plan);
+const panel = describeThread(plan, null);
+---
+
+<figure class="kwx" data-slot={cacheSlot}>
+	<figcaption class="kwx-title">{title}</figcaption>
+	<div class="kwx-controls">
+		<label>kernel
+			<select name="kernel">
+				<option value="vllm" selected={kernel === "vllm"}>vLLM reshape_and_cache_flash</option>
+				<option value="sglang" selected={kernel === "sglang"}>SGLang store_kvcache_kernel</option>
+			</select>
+		</label>
+		<label>model
+			<select name="preset">
+				{Object.entries(KV_PRESETS).map(([k, v]) => <option value={k} selected={k === preset}>{v.label}</option>)}
+			</select>
+		</label>
+	</div>
+	<div class="kwx-canvas" set:html={svg} />
+	<div class="kwx-panel" aria-live="polite" set:html={panel} />
+</figure>
+
+<script>
+	import { KV_PRESETS, type Kernel, describeThread, drawWrite, planWrite } from "./kvWriteMap";
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".kwx")) {
+		const q = <T extends Element>(s: string) => fig.querySelector<T>(s);
+		const canvas = q<HTMLElement>(".kwx-canvas");
+		const panel = q<HTMLElement>(".kwx-panel");
+		const slot = Number(fig.dataset.slot ?? 0);
+		let plan = planWrite("vllm", KV_PRESETS.tp4.cfg, slot);
+		const mark = (t: number | null) => {
+			for (const el of canvas?.querySelectorAll<SVGRectElement>("[data-t]") ?? [])
+				el.classList.toggle("on", t !== null && Number(el.dataset.t) === t);
+			canvas?.classList.toggle("focus", t !== null && t >= 0);
+			if (panel) panel.innerHTML = describeThread(plan, t);
+		};
+		const render = () => {
+			const kernel = (q<HTMLSelectElement>("[name=kernel]")?.value ?? "vllm") as Kernel;
+			const preset = q<HTMLSelectElement>("[name=preset]")?.value ?? "tp4";
+			plan = planWrite(kernel, KV_PRESETS[preset].cfg, slot);
+			if (canvas) canvas.innerHTML = drawWrite(plan);
+			mark(null);
+		};
+		const pick = (e: Event) => {
+			const el = (e.target as Element).closest<SVGRectElement>("[data-t]");
+			if (el) mark(Number(el.dataset.t));
+		};
+		for (const s of fig.querySelectorAll("select")) s.addEventListener("change", render);
+		render();
+		canvas?.addEventListener("mouseover", pick);
+		canvas?.addEventListener("click", pick);
+		canvas?.addEventListener("mouseleave", () => mark(null));
+	}
+</script>
+
+<style>
+	.kwx {
+		--kw-0: #2f6f9f; --kw-1: #b8742a; --kw-2: #5b8a3a; --kw-3: #8a4f9e;
+		--kw-4: #b0464f; --kw-5: #2c8c8a; --kw-6: #8c7a2c; --kw-7: #5a5fb0;
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+	}
+	@media (prefers-color-scheme: dark) {
+		.kwx {
+			--kw-0: #7fb2dc; --kw-1: #e0a35e; --kw-2: #9cc97a; --kw-3: #c79bd8;
+			--kw-4: #e38990; --kw-5: #6fcdca; --kw-6: #d6c46a; --kw-7: #a3a7ec;
+		}
+	}
+	.kwx-title { text-align: center; font-size: 0.9rem; font-weight: 600; margin-bottom: 0.4rem; }
+	.kwx-controls { display: flex; flex-wrap: wrap; gap: 0.4rem 1rem; align-items: center; font-size: 0.78rem; color: var(--muted); margin-bottom: 0.5rem; }
+	.kwx-controls label { display: inline-flex; gap: 0.35rem; align-items: center; }
+	.kwx-controls select { font: 0.78rem var(--mono); color: var(--text); background: var(--bg); border: 1px solid var(--faint); border-radius: 6px; padding: 0.1rem 0.3rem; max-width: 100%; }
+	.kwx-canvas { max-width: 100%; overflow-x: auto; padding: 0.5rem; border: 1px solid var(--faint); border-radius: 10px; background: var(--surface); }
+	.kwx-canvas :global(svg) { display: block; max-width: none; }
+	.kwx-canvas :global(.kw-h) { font: 600 9.5px var(--sans); fill: var(--muted); }
+	.kwx-canvas :global(.kw-row) { font: 8px var(--mono); fill: var(--muted); text-anchor: end; }
+	.kwx-canvas :global(rect[data-t]) { cursor: pointer; stroke: transparent; stroke-width: 1.5; }
+	.kwx-canvas :global(.kw-t.idle) { fill: var(--bg); stroke: var(--faint); stroke-width: 0.8; }
+	.kwx-canvas :global(.kw-v.vv) { opacity: 0.7; }
+	.kwx-canvas :global(.h0) { fill: var(--kw-0); } .kwx-canvas :global(.h1) { fill: var(--kw-1); }
+	.kwx-canvas :global(.h2) { fill: var(--kw-2); } .kwx-canvas :global(.h3) { fill: var(--kw-3); }
+	.kwx-canvas :global(.h4) { fill: var(--kw-4); } .kwx-canvas :global(.h5) { fill: var(--kw-5); }
+	.kwx-canvas :global(.h6) { fill: var(--kw-6); } .kwx-canvas :global(.h7) { fill: var(--kw-7); }
+	.kwx-canvas:global(.focus) :global(rect[data-t]:not(.on):not(.idle)) { opacity: 0.25; }
+	.kwx-canvas :global(rect.on) { stroke: var(--text); opacity: 1; }
+	.kwx-panel { margin-top: 0.5rem; font-size: 0.8rem; }
+	.kwx-panel :global(p) { margin: 0.3rem 0; }
+	.kwx-panel :global(.kw-list) { margin: 0.2rem 0 0; padding-left: 1.1rem; font: 0.72rem var(--mono); }
+	.kwx-panel :global(.kw-list li) { margin: 0.1rem 0; }
+</style>

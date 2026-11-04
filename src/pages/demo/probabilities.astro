@@ -1,0 +1,63 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import BiasVarianceFits from "../../utils/probtheory/BiasVarianceFits.astro";
+import DensityTransform from "../../utils/probtheory/DensityTransform.astro";
+import ElboBars from "../../utils/probtheory/ElboBars.astro";
+import EntropyCoding from "../../utils/probtheory/EntropyCoding.astro";
+import Gaussian2D from "../../utils/probtheory/Gaussian2D.astro";
+import GaussianKl from "../../utils/probtheory/GaussianKl.astro";
+import GaussianLikelihood from "../../utils/probtheory/GaussianLikelihood.astro";
+import InfoBars from "../../utils/probtheory/InfoBars.astro";
+import JensenChord from "../../utils/probtheory/JensenChord.astro";
+import JointCounts from "../../utils/probtheory/JointCounts.astro";
+import MapRegression from "../../utils/probtheory/MapRegression.astro";
+import MlBias from "../../utils/probtheory/MlBias.astro";
+import ScreeningPopulation from "../../utils/probtheory/ScreeningPopulation.astro";
+---
+
+<Layout title="Probability figures">
+	<main>
+		<h1>Probability figures</h1>
+		<h2>ScreeningPopulation</h2>
+		<ScreeningPopulation />
+		<ScreeningPopulation prior={0.001} title="Prevalence 0.1% (Exercise 2.1)" />
+		<h2>JointCounts</h2>
+		<JointCounts />
+		<JointCounts n={1000} seed={4} row={0} title="N = 1000, top row selected" />
+		<JointCounts joint={[[1, 2, 3, 2, 1], [2, 1, 1, 1, 2], [1, 1, 4, 1, 1]]} n={80} title="L = 5, M = 3 as in Figure 2.4" />
+		<h2>GaussianLikelihood</h2>
+		<GaussianLikelihood />
+		<GaussianLikelihood data={[-0.5, 0, 0.4, 2.8]} mu={0} s2={2} title="Four points" />
+		<h2>MlBias</h2>
+		<MlBias />
+		<MlBias n={10} start={100} title="N = 10, 100 data sets" />
+		<h2>MapRegression</h2>
+		<MapRegression ml />
+		<MapRegression lnLambda={-18} title="M = 9, ln λ = −18" />
+		<MapRegression order={3} ml title="M = 3, maximum likelihood" />
+		<h2>DensityTransform</h2>
+		<DensityTransform />
+		<DensityTransform mu={4} sigma={1.6} samples={20000} title="µ = 4, σ = 1.6" />
+		<h2>EntropyCoding</h2>
+		<EntropyCoding />
+		<EntropyCoding preset="peaked30" title="Peaked over 30 bins" />
+		<h2>JensenChord</h2>
+		<JensenChord />
+		<JensenChord fn="neglog" a={0.3} b={2.8} lambda={0.5} title="−ln x" />
+		<h2>GaussianKl</h2>
+		<GaussianKl />
+		<GaussianKl mu={0} sigma={1} m={0} s={1} title="Equal distributions" />
+		<h2>InfoBars</h2>
+		<InfoBars />
+		<InfoBars preset="noisy" title="Noisy copy" />
+		<h2>Gaussian2D</h2>
+		<Gaussian2D />
+		<Gaussian2D s1={1} s2={1} rho={-0.8} a={-2} title="Negative correlation" />
+		<h2>BiasVarianceFits</h2>
+		<BiasVarianceFits />
+		<BiasVarianceFits lnLambda={-6} title="Weak regularisation" />
+		<h2>ElboBars</h2>
+		<ElboBars />
+		<ElboBars x={3} q={0.5} title="x = 3" />
+	</main>
+</Layout>

@@ -1,0 +1,148 @@
+---
+// The likelihood function of a Gaussian (Bishop & Bishop, Section 2.3.2, Figure 2.9). Left: a
+// small data set (grey points on the axis), the Gaussian N(x | µ, σ²) for the slider values and
+// the value of the density at each point (blue dots on dashed stems); the likelihood (2.55) is
+// the product of those heights. Right: the log likelihood (2.56) over a grid of (µ, σ²), darker
+// is higher, with the current setting (ring) and the maximum-likelihood solution (2.57)–(2.58)
+// (cross). Drag on the right panel or use the sliders; "Fit" jumps to the maximum.
+// Logic in probTheory.ts.
+// Usage in .mdx:
+//   <GaussianLikelihood data={[0.3, 1.1, 1.6, 2.2, 2.4, 3.4]} mu={1} s2={1} />
+import "../sampling/sampling.css";
+import "./probTheory.css";
+import { likelihoodData } from "./probTheory";
+
+interface Props {
+	data?: number[];
+	mu?: number;
+	s2?: number;
+	title?: string;
+	caption?: string;
+}
+
+const { data = likelihoodData, mu = 1, s2 = 1, title, caption } = Astro.props;
+---
+
+<figure class="smp-fig pt-gauss-lik">
+	{title && <div class="smp-title">{title}</div>}
+	<div class="smp-legend">
+		<span><i class="k-p"></i>N(x | µ, σ²)</span>
+		<span><i class="dot k-dot-p"></i>density at each data point</span>
+		<span><i class="k-text"></i>ln p over (µ, σ²): ring = current, cross = maximum</span>
+	</div>
+	<div class="smp-row">
+		<svg class="smp-svg s-dens" viewBox="0 0 320 230" role="img" aria-label="Gaussian density and its values at the data points"></svg>
+		<svg class="smp-svg s-heat" viewBox="0 0 320 230" role="img" aria-label="Log likelihood as a function of the mean and variance"></svg>
+	</div>
+	<div class="smp-controls">
+		<label class="smp-slider">µ = <strong class="v-mu"></strong>
+			<input type="range" class="i-mu" min="-1" max="4.5" step="0.01" value={mu} aria-label="Mean" />
+		</label>
+		<label class="smp-slider">σ² = <strong class="v-s2"></strong>
+			<input type="range" class="i-s2" min="0.1" max="4" step="0.01" value={s2} aria-label="Variance" />
+		</label>
+		<button type="button" class="smp-btn b-fit">Fit (maximum likelihood)</button>
+	</div>
+	<div class="smp-metrics">
+		<div><span>ln p(x | µ, σ²)</span><strong class="m-ll"></strong></div>
+		<div><span>µ_ML (sample mean)</span><strong class="m-mu"></strong></div>
+		<div><span>σ²_ML</span><strong class="m-s2"></strong></div>
+		<div><span>ln p at the maximum</span><strong class="m-max"></strong></div>
+	</div>
+	{caption && <figcaption>{caption}</figcaption>}
+	<script type="application/json" class="pt-init" set:html={JSON.stringify({ data })}></script>
+</figure>
+
+<script>
+	import { gauss, gaussLogLik, gaussMl } from "./probTheory";
+	import { axes, curve, el, fmt } from "../sampling/plot";
+
+	function attach(fig: HTMLElement) {
+		const { data } = JSON.parse(fig.querySelector(".pt-init")!.textContent ?? "{}") as { data: number[] };
+		const dens = fig.querySelector<SVGSVGElement>(".s-dens")!;
+		const heat = fig.querySelector<SVGSVGElement>(".s-heat")!;
+		const muIn = fig.querySelector<HTMLInputElement>(".i-mu")!;
+		const s2In = fig.querySelector<HTMLInputElement>(".i-s2")!;
+		const ml = gaussMl(data);
+		const llMax = gaussLogLik(data, ml.mu, ml.s2);
+		const muR: [number, number] = [-1, 4.5];
+		const s2R: [number, number] = [0.1, 4];
+
+		// Static heat map, drawn once.
+		const H = axes(heat, { x: 48, y: 8, w: 262, h: 182 }, muR, s2R, { xLabel: "µ", yLabel: "σ²" });
+		const nx = 55;
+		const ny = 39;
+		const floor = llMax - 25;
+		const heatG = el("g", {}, heat);
+		for (let a = 0; a < nx; a++)
+			for (let b = 0; b < ny; b++) {
+				const m0 = muR[0] + ((a + 0.5) / nx) * (muR[1] - muR[0]);
+				const v0 = s2R[0] + ((b + 0.5) / ny) * (s2R[1] - s2R[0]);
+				const t = Math.max(0, (gaussLogLik(data, m0, v0) - floor) / (llMax - floor));
+				const x0 = H.sx(muR[0] + (a / nx) * (muR[1] - muR[0]));
+				const x1 = H.sx(muR[0] + ((a + 1) / nx) * (muR[1] - muR[0]));
+				const y0 = H.sy(s2R[0] + ((b + 1) / ny) * (s2R[1] - s2R[0]));
+				const y1 = H.sy(s2R[0] + (b / ny) * (s2R[1] - s2R[0]));
+				el("rect", { x: x0, y: y0, width: x1 - x0 + 0.3, height: y1 - y0 + 0.3, class: "pt-heat", style: `fill: var(--accent); opacity: ${(t ** 2 * 0.85).toFixed(3)}` }, heatG);
+			}
+		heat.insertBefore(heatG, heat.firstChild);
+		const cx = H.sx(ml.mu);
+		const cy = H.sy(ml.s2);
+		el("path", { d: `M${cx - 5},${cy - 5}L${cx + 5},${cy + 5}M${cx - 5},${cy + 5}L${cx + 5},${cy - 5}`, class: "smp-text-line" }, heat);
+		const ring = el("circle", { r: 5, class: "smp-current" }, heat);
+
+		function draw() {
+			const mu = Number(muIn.value);
+			const s2 = Number(s2In.value);
+			dens.replaceChildren();
+			const top = Math.max(0.6, 1.15 / Math.sqrt(2 * Math.PI * s2));
+			const A = axes(dens, { x: 48, y: 8, w: 262, h: 182 }, [-1.5, 5], [0, top], { xLabel: "x", yLabel: "p(x)" });
+			el("path", { d: curve(A, (x) => gauss(x, mu, s2)), class: "smp-p" }, dens);
+			for (const x of data) {
+				const h = gauss(x, mu, s2);
+				el("line", { x1: A.sx(x), x2: A.sx(x), y1: A.sy(0), y2: A.sy(h), class: "pt-stem" }, dens);
+				el("circle", { cx: A.sx(x), cy: A.sy(h), r: 3.2, class: "smp-dot" }, dens);
+				el("circle", { cx: A.sx(x), cy: A.sy(0), r: 3.2, class: "smp-faint-dot" }, dens);
+			}
+			ring.setAttribute("cx", String(H.sx(mu)));
+			ring.setAttribute("cy", String(H.sy(s2)));
+			fig.querySelector(".v-mu")!.textContent = fmt(mu, 2);
+			fig.querySelector(".v-s2")!.textContent = fmt(s2, 2);
+			fig.querySelector(".m-ll")!.textContent = fmt(gaussLogLik(data, mu, s2), 3);
+			fig.querySelector(".m-mu")!.textContent = fmt(ml.mu, 3);
+			fig.querySelector(".m-s2")!.textContent = fmt(ml.s2, 3);
+			fig.querySelector(".m-max")!.textContent = fmt(llMax, 3);
+		}
+
+		const fromPointer = (ev: PointerEvent) => {
+			const m = heat.getScreenCTM();
+			if (!m) return;
+			const p = new DOMPoint(ev.clientX, ev.clientY).matrixTransform(m.inverse());
+			const mu = muR[0] + ((p.x - H.box.x) / H.box.w) * (muR[1] - muR[0]);
+			const s2 = s2R[0] + ((H.box.y + H.box.h - p.y) / H.box.h) * (s2R[1] - s2R[0]);
+			muIn.value = String(Math.min(muR[1], Math.max(muR[0], mu)));
+			s2In.value = String(Math.min(s2R[1], Math.max(s2R[0], s2)));
+			draw();
+		};
+		let dragging = false;
+		heat.addEventListener("pointerdown", (ev) => {
+			dragging = true;
+			heat.setPointerCapture(ev.pointerId);
+			fromPointer(ev);
+		});
+		heat.addEventListener("pointermove", (ev) => dragging && fromPointer(ev));
+		heat.addEventListener("pointerup", () => {
+			dragging = false;
+		});
+		muIn.addEventListener("input", draw);
+		s2In.addEventListener("input", draw);
+		fig.querySelector(".b-fit")!.addEventListener("click", () => {
+			muIn.value = String(ml.mu);
+			s2In.value = String(ml.s2);
+			draw();
+		});
+		draw();
+	}
+
+	document.querySelectorAll<HTMLElement>(".pt-gauss-lik").forEach(attach);
+</script>

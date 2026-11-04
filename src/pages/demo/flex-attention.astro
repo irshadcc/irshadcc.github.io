@@ -1,0 +1,36 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import BlockMaskExplorer from "../../utils/attention/BlockMaskExplorer.astro";
+import FlexKernelSteps from "../../utils/attention/FlexKernelSteps.astro";
+---
+
+<Layout title="FlexAttention block mask and kernel demo">
+	<h1>FlexAttention block mask and kernel demo</h1>
+	<p>
+		<code>BlockMaskExplorer</code> builds a BlockMask the way <code>create_block_mask</code> does and shows the
+		tiles one program of the Triton template visits (logic in <code>blockMask.ts</code>).
+		<code>FlexKernelSteps</code> steps through one program of the forward template on an 8-token example
+		(logic in <code>flexKernel.ts</code>).
+	</p>
+
+	<h2>Causal, forward, defaults</h2>
+	<BlockMaskExplorer />
+
+	<h2>Sliding window, 24 tokens, two tiles per block</h2>
+	<BlockMaskExplorer preset="sliding" len={24} block={4} tile={2} line={4} title="Sliding window: blocks off the band are skipped" />
+
+	<h2>Document mask, one tile per block</h2>
+	<BlockMaskExplorer preset="document" len={16} block={4} tile={4} line={3} />
+
+	<h2>Prefix LM, backward columns</h2>
+	<BlockMaskExplorer preset="prefix" len={16} block={4} tile={2} dir="bwd" line={0} title="dK/dV for key block 0" />
+
+	<h2>Edge case: 32 tokens, block 8, tile 1</h2>
+	<BlockMaskExplorer preset="causal" len={32} block={8} tile={1} line={3} />
+
+	<h2>Forward kernel, first step</h2>
+	<FlexKernelSteps title="One program of the forward template" />
+
+	<h2>Forward kernel, starting on the third tile's scores</h2>
+	<FlexKernelSteps step={5} />
+</Layout>

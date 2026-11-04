@@ -1,0 +1,122 @@
+---
+// Which CUDA graph vLLM or SGLang replays for one forward step of a small decoder (3 layers,
+// scaled down from a real model's 32), and which ops run inside it. Pick the engine, whether
+// the batch is decode-only or contains prefill tokens, and the number of tokens; each op chip
+// is tinted by the graph segment (G1, G2, ...) that replays it, or outlined dashed when it is
+// launched eagerly. The panel gives the mode, the padded size and the reason, from the rules
+// in graphDispatch.ts (read from vLLM 54beee8 and SGLang 5eb7018).
+// Usage in .mdx:
+//   <GraphDispatch />
+//   <GraphDispatch engine="sglang" kind="mixed" tokens={300} title="SGLang prefill" />
+import {
+	type BatchKind,
+	type Engine,
+	describeDispatch,
+	dispatch,
+	drawDispatch,
+} from "./graphDispatch";
+
+interface Props {
+	engine?: Engine;
+	kind?: BatchKind;
+	tokens?: number;
+	title?: string;
+}
+
+const {
+	engine = "vllm",
+	kind = "decode",
+	tokens = 13,
+	title = "Which graph runs this step?",
+} = Astro.props;
+const d = dispatch(engine, kind, tokens);
+const svg = drawDispatch(engine, d);
+const panel = describeDispatch(tokens, d);
+---
+
+<figure class="gdx" data-tokens={tokens}>
+	<figcaption class="gdx-title">{title}</figcaption>
+	<div class="gdx-controls">
+		<label>engine
+			<select name="engine">
+				<option value="vllm" selected={engine === "vllm"}>vLLM</option>
+				<option value="sglang" selected={engine === "sglang"}>SGLang</option>
+			</select>
+		</label>
+		<label>batch
+			<select name="kind">
+				<option value="decode" selected={kind === "decode"}>decode only</option>
+				<option value="mixed" selected={kind === "mixed"}>with prefill tokens</option>
+			</select>
+		</label>
+		<label>tokens <input type="range" name="tokens" min="1" max="2400" value={tokens} /><output>{tokens}</output></label>
+	</div>
+	<div class="gdx-legend">
+		<span><i class="g"></i>replayed from a CUDA graph (G1, G2, ... are separate graphs)</span>
+		<span><i class="e"></i>launched eagerly</span>
+	</div>
+	<div class="gdx-canvas" set:html={svg} />
+	<div class="gdx-panel" aria-live="polite" set:html={panel} />
+</figure>
+
+<script>
+	import { type BatchKind, type Engine, describeDispatch, dispatch, drawDispatch } from "./graphDispatch";
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".gdx")) {
+		const q = <T extends Element>(s: string) => fig.querySelector<T>(s);
+		const canvas = q<HTMLElement>(".gdx-canvas");
+		const panel = q<HTMLElement>(".gdx-panel");
+		const slider = q<HTMLInputElement>("[name=tokens]");
+		const shown = q<HTMLOutputElement>("output");
+		const render = () => {
+			const engine = (q<HTMLSelectElement>("[name=engine]")?.value ?? "vllm") as Engine;
+			const kind = (q<HTMLSelectElement>("[name=kind]")?.value ?? "decode") as BatchKind;
+			const tokens = Number(slider?.value ?? 1);
+			if (shown) shown.textContent = String(tokens);
+			const d = dispatch(engine, kind, tokens);
+			if (canvas) canvas.innerHTML = drawDispatch(engine, d);
+			if (panel) panel.innerHTML = describeDispatch(tokens, d);
+		};
+		for (const s of fig.querySelectorAll("select")) s.addEventListener("change", render);
+		slider?.addEventListener("input", render);
+	}
+</script>
+
+<style>
+	.gdx {
+		--gd-a: #2f6f9f;
+		--gd-b: #5b8a3a;
+		--gd-e: #b8742a;
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+	}
+	@media (prefers-color-scheme: dark) {
+		.gdx {
+			--gd-a: #7fb2dc;
+			--gd-b: #9cc97a;
+			--gd-e: #e0a35e;
+		}
+	}
+	.gdx-title { text-align: center; font-size: 0.9rem; font-weight: 600; margin-bottom: 0.4rem; }
+	.gdx-controls { display: flex; flex-wrap: wrap; gap: 0.4rem 1rem; align-items: center; font-size: 0.78rem; color: var(--muted); margin-bottom: 0.5rem; }
+	.gdx-controls label { display: inline-flex; gap: 0.35rem; align-items: center; }
+	.gdx-controls select { font: 0.78rem var(--mono); color: var(--text); background: var(--bg); border: 1px solid var(--faint); border-radius: 6px; padding: 0.1rem 0.3rem; }
+	.gdx-controls input[type="range"] { width: 10rem; accent-color: var(--accent); }
+	.gdx-controls output { font: 0.78rem var(--mono); color: var(--text); min-width: 2.5rem; }
+	.gdx-legend { display: flex; flex-wrap: wrap; gap: 0.3rem 0.9rem; margin-bottom: 0.4rem; font-size: 0.72rem; color: var(--muted); }
+	.gdx-legend span { display: inline-flex; align-items: center; gap: 0.3rem; }
+	.gdx-legend i { display: inline-block; width: 0.8rem; height: 0.8rem; border-radius: 3px; }
+	.gdx-legend i.g { background: color-mix(in oklch, var(--gd-a) 28%, var(--bg)); border: 1px solid var(--gd-a); }
+	.gdx-legend i.e { background: var(--bg); border: 1.5px dashed var(--gd-e); }
+	.gdx-canvas { max-width: 100%; overflow-x: auto; padding: 0.5rem; border: 1px solid var(--faint); border-radius: 10px; background: var(--surface); }
+	.gdx-canvas :global(svg) { display: block; max-width: none; }
+	.gdx-canvas :global(.gd-row) { font: 600 10px var(--sans); fill: var(--muted); text-anchor: end; }
+	.gdx-canvas :global(.gd-lab) { font: 8.5px var(--mono); fill: var(--text); text-anchor: middle; pointer-events: none; }
+	.gdx-canvas :global(.gd-no) { font: 700 8px var(--sans); fill: var(--muted); }
+	.gdx-canvas :global(.gd-op.graph.g1 rect) { fill: color-mix(in oklch, var(--gd-a) 28%, var(--bg)); stroke: var(--gd-a); }
+	.gdx-canvas :global(.gd-op.graph.g0 rect) { fill: color-mix(in oklch, var(--gd-b) 28%, var(--bg)); stroke: var(--gd-b); }
+	.gdx-canvas :global(.gd-op.eager rect) { fill: var(--bg); stroke: var(--gd-e); stroke-width: 1.5; stroke-dasharray: 4 2; }
+	.gdx-canvas :global(.gd-op.eager.attn .gd-lab) { font-weight: 700; }
+	.gdx-panel { margin-top: 0.5rem; font-size: 0.8rem; }
+	.gdx-panel :global(p) { margin: 0.3rem 0; }
+</style>

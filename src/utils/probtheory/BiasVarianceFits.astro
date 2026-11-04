@@ -1,0 +1,95 @@
+---
+// The bias–variance trade-off (Bishop & Bishop, Section 4.3, Figures 4.7 and 4.8), scaled down
+// and recomputed. 100 data sets of 25 points from sin 2πx + N(0, 0.3²) are each fitted with 24
+// Gaussian basis functions (width 0.1) plus a constant by regularised least squares. Left: 20 of
+// the fits (faint), their average (blue) and sin 2πx (red dashed) for the chosen ln λ. Right:
+// squared bias, variance and their sum against ln λ, with the current value marked.
+// Logic in probTheory.ts (biasVariance), computed in the browser for each slider value.
+// Usage in .mdx:
+//   <BiasVarianceFits lnLambda={0} />
+import "../sampling/sampling.css";
+import "./probTheory.css";
+
+interface Props {
+	lnLambda?: number;
+	title?: string;
+	caption?: string;
+}
+
+const { lnLambda = 0, title, caption } = Astro.props;
+---
+
+<figure class="smp-fig pt-bv">
+	{title && <div class="smp-title">{title}</div>}
+	<div class="smp-legend">
+		<span><i class="k-p"></i>average fit E_D[f]</span>
+		<span><i class="k-qd"></i>sin 2πx</span>
+		<span><i class="k-q"></i>(bias)²</span>
+		<span><i class="k-model"></i>variance</span>
+		<span><i class="k-text"></i>(bias)² + variance</span>
+	</div>
+	<div class="smp-row">
+		<svg class="smp-svg s-fits" viewBox="0 0 320 250" role="img" aria-label="Twenty regularised fits and their average"></svg>
+		<svg class="smp-svg s-curve" viewBox="0 0 320 250" role="img" aria-label="Squared bias and variance against the regularisation coefficient"></svg>
+	</div>
+	<div class="smp-controls">
+		<label class="smp-slider">ln λ = <strong class="v-l"></strong>
+			<input type="range" class="i-l" min="-6" max="3" step="0.5" value={lnLambda} aria-label="Log regularisation coefficient" />
+		</label>
+	</div>
+	<div class="smp-metrics">
+		<div><span>(bias)²</span><strong class="m-b"></strong></div>
+		<div><span>variance</span><strong class="m-v"></strong></div>
+		<div><span>(bias)² + variance</span><strong class="m-s"></strong></div>
+		<div><span>+ noise 0.09 = expected loss</span><strong class="m-t"></strong></div>
+	</div>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import { type BiasVariance, biasVariance, bvGrid } from "./probTheory";
+	import { axes, curve, el, fmt } from "../sampling/plot";
+
+	function attach(fig: HTMLElement) {
+		const fits = fig.querySelector<SVGSVGElement>(".s-fits")!;
+		const cv = fig.querySelector<SVGSVGElement>(".s-curve")!;
+		const lIn = fig.querySelector<HTMLInputElement>(".i-l")!;
+		const values = Array.from({ length: 19 }, (_, i) => -6 + i / 2);
+		const cache = new Map<number, BiasVariance>();
+		const get = (l: number) => {
+			if (!cache.has(l)) cache.set(l, biasVariance(l));
+			return cache.get(l)!;
+		};
+
+		function draw() {
+			const l = Number(lIn.value);
+			const r = get(l);
+			fits.replaceChildren();
+			const A = axes(fits, { x: 34, y: 8, w: 276, h: 205 }, [0, 1], [-1.6, 1.6], { xLabel: "x", xTicks: 4, yTicks: 4 });
+			const path = (ys: number[]) => ys.map((y, i) => `${i ? "L" : "M"}${A.sx(bvGrid[i]).toFixed(1)},${A.sy(Math.max(-1.6, Math.min(1.6, y))).toFixed(1)}`).join("");
+			for (const f of r.fits) el("path", { d: path(f), class: "pt-faint-curve" }, fits);
+			el("path", { d: curve(A, (x) => Math.sin(2 * Math.PI * x)), class: "smp-q-dash" }, fits);
+			el("path", { d: path(r.mean), class: "smp-p" }, fits);
+
+			cv.replaceChildren();
+			const all = values.map(get);
+			const B = axes(cv, { x: 44, y: 8, w: 266, h: 205 }, [-6, 3], [0, 0.12], { xLabel: "ln λ", xTicks: 5, yTicks: 4 });
+			const line = (f: (b: BiasVariance) => number, cls: string) =>
+				el("path", { d: all.map((b, i) => `${i ? "L" : "M"}${B.sx(b.lnLambda).toFixed(1)},${B.sy(Math.min(0.12, f(b))).toFixed(1)}`).join(""), class: cls }, cv);
+			line((b) => b.bias2, "smp-q");
+			line((b) => b.variance, "smp-model");
+			line((b) => b.bias2 + b.variance, "smp-text-line");
+			el("line", { x1: B.sx(l), x2: B.sx(l), y1: B.box.y, y2: B.box.y + B.box.h, class: "smp-muted-line" }, cv);
+
+			fig.querySelector(".v-l")!.textContent = fmt(l, 1);
+			fig.querySelector(".m-b")!.textContent = fmt(r.bias2, 4);
+			fig.querySelector(".m-v")!.textContent = fmt(r.variance, 4);
+			fig.querySelector(".m-s")!.textContent = fmt(r.bias2 + r.variance, 4);
+			fig.querySelector(".m-t")!.textContent = fmt(r.test, 4);
+		}
+		lIn.addEventListener("input", draw);
+		draw();
+	}
+
+	document.querySelectorAll<HTMLElement>(".pt-bv").forEach(attach);
+</script>

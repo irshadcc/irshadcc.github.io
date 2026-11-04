@@ -53,6 +53,11 @@ respect to inputs) and the **Hessian** (second derivatives), and finally see it 
 [matrix calculus post](/blog/matrix-calculus/) covers the same ideas in matrix form, and
 [Inside JAX](/blog/jax-internals/) shows how a real library implements them.
 
+This is the middle article in a three-part sequence. [Gradient Descent](/blog/gradient-descent/)
+derives the optimizers that consume these derivatives, and
+[Regularization](/blog/regularization/) explains how the training procedure is biased toward
+solutions that generalize.
+
 A word on the name. "Backpropagation" is sometimes used for a whole training procedure, or even
 for feed-forward networks themselves. Here, as in the book, it means only the procedure that
 *evaluates derivatives*. What you then do with the gradient (gradient descent, Adam) is a separate
@@ -843,6 +848,72 @@ differences of the gradient, $(\nabla E(\mathbf{w} + \epsilon\mathbf{v}) - \nabl
 \epsilon\mathbf{v}))/2\epsilon$ with $\epsilon = 10^{-5}$. Forward-over-reverse matched the full
 product to {sci(hessianFinal.errFwdRev)}, rounding level; central differences to
 {sci(hessianFinal.errFd)}, the accuracy the finite-difference chart predicts.
+
+## Exercise map
+
+The main text develops the longer answers where they naturally arise. This map makes every exercise
+explicit and supplies the remaining algebra.<Sidenote>Answers were cross-checked against Version 1.0
+of the authors' solutions manual. In Exercise 8.17 the required forward-mode result is
+$\dot v_7$, not $\dot v_5$ as stated in the book.</Sidenote>
+
+### Exercises 8.1--8.5: first derivatives and Jacobians
+
+For Exercise 8.1, insert $\delta_k=\partial E_n/\partial a_k$ and
+$\partial a_k/\partial a_j=w_{kj}h'(a_j)$ into the multivariable chain rule to obtain (8.13).
+Exercise 8.2 is the matrix recurrence derived after the first error-flow figure. Exercise 8.3 is
+the central-difference Taylor cancellation in “Numerical differentiation.”
+
+For a skip connection $u_{ki}$ from input $x_i$ to output pre-activation $a_k$,
+$a_k=\sum_jw_{kj}^{(2)}z_j+\sum_i u_{ki}x_i$, so the chain rule gives
+$\partial E/\partial u_{ki}=\delta_kx_i$ (8.4). For the forward Jacobian recurrence, define
+$D_{ji}=\partial a_j/\partial x_i$. The first layer has $D_{ji}=w_{ji}$ and later layers have
+
+$$
+D_{ji}=\sum_l w_{jl}h'(a_l)D_{li},
+$$
+
+after which $J_{ki}=h_k'(a_k)D_{ki}$ at the output (8.5).
+
+### Exercises 8.6--8.12: Hessians
+
+Let $M_{kk'}=\partial^2E/\partial a_k\partial a_{k'}$. Two output-layer weights give
+$\partial^2E/(\partial w_{kj}^{(2)}\partial w_{k'j'}^{(2)})=z_jz_{j'}M_{kk'}$. Applying the
+product rule to two first-layer weights adds the $h''$ term and a propagated
+$\sum_{kk'}w_{kj}^{(2)}w_{k'j'}^{(2)}M_{kk'}$ term (8.6). With skip weights, the three new blocks
+are $M_{kk'}x_ix_{i'}$, $M_{kk'}x_iz_j$, and
+$x_ix_{i'}h'(a_j)\sum_{k'}M_{kk'}w_{k'j}^{(2)}$ (8.7).
+
+For vector outputs and squared error, twice differentiating gives
+
+$$
+H_{ij}=\sum_n\left[
+\left(\frac{\partial\mathbf y_n}{\partial w_j}\right)^T
+\frac{\partial\mathbf y_n}{\partial w_i}
++(\mathbf y_n-\mathbf t_n)^T
+\frac{\partial^2\mathbf y_n}{\partial w_j\partial w_i}
+\right].
+$$
+
+Dropping the residual-weighted second term gives $H\simeq\sum_nB_nB_n^T$ (8.8). At the
+population squared-error optimum, $\mathbf y(x)=\mathbb E[\mathbf t\mid x]$, so that second term
+vanishes exactly in expectation (8.9). Binary cross-entropy instead gives
+$H\simeq\sum_n y_n(1-y_n)\mathbf b_n\mathbf b_n^T$, with
+$\mathbf b_n=\nabla a_n$ (8.10). Softmax gives the output-curvature matrix
+$\operatorname{diag}(\mathbf y_n)-\mathbf y_n\mathbf y_n^T$ between the two pre-activation
+Jacobians (8.11). Exercise 8.12 is the Sherman--Morrison inverse update stated in the Hessian
+section.
+
+### Exercises 8.13--8.18: automatic differentiation
+
+Exercise 8.13 is the soft-ReLU symbolic derivative checked above, and 8.14 is the logistic-map
+expression-swell figure. For the trace in Figure 8.4, forward mode follows
+$\dot v_i=\sum_{j\in\mathrm{pa}(i)}\dot v_j\,\partial v_i/\partial v_j$ (8.15), while reverse mode
+follows $\bar v_i=\sum_{j\in\mathrm{ch}(i)}\bar v_j\,\partial v_j/\partial v_i$ from
+$\bar v_7=1$ (8.16). Substitution of $(x_1,x_2)=(1,2)$ produces
+$\partial f/\partial x_1=2+2e^2$ in either mode (8.17). Finally, expanding
+$\mathbf r=\sum_i r_i\mathbf e_i$ gives
+$J\mathbf r=\sum_i r_iJ\mathbf e_i$, which a single forward pass computes by seeding
+$\dot{\mathbf x}=\mathbf r$ (8.18).
 
 ## Summary
 

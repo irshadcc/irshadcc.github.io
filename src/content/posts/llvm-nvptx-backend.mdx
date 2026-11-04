@@ -1,6 +1,6 @@
 ---
 title: "Inside LLVM: IR, TableGen and the NVPTX Backend"
-description: "How a CUDA kernel becomes PTX inside LLVM. This post reads LLVM IR and SSA form, watches the optimizer shrink a kernel pass by pass, follows the backend through the SelectionDAG, instruction selection and Machine IR, opens up TableGen, and ends with what makes the NVPTX backend different. Every listing is real LLVM 23 output."
+description: "How a CUDA kernel becomes PTX inside LLVM, with the syntax of each language explained piece by piece. This post reads LLVM IR (names, types, every instruction family, GEP, atomics, attributes, metadata) and writes and runs it by hand, watches the optimizer shrink a kernel pass by pass, follows the backend through the SelectionDAG, instruction selection and Machine IR, teaches TableGen from toy files up to NVPTX's real instruction definitions and the matcher table they compile to, and ends with what makes the NVPTX backend different: address spaces, shared memory, barriers, shuffles, atomics and hand-written kernels. Every listing is real LLVM 23 output."
 date: 2026-10-02
 tags: [Compilers, Draft]
 ---
@@ -12,6 +12,7 @@ import CodeStages from "../../utils/compiler/CodeStages.astro";
 import IrCfg from "../../utils/compiler/IrCfg.astro";
 import SelectionDag from "../../utils/compiler/SelectionDag.astro";
 import BackendPhases from "../../utils/compiler/BackendPhases.astro";
+import PtxAnatomy from "../../utils/gpu/PtxAnatomy.astro";
 import {
 	dotIr,
 	optStages,
@@ -20,6 +21,28 @@ import {
 	tablegenStages,
 	tablegenTags,
 } from "../../utils/compiler/llvmData";
+import {
+	atomicStages,
+	atomicTags,
+	madStages,
+	madTags,
+	reduceStages,
+	reduceTags,
+	reluStages,
+	reluTags,
+	sumsqStages,
+	sumsqTags,
+	tdClassStages,
+	tdClassTags,
+	tdMultiStages,
+	tdMultiTags,
+	tdTableStages,
+	tdTableTags,
+	tdValueStages,
+	tdValueTags,
+	warpStages,
+	warpTags,
+} from "../../utils/compiler/llvmSyntaxFigures";
 
 ## Background
 
@@ -31,17 +54,22 @@ that compiler is **LLVM**: Clang compiles CUDA with it, Triton (and so
 
 Knowing how LLVM works explains things you see every day when you read generated code. Why does
 `a * x[i] + y[i]` become a single `fma` instruction? Why does the PTX declare loads as
-`ld.global` when the source only had plain pointers? Why does PTX never spill a register, while
-the same kernel in SASS (the GPU's real machine code) does? Each answer lives in a specific part
-of LLVM.
+`ld.global` when the source only had plain pointers? Why does a float `atomicAdd` sometimes turn
+into a loop? Why does PTX never spill a register, while the same kernel in SASS (the GPU's real
+machine code) does? Each answer lives in a specific part of LLVM, and to find it you have to be
+able to read three languages: LLVM IR, TableGen and PTX.
 
-This post follows one small kernel through all of it. It starts with the big picture, then reads
-**LLVM IR**, the language at the centre. Next comes the **optimizer**, then the **backend** that
-turns IR into machine code: the SelectionDAG, instruction selection, Machine IR and code
-emission. Then **TableGen**, the language that describes a target to the backend, and finally
-what is special about the **NVPTX backend**, LLVM's code generator for NVIDIA GPUs. Every listing
-is real output from LLVM 23.1.2, and every link into LLVM's source points at the same pinned
-commit.
+This post teaches the first two from the syntax up, and follows one small kernel through all of
+LLVM. It starts with the big picture, then reads **LLVM IR**, the language at the centre: names,
+types, every family of instructions, attributes and metadata, ending with a program written and
+run by hand. Next comes the **optimizer**, then the **backend** that turns IR into machine code:
+the SelectionDAG, instruction selection, Machine IR and code emission, with a guide to reading
+each one's dumps. Then **TableGen**, the language that describes a target to the backend, from toy
+files to NVPTX's real instruction definitions and the C++ they generate. Finally, the **NVPTX
+backend**, LLVM's code generator for NVIDIA GPUs, through kernels that use shared memory,
+barriers, warp shuffles, atomics and vector loads. Every listing is real output from LLVM 23.1.2,
+and every link into LLVM's source points at the same pinned commit. The [PTX post](/blog/ptx/)
+covers the output language itself.
 
 ## The big picture
 
@@ -96,13 +124,16 @@ The rest of the post explains each step of that journey.
 
 ### Modules, functions and blocks
 
-Here is the optimized IR of `saxpy`, with attribute lists and metadata dropped:
+Here is the complete IR Clang writes for `saxpy` at `-O2`, nothing removed:
 
 ```llvm
+; ModuleID = 'saxpy.cu'
+source_filename = "saxpy.cu"
 target datalayout = "e-p6:32:32-i64:64-i128:128-i256:256-v16:16-v32:32-n16:32:64"
 target triple = "nvptx64-nvidia-cuda"
 
-define dso_local ptx_kernel void @saxpy(i32 noundef %0, float noundef %1, ptr nofree noundef readonly captures(none) %2, ptr nofree noundef captures(none) %3) local_unnamed_addr {
+; Function Attrs: mustprogress nofree noinline norecurse nosync nounwind willreturn memory(argmem: readwrite)
+define dso_local ptx_kernel void @saxpy(i32 noundef %0, float noundef %1, ptr nofree noundef readonly captures(none) %2, ptr nofree noundef captures(none) %3) local_unnamed_addr #0 {
   %5 = tail call noundef i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
   %6 = tail call noundef i32 @llvm.nvvm.read.ptx.sreg.ntid.x()
   %7 = mul i32 %5, %6
@@ -114,50 +145,364 @@ define dso_local ptx_kernel void @saxpy(i32 noundef %0, float noundef %1, ptr no
 11:                                               ; preds = %4
   %12 = sext i32 %9 to i64
   %13 = getelementptr inbounds [4 x i8], ptr %2, i64 %12
-  %14 = load float, ptr %13, align 4
+  %14 = load float, ptr %13, align 4, !tbaa !8
   %15 = fmul contract float %1, %14
   %16 = getelementptr inbounds [4 x i8], ptr %3, i64 %12
-  %17 = load float, ptr %16, align 4
+  %17 = load float, ptr %16, align 4, !tbaa !8
   %18 = fadd contract float %15, %17
-  store float %18, ptr %16, align 4
+  store float %18, ptr %16, align 4, !tbaa !8
   br label %19
 
 19:                                               ; preds = %11, %4
   ret void
 }
 
-declare noundef range(i32 0, 2147483647) i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
-declare noundef range(i32 1, 1025) i32 @llvm.nvvm.read.ptx.sreg.ntid.x()
-declare noundef range(i32 0, 1024) i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 2147483647) i32 @llvm.nvvm.read.ptx.sreg.ctaid.x() #1
+
+; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 1, 1025) i32 @llvm.nvvm.read.ptx.sreg.ntid.x() #1
+
+; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 1024) i32 @llvm.nvvm.read.ptx.sreg.tid.x() #1
+
+attributes #0 = { mustprogress nofree noinline norecurse nosync nounwind willreturn memory(argmem: readwrite) "frame-pointer"="all" "no-trapping-math"="true" "stack-protector-buffer-size"="8" "target-cpu"="sm_90" "target-features"="+sm_90" "uniform-work-group-size" }
+attributes #1 = { mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+
+!llvm.module.flags = !{!0, !1}
+!llvm.ident = !{!2}
+!llvm.errno.tbaa = !{!3}
+
+!0 = !{i32 4, !"nvvm-reflect-ftz", i32 0}
+!1 = !{i32 7, !"frame-pointer", i32 2}
+!2 = !{!"Homebrew clang version 23.1.2"}
+!3 = !{!4, !5, i64 0}
+!4 = !{!"__libc_errno", !5, i64 0}
+!5 = !{!"int", !6, i64 0}
+!6 = !{!"omnipotent char", !7, i64 0}
+!7 = !{!"Simple C++ TBAA"}
+!8 = !{!9, !9, i64 0}
+!9 = !{!"float", !6, i64 0}
 ```
 
-It has four levels, each inside the one before:
+That looks like a lot, but it has only four levels, each inside the one before:
 
 - A **module** is one file of IR. It starts with the **target triple** (here
   `nvptx64-nvidia-cuda`) and the **data layout**, which records facts the optimizer needs about
-  the target, such as type sizes and alignments.
+  the target, such as type sizes and alignments. Then come globals, functions, attribute groups and
+  metadata, in any order.
 - A **function** is a `define` with a body, or a `declare` without one. Its parameters are
   `%0` to `%3`, in source order: `n`, `a`, `x`, `y`.
 - A **basic block** is a straight run of instructions with one way in (the top) and one way out
   (its last instruction). This function has three: the entry block, `%11` (the `if` body) and
   `%19` (the return).
-- The last instruction of every block is a **terminator**: a branch (`br`) or a return (`ret`).
+- The last instruction of every block is a **terminator**: a branch (`br`), a `switch` or a
+  return (`ret`).
 
-Values without a source name are numbered in order: `%0` to `%3` are the parameters, `%4` is the
-entry block (which has no label line), and so on.<Sidenote>That is why the entry block's number,
-`%4`, appears only in the `; preds = %4` comments. Names like `%x` show up instead when the front
-end keeps the source names, as Clang does in debug builds.</Sidenote>
+Everything after `;` on a line is a comment. Clang adds comments of its own: the `; preds = %4`
+after a block label lists the blocks that branch to it, and `; Function Attrs:` repeats a
+function's attribute group in readable form. The rest of this section takes the listing apart
+piece by piece.
 
-### Types and instructions
+#### Names and sigils
 
-IR is **typed**. `i32` is a 32-bit integer, `i1` a single bit (a boolean), `float` a 32-bit float,
-and `ptr` a pointer. There are vectors (`<4 x float>`) and arrays (`[4 x i8]`) too. Integer types
-carry no sign: the instruction says how to treat the bits, so the comparison is `icmp slt`
-("signed less than") and the widening of `i` is `sext` ("sign extend").
+Every name in IR starts with a character that says what kind of thing it is. Once you know the
+five, the listing becomes much easier to scan.
 
-Most instructions read like assembly for a machine with unlimited registers. The one that
-surprises people is **getelementptr** (GEP), which only computes an address and never touches
-memory:
+| Sigil | Names | Example | Scope |
+| ----- | ----- | ------- | ----- |
+| `@` | a global: function or global variable | `@saxpy`, `@llvm.nvvm.read.ptx.sreg.tid.x` | the module |
+| `%` | a local value: parameter, instruction result, block label | `%0`, `%13`, `%11` | one function |
+| `%` (at top level) | a named type | `%struct.Particle` | the module |
+| `#` | an attribute group | `#0` | the module |
+| `!` | metadata | `!8`, `!llvm.module.flags` | the module |
+
+Names are either **named** (`%x`, `@saxpy`) or **numbered** (`%13`). Unnamed values are numbered
+in order, starting at 0 in each function: `%0` to `%3` are the parameters, `%4` is the entry block
+(which has no label line), and so on. Clang keeps source names only in debug builds, so optimized
+IR is mostly numbers.<Sidenote>That is why the entry block's number, `%4`, appears only in the
+`; preds = %4` comments. Names with odd characters are quoted, as in `@"my name"`. Numbering is
+strict: if you write IR by hand with numbered values, they must appear in order with no
+gaps.</Sidenote>
+
+#### Reading one instruction
+
+Most lines have the same shape: a result, an opcode, optional flags, a type, and operands. Hover
+or tap each part of the multiply-add's second half:
+
+<PtxAnatomy
+	title="One IR instruction: %18 = fadd contract float %15, %17"
+	parts={[
+		{ text: "%18 =", kind: "guard", label: "result", note: "The value this instruction defines. <code>%</code> makes it local to the function. In SSA form it is assigned exactly once, here and nowhere else. Instructions that produce nothing, like <code>store</code> and <code>br</code>, have no <code>%x =</code>." },
+		{ text: "fadd", kind: "op", label: "opcode", note: "Floating-point add. Integer add is a different opcode, <code>add</code>: IR never decides from the type which operation you meant." },
+		{ text: "contract", kind: "mod", label: "fast-math flag", note: "Allows this add to be fused with the multiply that feeds it into one fused multiply-add. Other fast-math flags are <code>nnan</code>, <code>ninf</code>, <code>nsz</code>, <code>arcp</code>, <code>afn</code>, <code>reassoc</code>, and <code>fast</code> for all of them." },
+		{ text: "float", kind: "type", label: "type", note: "The type of both operands and of the result. It is written once, before the operands. IR never converts types implicitly: both operands must be <code>float</code>, or the file does not parse." },
+		{ text: "%15, %17", kind: "operand", label: "operands", note: "The values added: the product <code>a * x[i]</code> (<code>%15</code>) and the loaded <code>y[i]</code> (<code>%17</code>). An operand can also be a constant, such as <code>1.0</code>." },
+	]}
+/>
+
+Function headers carry more parts, because a function has properties of its own and so does each
+parameter:
+
+<PtxAnatomy
+	title="A function definition"
+	parts={[
+		{ text: "define", kind: "op", label: "keyword", note: "<code>define</code> starts a function with a body. <code>declare</code> starts one without, like the three intrinsics at the end of the module, defined elsewhere." },
+		{ text: "dso_local", kind: "mod", label: "preemption", note: "The function resolves to this definition inside the same linked unit (the DSO), so calls to it need no indirection." },
+		{ text: "ptx_kernel", kind: "mod", label: "calling conv.", note: "The calling convention. <code>ptx_kernel</code> makes the function a kernel, a PTX <code>.entry</code> the host can launch. Without it the function is a device function, a PTX <code>.func</code>." },
+		{ text: "void", kind: "type", label: "return type", note: "What the function returns. Kernels always return <code>void</code>." },
+		{ text: "@saxpy", kind: "guard", label: "name", note: "A global name: <code>@</code>. <code>extern \"C\"</code> in the source kept it unmangled; without it the name would be <code>@_Z5saxpyifPKfPf</code>." },
+		{ text: "(i32 noundef %0,", kind: "operand", label: "param 0: n", note: "A parameter is a type, optional <b>parameter attributes</b>, and a name. <code>noundef</code> promises the value is never undefined or poison." },
+		{ text: "float noundef %1,", kind: "operand", label: "param 1: a", note: "The scalar <code>a</code>." },
+		{ text: "ptr nofree noundef readonly captures(none) %2,", kind: "operand", label: "param 2: x", note: "The pointer <code>x</code>. The optimizer inferred these attributes from the body: the function never frees it (<code>nofree</code>), only reads through it (<code>readonly</code>, because it was <code>const float *</code> and is only loaded), and doesn't store the pointer anywhere that outlives the call (<code>captures(none)</code>)." },
+		{ text: "ptr nofree noundef captures(none) %3)", kind: "operand", label: "param 3: y", note: "The pointer <code>y</code>: no <code>readonly</code>, because the kernel stores through it." },
+		{ text: "local_unnamed_addr", kind: "mod", label: "address", note: "The function's address is not significant inside this module, so it could be merged with an identical function." },
+		{ text: "#0", kind: "mod", label: "attributes", note: "A reference to <b>attribute group</b> <code>#0</code>, defined at the end of the module. Groups let many functions share one long attribute list." },
+	]}
+/>
+
+#### Global variables and linkage
+
+A **global variable** is a module-level `@name` that holds memory. Its value is always a
+*pointer* to that memory, so `@buf` has type `ptr`, whatever it stores. Here is one from a kernel
+later in this post, a CUDA `__shared__ float buf[256]`:
+
+<PtxAnatomy
+	title="A global variable"
+	parts={[
+		{ text: "@_ZZ9block_sumE3buf =", kind: "guard", label: "name", note: "The C++-mangled name of <code>buf</code>, local to function <code>block_sum</code>." },
+		{ text: "internal", kind: "mod", label: "linkage", note: "Visible only inside this module, like a C <code>static</code>. See the linkage table below." },
+		{ text: "unnamed_addr", kind: "mod", label: "address", note: "Only the contents matter, not the address, so identical constants may be merged." },
+		{ text: "addrspace(3)", kind: "mod", label: "address space", note: "Which memory the variable lives in. On NVPTX, 3 is shared memory. The default, 0, is the generic space." },
+		{ text: "global", kind: "op", label: "kind", note: "<code>global</code> is writable. <code>constant</code> promises that the contents never change, which lets the optimizer fold loads from it." },
+		{ text: "[256 x float]", kind: "type", label: "value type", note: "The type of the memory: an array of 256 floats, 1024 bytes." },
+		{ text: "undef,", kind: "operand", label: "initializer", note: "Shared memory can't be initialized, so the initial value is <code>undef</code>. A normal global would have <code>zeroinitializer</code> or a constant here; an <code>external</code> one has none." },
+		{ text: "align 4", kind: "mod", label: "alignment", note: "The address is a multiple of 4 bytes." },
+	]}
+/>
+
+**Linkage** says who else can see a global. The common ones, and what produces them from C++:
+
+| Linkage | Visible to | Produced by |
+| ------- | ---------- | ----------- |
+| (none written) = `external` | other modules | an ordinary function or global |
+| `internal` | this module only | `static`, anonymous namespaces, function-local statics |
+| `private` | this module only, and not even in the symbol table | string literals, compiler-made constants |
+| `linkonce_odr` | merged with identical copies; dropped if unused | inline functions, templates |
+| `weak_odr` | merged with identical copies; kept | explicit template instantiations |
+
+A few global declarations, all accepted by `llvm-as`:
+
+```llvm
+@counter = internal global i32 0, align 4
+@table   = private unnamed_addr constant [3 x i32] [i32 1, i32 2, i32 4], align 4
+@weights = external addrspace(4) global [16 x float]    ; defined elsewhere, in constant memory
+```
+
+#### Attributes
+
+**Attributes** are facts and promises attached to functions, parameters and return values. Front
+ends add some, and the optimizer's attribute-inference passes (`PostOrderFunctionAttrs` in the
+[optimizer table](#the-optimizer)) add more. Later passes rely on them: a `readonly` pointer
+can't be the target of a store, so loads through it can move freely. The ones in this post:
+
+| Attribute | On | Means |
+| --------- | -- | ----- |
+| `noundef` | param, return | the value is never `undef` or `poison` |
+| `readonly`, `writeonly` | pointer param | the function only reads, or only writes, through it |
+| `captures(none)` | pointer param | the pointer doesn't outlive the call |
+| `noalias` | pointer param | no other pointer reaches the same memory (from `__restrict__`) |
+| `byval(T)` | pointer param | the argument is a copy of a `T`, passed by value |
+| `range(i32 0, 1024)` | return | the result lies in $[0, 1024)$ |
+| `nounwind` | function | never throws |
+| `memory(argmem: readwrite)` | function | touches only memory reachable from its pointer arguments |
+| `convergent` | function, call | can't be made control-dependent on more values (barriers, shuffles) |
+| `"target-cpu"="sm_90"` | function | a string attribute: free-form key and value for the backend |
+
+`convergent` matters on GPUs. A barrier must be reached by all threads of a block together, so the
+optimizer must not, for example, move a `__syncthreads()` inside an `if` that only some threads
+take. The [reduction kernel](#shared-memory-and-barriers) below carries it.
+
+#### Metadata
+
+**Metadata** is information about the code that is not part of its meaning: dropping it must
+never change what the program computes, only how well it is optimized or debugged. Metadata nodes
+are written `!{...}`, numbered `!0`, `!1`, ..., and attached to instructions after a comma:
+
+- `!tbaa !8` on the loads and store is **type-based alias analysis** metadata. `!8` says "an
+  access to a `float`" (whose type node is `!9`); `int` has the type node `!5`. C++'s aliasing rules say a
+  `float` access and an `int` access can never touch the same memory, and this is how the
+  optimizer learns it.
+- `!llvm.module.flags` is a **named metadata** list of module-wide flags. `!0 = !{i32 4,
+  !"nvvm-reflect-ftz", i32 0}` reads: behaviour 4 (*override* when modules are linked), key
+  `nvvm-reflect-ftz`, value 0. The [NVVMReflect](#special-registers-intrinsics-and-nvvmreflect)
+  pass reads it.
+- `!llvm.loop !10` on a loop's back-edge branch carries loop hints, such as "don't unroll"; one
+  appears in the [reduction kernel](#shared-memory-and-barriers).
+
+### Types
+
+IR is **typed**, and every value has exactly one type. The full set is small:
+
+| Type | Example | Notes |
+| ---- | ------- | ----- |
+| integer `iN` | `i1`, `i8`, `i32`, `i64`, `i33` | any width from 1 bit; no sign |
+| floating point | `half`, `bfloat`, `float`, `double` | 16, 16, 32 and 64 bits |
+| pointer | `ptr`, `ptr addrspace(3)` | opaque: no pointee type, only an address space |
+| vector | `<4 x float>` | SIMD values; arithmetic works lane by lane |
+| array | `[256 x float]` | fixed length, in memory |
+| structure | `{ float, float, i32 }`, `<{ i8, i32 }>` | fields in order; `<{ }>` is packed, without padding |
+| named struct | `%Particle = type { float, float, i32 }` | a struct with a name, defined at top level |
+| `void`, `label` | | no value; a basic block |
+
+Integer types carry no sign: the instruction says how to treat the bits, so the comparison in
+`saxpy` is `icmp slt` ("signed less than") and the widening of `i` is `sext` ("sign extend"). Odd
+widths are real. When `opt` rewrote the loop of [a hand-written program](#writing-and-running-ir-by-hand)
+below, it used an `i33` so that a product of two 32-bit values could not overflow.
+
+Pointers used to say what they point to (`float*`), but since LLVM 15 every pointer is just `ptr` (typed pointers were removed entirely in LLVM 17).
+The type of the memory is given by the instruction that uses it instead: `load float, ptr %13`
+loads a `float`.
+
+The **data layout** string says how big and how aligned each type is on the target. It is a list
+of specifications separated by `-`. Decoding NVPTX's:
+
+| Spec | Means |
+| ---- | ----- |
+| `e` | little-endian |
+| `p6:32:32` | pointers in address space 6 are 32 bits, 32-bit aligned (all others: the default, 64 bits) |
+| `i64:64` | `i64` is 64-bit aligned (likewise `i128:128`, `i256:256`) |
+| `v16:16`, `v32:32` | 16- and 32-bit vectors are aligned to their size |
+| `n16:32:64` | native integer widths: the optimizer prefers arithmetic in 16, 32 or 64 bits |
+
+A **constant** is written as its type and value: `i32 7`, `float 1.0`, `float 0x3FB99999A0000000`
+(floats that aren't exact in decimal are written in hex), `<4 x float> splat (float 2.0)`,
+`[3 x i32] [i32 1, i32 2, i32 4]`, `zeroinitializer`, `null`, and the two special values `undef`
+and `poison`, explained under [flags](#flags-and-poison).
+
+### Instructions
+
+LLVM IR has about 70 instructions (opcodes 1 to 69 in `Instruction.def`). They fall into a few families, and once you know one member of
+each, the rest read the same way. Every result in the tables below was checked by running the
+instructions with `lli`, LLVM's interpreter and JIT, on the host CPU.
+
+#### Arithmetic and bitwise
+
+`add`, `sub`, `mul` work on integers and don't care about sign: in two's complement the bits of
+the result are the same. Division, remainder and right shift do care, so each comes in two
+versions:
+
+| Instruction | Result | Why |
+| ----------- | -----: | --- |
+| `sdiv i32 -7, 2` | −3 | signed, rounds toward zero |
+| `udiv i32 -7, 2` | 2147483644 | the bits of −7 read as unsigned are $2^{32} - 7 = 4294967289$ |
+| `srem i32 -7, 2` | −1 | the remainder takes the dividend's sign |
+| `ashr i32 -8, 1` | −4 | arithmetic shift copies the sign bit in |
+| `lshr i32 -8, 1` | 2147483644 | logical shift fills with zero |
+
+The bitwise ones are `and`, `or`, `xor` and `shl`. Floating point has its own: `fadd`, `fsub`,
+`fmul`, `fdiv`, `frem` and `fneg`. All of them also work lane by lane on vectors:
+`fmul <4 x float> %v, splat (float 2.0)` doubles four floats at once, and `extractelement` /
+`insertelement` read and write one lane.
+
+#### Flags and poison
+
+Some instructions take flags that give the optimizer extra facts. On integer arithmetic, `nsw`
+("no signed wrap") and `nuw` ("no unsigned wrap") promise the operation doesn't overflow. If it
+does, the result is **poison**: a value that stands for "this computation went wrong". Poison is
+not immediately undefined behaviour. It spreads through the instructions that use it, and only
+becomes undefined behaviour when it matters, for example when a branch depends on it.
+
+That promise is worth a lot. Here are two functions that compute `x + 1 > x`, one with `nsw`
+and one without, and what `opt -passes=instcombine` makes of them:
+
+```llvm
+define i1 @with_nsw(i32 %x) {           ; after instcombine:
+  %y = add nsw i32 %x, 1                ;   ret i1 true
+  %c = icmp sgt i32 %y, %x
+  ret i1 %c
+}
+
+define i1 @without_nsw(i32 %x) {        ; after instcombine:
+  %y = add i32 %x, 1                    ;   %c = icmp ne i32 %x, 2147483647
+  %c = icmp sgt i32 %y, %x              ;   ret i1 %c
+  ret i1 %c
+}
+```
+
+With `nsw` the answer is always true, because $x + 1$ can't overflow. Without it, $x = 2^{31} - 1$
+wraps to $-2^{31}$, so the comparison is false for exactly that one value, and the optimizer has
+to keep a test for it. C and C++ say signed overflow is undefined, so Clang puts `nsw` on every
+signed `int` add. That is why a loop over `int i` optimizes better than one over `unsigned i`.
+
+Other flags work the same way: `exact` on `sdiv`/`udiv`/`ashr`/`lshr` (no remainder or bits
+shifted out), `nneg` on `zext` (the input is non-negative), `inbounds` and `nuw` on
+`getelementptr`, and the fast-math flags on floating point, such as `contract`.
+
+#### Comparisons and select
+
+`icmp` compares integers and `fcmp` floats; both return an `i1`. The predicate says how:
+
+| `icmp` | Means | `fcmp` | Means |
+| ------ | ----- | ------ | ----- |
+| `eq`, `ne` | equal, not equal | `oeq`, `one` | ordered: false if either is NaN |
+| `slt`, `sle`, `sgt`, `sge` | signed | `olt`, `ole`, `ogt`, `oge` | ordered |
+| `ult`, `ule`, `ugt`, `uge` | unsigned | `ueq`, `ult`, ... | unordered: true if either is NaN |
+
+The same bits compare differently under each: `icmp ult i32 -1, 1` is false, because −1 read as
+unsigned is $2^{32} - 1$, while `icmp slt i32 -1, 1` is true.
+
+`select` picks one of two values without branching, like C's `?:`:
+
+```llvm
+%neg = icmp slt i32 %x, 0
+%r = select i1 %neg, i32 0, i32 %x      ; r = x < 0 ? 0 : x
+```
+
+On a GPU this matters: a `select` keeps every thread of a warp on the same path, while a branch
+can make them diverge. NVPTX turns a `select` into `selp`, or into something better: the
+[hand-written kernel](#writing-nvptx-ir-by-hand) below shows a compare and a select becoming a
+single `max.f32`.
+
+#### Casts
+
+A **cast** changes a value's type. Each one says exactly what happens to the bits:
+
+| Cast | Example | Result |
+| ---- | ------- | -----: |
+| `trunc` | `trunc i32 300 to i8` | 44 (keeps the low 8 bits: $300 - 256$) |
+| `zext` | `zext i8 -3 to i32` | 253 (fills with zeros) |
+| `sext` | `sext i8 -3 to i32` | −3 (copies the sign bit) |
+| `fptosi` | `fptosi float -2.7 to i32` | −2 (rounds toward zero) |
+| `sitofp`, `uitofp` | `sitofp i32 -2 to float` | −2.0 |
+| `fptrunc`, `fpext` | `fpext float %f to double` | the same number, wider |
+| `bitcast` | `bitcast float 1.0 to i32` | 1065353216, which is `0x3F800000`: the same bits |
+| `ptrtoint`, `inttoptr` | `ptrtoint ptr %p to i64` | the address as an integer |
+| `addrspacecast` | `addrspacecast ptr %p to ptr addrspace(1)` | the same object, seen from another address space |
+
+`addrspacecast` is the one the NVPTX backend cares about most; it is how generic pointers
+become [global ones](#kernel-parameters-and-address-spaces).
+
+#### Memory
+
+Three instructions touch memory, and they are deliberately simple:
+
+```llvm
+%p = alloca i32, align 4              ; reserve 4 bytes on the stack, %p points to them
+store i32 7, ptr %p, align 4          ; write: no result
+%v = load i32, ptr %p, align 4        ; read: %v = 7
+```
+
+`alloca` reserves stack memory for the life of the function. `load` names the type it reads and
+the pointer it reads from; `store` names the value it writes and the pointer it writes to. `align
+4` promises the address is a multiple of 4. A `volatile` keyword stops the optimizer from removing
+or merging the access. Clang's `-O0` output puts every local variable in an `alloca`; the
+[optimizer section](#the-optimizer) shows how they disappear.
+
+#### getelementptr
+
+The instruction that surprises people is **getelementptr** (GEP). It only computes an address and
+never touches memory. In `saxpy`:
 
 ```llvm
 %13 = getelementptr inbounds [4 x i8], ptr %2, i64 %12
@@ -166,6 +511,95 @@ memory:
 reads "start at `%2` (that is `x`) and step `%12` elements of type `[4 x i8]`", which is $4 \cdot
 i$ bytes. Check one entry: for $i = 3$, `%13` is `x + 12`, the address of `x[3]`. The `load` on
 the next line then reads it.
+
+GEP gets interesting with structs and nested arrays, where it takes several indices. The first
+index steps over whole objects of the given type; each later one goes one level inside:
+
+<PtxAnatomy
+	title="getelementptr into an array of structs: &p[i].y"
+	parts={[
+		{ text: "%q =", kind: "guard", label: "result", note: "A pointer. No memory is read or written." },
+		{ text: "getelementptr", kind: "op", label: "opcode", note: "Address arithmetic, in units the type defines." },
+		{ text: "inbounds", kind: "mod", label: "flag", note: "Promises the result stays inside the object <code>%p</code> points into. If not, the result is poison. This lets the optimizer assume, for example, that the address doesn't wrap around." },
+		{ text: "%Particle,", kind: "type", label: "source type", note: "The type the indices walk through. Here <code>%Particle = type { float, float, i32 }</code>: 12 bytes, fields at offsets 0, 4 and 8." },
+		{ text: "ptr %p,", kind: "operand", label: "base", note: "The pointer to start from." },
+		{ text: "i64 %i,", kind: "operand", label: "index 1", note: "Steps over whole <code>Particle</code>s: <code>%i * 12</code> bytes. This is the <code>[i]</code>." },
+		{ text: "i32 1", kind: "operand", label: "index 2", note: "Goes inside the struct, to field 1, <code>y</code>: plus 4 bytes. Struct field indices must be constants, since each field has its own offset and type." },
+	]}
+/>
+
+So `&p[2].y` is $2 \cdot 12 + 4 = 28$ bytes from `p`. For a 2-D array, `getelementptr [4 x [8 x
+float]], ptr %g, i64 0, i64 %r, i64 %c` is `&g[r][c]`: the leading `0` stays on the first array,
+then $r$ rows of 32 bytes and $c$ floats of 4, so `&g[2][3]` is $2 \cdot 32 + 3 \cdot 4 = 76$.
+Both offsets were checked by running the GEPs with `lli` on a null base and printing them as
+integers.<Sidenote>`ptrtoint (getelementptr %Particle, ptr null, i64 2, i32 1)` printed 28, and the
+2-D one 76; `getelementptr %Particle, ptr null, i64 1` printed 12, the struct's size. This
+"GEP from null" trick is how IR computes `sizeof` and `offsetof`.</Sidenote>
+
+The optimizer rewrites these into a canonical byte-based form. `opt -passes=instcombine` turns the
+struct GEP into two simpler ones:
+
+```llvm
+%q.split = getelementptr inbounds [12 x i8], ptr %p, i64 %i    ; + 12 * i
+%q = getelementptr inbounds nuw i8, ptr %q.split, i64 4        ; + 4
+```
+
+which is the same `[4 x i8]` style seen in `saxpy`. NVPTX then selects `mad.lo.s64 %rd3, %rd2,
+12, %rd1` and `add.s64 %rd4, %rd3, 4`: the address is $12 i + p + 4$.
+
+#### Control flow and calls
+
+Terminators end a block and say where to go next:
+
+```llvm
+br i1 %10, label %11, label %19        ; conditional: true → %11, false → %19
+br label %19                           ; unconditional
+switch i32 %k, label %other [          ; jump table: 0 → %zero, 1 → %one, else %other
+  i32 0, label %zero
+  i32 1, label %one
+]
+ret void                               ; return nothing; ret i32 %v returns a value
+unreachable                            ; control never gets here
+```
+
+`call` runs a function: `%5 = tail call noundef i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()`. The
+`tail` marker says the callee doesn't use the caller's stack, `noundef` is an attribute on the
+return value, and then come the return type, the callee and the arguments. A **variadic** call,
+such as to `printf`, writes the function's type first: `call i32 (ptr, ...) @printf(ptr @fmt,
+i32 %v)`.
+
+#### Atomics
+
+Atomic instructions read and modify memory as one indivisible step, so threads running at the
+same time can't interfere. They carry two extra pieces of syntax: an **ordering** and,
+optionally, a **synchronization scope**.
+
+<PtxAnatomy
+	title="An atomic float add at device scope"
+	parts={[
+		{ text: "%old =", kind: "guard", label: "result", note: "The value that was in memory before the add." },
+		{ text: "atomicrmw fadd", kind: "op", label: "op", note: "Atomic read-modify-write. The operation can be <code>xchg</code>, <code>add</code>, <code>sub</code>, <code>and</code>, <code>or</code>, <code>xor</code>, <code>max</code>, <code>min</code>, <code>umax</code>, <code>umin</code>, <code>fadd</code>, <code>fsub</code>, <code>fmax</code>, <code>fmin</code> and a few more." },
+		{ text: "ptr addrspace(1) %p,", kind: "operand", label: "address", note: "Where: a pointer into global memory." },
+		{ text: "float %v", kind: "operand", label: "value", note: "What to add." },
+		{ text: "syncscope(\"device\")", kind: "mod", label: "scope", note: "Which threads the atomicity is guaranteed against. Target-specific; NVPTX knows <code>\"block\"</code>, <code>\"cluster\"</code> and <code>\"device\"</code>. Leaving it out means the whole system, including the CPU." },
+		{ text: "monotonic", kind: "mod", label: "ordering", note: "How it orders other memory accesses. From weakest: <code>unordered</code>, <code>monotonic</code> (atomic, no ordering of other accesses; C++ <code>relaxed</code>), <code>acquire</code>, <code>release</code>, <code>acq_rel</code>, <code>seq_cst</code>." },
+		{ text: "align 4", kind: "mod", label: "alignment", note: "Atomics must be naturally aligned." },
+	]}
+/>
+
+The other atomics are `cmpxchg` (compare and swap), `fence` (an ordering without an access) and
+`load atomic` / `store atomic`. `cmpxchg` returns a struct of two values, the old value and a
+success bit, which `extractvalue` takes apart:
+
+```llvm
+%pair = cmpxchg ptr @counter, i32 0, i32 1 acq_rel monotonic, align 4  ; if 0, make it 1
+%got  = extractvalue { i32, i1 } %pair, 0                              ; the old value
+%ok   = extractvalue { i32, i1 } %pair, 1                              ; did it swap?
+```
+
+It takes two orderings: one for success and one, never stronger, for failure. The
+[NVPTX section](#warp-shuffles-and-atomics) shows how these become PTX `atom` instructions, and
+when an `atomicrmw` becomes a `cmpxchg` loop instead.
 
 ### SSA form and φ-nodes
 
@@ -202,9 +636,10 @@ Block `%7` is the loop body, and it branches back to itself. Its first instructi
 ```
 
 reads "`%8` is `%17` if we arrived from `%7` (the previous trip), or `0` if we arrived from the
-entry block `%3`". So `%8` is `i`, and `%17 = %8 + 1` is `i + 1`, ready for the next trip. In the
-same way `%9` is the sum coming into a trip and `%16` the sum going out. Running it with $n = 3$,
-$x = (1, 2, 3)$ and $y = (4, 5, 6)$:
+entry block `%3`". Each `[ value, block ]` pair is one incoming edge, and a φ needs exactly one
+pair per predecessor. So `%8` is `i`, and `%17 = %8 + 1` is `i + 1`, ready for the next trip. In
+the same way `%9` is the sum coming into a trip and `%16` the sum going out. Running it with $n =
+3$, $x = (1, 2, 3)$ and $y = (4, 5, 6)$:
 
 | trip | `%8` ($i$) | `%9` ($s$ in) | `%12` ($x_i$) | `%14` ($y_i$) | `%16` ($s$ out) | `%17` ($i+1$) |
 | ---: | ---------: | ------------: | ------------: | ------------: | --------------: | ------------: |
@@ -217,6 +652,11 @@ After the third trip `%17 = 3` equals $n$, so the branch goes to `%5`, whose φ-
 entry for arriving straight from `%3`, when $n \le 0$ and the loop never runs: then the result is
 `0.0`.
 
+SSA comes with one rule that the IR verifier enforces: a definition must **dominate** every use.
+Block $A$ dominates block $B$ if every path from the entry to $B$ passes through $A$; within one
+block, the definition must come first. A φ is the exception that makes loops possible: its
+operand `%17` only has to dominate the end of the predecessor block `%7`, not the φ itself.
+
 ### Intrinsics, flags and address spaces
 
 Three more things in the `saxpy` IR are worth knowing, because the NVPTX backend leans on them.
@@ -225,7 +665,9 @@ Three more things in the `saxpy` IR are worth knowing, because the NVPTX backend
 itself. `threadIdx.x` became a call to `@llvm.nvvm.read.ptx.sreg.tid.x`, which reads a PTX
 **special register**. Its declaration carries `range(i32 0, 1024)`: a block has at most 1024
 threads, and telling the optimizer so lets it prove facts like "this index can't overflow".
-Target-independent intrinsics exist too, such as `@llvm.fma.f32`.
+Target-independent intrinsics exist too, such as `@llvm.fma.f32`. An intrinsic's name encodes its
+types when it is generic: `@llvm.fma.f32` and `@llvm.fma.v4f32` are the same intrinsic on `float`
+and `<4 x float>`.
 
 **Flags** on instructions grant extra freedom. `contract` on `fmul` and `fadd` allows the two to
 be fused into one fused multiply-add, which rounds once instead of twice. Clang adds it because
@@ -250,6 +692,51 @@ Two newer ones, tensor (6) and shared memory across a cluster (7), are left out 
 A load through a generic pointer has to check where the address falls; a load through a global
 pointer doesn't. We'll see the backend turn `saxpy`'s generic pointers into global ones in the
 [NVPTX section](#kernel-parameters-and-address-spaces).
+
+### Writing and running IR by hand
+
+The best way to learn the syntax is to write some. IR is a real programming language: `lli` runs
+it, `opt` optimizes it, and `llc` compiles it for any target LLVM supports. Here is a complete
+module, written by hand, that computes $\sum_{i=1}^{n} i^2$ with a loop and prints the result for
+$n = 4$. Step through it: the source, what `lli` prints, and what `opt -O2` makes of it.
+
+<CodeStages stages={sumsqStages} tags={sumsqTags} step={0} maxLines={30} title="A hand-written module: write, run, optimize" />
+
+Things to notice in the source:
+
+- Blocks have names (`entry`, `loop`, `exit`) and values have names (`%i`, `%s.next`). Names
+  make hand-written IR readable; `opt` keeps them.
+- The loop needs two φ-nodes, one for each variable the C version would update: `%i` and the
+  running sum `%s`. Each takes its start value from `entry` and its next value from `loop`
+  itself.
+- `exit` has its own φ, because it can be reached two ways: straight from `entry` when $n < 1$
+  (result 0), or from the loop (result `%s.next`).
+- The string is a `private` constant of type `[12 x i8]`: 10 characters, a newline (`\0A`) and
+  a terminating zero (`\00`), each escape counting as one byte.
+
+`lli` prints `sumsq = 30`, and $1 + 4 + 9 + 16 = 30$. The optimized version is more surprising:
+there is no loop left. The `IndVarSimplify` pass worked out the sum's value at loop exit as a
+polynomial in $n$, and once nothing used the loop any more, it was deleted.<Sidenote>To check the
+closed form, a Python script evaluated it with the same wrap-around arithmetic for $n = 1, \ldots,
+7$ and got $1, 5, 14, 30, 55, 91, 140$, matching the loop. The constant 1431655766 is
+$(2^{32} + 2) / 3$. Multiplying an exact multiple of 3 by it, modulo $2^{32}$, gives two thirds
+of that number: a division by 3 without a divide instruction.</Sidenote> `main` was reduced to printing the constant 30.
+
+When the syntax is wrong, the tools say exactly where. These are real error messages from `opt`
+on small broken files, and the first one came from this very example, written with the string's
+length miscounted as 13:
+
+| Mistake | Message |
+| ------- | ------- |
+| array length doesn't match the string | `error: constant expression type mismatch: got type '[12 x i8]' but expected '[13 x i8]'` |
+| operand of the wrong type | `error: '%y' defined with type 'i64' but expected 'i32'` |
+| assigning `%a` twice | `error: multiple definition of local value named 'a'` |
+| a block with no terminator | `error: expected instruction opcode` (at the closing `}`) |
+| a use before its definition | `Instruction does not dominate all uses!` |
+
+The last one parses fine but fails the **verifier**, the pass that checks SSA's rules after
+parsing and between passes. Running `opt -passes=verify` on any file is a quick way to check
+hand-written IR.
 
 ## The optimizer
 
@@ -286,6 +773,11 @@ anything. Step through them:
 slot's address escapes, so each slot is just a variable in disguise, and it replaces every load
 with the value last stored. This is the job textbooks call **mem2reg**, and it is how SSA form
 gets built in practice: front ends emit memory, and the optimizer promotes it to registers.
+
+You can run any pass on its own with `-passes=`, which is the best way to learn what one does.
+Pass names are the lower-case ones in the table (`sroa`, `early-cse`, `instcombine`), and
+several can be chained: `opt -passes='sroa,early-cse,instcombine' -S file.ll`. The
+`nsw` and GEP examples above were made exactly that way.
 
 The optimizer is mostly target-independent, but not target-blind. Passes ask the target
 questions through **TargetTransformInfo** (TTI), such as "is this instruction cheap?" or "which
@@ -340,6 +832,24 @@ Things to notice in the first step, **Built**:
 - The GEP is gone. It became plain arithmetic: `sign_extend` $i$ to 64 bits, shift left by 2
   (times 4 bytes), and `add` to the base pointer.
 
+#### Reading a DAG dump
+
+The figure is drawn from text dumps, one line per node, and those dumps are what you'll see when
+you debug selection yourself. One line, the load of `x[i]`:
+
+<PtxAnatomy
+	title="One SelectionDAG node from llc -debug-only=isel"
+	parts={[
+		{ text: "t11:", kind: "guard", label: "node id", note: "Nodes are numbered <code>t0</code>, <code>t1</code>, ... Other lines refer to this node as <code>t11</code>, or <code>t11:1</code> for its second result." },
+		{ text: "f32,ch", kind: "type", label: "result types", note: "A node can produce several values. A load produces the loaded <code>f32</code> and a new chain, <code>ch</code>, which later memory operations hang off." },
+		{ text: "= load", kind: "op", label: "opcode", note: "A generic node, <code>ISD::LOAD</code>. After selection it is replaced by a target node, such as <code>LD_i32</code>." },
+		{ text: "<(load (s32) from %ir.15, !tbaa !8, addrspace 1)>", kind: "mod", label: "memory operand", note: "What the load touches: 32 bits (<code>s32</code>), from IR value <code>%ir.15</code>, with its TBAA tag, in address space 1. The selector reads the address space from here to choose <code>ld.global</code>." },
+		{ text: "t0,", kind: "operand", label: "chain in", note: "The incoming chain: <code>t0</code>, the block's <code>EntryToken</code>. Operand 0 of a memory node is always its chain." },
+		{ text: "t8,", kind: "operand", label: "address", note: "The address, computed by node <code>t8</code>, an <code>add</code>." },
+		{ text: "undef:i64", kind: "operand", label: "offset", note: "An offset for indexed loads; unused here, so <code>undef</code>." },
+	]}
+/>
+
 ### Combining and legalizing
 
 Selection then alternates two kinds of rewrite.
@@ -386,31 +896,91 @@ patterns are not hand-written C++. They are written in TableGen and compiled int
 Selection also picks the cheapest of several matches. The `mul` and `add` that compute
 `i = blockIdx.x * blockDim.x + threadIdx.x` (in the entry block, not drawn) match both "`mul`,
 then `add`" and the single pattern `MAD_LO_S32rrr` for `add (mul a, b), c`. The bigger pattern
-wins, so the PTX has one `mad.lo.s32`.
+wins, so the PTX has one `mad.lo.s32`. [Later](#one-instruction-from-td-to-ptx) we follow exactly
+this instruction from its TableGen definition to the PTX.
 
 ### Machine IR and register allocation
 
 After selection the function is **Machine IR**: a list of target instructions in basic blocks,
 still in SSA form, on **virtual registers** (`%0`, `%1`, ...) that each belong to a **register
-class** (`b1`, `b32`, `b64`). This is the `if` body, from `llc -stop-after=finalize-isel`:
+class** (`b1`, `b32`, `b64`). This is the whole function, from `llc -stop-after=finalize-isel`:
 
 ```
+bb.0 (%ir-block.4):
+  successors: %bb.1(0x40000000), %bb.2(0x40000000)
+
+  %3:b32 = LD_i32 0, 0, 101, 3, 32, -1, &saxpy_param_1, 0 :: (dereferenceable invariant load (s32), addrspace 101)
+  %4:b32 = LD_i32 0, 0, 101, 3, 32, -1, &saxpy_param_0, 0 :: (dereferenceable invariant load (s32), addrspace 101)
+  %5:b64 = LD_i64 0, 0, 101, 3, 64, -1, &saxpy_param_2, 0 :: (dereferenceable invariant load (s64), addrspace 101)
+  %0:b64 = cvta_to_global_64 killed %5
+  %6:b64 = LD_i64 0, 0, 101, 3, 64, -1, &saxpy_param_3, 0 :: (dereferenceable invariant load (s64), addrspace 101)
+  %1:b64 = cvta_to_global_64 killed %6
+  %7:b32 = INT_PTX_SREG_CTAID_x
+  %8:b32 = INT_PTX_SREG_NTID_x
+  %9:b32 = INT_PTX_SREG_TID_x
+  %2:b32 = MAD_LO_S32rrr killed %7, killed %8, killed %9
+  %10:b1 = SETP_i32rr %2, killed %4, 5
+  CBranch killed %10, %bb.2, 0
+  GOTO %bb.1
+
 bb.1 (%ir-block.13):
   successors: %bb.2(0x80000000)
 
   %11:b64 = MUL_WIDEs32_ri %2, 4
   %12:b64 = ADD64rr %0, %11
-  %13:b32 = LD_i32 0, 0, 1, 3, 32, -1, killed %12, 0 :: (load (s32) from %ir.15, addrspace 1)
+  %13:b32 = LD_i32 0, 0, 1, 3, 32, -1, killed %12, 0 :: (load (s32) from %ir.15, !tbaa !8, addrspace 1)
   %14:b64 = ADD64rr %1, %11
-  %15:b32 = LD_i32 0, 0, 1, 3, 32, -1, %14, 0 :: (load (s32) from %ir.17, addrspace 1)
+  %15:b32 = LD_i32 0, 0, 1, 3, 32, -1, %14, 0 :: (load (s32) from %ir.17, !tbaa !8, addrspace 1)
   %16:b32 = contract FMA_F32rrr %3, killed %13, killed %15, 0
-  ST_i32 killed %16, 0, 0, 1, 32, %14, 0 :: (store (s32) into %ir.17, addrspace 1)
+  ST_i32 killed %16, 0, 0, 1, 32, %14, 0 :: (store (s32) into %ir.17, !tbaa !8, addrspace 1)
+
+bb.2 (%ir-block.20):
+  Return
 ```
 
-The bare numbers are instruction operands that TableGen defined, such as the address space (`1`,
-global) and access width (`32`) of the load. `killed` marks the last use of a register. Machine
-IR is where the late optimizations run: machine common-subexpression elimination, loop-invariant
-code motion, sinking, and peephole rewrites.
+#### Reading Machine IR
+
+A block header `bb.1 (%ir-block.13)` names the machine block and the IR block it came from.
+`successors:` lists where it can go, each with a branch probability as a fraction of
+`0x80000000`: `0x40000000` is 50%, so the entry block's two successors are equally likely. In
+each instruction, `%13:b32` is a virtual register with its class, `killed` marks a register's last
+use, and anything after `::` is a **memory operand**, the same description of the access the DAG
+had.
+
+The bare numbers are the instruction's other operands, and only its TableGen definition says what
+they mean. Here is the load of `x[i]`, decoded with the operand list of `LD_i32` from
+[`NVPTXInstrInfo.td`](https://github.com/llvm/llvm-project/blob/85ac560262434c9ccfc0c183ec22d4138ed647fb/llvm/lib/Target/NVPTX/NVPTXInstrInfo.td#L1940-L1953),
+`(ins AtomicCode:$sem, AtomicCode:$scope, AtomicCode:$addsp, AtomicCode:$Sign, i32imm:$fromWidth,
+UsedBytesMask:$usedBytes, ADDR:$addr)`:
+
+<PtxAnatomy
+	title="One Machine IR load, operand by operand"
+	parts={[
+		{ text: "%13:b32 =", kind: "guard", label: "def", note: "The result: virtual register 13, in the 32-bit class <code>b32</code>." },
+		{ text: "LD_i32", kind: "op", label: "opcode", note: "The TableGen record <code>LD_i32</code>, a load into a 32-bit register. Its asm string is <code>ld${sem:sem}${scope:scope}${addsp:addsp}.${Sign:sign}$fromWidth \\t$dst, [$addr];</code>." },
+		{ text: "0,", kind: "mod", label: "$sem", note: "Memory ordering 0, <code>NotAtomic</code>: a plain (\"weak\") load. Printed as nothing. An atomic load would print <code>.relaxed</code>, <code>.acquire</code>, ..." },
+		{ text: "0,", kind: "mod", label: "$scope", note: "Scope 0, <code>Thread</code>. Printed as nothing for a non-atomic load." },
+		{ text: "1,", kind: "mod", label: "$addsp", note: "Address space 1, global: printed <code>.global</code>. The parameter loads above have 101, param: <code>.param</code>." },
+		{ text: "3,", kind: "mod", label: "$Sign", note: "Type kind 3 from <code>enum FromType { Unsigned, Signed, Float, Untyped }</code>: <code>Untyped</code>, printed <code>.b</code>." },
+		{ text: "32,", kind: "type", label: "$fromWidth", note: "Width in bits: <code>32</code>, so together <code>.b32</code>." },
+		{ text: "-1,", kind: "mod", label: "$usedBytes", note: "A mask of the bytes actually used; −1 (all bits set) means all of them, and prints nothing. Otherwise it prints a <code>.pragma \"used_bytes_mask\"</code> line." },
+		{ text: "killed %12, 0", kind: "operand", label: "$addr", note: "<code>ADDR</code> is one TableGen operand made of two machine operands, base and offset: register <code>%12</code> plus 0 bytes. This is register 12's last use." },
+		{ text: ":: (load (s32) from %ir.15, !tbaa !8, addrspace 1)", kind: "mod", label: "mem operand", note: "The memory operand, carried over from the DAG. It is not printed in PTX; later passes use it for alias analysis." },
+	]}
+/>
+
+So the operands spell `ld` + `.global` + `.b` + `32`, and the AsmPrinter prints `ld.global.b32
+%r7, [%rd6];`. Likewise `SETP_i32rr %2, %4, 5` has comparison mode 5, `GE` in NVPTX's `CmpMode`
+enum, which becomes `setp.ge.s32`, and the last `0` of `FMA_F32rrr` is its `$ftz` flag: no
+flush-to-zero.
+
+Machine IR is where the late optimizations run: machine common-subexpression elimination,
+loop-invariant code motion, sinking, and peephole rewrites. The dump is also a file format: `llc
+-stop-after=<pass>` writes a `.mir` file (YAML around the body above, with a `registers:` table
+listing each virtual register's class), and `llc -run-pass=<pass>` reads one back and runs a
+single machine pass on it.
+
+#### Register allocation, skipped
 
 Then the function leaves SSA form. φ-nodes become copies, and on a CPU the **register allocator**
 maps the unlimited virtual registers onto the few physical ones (16 general-purpose registers on
@@ -444,7 +1014,7 @@ declares `%r0` to `%r9`.
 
 ## TableGen
 
-### Records and classes
+### The language
 
 A backend needs a lot of tables: every instruction with its operands, assembly syntax and
 selection pattern; every register and register class; every processor and feature. Writing those
@@ -452,8 +1022,46 @@ in C++ would be thousands of lines of near-repetition. LLVM writes them in **Tab
 (`.td` files), a small language whose only job is to produce **records**: named bags of typed
 fields.
 
+TableGen doesn't run anything. `llvm-tblgen` parses the files, builds every record, and then
+hands the records to a **backend**, a C++ program inside `llvm-tblgen` that writes one output
+file. The most useful backend for learning is `--print-records`, which just prints every record
+with all its fields resolved. All the toy examples below are real `.td` files run through it.
+
+These are the types a field can have:
+
+| Type | Values look like | Notes |
+| ---- | ---------------- | ----- |
+| `bit` | `true`, `false`, `1`, `0` | a single bit |
+| `int` | `7`, `-3`, `0x1F`, `0b1010` | 64-bit integer |
+| `bits<n>` | `0b1010`, `{ 1, 0, 1, 0 }` | $n$ bits; select with `Nibble{3}` or `Inst{8...7}` |
+| `string` | `"add.s32"` | `#` pastes strings: `"add" # ".s32"` |
+| `code` | `[{ return N->hasOneUse(); }]` | a string meant to be pasted into C++ |
+| `list<T>` | `[16, 32, 64]` | a list of any one type |
+| `dag` | `(add i32:$a, i32:$b)` | an operator applied to named arguments |
+| a class | `F32RT`, `B32` | a reference to a record of that class |
+
+A field set to `?` is **uninitialized**: it has no value yet. Comments are `//` and `/* */`, and
+`include "file.td"` pulls in another file.
+
+### Records and classes
+
 A **class** is a template for records, with parameters and default fields. A **def** creates one
-record from one or more classes. For example, NVPTX's registers:
+record from one or more classes. Step through a toy file and the records TableGen builds from it:
+
+<CodeStages stages={tdClassStages} tags={tdClassTags} step={0} maxLines={26} title="Classes, defs and let: shapes.td" />
+
+Four rules are at work here:
+
+- **Template arguments** (`<string name, int sides>`) are only visible while the class body is
+  being built. A field that wants to keep one has to copy it: `string Name = name;`.
+- **Fields can be computed**: `bit IsPolygon = !gt(sides, 2);` is evaluated for each record.
+- **`let` overrides** a field the class already has. `def Square : Shape<...> { let Area = 16; }`
+  changes `Area`; `let` can't create a new field.
+- **Several parents** are allowed, separated by commas, and their fields are combined in order.
+  The comment after `def RedSquare {` lists them: `// Shape Coloured`.
+
+NVPTX's registers are a real example. `NVPTXReg` inherits from LLVM's generic `Register` class
+and sets one field, and a `foreach` loop defines 25 records, `P0` to `RQ4`:
 
 ```tablegen
 class NVPTXReg<string n> : Register<n> {
@@ -469,16 +1077,22 @@ foreach i = 0...4 in {
 }
 ```
 
-`NVPTXReg` inherits from LLVM's generic `Register` class and sets one field. The `foreach` loop
-defines 25 records, `P0` to `RQ4`, and `#` pastes strings together, so `R3` gets the assembly
-name `%r3`.
+`0...4` is an inclusive range, and `#` pastes strings together, also in record names, so `R3`
+gets the assembly name `%r3`.
 
 ### Multiclasses and defm
 
 A **multiclass** is a template for *several* records at once, and **defm** instantiates one,
-prefixing every record name with its own. Below is how NVPTX defines the instructions that read
-special registers like `%tid.x`. Step through it to see the source, the record TableGen produces
-for `INT_PTX_SREG_TID_x`, and the C++ generated from that record.
+prefixing every record name with its own. Inside a multiclass, `NAME` is that prefix. A **let
+block**, `let Field = value in { ... }`, sets a field on every record defined inside it. Here they
+are on a toy instruction set:
+
+<CodeStages stages={tdMultiStages} tags={tdMultiTags} step={0} maxLines={28} title="Multiclasses, defm, foreach and let blocks: insts.td" />
+
+That is the whole trick behind NVPTX's thousands of instructions: a multiclass for each family,
+one `defm` per variant. Below is how NVPTX defines the instructions that read special registers
+like `%tid.x`. Step through it to see the source, the record TableGen produces for
+`INT_PTX_SREG_TID_x`, and the C++ generated from that record.
 
 <CodeStages stages={tablegenStages} tags={tablegenTags} step={0} maxLines={20} title="From TableGen to C++: the instruction that reads %tid.x" />
 
@@ -490,6 +1104,161 @@ TableGen record, defined in
 [`IntrinsicsNVVM.td`](https://github.com/llvm/llvm-project/blob/85ac560262434c9ccfc0c183ec22d4138ed647fb/llvm/include/llvm/IR/IntrinsicsNVVM.td#L2362),
 and it is the `@llvm.nvvm.read.ptx.sreg.tid.x` that Clang emitted for `threadIdx.x`. So the whole
 chain, from IR call to selected instruction to printed PTX, is described by these few lines.
+
+### Bang operators and dags
+
+Computed fields use **bang operators**, built-in functions whose names start with `!`. There are
+several dozen; a handful do most of the work in real `.td` files. One more toy file, with the values
+it resolves to:
+
+<CodeStages stages={tdValueStages} tags={tdValueTags} step={0} maxLines={26} title="Values, bang operators and dags: values.td" />
+
+| Operator | Does | In the example |
+| -------- | ---- | -------------- |
+| `!if(c, a, b)` | `a` if `c` is non-zero, else `b` | `"seven"` |
+| `!eq`, `!ne`, `!lt`, `!gt`, `!ge` | compare | `!eq(Seven, 7)` = 1 |
+| `!add`, `!mul`, `!and`, `!or`, `!not` | arithmetic and logic | |
+| `!strconcat(a, b)`, `a # b` | paste strings | |
+| `!foreach(x, list, expr)` | map over a list (or a dag) | `["b16", "b32", "b64"]` |
+| `!filter(x, list, pred)` | keep elements where `pred` holds | `[32, 64]` |
+| `!foldl(init, list, acc, x, expr)` | reduce a list | $16 + 32 + 64 = 112$ |
+| `!size`, `!empty`, `!range(n)` | length, emptiness, the list $0 \ldots n-1$ | `!size(Widths)` = 3 |
+| `!interleave(list, sep)` | join strings | `"b16, b32, b64"` |
+| `!cast<T>(x)` | convert, or look a record up by its name | |
+| `!con(d1, d2)` | concatenate two dags | `(ins B32:$a, B32:$c)` |
+| `!getdagname(d, i)`, `!getdagarg<T>(d, i)` | a dag argument's `$name`, its value | `"a"` |
+
+The **dag** type is what makes TableGen fit for compilers. A dag value is an operator followed by
+arguments, each optionally named with `$`: `(ins B32:$a, i32imm:$b)` has operator `ins` and two
+arguments, `B32` named `a` and `i32imm` named `b`. Operators and arguments are references to
+records (that is why the toy file defines `ins`, `outs` and `B32` as empty records). Instruction
+operand lists, selection patterns and output instructions are all dags, and the names tie them
+together: `$a` in a pattern is the same operand as `$a` in the operand list and in the asm
+string.
+
+NVPTX uses these operators to build asm strings from operand lists. Its class
+`BasicFlagsNVPTXInst`
+([source](https://github.com/llvm/llvm-project/blob/85ac560262434c9ccfc0c183ec22d4138ed647fb/llvm/lib/Target/NVPTX/NVPTXInstrInfo.td#L253-L277))
+takes just the opcode, such as `"add.s32"`, and appends the operands:
+
+```tablegen
+!strconcat(asmstr, " \t",
+  !interleave(!foreach(i, !range(!size(outs_dag)), "$" # !getdagname(outs_dag, i)), "|"),
+  ", ",
+  !interleave(!foreach(i, !range(!size(ins_dag)),
+      !if(!eq(!cast<string>(!getdagarg<DAGOperand>(ins_dag, i)), "ADDR"),
+          "[$" # !getdagname(ins_dag, i) # "]",       // an address operand gets brackets
+          "$" # !getdagname(ins_dag, i))), ", "),
+  ";")
+```
+
+(slightly shortened: the real one also handles empty operand lists). For `(outs B32:$dst)` and
+`(ins B32:$a, B32:$b)` this gives `"add.s32 \t$dst, $a, $b;"`, which is exactly the `AsmString`
+of the record `ADD32rr`, so no instruction has to spell out its own operand syntax. The toy
+file's `Asm` field does the same on a small scale.
+
+### Describing a target
+
+A backend is described by records of a few classes from LLVM's shared `.td` files:
+`Register` and `RegisterClass` for registers, `Instruction` for instructions, `SDNode` and
+`PatFrag` for DAG nodes and pattern pieces, `Pat` for extra patterns, and `Processor` and
+`SubtargetFeature` for chips. The `Instruction` class
+([`Target.td`](https://github.com/llvm/llvm-project/blob/85ac560262434c9ccfc0c183ec22d4138ed647fb/llvm/include/llvm/Target/Target.td#L663))
+has about 80 fields, but these are the ones you read most:
+
+| Field | Type | Says |
+| ----- | ---- | ---- |
+| `OutOperandList` | `dag` | the results: `(outs B32:$dst)` |
+| `InOperandList` | `dag` | the inputs: `(ins B32:$a, B32:$b)` |
+| `AsmString` | `string` | how to print it; `$name` is replaced by that operand |
+| `Pattern` | `list<dag>` | the SelectionDAG pattern it implements, if any |
+| `Predicates` | `list<Predicate>` | conditions for using it, such as `hasSM<90>` |
+| `mayLoad`, `mayStore`, `hasSideEffects` | `bit` | what it may do, for the optimizer |
+| `isBranch`, `isTerminator`, `isCommutable` | `bit` | more properties |
+| `AddedComplexity` | `int` | raises the pattern's priority |
+| `Namespace` | `string` | the C++ namespace of its opcode: `NVPTX::ADD32rr` |
+
+NVPTX layers its own classes on top. `NVPTXInst`
+([source](https://github.com/llvm/llvm-project/blob/85ac560262434c9ccfc0c183ec22d4138ed647fb/llvm/lib/Target/NVPTX/NVPTXInstrFormats.td#L16))
+sets the namespace and some flag bits; `BasicNVPTXInst` builds the asm string as above. And the
+class `RegTyInfo` bundles everything about one value type, so a multiclass can take a single
+argument for it:
+
+```tablegen
+class RegTyInfo<ValueType ty, NVPTXRegClass rc, string ptx_type, Operand imm, SDNode imm_node,
+                bit supports_imm = 1> {
+  ValueType Ty = ty;          // the DAG type, i32
+  NVPTXRegClass RC = rc;      // its register class, B32
+  Operand Imm = imm;          // its immediate operand, i32imm
+  ...
+  int Size = ty.Size;         // 32
+  string PtxType = ptx_type;  // "b32"
+}
+
+def I32RT    : RegTyInfo<i32, B32, "b32",  i32imm, imm>;
+def F32RT    : RegTyInfo<f32,  B32, "f32",  f32imm,  fpimm>;
+```
+
+With that, here is how one line defines every integer add. Follow the names:
+
+```tablegen
+multiclass I3Inst<string op_str, SDPatternOperator op_node, RegTyInfo t,
+                  bit commutative, list<Predicate> requires = []> {
+  def rr :
+    BasicNVPTXInst<(outs t.RC:$dst), (ins t.RC:$a, t.RC:$b),
+              op_str,
+              [(set t.Ty:$dst, (op_node t.Ty:$a, t.Ty:$b))]>,
+              Requires<requires>;
+  def ri :
+    BasicNVPTXInst<(outs t.RC:$dst), (ins t.RC:$a, t.Imm:$b),
+              op_str,
+              [(set t.Ty:$dst, (op_node t.Ty:$a, (t.Ty imm:$b)))]>,
+              Requires<requires>;
+  if !not(commutative) then
+    def ir : ...   // immediate first; only needed if the order matters
+}
+
+multiclass I3<string op_str, SDPatternOperator op_node, bit commutative> {
+  foreach t = [I16RT, I32RT, I64RT] in
+    defm t.Size# : I3Inst<op_str # t.Size, op_node, t, commutative>;
+}
+
+defm ADD : I3<"add.s", add, commutative = true>;
+```
+
+`defm ADD` runs `I3`, whose `foreach` runs `I3Inst` three times, with name prefixes `16`, `32` and
+`64` (`t.Size#` turns the number into a name piece). So the records are `ADD` + `32` + `rr` =
+`ADD32rr`, with asm `"add.s" # 32` = `"add.s32"`, and `ADD32ri` with an immediate second operand.
+There is no `ADD32ir`, because `add` is commutative and `ri` covers both orders; `SUB32ir` does
+exist. Those are the opcodes in the Machine IR above: `ADD64rr`, `MUL_WIDEs32_ri`,
+`FMA_F32rrr`.
+
+Patterns refer to DAG nodes by records too. Generic ones like `add` and `fma` are defined in
+`TargetSelectionDAG.td`; NVPTX adds its own, such as the wide multiply the combiner created:
+
+```tablegen
+def SDTMulWide : SDTypeProfile<1, 2, [SDTCisInt<0>, SDTCisInt<1>, SDTCisSameAs<1, 2>]>;
+def smul_wide : SDNode<"NVPTXISD::MUL_WIDE_SIGNED", SDTMulWide, [SDNPCommutative]>;
+```
+
+`SDTypeProfile<1, 2, ...>` reads "one result, two operands; result 0 is an integer, operand 1 is
+an integer, operands 1 and 2 have the same type". `SDNode` ties the record `smul_wide` to the C++
+opcode `NVPTXISD::MUL_WIDE_SIGNED` and marks it commutative.
+
+Not every pattern lives inside an instruction. A standalone **`Pat`** maps a DAG pattern to
+existing instructions, and may reorder operands:
+
+```tablegen
+foreach vt = [v2f16, v2bf16, v2i16, v4i8] in {
+def : Pat<(vt (select i1:$p, vt:$a, vt:$b)),
+          (SELP_b32rr $a, $b, $p)>;
+}
+```
+
+A `select` on any of four 32-bit vector types is just a 32-bit `selp`, with the condition moved
+last. And some instructions have no pattern at all: `LD_i32` has `Pattern = []`, because choosing
+a load's address space, width and ordering takes C++, in `NVPTXDAGToDAGISel::tryLoad`
+([source](https://github.com/llvm/llvm-project/blob/85ac560262434c9ccfc0c183ec22d4138ed647fb/llvm/lib/Target/NVPTX/NVPTXISelDAGToDAG.cpp#L1111)).
 
 ### Patterns and the generated C++
 
@@ -522,11 +1291,41 @@ defm FMA_F32    : FMA<F32RT,    allow_ftz = true>;
 defm FMA_F64    : FMA<F64RT,    allow_ftz = false>;
 ```
 
+Three more pieces of syntax appear here. `defvar` names a value for use in the rest of the body
+(it is not a field of the records). `if ... then { }` defines records only when the condition
+holds. And `allow_ftz = true` in the `defm` line passes a template argument by name.
+
 `defm FMA_F32` makes `FMA_F32rrr` (three registers), `FMA_F32rri` (third operand an immediate)
 and so on. The suffix names the operand kinds, which is why the selected DAG showed
 `FMA_F32rrr` and `MUL_WIDEs32_ri` (a register times the immediate 4). The pattern `(fma $a, $b,
-$c)` is a DAG fragment; the selector matches it against the SelectionDAG. `$ftz` is an extra
-operand that selects the flush-to-zero variant, `fma.rn.ftz.f32`; `saxpy` gets the plain one.
+$c)` is a DAG fragment; the selector matches it against the SelectionDAG. `(set t.Ty:$dst, ...)`
+says the instruction's result `$dst` is the value of that fragment. `$ftz` is an extra operand
+that selects the flush-to-zero variant, `fma.rn.ftz.f32`; `saxpy` gets the plain one.
+
+#### One instruction from .td to PTX
+
+To see all the pieces connect, follow `mad.lo.s32` from its definition to the line of PTX that
+computes `saxpy`'s index. Step through the five stages:
+
+<CodeStages stages={madStages} tags={madTags} step={0} maxLines={26} title="mad.lo.s32: source, record, matcher table, Machine IR, PTX" />
+
+The pattern `(add (OneUse2<mul> $a, $b), $c)` uses a **PatFrag**, a reusable pattern piece with a
+C++ check attached: `OneUse2<mul>` matches a `mul` only if nothing else uses its result. That
+check is what keeps the multiply-add honest. If the product were needed elsewhere too, fusing it
+into the add would compute it twice, so the pattern refuses. Compiling `m = a * b; return m + c;`
+gives `mad.lo.s32`, while `m = a * b; return m + (m + c);` keeps a separate `mul.lo.s32`.
+
+The predicate `hasOptEnabled` is a C++ condition on the compile settings, `TM.getOptLevel() != CodeGenOptLevel::None`. At `-O0` it is
+false, and the same `a * b + c` compiles to `mul.lo.s32` followed by `add.s32`: the pattern exists
+but is switched off. Both experiments were run with `llc` on small IR files.
+
+In the matcher table, each entry carries its pattern as a comment: a `// Src:` line with the
+pattern matched and its complexity, and a `// Dst:` line with the instruction produced. The table
+is a byte code (`OPC_MoveChild0`, `OPC_CheckOpcode`, `OPC_RecordChild1`, ...) that
+`SelectCodeCommon` interprets, trying the most complex patterns first. `mad.lo.s32`'s complexity
+of 7 beats the 3 of a plain `add`, which is why the fused form wins.
+
+#### TableGen backends
 
 Separate **TableGen backends** read the same records and each write one C++ file (a `.inc`) that
 the hand-written backend `#include`s. NVPTX runs six of them
@@ -544,9 +1343,20 @@ the hand-written backend `#include`s. NVPTX runs six of them
 That is 140,781 lines of C++ from 9,422 lines of `.td` in the NVPTX directory (which also pulls
 in LLVM's shared `.td` files). In total TableGen produces 6,410 instruction records for
 NVPTX.<Sidenote>Line counts are from an LLVM 23.1.2 release build, which leaves the pattern
-comments out of the matcher table. Regenerated with `-omit-comments=false`, each entry is annotated
-with its source pattern: a `// Src: (fma ...)` comment followed by `// Dst: (FMA_F32rrr ...)`.</Sidenote> MLIR reuses TableGen for its operation definitions (ODS); the
-[MLIR post](/blog/mlir/) touches on that.
+comments out of the matcher table. Regenerated with `-omit-comments=false`, as in the figure above,
+the matcher table grows to 78,787 lines.</Sidenote>
+
+You can drive a backend from your own records too. `-gen-searchable-tables` is a general-purpose
+one: give it records of any class plus a `GenericTable` that collects them, and it writes a sorted
+C++ array and lookup functions. LLVM uses it for tables that have nothing to do with instructions:
+
+<CodeStages stages={tdTableStages} tags={tdTableTags} step={0} maxLines={28} title="Your own records, a stock backend: sregs.td to C++" />
+
+A `def` with no name (`def : Sreg<...>`) makes an **anonymous record**, fine when nothing refers to
+it by name. Two details of the output are worth noticing: the array is sorted by name, and the
+lookup is case-insensitive (it compares upper-cased copies), which is why the backend refused at
+first to make `Name` a primary key and asked for a separate `SearchIndex`. MLIR reuses TableGen for
+its operation definitions (ODS); the [MLIR post](/blog/mlir/) touches on that.
 
 ## The NVPTX backend
 
@@ -610,7 +1420,9 @@ and copies them to local memory when the code writes to them
 CUDA's built-in variables map to PTX special registers through intrinsics, as the TableGen
 section traced: `threadIdx.x` → `@llvm.nvvm.read.ptx.sreg.tid.x` → `INT_PTX_SREG_TID_x` →
 `mov.u32 %r6, %tid.x;`. NVPTX defines over a thousand `llvm.nvvm.*` intrinsics this way, for
-barriers, warp shuffles, atomics, asynchronous copies and tensor-core instructions.
+barriers, warp shuffles, atomics, asynchronous copies and tensor-core instructions. Clang exposes
+most of them as builtins named `__nvvm_*`, and CUDA's headers build functions like
+`__shfl_down_sync` on those builtins.
 
 One more NVPTX pass is unusual. NVIDIA's math library, **libdevice**, ships as LLVM bitcode and
 must behave differently depending on compiler options, such as whether denormal floats are
@@ -620,6 +1432,117 @@ each such call with a constant read from the module, here the flag `!{i32 4,
 branch not taken
 ([source](https://github.com/llvm/llvm-project/blob/85ac560262434c9ccfc0c183ec22d4138ed647fb/llvm/lib/Target/NVPTX/NVVMReflect.cpp#L9-L18)).
 It is conditional compilation, decided at link time instead of preprocessing time.
+
+### Shared memory and barriers
+
+`saxpy` only uses global memory. A kernel that cooperates within a block needs **shared memory**,
+a scratchpad visible to every thread of the block, and **barriers** to order the threads' accesses
+to it. The classic example is a block-level sum: 256 threads each load one element, then repeatedly
+add the upper half of the array onto the lower half. Step through it from CUDA to PTX, and follow
+the colours:
+
+<CodeStages stages={reduceStages} tags={reduceTags} step={0} maxLines={30} title="A block sum: shared memory, barriers and launch bounds" />
+
+Each CUDA feature becomes a specific piece of IR, and each piece a specific piece of PTX:
+
+| CUDA | LLVM IR | PTX |
+| ---- | ------- | --- |
+| `__shared__ float buf[256]` | `@buf = internal addrspace(3) global [256 x float] undef` | `.shared .align 4 .b8 buf[1024]` |
+| `buf[t]` | `ptr addrspace(3)` after InferAddressSpaces | `ld.shared.b32`, `st.shared.b32` |
+| `__syncthreads()` | `call void @llvm.nvvm.barrier.cta.sync.aligned.all(i32 0)` | `bar.sync 0` |
+| `__launch_bounds__(256)` | function attribute `"nvvm.maxntid"="256"` | `.maxntid 256` |
+| `#pragma unroll 1` | `!llvm.loop` metadata with `llvm.loop.unroll.disable` | `.pragma "nounroll"` |
+
+Three details are worth a closer look. First, C++ pointers are generic, so Clang's IR reaches
+`buf` only through `addrspacecast (ptr addrspace(3) @buf to ptr)`; it is the backend's
+`InferAddressSpaces` pass that strips the casts and lets the loads become `ld.shared`. Second,
+the barrier intrinsic is declared `convergent` (attribute group `#1` in the IR), which forbids
+the optimizer from moving it under a condition. Third, NVPTX **demotes** `buf` into the kernel:
+the PTX declares it inside `block_sum`'s body, because it is an `internal` shared variable used by
+only one function
+([source](https://github.com/llvm/llvm-project/blob/85ac560262434c9ccfc0c183ec22d4138ed647fb/llvm/lib/Target/NVPTX/NVPTXAsmPrinter.cpp#L718-L730)).
+
+Check the loop with numbers. The φ for `s` starts at 128 and `lshr` halves it, so the trips use
+$s = 128, 64, \ldots, 1$: eight trips, after which $s = 0$ and the loop exits. In trip one, thread
+5 adds `buf[133]` to `buf[5]`; the PTX computes that address as `buf + 4·5` plus `mul.wide.s32`
+of $128 \cdot 4 = 512$ bytes.
+
+### Warp shuffles and atomics
+
+The 32 threads of a warp can exchange registers directly, without shared memory, using
+**shuffles**. And threads anywhere on the GPU can update the same memory safely with **atomics**.
+Here is a warp sum that uses both: five shuffles fold 32 values into lane 0, and lane 0 adds the
+warp's total to a global counter.
+
+<CodeStages stages={warpStages} tags={warpTags} step={0} maxLines={30} title="A warp sum: shuffles and an atomic add" />
+
+The shuffle is a plain intrinsic, `@llvm.nvvm.shfl.sync.down.f32(i32 mask, float value, i32
+offset, i32 clamp)`, and it becomes one `shfl.sync.down.b32` per call. Its arguments land in PTX
+in a different order: value, offset, clamp, then the mask $-1$ (all 32 lanes, `0xffffffff`). The
+`for` loop with `off /= 2` was fully unrolled, because its trip count, five, is known.<Sidenote>Clang
+needs to know the PTX version to accept shuffle builtins, and without a CUDA installation it
+can't find out; the listing was compiled with `-Xclang -target-feature -Xclang +ptx78`, the
+version LLVM 23 targets for `sm_90` by default.</Sidenote>
+
+The atomic is the surprise. `atomicrmw fadd` did not become one `atom.add.f32`: it became a load
+followed by a loop of `atom.cas` (compare-and-swap) that retries until no other thread got in
+between. The reason is in NVPTX's `shouldExpandAtomicRMWInIR`
+([source](https://github.com/llvm/llvm-project/blob/85ac560262434c9ccfc0c183ec22d4138ed647fb/llvm/lib/Target/NVPTX/NVPTXISelLowering.cpp#L7467-L7500)):
+PTX's `atom.add.f32` on global memory flushes denormal numbers to zero, while this function keeps
+them, so using it would change results. The comment in the code puts it this way:
+
+```cpp
+  // Try to lower LLVM atomicrmw fadd to PTX atomic.add.  This is complicated
+  // by the weird FTZ behavior PTX atom.add has:
+  //   - atom.add.f32 on global memory flushes denormals
+  //   - atom.add.f32 on shared memory does not flush denormals
+  //   - atom.add.f16 and atomic.add.bf16 never flush denormals
+```
+
+Four hand-written atomics show the rule, and how the IR's ordering and scope reach PTX:
+
+<CodeStages stages={atomicStages} tags={atomicTags} step={0} maxLines={30} title="Four atomicrmw instructions and the PTX they become" />
+
+| IR | PTX |
+| -- | --- |
+| `fadd`, global, `syncscope("device")`, function keeps denormals | `ld` + `atom.relaxed.gpu.global.cas.b32` loop |
+| the same, function has `denormal_fpenv(float: preservesign)` | `atom.relaxed.gpu.global.add.f32` |
+| `fadd`, shared, `syncscope("block")` | `atom.relaxed.cta.shared.add.f32` |
+| integer `add`, global, no syncscope | `atom.relaxed.sys.global.add.u32` |
+
+`monotonic` became `.relaxed`, the scopes `"block"`, `"device"` and none became `.cta`, `.gpu` and
+`.sys`. Compiling the CUDA kernel with `-fgpu-flush-denormals-to-zero` adds the
+`denormal_fpenv(float: preservesign)` attribute to it, and its atomic then becomes a single
+`atom.relaxed.sys.global.add.f32`. The flag also sets `nvvm-reflect-ftz` to 1 and turns every
+`add.f32` into `add.ftz.f32`.<Sidenote>Real CUDA code calls `atomicAdd`. Under Clang, its
+`float` version is `__fAtomicAdd` in Clang's `__clang_cuda_device_functions.h`, which calls the
+same builtin used here, so it compiles the same way, at system scope. The PTX could not be run
+here: macOS has no ptxas or GPU, so these kernels were compiled but not executed.</Sidenote>
+
+### Writing NVPTX IR by hand
+
+Nothing requires a front end. A file with the NVPTX triple, a `ptx_kernel` function and the right
+address spaces is a complete GPU program, and `llc` compiles it like any other. This is how
+compilers such as Triton use NVPTX, and the easiest way to see what one IR construct becomes:
+
+<CodeStages stages={reluStages} tags={reluTags} step={0} maxLines={30} title="A hand-written kernel: vector loads, select and inline asm" />
+
+- **No data layout**: `llc` fills in the target's default. Only `target triple` is needed.
+- **Pointers already in `addrspace(1)`**: the PTX parameters are declared `.ptr .global`, and no
+  `cvta.to.global` is needed, unlike `saxpy`.
+- **Vector types**: a `load <4 x float>` with `align 16` becomes one 16-byte `ld.global.v4.b32`
+  with four destination registers. Wider loads mean fewer instructions for the same bytes, which
+  is what `float4` does in CUDA. The alignment is required: with `align 4` the backend has to
+  split the access.
+- **Compare and select**: `fcmp ogt` + `select` against zero is a ReLU, and the DAG combiner
+  recognises it as a maximum, `max.f32 %r, %r, 0f00000000` (the PTX spelling of the float 0.0).
+- **Inline asm**: `call i32 asm "mov.u32 $0, %laneid;", "=r"()` pastes PTX text into the output.
+  The second string is the **constraint** list: `=r` means "output 0 is a 32-bit register", and
+  `$0` in the template is replaced by the register LLVM picks, here `%r1`. CUDA's `asm("..." :
+  "=r"(x))` produces exactly this.
+
+The index check: thread 3 loads from `x + 3 · 16 = x + 48` bytes (`mul.wide.u32 %rd4, %r2, 16`),
+which is `x[3]` when `x` is an array of `<4 x float>`.
 
 ### saxpy, line by line
 
@@ -653,41 +1576,55 @@ build of LLVM, except `-debug-only`, which needs one built with `-DLLVM_ENABLE_A
 | To see | Run |
 | ------ | --- |
 | IR straight from Clang | `clang++ -x cuda --cuda-device-only --cuda-gpu-arch=sm_90 -O0 -Xclang -disable-O0-optnone -S -emit-llvm` |
+| whether hand-written IR is valid | `opt -passes=verify file.ll -S -o /dev/null` |
+| run IR on the host CPU | `lli file.ll` |
 | what each optimizer pass changed | `opt -O2 -print-changed=quiet file.ll` |
 | one pass alone | `opt -passes=sroa file.ll -S` |
+| the IR after one backend pass | `llc -O2 -print-after=infer-address-spaces file.ll` |
 | the IR after every backend pass | `llc -O2 -print-after-all file.ll` |
 | the backend's pass list | `llc -O2 -debug-pass=Structure file.ll` |
 | SelectionDAG at each phase | `llc -O2 -debug-only=isel file.ll` |
 | Machine IR right after selection | `llc -O2 -stop-after=finalize-isel file.ll` |
-| TableGen's expanded records | `llvm-tblgen --print-records -I llvm/include -I lib/Target/NVPTX NVPTX.td` |
+| TableGen's records for a toy file | `llvm-tblgen --print-records file.td` |
+| TableGen's expanded records for NVPTX | `llvm-tblgen --print-records -I llvm/include -I lib/Target/NVPTX NVPTX.td` |
+| the matcher table with pattern comments | `llvm-tblgen -gen-dag-isel -omit-comments=false -I llvm/include -I lib/Target/NVPTX NVPTX.td` |
 
-For `llc`, add `-mtriple=nvptx64-nvidia-cuda -mcpu=sm_90`.
+For `llc`, add `-mtriple=nvptx64-nvidia-cuda -mcpu=sm_90`, unless the file sets the triple itself.
+A good exercise: take the hand-written kernel above, change one thing (the alignment, the
+`select`, the address space, the `syncscope`), and predict the PTX before running `llc`.
 
 ## Summary
 
-- LLVM splits a compiler into front ends, one optimizer and many back ends, connected by **LLVM
-  IR**: a typed, SSA-form language of modules, functions and basic blocks, where φ-nodes merge
-  values at control-flow joins.
-- The **optimizer** is a pipeline of passes. On `saxpy`, SROA turned Clang's stack-slot code into
-  SSA (39 → 20 instructions) and EarlyCSE removed repeated work (→ 17); most other passes changed
-  nothing.
+- **LLVM IR** is a typed, SSA-form language of modules, functions and basic blocks. Names say
+  what they are (`@` global, `%` local, `#` attributes, `!` metadata); every instruction names
+  its types; flags (`nsw`, `contract`, `inbounds`) and attributes (`readonly`, `convergent`)
+  give the optimizer facts it could not prove, and breaking a flag's promise produces poison.
+- `getelementptr` only does address arithmetic, in units of a type, and φ-nodes merge values at
+  control-flow joins. Hand-written IR runs with `lli`, and the verifier enforces that every
+  definition dominates its uses.
 - The **backend** builds a **SelectionDAG** per basic block, combines and legalizes it, and
-  selects target instructions by pattern matching. That is where `fmul` + `fadd` became `fma`,
-  `sext` + `shl` became `mul.wide`, and `i8` became `i16`. It then optimizes **Machine IR** and
-  prints it through the MC layer.
-- **TableGen** describes the target as records (instructions, operands, asm strings, selection
-  patterns, registers), and its backends generate the C++ tables; NVPTX's 9,422 lines of `.td`
-  produce about 141,000 lines of C++.
-- **NVPTX** emits PTX, a virtual ISA, so it skips register allocation and leaves it to ptxas. It
-  uses target hooks to turn kernel pointers into global ones, maps CUDA built-ins to special
-  registers through intrinsics, and resolves libdevice's options with NVVMReflect.
+  selects target instructions by pattern matching, then optimizes **Machine IR**, whose bare
+  operands are decoded by the instruction's TableGen operand list.
+- **TableGen** builds records from classes, multiclasses and `defm`, with bang operators and dag
+  values; NVPTX's records describe each instruction's operands, asm string, pattern and
+  predicates, and backends compile them into C++ such as the matcher table that turns `add (mul
+  a, b), c` into `mad.lo.s32`.
+- **NVPTX** emits PTX, a virtual ISA, so it skips register allocation. It infers address spaces
+  (generic pointers into `ld.global` and `ld.shared`), maps CUDA built-ins, barriers and shuffles
+  to intrinsics, and lowers atomics by their scope, ordering and floating-point mode.
 
 ## References
 
-- LLVM Language Reference Manual, [llvm.org/docs/LangRef.html](https://llvm.org/docs/LangRef.html).
+- LLVM Language Reference Manual, [llvm.org/docs/LangRef.html](https://llvm.org/docs/LangRef.html):
+  types, instructions, linkage, attributes, metadata, poison.
+- "The Often Misunderstood GEP Instruction", [llvm.org/docs/GetElementPtr.html](https://llvm.org/docs/GetElementPtr.html).
+- LLVM Atomic Instructions and Concurrency Guide, [llvm.org/docs/Atomics.html](https://llvm.org/docs/Atomics.html).
 - The LLVM Target-Independent Code Generator, [llvm.org/docs/CodeGenerator.html](https://llvm.org/docs/CodeGenerator.html):
   SelectionDAG, legalization, Machine IR and the MC layer.
-- TableGen Overview and Programmer's Reference, [llvm.org/docs/TableGen/](https://llvm.org/docs/TableGen/).
+- Machine IR (MIR) Format Reference Manual, [llvm.org/docs/MIRLangRef.html](https://llvm.org/docs/MIRLangRef.html).
+- TableGen Overview and Programmer's Reference, [llvm.org/docs/TableGen/](https://llvm.org/docs/TableGen/),
+  and the TableGen Backends guide, [llvm.org/docs/TableGen/BackEnds.html](https://llvm.org/docs/TableGen/BackEnds.html)
+  (including `SearchableTables`).
 - User Guide for NVPTX Back-end, [llvm.org/docs/NVPTXUsage.html](https://llvm.org/docs/NVPTXUsage.html).
 - NVIDIA, Parallel Thread Execution ISA, [docs.nvidia.com/cuda/parallel-thread-execution](https://docs.nvidia.com/cuda/parallel-thread-execution/).
 - Chris Lattner, "LLVM", in *The Architecture of Open Source Applications*, Volume 1,

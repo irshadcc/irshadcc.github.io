@@ -1,0 +1,160 @@
+---
+// Step-through of one decode step of two requests (A, B, sharing a 4-token prompt prefix)
+// through the KV cache kernels of vLLM or SGLang, on a scaled-down cache (head dim 2, one KV
+// head, 4-token pages, 32 slots). Top: the step's pipeline, from the CPU scheduler to the
+// sampler, with the running kernel highlighted, and the condensed kernel code with the lines
+// the step runs. Middle: the KV pool (vLLM: 8 blocks × 4 slots; SGLang: 32 one-token slots)
+// coloured by owner, new writes and the tile being read outlined, beside the block tables or
+// req_to_token rows. Bottom: the step's numbers (slot arithmetic, the online-softmax state per
+// tile, SGLang's split-KV partial outputs and their LSE merge), checked against dense softmax
+// attention. Logic and data in decodeStep.ts.
+// Usage in .mdx:
+//   <DecodeStepKernels />
+//   <DecodeStepKernels engine="sglang" step={4} title="SGLang's Triton decode kernel" />
+import StepControls from "../compiler/StepControls.astro";
+import { CODE, type Engine, STAGES, buildSteps, drawStep } from "./decodeStep";
+
+interface Props {
+	engine?: Engine;
+	step?: number;
+	title?: string;
+}
+
+const { engine = "vllm", step = 0, title } = Astro.props;
+const steps = buildSteps(engine);
+const at = Math.max(0, Math.min(steps.length - 1, step));
+const stages = STAGES[engine];
+const code = CODE[engine];
+---
+
+<figure class="dsk" data-step={at} tabindex="0">
+	{title && <figcaption class="dsk-title">{title}</figcaption>}
+	<ol class="dsk-pipe" aria-label="Pipeline of one decode step">
+		{
+			stages.map((s, i) => (
+				<li class:list={["dsk-stage", { on: steps[at].stage === i }]} data-i={i}>
+					<span class="nm">{s.name}</span>
+					<code>{s.kernel}</code>
+				</li>
+			))
+		}
+	</ol>
+	<pre class="dsk-code" aria-label="Condensed kernel code"><code>{code.map((l, i) => <span class:list={["ln", { cmt: l.trimStart().startsWith("#"), on: steps[at].lines.includes(i) }]}>{l}{"\n"}</span>)}</code></pre>
+	<StepControls labels={steps.map((s) => s.label)} step={at} />
+	<div class="dsk-steps">
+		{
+			steps.map((s, i) => (
+				<div class="dsk-step" data-i={i} data-stage={s.stage} data-lines={s.lines.join(" ")} hidden={i !== at}>
+					<div class="dsk-canvas" set:html={drawStep(engine, s)} />
+					<div class="dsk-tables">
+						{s.tables.map((t) => (
+							<div class="mat">
+								<p class="mat-head">
+									<code>{t.name}</code>
+									{t.sub && <span>{t.sub}</span>}
+								</p>
+								<table>
+									<thead>
+										<tr>
+											<th />
+											{t.cols.map((c) => <th>{c}</th>)}
+										</tr>
+									</thead>
+									<tbody>
+										{t.rows.map((r) => (
+											<tr class:list={{ hl: r.hl }}>
+												<th>{r.head}</th>
+												{r.cells.map((c) => <td>{c}</td>)}
+											</tr>
+										))}
+									</tbody>
+								</table>
+							</div>
+						))}
+					</div>
+					<p class="dsk-note">{s.note}</p>
+				</div>
+			))
+		}
+	</div>
+</figure>
+
+<script>
+	import { bindStepper } from "../compiler/stepper";
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".dsk")) {
+		const panels = [...fig.querySelectorAll<HTMLElement>(".dsk-step")];
+		const lines = [...fig.querySelectorAll<HTMLElement>(".dsk-code .ln")];
+		const pipe = [...fig.querySelectorAll<HTMLElement>(".dsk-stage")];
+		bindStepper(fig, panels.length, (i) => {
+			panels.forEach((p, k) => {
+				p.hidden = k !== i;
+			});
+			const p = panels[i];
+			const on = new Set((p.dataset.lines ?? "").split(" ").filter(Boolean).map(Number));
+			lines.forEach((l, k) => l.classList.toggle("on", on.has(k)));
+			pipe.forEach((s, k) => s.classList.toggle("on", String(k) === p.dataset.stage));
+		});
+	}
+</script>
+
+<style>
+	.dsk {
+		--ds-p: #7a5fb5;
+		--ds-a: #2f6f9f;
+		--ds-b: #b8742a;
+		--ds-w: #2f8a5b;
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+		outline: none;
+	}
+	@media (prefers-color-scheme: dark) {
+		.dsk {
+			--ds-p: #b39ddb;
+			--ds-a: #7fb2dc;
+			--ds-b: #e0a35e;
+			--ds-w: #63bf8d;
+		}
+	}
+	.dsk-title { text-align: center; font-size: 0.9rem; font-weight: 600; margin-bottom: 0.4rem; }
+	.dsk-pipe { display: flex; flex-wrap: wrap; gap: 0.25rem; list-style: none; margin: 0 0 0.4rem; padding: 0; counter-reset: st; }
+	.dsk-stage { flex: 1 1 5.2rem; min-width: 0; padding: 0.25rem 0.4rem; border: 1px solid var(--faint); border-radius: 6px; background: var(--surface); font-size: 0.68rem; color: var(--muted); position: relative; }
+	.dsk-stage .nm { display: block; font-weight: 600; color: var(--text); }
+	.dsk-stage code { font-size: 0.6rem; overflow-wrap: anywhere; background: none; padding: 0; }
+	.dsk-stage.on { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); background: var(--accent-soft); }
+	.dsk-code { margin: 0 0 0.3rem; padding: 0.45rem 0.7rem; border: 1px solid var(--faint); border-radius: 8px; background: var(--surface); font: 0.68rem/1.45 var(--mono); overflow-x: auto; }
+	.dsk-code .ln { display: block; padding: 0 0.3rem; border-radius: 3px; color: var(--muted); }
+	.dsk-code .ln.cmt { font-style: italic; }
+	.dsk-code .ln.on { background: var(--accent-soft); color: var(--text); box-shadow: inset 3px 0 var(--accent); }
+	.dsk-step { display: flex; flex-wrap: wrap; gap: 0.6rem 0.9rem; align-items: flex-start; }
+	.dsk-step[hidden] { display: none; }
+	.dsk-canvas { max-width: 100%; overflow-x: auto; padding: 0.4rem; border: 1px solid var(--faint); border-radius: 10px; background: var(--surface); }
+	.dsk-canvas :global(svg) { display: block; max-width: none; }
+	.dsk-canvas :global(.ds-h) { font: 600 10px var(--sans); fill: var(--muted); }
+	.dsk-canvas :global(.ds-row) { font: 9px var(--mono); fill: var(--muted); text-anchor: end; }
+	.dsk-canvas :global(.ds-leg) { font: 10px var(--sans); fill: var(--text); }
+	.dsk-canvas :global(.ds-lab) { font: 600 9.5px var(--mono); fill: var(--text); text-anchor: middle; dominant-baseline: middle; pointer-events: none; }
+	.dsk-canvas :global(.ds-slot) { font: 6.5px var(--mono); fill: var(--muted); text-anchor: end; pointer-events: none; }
+	.dsk-canvas :global(.ds-c rect) { fill: var(--bg); stroke: var(--faint); stroke-width: 1; }
+	.dsk-canvas :global(.ds-c.rsv rect) { fill: color-mix(in oklch, var(--muted) 18%, var(--bg)); stroke-dasharray: 2 2; }
+	.dsk-canvas :global(.ds-c.own-P rect) { fill: color-mix(in oklch, var(--ds-p) 30%, var(--bg)); stroke: var(--ds-p); }
+	.dsk-canvas :global(.ds-c.own-A rect) { fill: color-mix(in oklch, var(--ds-a) 30%, var(--bg)); stroke: var(--ds-a); }
+	.dsk-canvas :global(.ds-c.own-B rect) { fill: color-mix(in oklch, var(--ds-b) 30%, var(--bg)); stroke: var(--ds-b); }
+	.dsk-canvas :global(.ds-c.wr rect) { stroke: var(--ds-w); stroke-width: 3; }
+	.dsk-canvas :global(.ds-c.rd rect) { stroke: var(--text); stroke-width: 3; }
+	.dsk-canvas :global(.ds-c.nx rect) { fill: var(--bg); stroke: var(--accent); stroke-width: 1.5; stroke-dasharray: 3 2; }
+	.dsk-canvas :global(.ds-ix rect) { fill: var(--bg); stroke: var(--faint); }
+	.dsk-canvas :global(.ds-ix.on rect) { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
+	.dsk-canvas :global(.ds-ix.nx rect) { stroke: var(--accent); stroke-dasharray: 3 2; }
+	.dsk-tables { flex: 1 1 100%; min-width: 0; display: flex; flex-wrap: wrap; gap: 0.5rem 0.8rem; }
+	.mat { max-width: 100%; overflow-x: auto; }
+	.mat-head { margin: 0 0 0.15rem; font-size: 0.68rem; color: var(--muted); display: flex; flex-wrap: wrap; gap: 0.35rem; align-items: baseline; }
+	.mat-head code { font-size: 0.7rem; color: var(--text); }
+	.mat table { border-collapse: collapse; font: 0.68rem var(--mono); margin: 0; width: auto; }
+	.mat th, .mat td { padding: 0.08rem 0.4rem; border-bottom: 1px solid var(--faint); white-space: nowrap; }
+	.mat thead th { font: 600 0.62rem var(--sans); color: var(--muted); text-align: right; }
+	.mat tbody th { font: 0.64rem var(--mono); color: var(--muted); text-align: left; }
+	.mat td { text-align: right; font-variant-numeric: tabular-nums; }
+	.mat tr.hl td, .mat tr.hl th { background: var(--accent-soft); color: var(--text); }
+	.dsk-note { flex-basis: 100%; margin: 0; font-size: 0.8rem; color: var(--text); }
+</style>

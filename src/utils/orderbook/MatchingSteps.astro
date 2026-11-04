@@ -1,0 +1,71 @@
+---
+// Step-through of a price-time matching engine on a small book (logic in orderBook.ts, a port of
+// the post's C++ Engine and checked against its output). One frame per message: the incoming
+// order, the ladder after it (bids left, asks right, queue head next to the price, chip width
+// proportional to quantity), orders it consumed as struck-through ghosts, partly filled or newly
+// rested orders outlined, the spread shaded, and the trades it printed.
+// Usage in .mdx:
+//   <MatchingSteps />
+//   <MatchingSteps step={8} title="A buy order sweeps two levels" />
+import StepControls from "../compiler/StepControls.astro";
+import "./orderBook.css";
+import { type Msg, exampleFrames } from "./orderBook";
+import { drawLadder } from "./orderBookDraw";
+
+interface Props {
+	step?: number;
+	title?: string;
+	lo?: number;
+	hi?: number;
+}
+
+const {
+	step = 0,
+	title = "Price-time matching, one message at a time",
+	lo = 96,
+	hi = 105,
+} = Astro.props;
+const frames = exampleFrames();
+const at = Math.max(0, Math.min(frames.length - 1, step));
+const describe = (m: Msg) =>
+	m.kind === "cancel"
+		? `cancel #${m.id}`
+		: `#${m.id}: ${m.side} ${m.qty} @ ${m.price}`;
+---
+
+<figure class="obk obk-ms" data-step={at} tabindex="-1">
+	<figcaption class="obk-title">{title}</figcaption>
+	<StepControls labels={frames.map((f) => f.label)} step={at} />
+	<div class="obk-canvas">
+		{
+			frames.map((f, i) => (
+				<div class="obk-frame" hidden={i !== at}>
+					<p class="obk-msg">
+						incoming → <span class={f.msg.kind === "limit" ? f.msg.side : ""}>{describe(f.msg)}</span>
+					</p>
+					<Fragment set:html={drawLadder(f, { lo, hi })} />
+					<p class="obk-trades">
+						{f.trades.length
+							? f.trades.map((t) => `trade #${t.taker}×#${t.maker}: ${t.qty} @ ${t.price}`).join("   ")
+							: "no trades"}
+					</p>
+				</div>
+			))
+		}
+	</div>
+	<div class="obk-notes">
+		{frames.map((f, i) => <p hidden={i !== at}>{f.note}</p>)}
+	</div>
+</figure>
+
+<script>
+	import { bindStepper } from "../compiler/stepper";
+	for (const fig of document.querySelectorAll<HTMLElement>(".obk-ms")) {
+		const frames = [...fig.querySelectorAll<HTMLElement>(".obk-frame")];
+		const notes = [...fig.querySelectorAll<HTMLElement>(".obk-notes p")];
+		bindStepper(fig, frames.length, (i) => {
+			frames.forEach((f, k) => { f.hidden = k !== i; });
+			notes.forEach((n, k) => { n.hidden = k !== i; });
+		});
+	}
+</script>

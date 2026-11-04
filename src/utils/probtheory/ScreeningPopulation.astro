@@ -1,0 +1,135 @@
+---
+// The medical screening example (Bishop & Bishop, Section 2.1) as a population of people. Each
+// square is one person: red if they have cancer (C = 1), grey if not; an outline marks a
+// positive test (T = 1). Sliders set the prevalence p(C = 1), the sensitivity p(T = 1 | C = 1)
+// and the false-positive rate p(T = 1 | C = 0). "Only positives" dims everyone with a negative
+// test, so the fraction of red among the outlined squares is p(C = 1 | T = 1). The readouts
+// give the exact probabilities from the sum rule (2.20) and Bayes' theorem (2.21); the squares
+// are whole-person counts rounded from them. Logic in probTheory.ts.
+// Usage in .mdx:
+//   <ScreeningPopulation prior={0.01} sensitivity={0.9} falsePositive={0.03} />
+import "../sampling/sampling.css";
+import "./probTheory.css";
+
+interface Props {
+	prior?: number;
+	sensitivity?: number;
+	falsePositive?: number;
+	/** People drawn: 1000 (50 × 20 squares). */
+	people?: 1000 | 500;
+	title?: string;
+	caption?: string;
+}
+
+const {
+	prior = 0.01,
+	sensitivity = 0.9,
+	falsePositive = 0.03,
+	people = 1000,
+	title,
+	caption,
+} = Astro.props;
+---
+
+<figure class="smp-fig pt-screen" data-people={people}>
+	{title && <div class="smp-title">{title}</div>}
+	<div class="smp-legend">
+		<span><i class="box pt-k-well"></i>no cancer (C = 0)</span>
+		<span><i class="box pt-k-sick"></i>cancer (C = 1)</span>
+		<span><i class="box pt-k-pos"></i>positive test (T = 1)</span>
+	</div>
+	<svg class="smp-svg" viewBox="0 0 640 262" role="img" aria-label="A population of people coloured by cancer status and outlined by test result"></svg>
+	<div class="smp-controls">
+		<label class="smp-slider">prevalence <strong class="v-prior"></strong>
+			<input type="range" class="i-prior" min="0" max="0.9" step="0.001" aria-label="Prevalence p(C = 1)" />
+		</label>
+		<label class="smp-slider">sensitivity <strong class="v-sens"></strong>
+			<input type="range" class="i-sens" min="0.5" max="1" step="0.01" value={sensitivity} aria-label="Sensitivity" />
+		</label>
+		<label class="smp-slider">false-positive rate <strong class="v-fp"></strong>
+			<input type="range" class="i-fp" min="0" max="0.2" step="0.005" value={falsePositive} aria-label="False-positive rate" />
+		</label>
+		<label><input type="checkbox" class="i-only" /> only positives</label>
+	</div>
+	<div class="smp-metrics">
+		<div><span>p(T = 1), sum rule</span><strong class="m-pos"></strong></div>
+		<div><span>p(C = 1 | T = 1), Bayes</span><strong class="m-post"></strong></div>
+		<div><span>p(C = 1 | T = 0)</span><strong class="m-neg"></strong></div>
+		<div><span>people: TP / FP / FN</span><strong class="m-counts"></strong></div>
+	</div>
+	<p class="smp-narration"></p>
+	{caption && <figcaption>{caption}</figcaption>}
+	<script type="application/json" class="pt-init" set:html={JSON.stringify({ prior })}></script>
+</figure>
+
+<script>
+	import { screening, screeningCounts } from "./probTheory";
+	import { el, fmt } from "../sampling/plot";
+
+	// Prevalence slider on a log-like scale so 0.001 and 0.2 are both reachable.
+	const toPrior = (u: number) => 10 ** (-3 + 3 * u);
+	const fromPrior = (p: number) => (Math.log10(Math.max(p, 0.001)) + 3) / 3;
+
+	function attach(fig: HTMLElement) {
+		const svg = fig.querySelector("svg")!;
+		const n = Number(fig.dataset.people) || 1000;
+		const cols = 50;
+		const rows = n / cols;
+		const init = JSON.parse(fig.querySelector(".pt-init")!.textContent ?? "{}");
+		const pIn = fig.querySelector<HTMLInputElement>(".i-prior")!;
+		const sIn = fig.querySelector<HTMLInputElement>(".i-sens")!;
+		const fIn = fig.querySelector<HTMLInputElement>(".i-fp")!;
+		const only = fig.querySelector<HTMLInputElement>(".i-only")!;
+		pIn.value = String(fromPrior(init.prior ?? 0.01));
+		const cell = 12;
+		const ox = (640 - cols * cell) / 2;
+		svg.setAttribute("viewBox", `0 0 640 ${rows * cell + 22}`);
+		const rects: SVGElement[] = [];
+		for (let k = 0; k < n; k++) {
+			// Column-major so each group fills whole columns from the left.
+			const c = Math.floor(k / rows);
+			const r = k % rows;
+			rects.push(el("rect", { x: ox + c * cell + 1.5, y: 4 + r * cell + 1.5, width: cell - 3, height: cell - 3, rx: 2, class: "pt-person" }, svg));
+		}
+		const note = el("text", { x: 320, y: rows * cell + 18, class: "smp-note", "text-anchor": "middle" }, svg);
+
+		function draw() {
+			const prior = Number(toPrior(Number(pIn.value)).toFixed(4));
+			const sens = Number(sIn.value);
+			const fp = Number(fIn.value);
+			const s = screening(prior, sens, fp);
+			const [tn, fpos, fn, tp] = screeningCounts(n, prior, sens, fp);
+			// Order: cancer & positive, cancer & negative, no cancer & positive, no cancer & negative.
+			const groups: [number, boolean, boolean][] = [
+				[tp, true, true],
+				[fn, true, false],
+				[fpos, false, true],
+				[tn, false, false],
+			];
+			let k = 0;
+			for (const [count, sick, pos] of groups)
+				for (let i = 0; i < count; i++, k++) {
+					const r = rects[k];
+					r.classList.toggle("sick", sick);
+					r.classList.toggle("pos", pos);
+					r.classList.toggle("dim", only.checked && !pos);
+				}
+			note.textContent = `${n} people: ${tp + fn} with cancer, ${tp + fpos} test positive, of whom ${tp} have cancer`;
+			fig.querySelector(".v-prior")!.textContent = prior < 0.01 ? prior.toFixed(3) : prior.toFixed(2);
+			fig.querySelector(".v-sens")!.textContent = fmt(sens, 2);
+			fig.querySelector(".v-fp")!.textContent = fmt(fp, 3);
+			fig.querySelector(".m-pos")!.textContent = fmt(s.pPos, 4);
+			fig.querySelector(".m-post")!.textContent = fmt(s.pCancerGivenPos, 3);
+			fig.querySelector(".m-neg")!.textContent = s.pCancerGivenNeg.toExponential(2);
+			fig.querySelector(".m-counts")!.textContent = `${tp} / ${fpos} / ${fn}`;
+			fig.querySelector(".smp-narration")!.textContent =
+				`p(T=1) = ${fmt(fp, 3)} × ${fmt(1 - prior, 4)} + ${fmt(sens, 2)} × ${fmt(prior, 4)} = ${fmt(s.pPos, 4)}. ` +
+				`p(C=1 | T=1) = ${fmt(sens * prior, 5)} / ${fmt(s.pPos, 4)} = ${fmt(s.pCancerGivenPos, 3)}: ` +
+				`of every ${tp + fpos} positives about ${tp} are true positives.`;
+		}
+		for (const i of [pIn, sIn, fIn, only]) i.addEventListener("input", draw);
+		draw();
+	}
+
+	document.querySelectorAll<HTMLElement>(".pt-screen").forEach(attach);
+</script>

@@ -2,7 +2,7 @@
 
 ML Systems is a one of the most rapidly evolving fields in Computer Science with a lot of research focusing on scaling and optimisation. 
 This repository contains some public and private posts (this is for mostly for note taking purposes and correctness is not guaranteed). The public posts are available on irshadcc.github.io/blogs
-Please note that most of the content are created using LLMs.
+Please note that most of the content are created using LLMs for reading purposes during commute.
 
 ## Commands
 

@@ -1,0 +1,1649 @@
+---
+title: "Probabilities: From the Sum and Product Rules to Entropy and Bayes"
+description: "A walk through the Probabilities chapter of Bishop and Bishop's Deep Learning: the sum and product rules, Bayes' theorem, densities and expectations, the Gaussian and maximum likelihood, the bias of the variance estimate, change of variables, entropy, KL divergence, mutual information and the Bayesian view of regularisation, with every result derived, a worked example per idea, an interactive figure, and answers to all 41 exercises."
+date: 2026-11-04
+tags: [Machine learning, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import LineChart from "../../utils/charts/LineChart.astro";
+import ScreeningPopulation from "../../utils/probtheory/ScreeningPopulation.astro";
+import JointCounts from "../../utils/probtheory/JointCounts.astro";
+import GaussianLikelihood from "../../utils/probtheory/GaussianLikelihood.astro";
+import MlBias from "../../utils/probtheory/MlBias.astro";
+import MapRegression from "../../utils/probtheory/MapRegression.astro";
+import DensityTransform from "../../utils/probtheory/DensityTransform.astro";
+import EntropyCoding from "../../utils/probtheory/EntropyCoding.astro";
+import JensenChord from "../../utils/probtheory/JensenChord.astro";
+import GaussianKl from "../../utils/probtheory/GaussianKl.astro";
+import InfoBars from "../../utils/probtheory/InfoBars.astro";
+import Gaussian2D from "../../utils/probtheory/Gaussian2D.astro";
+import BiasVarianceFits from "../../utils/probtheory/BiasVarianceFits.astro";
+import ElboBars from "../../utils/probtheory/ElboBars.astro";
+import { coinEvidence, flowDensity, meanOfUniformsPdf } from "../../utils/probtheory/probTheory";
+
+## Background
+
+A classifier that labels skin lesions as benign or malignant will never be right every time.
+Part of the reason is **epistemic uncertainty** (also called systematic uncertainty): we have
+seen only a finite training set, and more examples would help. The other part is **aleatoric
+uncertainty** (intrinsic uncertainty, or noise): even with infinite data an image does not
+contain all the information that decides the answer, and only a different kind of measurement,
+such as a biopsy, would reduce it. Machine learning needs one language for both kinds, and that
+language is probability.
+
+Probability matters because almost every loss function in deep learning is a probability in
+disguise. The sum-of-squares error is the negative log likelihood of a Gaussian, cross-entropy
+is a Kullback–Leibler divergence up to a constant, and weight decay is a Gaussian prior. Knowing
+where these come from tells you when they are the right choice and when they are not.
+
+This post follows chapter 2 of Bishop and Bishop's *Deep Learning: Foundations and
+Concepts*<Sidenote>C. M. Bishop and H. Bishop, *Deep Learning: Foundations and Concepts*,
+Springer, 2024, chapter 2, pp. 23–63. Equation numbers such as (2.21) refer to the book. Every
+number in this post was computed by a script, with the same TypeScript code the figures run,
+and cross-checked with NumPy and SciPy.</Sidenote> section by section:
+
+1. **The rules of probability**: the sum and product rules, Bayes' theorem and a cancer
+   screening example.
+2. **Probability densities**: continuous variables, some standard densities, expectations and
+   covariances.
+3. **The Gaussian distribution**: its moments, maximum likelihood, the bias of the variance
+   estimate, and why least squares assumes Gaussian noise.
+4. **Transformation of densities**: why a density picks up a Jacobian and why its peak moves.
+5. **Information theory**: entropy, maximum entropy, the Kullback–Leibler divergence,
+   conditional entropy and mutual information.
+6. **Bayesian probabilities**: priors over parameters, regularisation as a prior, and the
+   predictive distribution.
+7. **Going further**: seven advanced ideas the chapter points to, explained simply: the
+   multivariate Gaussian, the central limit theorem, decision theory, the bias–variance trade-off,
+   model comparison, the evidence lower bound and normalizing flows.
+
+The post ends with answers to all 41 exercises. The [Bayesian statistics
+post](/blog/bayesian-statistics-and-optimisation/) takes the Bayesian part further, and the
+[sampling post](/blog/sampling-methods/) uses the change-of-variables rule from Section 2.4 to
+generate random numbers.
+
+## The rules of probability
+
+The chapter starts with two views of what a probability is. Take a bent coin that lands with
+its concave side up 60% of the time. "The probability of concave-side-up is 0.6" is a statement
+about the **frequency** of a repeatable event in the limit of infinitely many flips: the
+**frequentist** view. Now suppose we cannot see which side is heads. "The probability that the
+concave side is heads is 0.5" is not about any repeatable event; it measures our **uncertainty**
+about a fixed but unknown fact. This is the **Bayesian** view, and it includes the frequentist
+one as a special case. Both use the same two rules.
+
+### The sum and product rules
+
+Consider two **random variables**: $X$ takes values $x_1, \dots, x_L$ and $Y$ takes values
+$y_1, \dots, y_M$. Draw $N$ samples of the pair and count:
+
+- $n_{ij}$ = number of samples with $X = x_i$ and $Y = y_j$ (one cell of a grid),
+- $c_i = \sum_j n_{ij}$ = number with $X = x_i$ (a column),
+- $r_j = \sum_i n_{ij}$ = number with $Y = y_j$ (a row).
+
+In the limit $N \to \infty$ the fractions become probabilities. The **joint probability**
+is the fraction of samples in a cell, the **marginal probability** of $X = x_i$ is the fraction
+in its column, and the **conditional probability** of $Y = y_j$ given $X = x_i$ is the fraction
+of column $i$ that falls in cell $(i, j)$:
+
+$$
+\begin{gathered}
+p(X = x_i, Y = y_j) = \frac{n_{ij}}{N}, \qquad p(X = x_i) = \frac{c_i}{N}, \\
+p(Y = y_j \mid X = x_i) = \frac{n_{ij}}{c_i}.
+\end{gathered} \tag{2.1, 2.2, 2.5}
+$$
+
+Two rules follow from nothing more than how the counts add up. Because a column is the sum of
+its cells, $c_i = \sum_j n_{ij}$, dividing by $N$ gives the **sum rule**. Because
+$n_{ij}/N = (n_{ij}/c_i)(c_i/N)$, we get the **product rule**:
+
+$$
+\begin{aligned}
+\textbf{sum rule}&\quad p(X) = \sum_Y p(X, Y), \\
+\textbf{product rule}&\quad p(X, Y) = p(Y \mid X)\, p(X).
+\end{aligned} \tag{2.8, 2.9}
+$$
+
+Summing $p(X)$ over all values of $X$ gives $\sum_i c_i / N = 1$, and summing the conditional
+over $Y$ gives $\sum_j n_{ij}/c_i = 1$, so both are correctly normalised. Computing $p(X)$ by
+summing out $Y$ is called **marginalising**.
+
+The figure below draws 60 samples from a joint distribution over a nine-valued $X$ and a
+two-valued $Y$, in the spirit of the book's Figure 2.5.<Sidenote>The book does not list the
+probabilities behind its Figure 2.5, so the joint used here is our own: a narrow bump on the
+left for $Y = 1$ and a broad one on the right for $Y = 2$ (`figure25Joint` in
+`probTheory.ts`), sampled with seed 3.</Sidenote> Each dot is one sample. Below the grid are the
+histogram estimates of $p(X)$ and of $p(X \mid Y = 1)$; on the right is $p(Y)$. Hover a cell to
+see both rules evaluated with its counts.
+
+<JointCounts n={60} seed={3} caption="60 samples of (X, Y). A cell holds n_ij dots, a column c_i and a row r_j. The bottom row (Y = 1) is selected, so the last histogram is p(X | Y = 1) = n_i1 / r_1. Click another row to condition on it; raise N to see the histograms settle." />
+
+Check one cell by hand. Column $X = 4$ has $c_4 = 15$ dots, 12 of them in the row $Y = 1$, and
+that row has $r_1 = 33$ dots. So $p(X = 4, Y = 1) = 12/60 = 0.2$, the product rule gives
+$p(Y = 1 \mid X = 4)\, p(X = 4) = (12/15)(15/60) = 0.2$, and the conditional the other way round
+is $p(X = 4 \mid Y = 1) = 12/33 = 0.364$, the tallest bar of the last histogram.
+
+From now on we write $p(X)$ for the distribution of $X$ and $p(x_i)$ for its value at $x_i$
+whenever that is unambiguous.
+
+### Bayes' theorem
+
+The joint probability does not care about the order of its arguments, $p(X, Y) = p(Y, X)$.
+Writing both sides with the product rule, $p(Y \mid X)\, p(X) = p(X \mid Y)\, p(Y)$, and dividing
+by $p(X)$ gives **Bayes' theorem**:
+
+$$
+p(Y \mid X) = \frac{p(X \mid Y)\, p(Y)}{p(X)}, \qquad p(X) = \sum_Y p(X \mid Y)\, p(Y). \tag{2.10, 2.11}
+$$
+
+Bayes' theorem **reverses a conditional**: it turns $p(X \mid Y)$, which is often easy to
+measure, into $p(Y \mid X)$, which is often what we want. The denominator, rewritten with the
+sum and product rules, is just the constant that makes the left-hand side sum to one over $Y$.
+
+### Medical screening
+
+Suppose 1% of a population has cancer. A screening test gives a positive result for 90% of the
+people who have cancer (its **sensitivity**), and also for 3% of those who do not (its
+**false-positive rate**); the 10% of sick people who test negative are the **false negatives**. Let $C = 1$ mean cancer and
+$T = 1$ a positive test. Then
+
+$$
+p(C = 1) = \tfrac{1}{100}, \quad p(T = 1 \mid C = 1) = \tfrac{90}{100}, \quad p(T = 1 \mid C = 0) = \tfrac{3}{100}, \tag{2.12–2.17}
+$$
+
+with the complementary values $p(C = 0) = 99/100$, $p(T = 0 \mid C = 1) = 10/100$ and
+$p(T = 0 \mid C = 0) = 97/100$.
+
+**How likely is a positive test?** Apply the sum rule over $C$ and then the product rule to each
+term:
+
+$$
+p(T = 1) = \tfrac{3}{100} \cdot \tfrac{99}{100} + \tfrac{90}{100} \cdot \tfrac{1}{100} = \tfrac{297 + 90}{10\,000} = 0.0387. \tag{2.20}
+$$
+
+About 4% of people test positive, although only 1% are sick.
+
+**If the test is positive, how likely is cancer?** This needs the reversed conditional, so we use
+Bayes' theorem:
+
+$$
+\begin{aligned}
+p(C = 1 \mid T = 1) &= \frac{p(T = 1 \mid C = 1)\, p(C = 1)}{p(T = 1)} \\
+&= \frac{90/10\,000}{387/10\,000} = \frac{90}{387} \simeq 0.23.
+\end{aligned} \tag{2.21, 2.22}
+$$
+
+Only 23% of the people with a positive result have cancer. The figure shows why. Among 1000
+people, 10 are sick and 9 of them test positive, but 3% of the 990 healthy people is another 30
+positives. Tick "only positives": of the 39 outlined squares, 9 are red.
+
+<ScreeningPopulation prior={0.01} sensitivity={0.9} falsePositive={0.03} caption="1000 people, column by column: red squares have cancer, outlined squares tested positive. Readouts are exact probabilities; the squares are rounded counts. Move the prevalence slider down to 0.001 to see Exercise 2.1." />
+
+This result surprises many people, and the reason is the **prior**. Before the test, the best
+we can say is $p(C = 1) = 0.01$; this is the **prior probability**, available before we see the
+evidence. After seeing $T = 1$, Bayes' theorem gives the **posterior probability**
+$p(C = 1 \mid T = 1) = 0.23$. The test multiplied the probability of cancer by 23, which is
+strong evidence, but it started from a small number. The false positives outnumber the true
+positives because healthy people outnumber sick people 99 to 1.
+
+### Independence
+
+If the joint distribution factorises into its marginals, $p(X, Y) = p(X)\, p(Y)$, then $X$ and
+$Y$ are **independent**. The product rule then gives $p(Y \mid X) = p(X, Y)/p(X) = p(Y)$:
+knowing $X$ tells us nothing about $Y$. Successive flips of a coin are independent. A screening
+test whose result is independent of cancer would have $p(T \mid C) = p(T)$, so Bayes' theorem
+would return $p(C \mid T) = p(C)$, and the test would be useless.
+
+## Probability densities
+
+### Densities and the rules for continuous variables
+
+For a continuous variable, such as the dose of a drug, the probability of any exact value is
+zero. Instead we define a **probability density** $p(x)$: the probability that $x$ falls in a
+small interval $(x, x + \delta x)$ is $p(x)\, \delta x$ as $\delta x \to 0$. Probabilities of
+intervals are integrals,
+
+$$
+p\big(x \in (a, b)\big) = \int_a^b p(x)\, \mathrm{d}x, \qquad p(x) \geqslant 0, \qquad \int_{-\infty}^{\infty} p(x)\, \mathrm{d}x = 1, \tag{2.23–2.25}
+$$
+
+and the **cumulative distribution function** $P(z) = \int_{-\infty}^z p(x)\, \mathrm{d}x$ (2.26)
+satisfies $P'(x) = p(x)$. Note that a density can be larger than one; only its integral is
+bounded. For a vector $\mathbf{x}$ the probability of a small volume $\delta \mathbf{x}$ is
+$p(\mathbf{x})\, \delta \mathbf{x}$, with the same two conditions (2.27, 2.28).
+
+The sum and product rules and Bayes' theorem carry over with sums replaced by integrals:
+
+$$
+\begin{gathered}
+p(x) = \int p(x, y)\, \mathrm{d}y, \qquad p(x, y) = p(y \mid x)\, p(x), \\
+p(y \mid x) = \frac{p(x \mid y)\, p(y)}{\int p(x \mid y)\, p(y)\, \mathrm{d}y}.
+\end{gathered} \tag{2.29–2.32}
+$$
+
+A rigorous proof needs measure theory. An informal one cuts each real axis into bins of width
+$\Delta$, applies the discrete rules to the bins, and lets $\Delta \to 0$ so that sums become
+integrals.
+
+### Example distributions
+
+A density that is constant everywhere cannot be normalised (its integral diverges); such a
+distribution is called **improper**. Constant over a finite interval it is fine, and gives the
+**uniform distribution**. Three more appear throughout the book:
+
+$$
+\begin{aligned}
+\text{uniform:}&\quad p(x) = \frac{1}{d - c}, \quad x \in (c, d) &(2.33)\\
+\text{exponential:}&\quad p(x \mid \lambda) = \lambda e^{-\lambda x}, \quad x \geqslant 0 &(2.34)\\
+\text{Laplace:}&\quad p(x \mid \mu, \gamma) = \frac{1}{2\gamma} \exp\!\Big(-\frac{|x - \mu|}{\gamma}\Big) &(2.35)
+\end{aligned}
+$$
+
+The Laplace distribution is the exponential reflected about a movable centre $\mu$.
+
+<LineChart
+	x={() => Array.from({ length: 601 }, (_, i) => -2 + i / 100)}
+	series={[
+		{ name: "uniform on (−1, 1)", fn: (x) => (x > -1 && x < 1 ? 0.5 : 0) },
+		{ name: "exponential, λ = 1", fn: (x) => (x >= 0 ? Math.exp(-x) : 0) },
+		{ name: "Laplace, µ = 1, γ = 1", fn: (x) => 0.5 * Math.exp(-Math.abs(x - 1)) },
+	]}
+	title="Three simple densities (the book's Figure 2.7)"
+	xLabel="x"
+	yLabel="p(x)"
+	height={260}
+/>
+
+The **Dirac delta** $\delta(x - \mu)$ is zero everywhere except at $x = \mu$ and integrates to
+one: an infinitely tall, infinitely narrow spike of unit area. Its key property, the **sifting
+property**, is $\int f(x)\, \delta(x - \mu)\, \mathrm{d}x = f(\mu)$. Putting a spike on each of
+$N$ observations $\mathcal{D} = \{x_1, \dots, x_N\}$ gives the **empirical distribution**
+
+$$
+p(x \mid \mathcal{D}) = \frac{1}{N} \sum_{n=1}^{N} \delta(x - x_n), \tag{2.37}
+$$
+
+which puts mass $1/N$ on every data point (Exercise 2.6).
+
+### Expectations and covariances
+
+The **expectation** of a function $f$ is its average weighted by the distribution:
+
+$$
+\begin{gathered}
+\mathbb{E}[f] = \sum_x p(x) f(x) \quad \text{or} \quad \mathbb{E}[f] = \int p(x) f(x)\, \mathrm{d}x, \\
+\mathbb{E}[f] \simeq \frac{1}{N} \sum_{n=1}^N f(x_n).
+\end{gathered} \tag{2.38–2.40}
+$$
+
+The approximation on the right uses $N$ samples drawn from $p$ and becomes exact as
+$N \to \infty$. It is exactly the expectation under the empirical distribution (Exercise 2.7),
+and it is how every training loss is computed: the average over a mini-batch estimates the
+expectation over the data distribution. For functions of several variables a subscript says
+which one is averaged, so $\mathbb{E}_x[f(x, y)]$ is a function of $y$. A **conditional
+expectation** $\mathbb{E}_x[f \mid y] = \int p(x \mid y) f(x)\, \mathrm{d}x$ (2.42, 2.43) averages
+under a conditional distribution and is also a function of $y$.
+
+The **variance** measures how much $f$ spreads around its mean. Expanding the square and using
+linearity of expectation (Exercise 2.8) gives a form that is often easier to compute:
+
+$$
+\operatorname{var}[f] = \mathbb{E}\big[(f(x) - \mathbb{E}[f(x)])^2\big] = \mathbb{E}[f(x)^2] - \mathbb{E}[f(x)]^2. \tag{2.44, 2.45}
+$$
+
+The **covariance** measures how two variables vary together, and for vectors it is a matrix:
+
+$$
+\begin{aligned}
+\operatorname{cov}[x, y] &= \mathbb{E}_{x,y}\big[\{x - \mathbb{E}[x]\}\{y - \mathbb{E}[y]\}\big] = \mathbb{E}_{x,y}[xy] - \mathbb{E}[x]\,\mathbb{E}[y], \\
+\operatorname{cov}[\mathbf{x}, \mathbf{y}] &= \mathbb{E}[\mathbf{x}\mathbf{y}^{\mathrm{T}}] - \mathbb{E}[\mathbf{x}]\,\mathbb{E}[\mathbf{y}^{\mathrm{T}}].
+\end{aligned} \tag{2.47, 2.48}
+$$
+
+If $x$ and $y$ are independent, $\mathbb{E}[xy] = \mathbb{E}[x]\,\mathbb{E}[y]$ and the covariance
+is zero (Exercise 2.9). The converse is false: Exercise 2.39 builds two dependent variables with
+zero covariance. We write $\operatorname{cov}[\mathbf{x}] \equiv \operatorname{cov}[\mathbf{x}, \mathbf{x}]$
+for the covariance matrix of the components of one vector.
+
+## The Gaussian distribution
+
+### Normalisation, mean and variance
+
+The **Gaussian** or **normal** distribution of a real variable $x$ is
+
+$$
+\mathcal{N}(x \mid \mu, \sigma^2) = \frac{1}{(2\pi\sigma^2)^{1/2}} \exp\Big\{-\frac{1}{2\sigma^2}(x - \mu)^2\Big\}, \tag{2.49}
+$$
+
+with two parameters: the **mean** $\mu$ and the **variance** $\sigma^2$. Its square root $\sigma$
+is the **standard deviation**, and $\beta = 1/\sigma^2$ is the **precision**. It is positive
+everywhere, and it integrates to one. The proof is a classic trick (Exercise 2.12): the integral
+$I = \int e^{-x^2/2\sigma^2}\, \mathrm{d}x$ has no closed-form antiderivative, but its square is a
+two-dimensional integral that becomes easy in polar coordinates,
+
+$$
+I^2 = \int_0^{2\pi}\!\!\int_0^\infty e^{-r^2/2\sigma^2}\, r\, \mathrm{d}r\, \mathrm{d}\theta = 2\pi \cdot \tfrac{1}{2}\int_0^\infty e^{-u/2\sigma^2}\, \mathrm{d}u = 2\pi\sigma^2,
+$$
+
+where the extra factor $r$ is the area element and $u = r^2$. So $I = (2\pi\sigma^2)^{1/2}$,
+exactly the normalising constant in (2.49). Shifting $x$ by $\mu$ does not change the integral.
+
+The parameters earn their names from the first two **moments** (Exercise 2.13):
+
+$$
+\begin{gathered}
+\mathbb{E}[x] = \int \mathcal{N}(x \mid \mu, \sigma^2)\, x\, \mathrm{d}x = \mu, \qquad \mathbb{E}[x^2] = \mu^2 + \sigma^2, \\
+\operatorname{var}[x] = \mathbb{E}[x^2] - \mathbb{E}[x]^2 = \sigma^2.
+\end{gathered} \tag{2.52–2.54}
+$$
+
+The first follows by substituting $y = x - \mu$: the term $\int y\, \mathcal{N}\, \mathrm{d}y$ is
+zero because the integrand is odd. The second comes from differentiating the normalisation
+condition with respect to $\sigma^2$, which brings down a factor $(x - \mu)^2$. The maximum of a
+distribution is its **mode**; for the Gaussian it coincides with the mean (Exercise 2.14).
+
+### The likelihood function
+
+Now suppose we observe $N$ values $\mathsf{x} = (x_1, \dots, x_N)$ drawn **independently and
+identically distributed** (i.i.d.) from a Gaussian whose $\mu$ and $\sigma^2$ are unknown.
+Estimating a distribution from data is called **density estimation**. It is ill-posed in general,
+since any density that is non-zero at the data points could have produced them, so we restrict
+the search to Gaussians. Independence makes the joint probability of the data a product:
+
+$$
+p(\mathsf{x} \mid \mu, \sigma^2) = \prod_{n=1}^{N} \mathcal{N}(x_n \mid \mu, \sigma^2). \tag{2.55}
+$$
+
+Seen as a function of $\mu$ and $\sigma^2$ for fixed data, this is the **likelihood function**.
+**Maximum likelihood** picks the parameters that make the observed data most probable. We
+maximise the logarithm instead, which has the same maximiser because $\ln$ is increasing, turns
+the product into a sum, and avoids the numerical underflow of multiplying many small numbers:
+
+$$
+\ln p(\mathsf{x} \mid \mu, \sigma^2) = -\frac{1}{2\sigma^2} \sum_{n=1}^{N} (x_n - \mu)^2 - \frac{N}{2} \ln \sigma^2 - \frac{N}{2} \ln(2\pi). \tag{2.56}
+$$
+
+Setting the derivative with respect to $\mu$ to zero gives
+$\frac{1}{\sigma^2}\sum_n (x_n - \mu) = 0$; setting the derivative with respect to $\sigma^2$ to
+zero gives $\frac{1}{2\sigma^4}\sum_n (x_n - \mu)^2 - \frac{N}{2\sigma^2} = 0$ (Exercise 2.15).
+Solving,
+
+$$
+\mu_{\mathrm{ML}} = \frac{1}{N} \sum_{n=1}^{N} x_n, \qquad \sigma^2_{\mathrm{ML}} = \frac{1}{N} \sum_{n=1}^{N} (x_n - \mu_{\mathrm{ML}})^2: \tag{2.57, 2.58}
+$$
+
+the **sample mean** and the **sample variance**. The equation for $\mu$ does not involve
+$\sigma^2$, so we can solve for $\mu$ first and then plug it into the one for $\sigma^2$.
+
+**Worked example.** Take the six points $0.3, 1.1, 1.6, 2.2, 2.4, 3.4$. Their mean is
+$11/6 = 1.833$. The squared deviations sum to $5.853$, so $\sigma^2_{\mathrm{ML}} = 0.976$, and
+(2.56) gives a maximum log likelihood of $-8.439$. With $\mu = 1$, $\sigma^2 = 1$ instead, the
+squared deviations sum to $10.02$ and the log likelihood drops to
+$-10.02/2 - 3 \ln(2\pi) = -10.524$. In the figure, the likelihood is the product of the heights of
+the blue dots. Moving the Gaussian away from the data shrinks the heights; making it too narrow
+makes the outer points improbable, and making it too wide lowers every height.
+
+<GaussianLikelihood data={[0.3, 1.1, 1.6, 2.2, 2.4, 3.4]} mu={1} s2={1} caption="Left: the Gaussian and its value at each data point; the likelihood is the product of the blue heights. Right: the log likelihood over (µ, σ²), darker is higher; drag on it, or press Fit to jump to (µ_ML, σ²_ML) = (1.833, 0.976)." />
+
+Why maximise $p(\text{data} \mid \text{parameters})$ rather than the more natural
+$p(\text{parameters} \mid \text{data})$? The two are related by Bayes' theorem, as
+[the last section](#bayesian-probabilities) shows.
+
+### Bias of maximum likelihood
+
+The estimates (2.57) and (2.58) are functions of a random data set, so they are random too. Average
+them over many data sets of size $N$ drawn from a Gaussian with true parameters $\mu$ and
+$\sigma^2$ (Exercise 2.16):
+
+$$
+\mathbb{E}[\mu_{\mathrm{ML}}] = \mu, \qquad \mathbb{E}[\sigma^2_{\mathrm{ML}}] = \Big(\frac{N - 1}{N}\Big) \sigma^2. \tag{2.59, 2.60}
+$$
+
+The mean is right on average, but the variance is too small by a factor $(N - 1)/N$. An
+estimator whose average differs from the true value is **biased**. Here is the derivation. For
+two independent samples $\mathbb{E}[x_n x_m] = \mu^2$, and for the same sample
+$\mathbb{E}[x_n^2] = \mu^2 + \sigma^2$ by (2.53), so $\mathbb{E}[x_n x_m] = \mu^2 + I_{nm}\sigma^2$
+with $I_{nm} = 1$ when $n = m$ and $0$ otherwise. Expanding (2.58) as
+$\frac{1}{N}\sum_n x_n^2 - \mu_{\mathrm{ML}}^2$,
+
+$$
+\mathbb{E}[\sigma^2_{\mathrm{ML}}] = (\mu^2 + \sigma^2) - \frac{1}{N^2} \sum_{n}\sum_{m} \mathbb{E}[x_n x_m] = \mu^2 + \sigma^2 - \Big(\mu^2 + \frac{\sigma^2}{N}\Big) = \frac{N - 1}{N}\sigma^2.
+$$
+
+The lost $\sigma^2/N$ is the variance of $\mu_{\mathrm{ML}}$ itself. The deviations are measured
+from the sample mean, which sits in the middle of the data, so they are smaller than deviations
+from the true mean would be. Indeed, with the true mean, $\hat\sigma^2 = \frac{1}{N}\sum_n (x_n - \mu)^2$
+is unbiased (2.61, 2.62; Exercise 2.17), and rescaling (2.58) gives the familiar unbiased
+estimate
+
+$$
+\tilde\sigma^2 = \frac{N}{N - 1}\, \sigma^2_{\mathrm{ML}} = \frac{1}{N - 1} \sum_{n=1}^N (x_n - \mu_{\mathrm{ML}})^2. \tag{2.63}
+$$
+
+The figure draws data sets of $N = 2$ points from $\mathcal{N}(0, 1)$, as in the book's
+Figure 2.10, and keeps a running average of $\sigma^2_{\mathrm{ML}}$. The first three data sets
+give $\sigma^2_{\mathrm{ML}} = 0.227, 0.044, 0.514$, all below 1. After 1000 data sets the average
+is $0.483$, close to $(N - 1)/N = 0.5$, and the corrected average is $0.966$.<Sidenote>For
+$N = 2$, $\sigma^2_{\mathrm{ML}} = (x_1 - x_2)^2/4$, which is $\frac{1}{2}$ times a $\chi^2$
+variable with one degree of freedom, so its standard deviation is $\sqrt{2}/2 \approx 0.71$. The
+average of 1000 copies therefore has a standard error of about $0.022$; $0.483$ is within one of
+those from $0.5$.</Sidenote>
+
+<MlBias n={2} seed={11} start={3} caption="Top: the true N(0, 1) (red), the latest two-point data set (green) and its maximum-likelihood fit (blue), earlier fits faint. Bottom: the running mean of σ²_ML (purple) settles at (N − 1)/N, while the corrected estimate (green) settles at 1. Raise N and the bias shrinks." />
+
+The bias vanishes as $N \to \infty$, so for a Gaussian it only matters for small data sets. The
+book's point is that the same effect is much stronger for models with many parameters: fitting
+the parameters to the data and then measuring the error on that same data understates the error.
+That is **over-fitting**, and it is the bias of maximum likelihood in a bigger setting.
+
+### Linear regression as maximum likelihood
+
+The chapter now revisits the polynomial regression problem of chapter 1. We have inputs
+$\mathsf{x} = (x_1, \dots, x_N)$ with targets $\mathsf{t} = (t_1, \dots, t_N)$, and a polynomial
+$y(x, \mathbf{w}) = \sum_{j=0}^M w_j x^j$. Instead of choosing an error function, assume that a
+target is Gaussian around the curve:
+
+$$
+p(t \mid x, \mathbf{w}, \sigma^2) = \mathcal{N}\big(t \mid y(x, \mathbf{w}), \sigma^2\big). \tag{2.64}
+$$
+
+For i.i.d. data the log likelihood is (2.56) with $\mu$ replaced by $y(x_n, \mathbf{w})$:
+
+$$
+\ln p(\mathsf{t} \mid \mathsf{x}, \mathbf{w}, \sigma^2) = -\frac{1}{2\sigma^2} \sum_{n=1}^N \{y(x_n, \mathbf{w}) - t_n\}^2 - \frac{N}{2}\ln\sigma^2 - \frac{N}{2}\ln(2\pi). \tag{2.66}
+$$
+
+Only the first term depends on $\mathbf{w}$, and scaling by the positive constant $\sigma^2$ does
+not move the maximum. So maximising the likelihood over $\mathbf{w}$ is the same as minimising
+the **sum-of-squares error**
+
+$$
+E(\mathbf{w}) = \frac{1}{2} \sum_{n=1}^N \{y(x_n, \mathbf{w}) - t_n\}^2. \tag{2.67}
+$$
+
+Least squares is not an arbitrary choice: it is what maximum likelihood gives under Gaussian
+noise. A different noise model gives a different loss; Laplace noise (2.35), for example, gives
+the sum of absolute errors. With $\mathbf{w}_{\mathrm{ML}}$ found, maximising over $\sigma^2$ gives
+the mean squared residual (Exercise 2.18),
+
+$$
+\sigma^2_{\mathrm{ML}} = \frac{1}{N} \sum_{n=1}^N \{y(x_n, \mathbf{w}_{\mathrm{ML}}) - t_n\}^2, \tag{2.68}
+$$
+
+and the model now predicts a whole distribution, the **predictive distribution**
+$p(t \mid x, \mathbf{w}_{\mathrm{ML}}, \sigma^2_{\mathrm{ML}}) = \mathcal{N}(t \mid y(x, \mathbf{w}_{\mathrm{ML}}), \sigma^2_{\mathrm{ML}})$ (2.69).
+
+**Worked example.** Ten points at $x = 0, 1/9, \dots, 1$ with $t = \sin 2\pi x$ plus Gaussian noise
+of standard deviation 0.3 (seed 7). A cubic ($M = 3$) fitted by least squares has
+$E(\mathbf{w}_{\mathrm{ML}}) = 0.1235$, so $\sigma^2_{\mathrm{ML}} = 2 \times 0.1235 / 10 = 0.0247$
+and the predictive standard deviation is $0.157$. The figure shows the cubic, the band
+$y \pm \sigma_{\mathrm{ML}}$, and the predictive density at $x_0 = 0.6$ drawn sideways, as in the
+book's Figure 2.11.
+
+<MapRegression order={3} ml caption="Ten noisy samples of sin 2πx, a least-squares cubic, the band y ± σ_ML and the predictive density p(t | x0) at x0 = 0.6. Switch M to 9 with maximum likelihood ticked: the curve passes through every point, σ²_ML drops to zero and the coefficients explode." />
+
+Switching to $M = 9$ shows the bias problem in its extreme form. Ten coefficients can interpolate
+ten points, so $E(\mathbf{w}_{\mathrm{ML}}) = 0$ and $\sigma^2_{\mathrm{ML}} = 0$: the model claims to
+be certain, while its root-mean-square distance from $\sin 2\pi x$ is $0.494$, worse than the
+cubic's $0.275$. Its coefficients reach $\pm 10^5$ ($\mathbf{w}^{\mathrm{T}}\mathbf{w} = 2.9 \times 10^{10}$).
+We come back to this in [regularisation](#regularisation-as-a-prior).
+
+## Transformation of densities
+
+Normalising flows (chapter 18 of the book) build complicated densities by pushing a simple one
+through an invertible network. To do that we need to know how a density changes under a change of
+variable, and the answer differs from how an ordinary function changes.
+
+Let $x = g(y)$. A function just gets composed, $\tilde f(y) = f(g(y))$ (2.70). A density must keep
+probability: the mass in $(x, x + \delta x)$ ends up in the matching $(y, y + \delta y)$, so
+$p_x(x)\, |\delta x| = p_y(y)\, |\delta y|$, and in the limit
+
+$$
+p_y(y) = p_x(x) \left| \frac{\mathrm{d}x}{\mathrm{d}y} \right| = p_x(g(y))\, |g'(y)|. \tag{2.71}
+$$
+
+The modulus is there because $g$ may be decreasing while densities are positive. The factor
+$|g'(y)|$ is the ratio of interval lengths: where $g$ stretches space the density thins out.
+
+**Modes move.** For the function $\tilde f$, the chain rule gives $\tilde f'(\hat y) = f'(g(\hat y))\, g'(\hat y)$
+(2.72), so a peak of $f$ at $\hat x$ maps to a peak of $\tilde f$ at $\hat y = g^{-1}(\hat x)$.
+For the density, write $g'(y) = s\,|g'(y)|$ with $s = \pm 1$, so $p_y(y) = s\, p_x(g(y))\, g'(y)$, and
+differentiate:
+
+$$
+p_y'(y) = s\, p_x'(g(y))\, \{g'(y)\}^2 + s\, p_x(g(y))\, g''(y). \tag{2.73}
+$$
+
+The second term breaks the correspondence: at $\hat y = g^{-1}(\hat x)$ the first term is zero but the
+second is not, unless $g'' = 0$, that is, unless $g$ is linear. The location of a density's
+maximum therefore depends on the variable we choose to describe it in. This matters for maximum
+a posteriori estimates (below), which are modes and so change if we reparametrise.
+
+The book's example uses $x = g(y) = \ln y - \ln(1 - y) + 5$ (2.74), whose inverse
+$y = 1/(1 + e^{-x + 5})$ (2.75) is a logistic sigmoid, and a Gaussian $p_x$. Here
+$g'(y) = 1/(y(1 - y))$. With $p_x = \mathcal{N}(6, 1)$, the mode $\hat x = 6$ maps to
+$g^{-1}(6) = 0.731$, which is the peak of the substituted function $p_x(g(y))$ (green). The true
+density $p_y$ (magenta) peaks at $\hat y = 0.844$ instead, and $g(0.844) = 6.69 \neq 6$. A histogram
+of 50,000 samples of $x$ pushed through the sigmoid follows the magenta curve, not the green one.
+
+<DensityTransform mu={6} sigma={1} samples={50000} caption="Left: the sigmoid y = g⁻¹(x) and p_x(x) = N(6, 1) along the x axis. Right, on the same y axis: the substituted function p_x(g(y)) (green, rescaled), the density p_y(y) from (2.71) (magenta) and a histogram of 50,000 transformed samples. Switch the map to linear and the two modes coincide." />
+
+One consequence (Exercise 2.19): any density can be produced from any other, everywhere-positive
+density by a monotonic map. If $Q$ and $P$ are the two cumulative distribution functions, the map
+$y = f(x) = P^{-1}(Q(x))$ does it. The [sampling post](/blog/sampling-methods/) uses this with $q$
+uniform to turn uniform random numbers into any distribution.
+
+**Many variables.** For $\mathbf{x} = \mathbf{g}(\mathbf{y})$ with $\mathbf{x}, \mathbf{y} \in \mathbb{R}^D$,
+a small box $\Delta\mathbf{y}$ maps to a parallelepiped whose volume is $|\det \mathbf{J}|\, \Delta \mathbf{y}$,
+where $\mathbf{J}$ is the **Jacobian matrix** of partial derivatives $J_{ij} = \partial g_i / \partial y_j$
+(2.77). Conserving probability mass gives
+
+$$
+p_{\mathbf{y}}(\mathbf{y}) = p_{\mathbf{x}}(\mathbf{x})\, |\det \mathbf{J}|, \tag{2.76}
+$$
+
+the same factor that appears when changing variables in a multiple integral. The book's 2-D
+example maps $y_1 = x_1 + \tanh(5x_1)$ and $y_2 = x_2 + \tanh(5x_2) + x_1^3/3$ (2.78, 2.79). The
+chart shows the first coordinate: near $x_1 = 0$ its slope is $1 + 5 = 6$, so space is stretched
+six-fold and the density in $y$ is six times thinner there, while far from zero the slope returns
+to 1. Exercise 2.20 works out the full Jacobian.
+
+<LineChart
+	x={() => Array.from({ length: 301 }, (_, i) => -1.5 + i / 100)}
+	series={[
+		{ name: "y₁ = x₁ + tanh(5x₁)", fn: (x) => x + Math.tanh(5 * x) },
+		{ name: "dy₁/dx₁ = 1 + 5 sech²(5x₁)", fn: (x) => 1 + 5 / Math.cosh(5 * x) ** 2 },
+	]}
+	title="The first coordinate of the book's 2-D change of variables and its stretch factor"
+	xLabel="x₁"
+	height={250}
+/>
+
+## Information theory
+
+### Information and entropy
+
+How much **information** do we receive when we learn the value of a discrete variable $x$?
+Think of it as surprise: a rare event tells us more than a common one, and a certain event tells
+us nothing. So the information $h(x)$ should depend only on $p(x)$ and decrease as $p(x)$ grows.
+For two unrelated events we want the information to add, $h(x, y) = h(x) + h(y)$, while their
+probabilities multiply, $p(x, y) = p(x)\, p(y)$. The only continuous function that turns products
+into sums is a logarithm (Exercise 2.21 proves it), so
+
+$$
+h(x) = -\log_2 p(x), \tag{2.80}
+$$
+
+measured in **bits** for base 2. The average information sent when transmitting $x$ is the
+expectation of $h$, called the **entropy**:
+
+$$
+\mathrm{H}[x] = -\sum_x p(x) \log_2 p(x), \tag{2.81}
+$$
+
+with the convention $0 \ln 0 = 0$, justified by $\lim_{\epsilon \to 0} \epsilon \ln \epsilon = 0$.
+
+**Entropy is a code length.** A variable with eight equally likely states has
+$\mathrm{H} = -8 \cdot \frac{1}{8} \log_2 \frac{1}{8} = 3$ bits, and indeed we need a 3-bit number to
+send it. Now take eight states $a, \dots, h$ with probabilities
+$(\frac{1}{2}, \frac{1}{4}, \frac{1}{8}, \frac{1}{16}, \frac{1}{64}, \frac{1}{64}, \frac{1}{64}, \frac{1}{64})$
+(an example from Cover and Thomas). Its entropy is
+
+$$
+\mathrm{H} = \tfrac{1}{2} \cdot 1 + \tfrac{1}{4} \cdot 2 + \tfrac{1}{8} \cdot 3 + \tfrac{1}{16} \cdot 4 + 4 \cdot \tfrac{1}{64} \cdot 6 = 2 \text{ bits.}
+$$
+
+Giving the likely states short code words and the rare ones long words, as in
+$0, 10, 110, 1110, 111100, 111101, 111110, 111111$, gives an average length of exactly 2 bits. The
+code must be **prefix-free** (no word starts another) so that a stream can be split
+unambiguously: $11001110$ decodes only as $c, a, d$. The **noiseless coding theorem** (Shannon, 1948)
+says no code can do better than the entropy on average. In the figure, the code words come from
+Huffman's algorithm; each length equals $-\log_2 p$ here because every probability is a power of
+two.
+
+<EntropyCoding preset="cover-thomas" caption="A discrete distribution, its entropy and a Huffman code for it. For the Cover–Thomas example each code-word length equals −log₂ p and the average is 2 bits. Drag a bar to change the distribution: the Huffman average stays within one bit above the entropy. The 30-bin presets reproduce the two entropies of the book's Figure 2.14." />
+
+From here on the post, like the book, uses natural logarithms. Entropy is then in **nats**, and
+1 nat $= 1/\ln 2 = 1.443$ bits.
+
+**Entropy as disorder.** Physics reached the same formula by counting. Put $N$ identical objects
+into bins, $n_i$ in bin $i$. The number of distinguishable arrangements, the **multiplicity**, is
+$W = N! / \prod_i n_i!$ (2.82): $N!$ orderings, divided by the reorderings within each bin that
+change nothing. Define the entropy as $\mathrm{H} = \frac{1}{N} \ln W$ (2.83) and let $N \to \infty$
+with the fractions $n_i / N \to p_i$ fixed. Stirling's approximation $\ln N! \simeq N \ln N - N$
+(2.84) gives
+
+$$
+\mathrm{H} = \frac{1}{N}\Big[N \ln N - N - \sum_i (n_i \ln n_i - n_i)\Big] = -\sum_i \frac{n_i}{N} \ln \frac{n_i}{N} \;\to\; -\sum_i p_i \ln p_i, \tag{2.85}
+$$
+
+using $\sum_i n_i = N$ to cancel the $-N$ terms and to write $\ln N = \sum_i \frac{n_i}{N} \ln N$. A
+particular arrangement is a **microstate**, the occupation fractions are a **macrostate**, and
+$W$ counts the microstates of a macrostate. Spread-out distributions can be realised in many
+more ways than peaked ones, so they have higher entropy, as the 30-bin presets in the figure
+show: $\mathrm{H} = 1.77$ for the peaked one and $3.09$ for the broad one.
+
+### Maximum entropy
+
+**Discrete variables.** The entropy is zero when one $p_i = 1$ (no surprise) and largest for the
+uniform distribution. To prove the second claim, maximise $\mathrm{H}$ subject to $\sum_i p_i = 1$
+with a **Lagrange multiplier** $\lambda$:
+
+$$
+\begin{gathered}
+\tilde{\mathrm{H}} = -\sum_i p(x_i) \ln p(x_i) + \lambda \Big(\sum_i p(x_i) - 1\Big), \\
+\frac{\partial \tilde{\mathrm{H}}}{\partial p(x_i)} = -\ln p(x_i) - 1 + \lambda = 0.
+\end{gathered} \tag{2.87}
+$$
+
+Every $p(x_i)$ equals the same constant $e^{\lambda - 1}$, so $p(x_i) = 1/M$ and
+$\mathrm{H} = \ln M$. The second derivatives are
+$\partial^2 \tilde{\mathrm{H}} / \partial p_i \partial p_j = -I_{ij}/p_i$ (2.88), negative on the
+diagonal and zero elsewhere, so this stationary point is a maximum. For $M = 30$ the maximum is
+$\ln 30 = 3.40$ nats.
+
+**Continuous variables and differential entropy.** Cut the real line into bins of width $\Delta$.
+By the mean value theorem each bin contains a point $x_i$ with $\int_{i\Delta}^{(i+1)\Delta} p(x)\,\mathrm{d}x = p(x_i)\Delta$
+(2.89), so the binned variable has probabilities $p(x_i)\Delta$ and entropy
+
+$$
+\mathrm{H}_\Delta = -\sum_i p(x_i)\Delta \ln\big(p(x_i)\Delta\big) = -\sum_i p(x_i)\Delta \ln p(x_i) - \ln \Delta. \tag{2.90}
+$$
+
+As $\Delta \to 0$ the first term tends to the **differential entropy**
+$\mathrm{H}[x] = -\int p(x) \ln p(x)\, \mathrm{d}x$ (2.91, 2.92), while $-\ln\Delta$ diverges: pinning
+down a real number exactly takes infinitely many bits. Differential entropy is therefore only
+defined up to that offset, and it can be negative.
+
+Which density has the largest differential entropy? Without constraints the question has no
+answer (spread the density ever wider), so fix the mean $\mu$ and the variance $\sigma^2$, as well
+as normalisation (2.93–2.95). With three Lagrange multipliers we maximise the functional
+
+$$
+\begin{aligned}
+&-\int p \ln p\, \mathrm{d}x + \lambda_1\Big(\int p\, \mathrm{d}x - 1\Big) \\
+&+ \lambda_2\Big(\int x p\, \mathrm{d}x - \mu\Big) + \lambda_3\Big(\int (x - \mu)^2 p\, \mathrm{d}x - \sigma^2\Big).
+\end{aligned} \tag{2.96}
+$$
+
+Its derivative with respect to the value $p(x)$ at each point is
+$-\ln p(x) - 1 + \lambda_1 + \lambda_2 x + \lambda_3 (x - \mu)^2$. Setting it to zero,
+
+$$
+p(x) = \exp\{-1 + \lambda_1 + \lambda_2 x + \lambda_3 (x - \mu)^2\}: \tag{2.97}
+$$
+
+the exponential of a quadratic, which is a Gaussian. The constraints fix the multipliers
+(Exercise 2.24): the mean forces $\lambda_2 = 0$, the variance forces $\lambda_3 = -1/(2\sigma^2)$,
+and normalisation fixes $\lambda_1$, so the maximum-entropy density is exactly
+$\mathcal{N}(x \mid \mu, \sigma^2)$ (2.98). We never imposed $p \geqslant 0$, but the answer satisfies
+it anyway. Its entropy (Exercise 2.25) is
+
+$$
+\mathrm{H}[x] = \tfrac{1}{2}\{1 + \ln(2\pi\sigma^2)\}, \tag{2.99}
+$$
+
+which grows with $\sigma^2$ and is negative for $\sigma^2 < 1/(2\pi e) = 0.0585$.
+
+This is one reason the Gaussian is everywhere: if all we know (or choose to model) about a
+variable is its mean and variance, the Gaussian assumes nothing more. The chart compares three
+densities with the same mean 0 and variance 1. Their entropies are 1.419 for the Gaussian,
+1.347 for the Laplace ($\gamma = 1/\sqrt{2}$) and 1.242 for the uniform on $(-\sqrt3, \sqrt3)$.
+
+<LineChart
+	x={() => Array.from({ length: 501 }, (_, i) => -4 + i / 62.5)}
+	series={[
+		{ name: "Gaussian, H = 1.419", fn: (x) => Math.exp(-(x * x) / 2) / Math.sqrt(2 * Math.PI) },
+		{ name: "Laplace, H = 1.347", fn: (x) => Math.exp(-Math.abs(x) * Math.SQRT2) / Math.SQRT2 },
+		{ name: "uniform, H = 1.242", fn: (x) => (Math.abs(x) < Math.sqrt(3) ? 1 / (2 * Math.sqrt(3)) : 0) },
+	]}
+	title="Three densities with mean 0 and variance 1; the Gaussian has the largest entropy (nats)"
+	xLabel="x"
+	yLabel="p(x)"
+	height={260}
+/>
+
+### Kullback–Leibler divergence
+
+Now connect entropy to learning. Suppose data come from an unknown $p(x)$ and we model it with
+$q(x)$. If we build a code from $q$, the average extra information needed, compared with a code
+built from the true $p$, is the **Kullback–Leibler (KL) divergence** or **relative entropy**:
+
+$$
+\begin{aligned}
+\mathrm{KL}(p \,\|\, q) &= -\int p(x) \ln q(x)\, \mathrm{d}x - \Big(-\int p(x) \ln p(x)\, \mathrm{d}x\Big) \\
+&= -\int p(x) \ln\Big\{\frac{q(x)}{p(x)}\Big\} \mathrm{d}x.
+\end{aligned} \tag{2.100}
+$$
+
+The first term is the **cross-entropy** of $q$ relative to $p$, the second the entropy of $p$. KL is
+not symmetric: $\mathrm{KL}(p \,\|\, q) \not\equiv \mathrm{KL}(q \,\|\, p)$ in general.
+
+**KL is never negative.** The proof uses convexity. A function is **convex** if every chord lies on
+or above it: for $0 \leqslant \lambda \leqslant 1$,
+
+$$
+f(\lambda a + (1 - \lambda) b) \leqslant \lambda f(a) + (1 - \lambda) f(b). \tag{2.101}
+$$
+
+It is **strictly convex** if equality holds only at $\lambda = 0$ and $\lambda = 1$; $x \ln x$ and
+$x^2$ are examples, and so is $-\ln x$. Reading $\lambda$ and $1 - \lambda$ as probabilities of
+two values $a$ and $b$, the left side is $f(\mathbb{E}[x])$ and the right side is
+$\mathbb{E}[f(x)]$. By induction on the number of points (Exercise 2.33) this extends to
+**Jensen's inequality**:
+
+$$
+\begin{gathered}
+f\Big(\sum_i \lambda_i x_i\Big) \leqslant \sum_i \lambda_i f(x_i), \qquad f(\mathbb{E}[x]) \leqslant \mathbb{E}[f(x)], \\
+f\Big(\int x\, p(x)\, \mathrm{d}x\Big) \leqslant \int f(x)\, p(x)\, \mathrm{d}x.
+\end{gathered} \tag{2.102–2.104}
+$$
+
+<JensenChord fn="xlnx" a={0.2} b={2.5} lambda={0.4} caption="A convex function lies under its chords. The blue dot is λ f(a) + (1 − λ) f(b) = E[f(x)], the green dot f(λa + (1 − λ)b) = f(E[x]); the gap is never negative. Try f = −ln x, the function used to prove KL ⩾ 0." />
+
+Apply (2.104) with the convex $f = -\ln$ to the variable $q(x)/p(x)$ averaged under $p$:
+
+$$
+\begin{aligned}
+\mathrm{KL}(p \,\|\, q) &= \int p(x) \Big\{-\ln \frac{q(x)}{p(x)}\Big\} \mathrm{d}x \geqslant -\ln \int p(x) \frac{q(x)}{p(x)}\, \mathrm{d}x \\
+&= -\ln \int q(x)\, \mathrm{d}x = -\ln 1 = 0.
+\end{aligned} \tag{2.105}
+$$
+
+Because $-\ln$ is strictly convex, equality needs $q(x)/p(x)$ to be constant, and since both
+integrate to one, $q = p$. So $\mathrm{KL}(p \,\|\, q) \geqslant 0$ with equality if and only if $p = q$,
+and it can serve as a measure of how different two distributions are. Using any model other than
+the truth always costs extra bits.
+
+For two Gaussians the integral has a closed form (Exercise 2.27):
+$\mathrm{KL}\big(\mathcal{N}(\mu, \sigma^2) \,\|\, \mathcal{N}(m, s^2)\big) = \ln\frac{s}{\sigma} + \frac{\sigma^2 + (\mu - m)^2}{2s^2} - \frac{1}{2}$.
+For $p = \mathcal{N}(0, 1)$ and $q = \mathcal{N}(1, 4)$ this is $\ln 2 + 2/8 - 1/2 = 0.443$ nats, and the
+reverse $\mathrm{KL}(q \,\|\, p) = -\ln 2 + 5/2 - 1/2 = 1.307$ nats. The reverse is larger because
+$q$ puts mass where $p$ has very little, and $-\ln p$ is large there.
+
+<GaussianKl mu={0} sigma={1} m={1} s={2} caption="Top: p = N(0, 1) and q = N(1, 2²). Bottom: the integrand p ln(p/q). It is negative where q > p, but the net area, KL(p‖q) = 0.443, is positive; the numerical integral matches the closed form. Set q equal to p to see it reach zero." />
+
+**Minimising KL is maximum likelihood.** We cannot compute $\mathrm{KL}(p \,\|\, q_\theta)$ for a
+model $q(x \mid \boldsymbol\theta)$ because $p$ is unknown. But with training points
+$x_1, \dots, x_N$ drawn from $p$, the expectation can be replaced by a sample average (2.40):
+
+$$
+\mathrm{KL}(p \,\|\, q) \simeq \frac{1}{N} \sum_{n=1}^N \big\{-\ln q(x_n \mid \boldsymbol\theta) + \ln p(x_n)\big\}. \tag{2.106}
+$$
+
+The second term does not depend on $\boldsymbol\theta$, and the first is the negative log
+likelihood divided by $N$. So fitting a model by maximum likelihood is approximately minimising
+its KL divergence from the data distribution, and the cross-entropy loss of a classifier is this
+same quantity (Exercise 2.34). Compression and density estimation are the same problem.
+
+### Conditional entropy and mutual information
+
+If we already know $x$, the extra information needed to specify $y$ is $-\ln p(y \mid x)$. Its
+average is the **conditional entropy**
+
+$$
+\begin{gathered}
+\mathrm{H}[y \mid x] = -\iint p(y, x) \ln p(y \mid x)\, \mathrm{d}y\, \mathrm{d}x, \\
+\mathrm{H}[x, y] = \mathrm{H}[y \mid x] + \mathrm{H}[x].
+\end{gathered} \tag{2.107, 2.108}
+$$
+
+The identity on the right follows by writing $\ln p(x, y) = \ln p(y \mid x) + \ln p(x)$ inside the
+joint entropy (Exercise 2.35): describing $x$ and $y$ costs describing $x$, plus describing $y$
+once $x$ is known.
+
+How far are $x$ and $y$ from independent? Measure the KL divergence between the joint and the
+product of the marginals. This is the **mutual information**:
+
+$$
+\mathrm{I}[x, y] \equiv \mathrm{KL}\big(p(x, y) \,\|\, p(x)p(y)\big) = -\iint p(x, y) \ln\Big(\frac{p(x)\, p(y)}{p(x, y)}\Big) \mathrm{d}x\, \mathrm{d}y. \tag{2.109}
+$$
+
+By the properties of KL, $\mathrm{I}[x, y] \geqslant 0$ with equality exactly when $x$ and $y$ are
+independent. Splitting the logarithm as in Exercise 2.38 gives
+
+$$
+\mathrm{I}[x, y] = \mathrm{H}[x] - \mathrm{H}[x \mid y] = \mathrm{H}[y] - \mathrm{H}[y \mid x]: \tag{2.110}
+$$
+
+the reduction in uncertainty about $x$ from learning $y$, or vice versa. In Bayesian terms
+$p(x)$ is a prior, $p(x \mid y)$ a posterior after observing $y$, and the mutual information is how
+much the observation teaches us on average.
+
+The figure lays out these quantities as an information diagram for the joint table of
+Exercise 2.36. The overlap of $\mathrm{H}[x]$ and $\mathrm{H}[y]$ is $\mathrm{I}[x, y]$, the rest of each
+bar is a conditional entropy, and together they span $\mathrm{H}[x, y]$.
+
+<InfoBars preset="ex236" caption="Joint, marginal and conditional entropies of two binary variables, with the mutual information as the overlap (gold). Edit the table: an independent joint makes the overlap vanish, and y = x makes H[x], H[y], H[x, y] and I all equal ln 2." />
+
+## Bayesian probabilities
+
+### Model parameters
+
+We now use probability for the uncertainty about **parameters**. Return to the bent coin and its
+unknown heads side: observing flips should change our belief, and Bayes' theorem says exactly
+how. More generally, take the regression model with weights $\mathbf{w}$ and training data
+$\mathcal{D}$. Encode what we believe before seeing data as a **prior** $p(\mathbf{w})$. The data
+enter through the **likelihood** $p(\mathcal{D} \mid \mathbf{w})$, and Bayes' theorem gives the
+**posterior**:
+
+$$
+\begin{gathered}
+p(\mathbf{w} \mid \mathcal{D}) = \frac{p(\mathcal{D} \mid \mathbf{w})\, p(\mathbf{w})}{p(\mathcal{D})}, \qquad \text{posterior} \propto \text{likelihood} \times \text{prior}, \\
+p(\mathcal{D}) = \int p(\mathcal{D} \mid \mathbf{w})\, p(\mathbf{w})\, \mathrm{d}\mathbf{w}.
+\end{gathered} \tag{2.111–2.113}
+$$
+
+The likelihood is a function of $\mathbf{w}$ but not a distribution over it: its integral over
+$\mathbf{w}$ need not be one. Its negative logarithm is what machine learning calls an **error
+function**. The two schools use the likelihood differently. A **frequentist** treats $\mathbf{w}$
+as fixed and asks how an **estimator** such as $\mathbf{w}_{\mathrm{ML}}$ would vary over possible data
+sets. A **Bayesian** treats the one observed data set as fixed and expresses uncertainty about
+$\mathbf{w}$ as a distribution. Cox (1946) showed that any system of numerical degrees of belief
+satisfying a few common-sense axioms must obey the sum and product rules, which is why degrees of
+belief deserve the name probabilities.
+
+A prior also prevents extreme conclusions from little data. Three heads in three tosses make the
+maximum-likelihood estimate of the heads probability equal to 1, predicting heads forever; any
+reasonable prior gives a less extreme answer. The [Bayesian statistics
+post](/blog/bayesian-statistics-and-optimisation/) works this out with a Beta prior.
+
+### Regularisation as a prior
+
+Instead of maximising the likelihood we can maximise the posterior, the **maximum a posteriori**
+(MAP) estimate. Taking negative logarithms of (2.111),
+
+$$
+-\ln p(\mathbf{w} \mid \mathcal{D}) = -\ln p(\mathcal{D} \mid \mathbf{w}) - \ln p(\mathbf{w}) + \ln p(\mathcal{D}). \tag{2.114}
+$$
+
+The last term does not depend on $\mathbf{w}$; the middle one is new. Choose independent zero-mean
+Gaussians with variance $s^2$ for each of the $M + 1$ weights,
+
+$$
+p(\mathbf{w} \mid s) = \prod_{i=0}^{M} \mathcal{N}(w_i \mid 0, s^2) = \prod_{i=0}^{M} \Big(\frac{1}{2\pi s^2}\Big)^{1/2} \exp\Big\{-\frac{w_i^2}{2s^2}\Big\}, \tag{2.115}
+$$
+
+so that $-\ln p(\mathbf{w}) = \frac{1}{2s^2}\mathbf{w}^{\mathrm{T}}\mathbf{w} + \text{const}$ (2.116).
+With the regression log likelihood (2.66), MAP minimises
+
+$$
+E(\mathbf{w}) = \frac{1}{2\sigma^2} \sum_{n=1}^N \{y(x_n, \mathbf{w}) - t_n\}^2 + \frac{1}{2s^2}\mathbf{w}^{\mathrm{T}}\mathbf{w}. \tag{2.117}
+$$
+
+Multiplying by $\sigma^2$ gives the regularised sum-of-squares error of chapter 1 with
+coefficient $\lambda = \sigma^2 / s^2$. **Weight decay is a Gaussian prior**: a narrow prior
+(small $s^2$) means a large $\lambda$ and a strong pull towards zero.
+
+Back to the $M = 9$ polynomial. With $\ln\lambda = -18$ the fit no longer passes through every
+point: $E = 0.082$, $\sigma^2_{\mathrm{ML}} = 0.016$, the coefficients shrink from $10^5$ to a few
+hundred ($\mathbf{w}^{\mathrm{T}}\mathbf{w} = 2.2 \times 10^5$ instead of $2.9 \times 10^{10}$), and the
+root-mean-square distance from $\sin 2\pi x$ falls from $0.494$ to $0.299$. With $\ln\lambda = 0$
+the prior dominates and the curve flattens towards zero ($E = 0.587$, distance $0.549$).
+
+<MapRegression order={9} lnLambda={-18} caption="The same ten points fitted by an order-9 polynomial with MAP weights for ln λ = −18 (λ = σ²/s²). Tick maximum likelihood to drop the prior and watch the fit interpolate; slide ln λ up to 0 and the prior flattens the curve. The table shows how the prior controls the size of the coefficients." />
+
+### Bayesian machine learning
+
+MAP still returns a single $\mathbf{w}$, so it ignores the uncertainty that the posterior
+describes. A fully Bayesian prediction for a new input $x$ averages the model's predictions over
+all weights, each weighted by its posterior probability:
+
+$$
+p(t \mid x, \mathcal{D}) = \int p(t \mid x, \mathbf{w})\, p(\mathbf{w} \mid \mathcal{D})\, \mathrm{d}\mathbf{w}. \tag{2.118}
+$$
+
+This **integration over parameters** is what distinguishes Bayesian methods. It removes the
+over-fitting of maximum likelihood, and averaging over models of different complexity, weighted
+by their posterior probabilities, automatically favours models of intermediate complexity: very
+simple models cannot fit the data, and very complex ones spread their prior over so many
+functions that each gets little posterior mass. The [Gaussian process
+post](/blog/gaussian-process/) is an example where (2.118) has a closed form.
+
+The catch is (2.118) itself. A modern network has millions or billions of parameters, and even
+approximating that integral is usually infeasible. With a limited compute budget and plenty of
+data, the book concludes, a large network trained by regularised maximum likelihood often beats a
+Bayesian treatment of a smaller one.
+
+## Going further
+
+Chapter 2 keeps pointing ahead: "the Gaussian arises from the central limit theorem", "combined
+with decision theory", "over-fitting is a pathology of maximum likelihood", "normalizing flows".
+This part explains seven of those ideas from later chapters, each in plain terms and each built
+only from what we have seen so far. None of them needs new rules of probability; they are the sum
+rule, the product rule, Bayes' theorem, the change of variables and the KL divergence, used
+cleverly.
+
+### The multivariate Gaussian
+
+**The idea.** A Gaussian over a vector $\mathbf{x} \in \mathbb{R}^D$ is a bell-shaped hill whose
+cross-sections are ellipses. Its formula (Section 3.2 of the book) replaces $(x - \mu)^2/\sigma^2$
+by a quadratic form:
+
+$$
+\begin{gathered}
+\mathcal{N}(\mathbf{x} \mid \boldsymbol\mu, \boldsymbol\Sigma) = \frac{1}{(2\pi)^{D/2}|\boldsymbol\Sigma|^{1/2}} \exp\Big\{-\tfrac{1}{2}\Delta^2\Big\}, \\
+\Delta^2 = (\mathbf{x} - \boldsymbol\mu)^{\mathrm{T}}\boldsymbol\Sigma^{-1}(\mathbf{x} - \boldsymbol\mu).
+\end{gathered} \tag{3.26, 3.27}
+$$
+
+$\boldsymbol\mu$ is the centre, the **covariance matrix** $\boldsymbol\Sigma$ sets the shape, and
+$\Delta$ is the **Mahalanobis distance**: distance measured in units of the spread in each
+direction. Points with the same $\Delta$ have the same density.
+
+**Why ellipses?** Write $\boldsymbol\Sigma$ through its eigenvectors, $\boldsymbol\Sigma\mathbf{u}_i = \lambda_i\mathbf{u}_i$.
+In the rotated coordinates $y_i = \mathbf{u}_i^{\mathrm{T}}(\mathbf{x} - \boldsymbol\mu)$ the quadratic
+form becomes $\Delta^2 = \sum_i y_i^2 / \lambda_i$ (3.33), and the density factorises into $D$
+independent one-dimensional Gaussians with variances $\lambda_i$ (3.39). So a multivariate
+Gaussian is just independent Gaussians, rotated: the eigenvectors are the axes of the ellipse and
+$\sqrt{\lambda_i}$ are its half-lengths. The rotation has Jacobian 1, which is why
+$|\boldsymbol\Sigma| = \prod_i \lambda_i$ appears in the normalising constant.
+
+**Conditioning stays Gaussian.** Split $\mathbf{x}$ into two parts $\mathbf{x}_a$ and $\mathbf{x}_b$.
+Observing $\mathbf{x}_b$ slices the hill, and the slice is again a Gaussian, with
+
+$$
+\boldsymbol\mu_{a|b} = \boldsymbol\mu_a + \boldsymbol\Sigma_{ab}\boldsymbol\Sigma_{bb}^{-1}(\mathbf{x}_b - \boldsymbol\mu_b), \qquad \boldsymbol\Sigma_{a|b} = \boldsymbol\Sigma_{aa} - \boldsymbol\Sigma_{ab}\boldsymbol\Sigma_{bb}^{-1}\boldsymbol\Sigma_{ba}. \tag{3.65, 3.66}
+$$
+
+Read it in words: the conditional mean moves **linearly** with what we observed, and the
+conditional covariance **shrinks** by an amount that does not depend on the observed value. The
+marginal $p(\mathbf{x}_a)$ is simply $\mathcal{N}(\boldsymbol\mu_a, \boldsymbol\Sigma_{aa})$: summing
+out variables just deletes their rows and columns.
+
+**Worked example.** Take two variables with zero means, $\sigma_1 = 1.5$, $\sigma_2 = 0.8$ and
+correlation $\rho = 0.6$, so
+
+$$
+\boldsymbol\Sigma = \begin{pmatrix} 2.25 & 0.72 \\ 0.72 & 0.64 \end{pmatrix}, \qquad \lambda_1 = 2.525, \quad \lambda_2 = 0.365, \quad |\boldsymbol\Sigma| = 0.9216.
+$$
+
+Observe $x_1 = 1.5$. Then $\mathbb{E}[x_2 \mid x_1] = (0.72/2.25) \times 1.5 = 0.48$ and
+$\operatorname{var}[x_2 \mid x_1] = 0.64 - 0.72^2/2.25 = 0.4096$, which is $\sigma_2^2(1 - \rho^2)$:
+knowing $x_1$ removed $\rho^2 = 36\%$ of the variance of $x_2$. Check: $\lambda_1\lambda_2 = 2.525 \times 0.365 = 0.9216 = 2.25 \times 0.64 - 0.72^2$.
+
+<Gaussian2D s1={1.5} s2={0.8} rho={0.6} a={1.5} caption="Left: samples of a 2-D Gaussian, the ellipses Δ = 1 and Δ = 2, and the eigenvectors scaled by √λ. Right: the marginal p(x₂) (blue) and the conditional p(x₂ | x₁ = a) (red). Drag a: the red curve slides but never changes width. Set ρ = 0 and the two curves coincide." />
+
+This is the engine behind Gaussian processes (see the [Gaussian process post](/blog/gaussian-process/)),
+Kalman filters and the forward process of [diffusion models](/blog/diffusion-models/): all of them
+condition or marginalise Gaussians and stay in closed form.
+
+### Why Gaussians are everywhere: the central limit theorem
+
+**The idea.** Add up many independent random quantities and the total is approximately Gaussian,
+almost whatever the individual distributions look like. This is the **central limit theorem**
+(CLT), and it is the second reason, after maximum entropy, that the book gives for the Gaussian's
+importance (Section 3.2).
+
+**A concrete case.** Average $N$ numbers drawn uniformly from $[0, 1]$. One number has a flat
+density. The average of two has the triangle we met in Exercise 2.3. The average of $N$ has mean
+$\frac{1}{2}$ and variance $\frac{1}{12N}$, because variances of independent variables add
+(Exercise 2.10) and dividing by $N$ divides the variance by $N^2$. Already at $N = 10$ the exact
+density peaks at $4.304$, against $4.370$ for the Gaussian with the same mean and variance, a 1.5%
+difference.<Sidenote>The exact density of a sum of $N$ uniforms is the Irwin–Hall distribution,
+$\frac{1}{(N - 1)!}\sum_{k=0}^{\lfloor s \rfloor}(-1)^k\binom{N}{k}(s - k)^{N-1}$ for the sum $s$;
+the chart rescales it to the average. A Monte Carlo check with $5 \times 10^5$ averages gave a peak
+of $4.32$.</Sidenote>
+
+<LineChart
+	x={() => Array.from({ length: 401 }, (_, i) => i / 400)}
+	series={[
+		{ name: "N = 1", fn: (x) => meanOfUniformsPdf(x, 1) },
+		{ name: "N = 2", fn: (x) => meanOfUniformsPdf(x, 2) },
+		{ name: "N = 3", fn: (x) => meanOfUniformsPdf(x, 3) },
+		{ name: "N = 10", fn: (x) => meanOfUniformsPdf(x, 10) },
+		{ name: "Gaussian, N = 10", fn: (x) => Math.exp(-((x - 0.5) ** 2) * 60) / Math.sqrt(Math.PI / 60) },
+	]}
+	title="Density of the mean of N uniform numbers (the book's Figure 3.2, exact)"
+	xLabel="mean of N uniform numbers"
+	yLabel="density"
+	height={270}
+/>
+
+**Why it matters for deep learning.** A mini-batch gradient is an average of many per-example
+gradients, so its noise is close to Gaussian; a pre-activation $\sum_j w_j x_j$ is a sum of many
+terms, which is why Gaussian initialisation analyses work; and measurement noise is often the sum
+of many small effects, which justifies the Gaussian noise model behind least squares. The CLT
+needs the terms to be independent with finite variance; heavy-tailed terms (such as Cauchy
+variables) never become Gaussian.
+
+### From probabilities to decisions
+
+**The idea.** A probability is not yet a decision. To act, combine the posterior with the **cost
+of each kind of mistake**. This is **decision theory** (Sections 4.2 and 5.2 of the book), and it
+splits every prediction task into two steps: **inference** (compute the posterior) and **decision**
+(pick the action with the smallest expected loss).
+
+**The rule.** Let $L_{kj}$ be the loss of choosing class $j$ when the truth is class $k$. Since the
+truth is unknown, average the loss over the posterior and pick the class $j$ that minimises
+
+$$
+\sum_k L_{kj}\, p(\mathcal{C}_k \mid \mathbf{x}). \tag{5.23}
+$$
+
+With the **0–1 loss** (every mistake costs 1) this reduces to "pick the most probable class",
+which minimises the number of mistakes.
+
+**Worked example.** Back to cancer screening, with the book's loss matrix: telling a healthy
+person they may have cancer costs 1 (worry and a follow-up), and telling a sick person they are
+healthy costs 100. Write $p = p(C = 1 \mid T)$. The expected losses are
+
+$$
+\text{say "healthy"}: \; 100\,p, \qquad \text{say "cancer"}: \; 1 \cdot (1 - p),
+$$
+
+so we should flag cancer whenever $100\,p > 1 - p$, that is $p > 1/101 \approx 0.0099$.
+
+| test result | posterior $p(C = 1 \mid T)$ | loss of "healthy" | loss of "cancer" | decision |
+| --- | ---: | ---: | ---: | --- |
+| positive | 0.233 | 23.3 | 0.767 | follow up |
+| negative | 0.00104 | 0.104 | 0.999 | healthy |
+| positive, prevalence 0.1% | 0.0292 | 2.92 | 0.971 | follow up |
+
+Notice that with the 0–1 loss we would never flag anyone: the posterior after a positive test is
+only 0.23, below 0.5. The asymmetric loss is what makes the test useful. The threshold depends
+only on the loss matrix, so the same trained model serves different users with different costs, a
+strong argument for models that output calibrated probabilities rather than bare decisions.
+
+<LineChart
+	x={() => Array.from({ length: 201 }, (_, i) => i / 4000)}
+	series={[
+		{ name: "expected loss of saying healthy = 100 p", fn: (p) => 100 * p },
+		{ name: "expected loss of saying cancer = 1 − p", fn: (p) => 1 - p },
+	]}
+	title="Expected loss of each decision against the posterior; they cross at p = 1/101"
+	xLabel="posterior p(C = 1 | T)"
+	yLabel="expected loss"
+	height={250}
+/>
+
+**The reject option.** Where the largest posterior is below some threshold $\theta$, the book
+suggests refusing to decide and passing the case to a human or a more expensive test (Section
+5.2.3). In screening, the biopsy is exactly such a reject option.
+
+### Bias and variance
+
+**The idea.** We saw two ways a model can be wrong: the cubic was too rigid, and the order-9
+polynomial chased the noise. The **bias–variance decomposition** (Section 4.3) makes this
+precise. Imagine training the same model on many independent data sets of the same size. The
+average squared error of its prediction $f(x; \mathcal{D})$ against the true regression function
+$h(x) = \mathbb{E}[t \mid x]$ splits into two parts, by adding and subtracting the average
+prediction $\mathbb{E}_{\mathcal{D}}[f]$ and noting that the cross term averages to zero:
+
+$$
+\begin{aligned}
+\mathbb{E}_{\mathcal{D}}\big[\{f(x; \mathcal{D}) - h(x)\}^2\big] = {}& \underbrace{\{\mathbb{E}_{\mathcal{D}}[f(x; \mathcal{D})] - h(x)\}^2}_{(\text{bias})^2} \\
+&+ \underbrace{\mathbb{E}_{\mathcal{D}}\big[\{f(x; \mathcal{D}) - \mathbb{E}_{\mathcal{D}}[f(x; \mathcal{D})]\}^2\big]}_{\text{variance}}.
+\end{aligned} \tag{4.45}
+$$
+
+Adding the irreducible noise of the targets gives **expected loss = bias² + variance + noise**
+(4.46). **Bias** is how wrong the model is on average: it is large for rigid models. **Variance** is
+how much the model changes from one data set to the next: it is large for flexible models. This is
+the same story as the bias of $\sigma^2_{\mathrm{ML}}$, told for a whole function.
+
+**Worked example.** Following the book's Figure 4.7 setup, scaled to our own recomputation: 100
+data sets of 25 points from $\sin 2\pi x$ plus noise of standard deviation 0.3, each fitted with 24
+Gaussian basis functions of width 0.1 plus a constant, with regularisation $\lambda$.<Sidenote>The
+book does not state the basis width or the input locations, so these are our choices (inputs at
+$x = (i + 0.5)/25$, seed 2). A NumPy re-run with a different random generator gives the same
+picture: at $\ln\lambda = 0$, bias² $0.0032$ and variance $0.0182$, against our $0.0022$ and
+$0.0184$.</Sidenote> With $\ln\lambda = -6$ the fits are wild but their average is almost perfect:
+bias² $0.0006$, variance $0.0362$. With $\ln\lambda = 3$ every fit is flattened in the same way:
+bias² $0.100$, variance $0.005$. The sum is smallest at $\ln\lambda = 0.5$: $0.0201$ (bias²
+$0.0039$, variance $0.0163$); adding the noise variance $0.09$ gives the expected test
+loss $0.110$.
+
+<BiasVarianceFits lnLambda={0.5} caption="Left: 20 of the 100 regularised fits (faint), their average (blue) and sin 2πx. Right: squared bias, variance and their sum against ln λ. Slide ln λ down: the fits scatter (variance) while their average hugs the sine (low bias); slide it up and the opposite happens." />
+
+Two lessons follow. The average of many high-variance fits is excellent, which is why
+**ensembles** and **model averaging** work (Section 9.6), and why the Bayesian average (2.118)
+helps. And the decomposition needs many data sets, which we never have; in practice we pick
+$\lambda$ on a held-out validation set.
+
+### Comparing models: Occam's razor
+
+**The idea.** Maximum likelihood always prefers the more flexible model, because it can fit the
+data at least as well. The Bayesian answer (Section 2.6.3) is to compare models by their
+**evidence** $p(\mathcal{D} \mid \mathcal{M}) = \int p(\mathcal{D} \mid \mathbf{w}, \mathcal{M})\, p(\mathbf{w} \mid \mathcal{M})\, \mathrm{d}\mathbf{w}$,
+the denominator of Bayes' theorem (2.113). A flexible model must spread its probability over many
+possible data sets, so it gives less to each one. That built-in penalty is **Occam's razor**.
+
+**Worked example.** Ten coin flips. Model $\mathcal{M}_0$: the coin is fair. Model $\mathcal{M}_1$:
+the heads probability $\theta$ is unknown, uniform on $[0, 1]$. For a particular sequence with $h$
+heads and $t$ tails,
+
+$$
+p(\mathcal{D} \mid \mathcal{M}_0) = 0.5^{10} = 9.77 \times 10^{-4}, \qquad p(\mathcal{D} \mid \mathcal{M}_1) = \int_0^1 \theta^h (1 - \theta)^t\, \mathrm{d}\theta = \frac{h!\, t!}{(h + t + 1)!}.
+$$
+
+| data | $p(\mathcal{D} \mid \mathcal{M}_0)$ | $p(\mathcal{D} \mid \mathcal{M}_1)$ | Bayes factor $\mathcal{M}_1 : \mathcal{M}_0$ |
+| --- | ---: | ---: | ---: |
+| 5 heads, 5 tails | $9.77 \times 10^{-4}$ | $3.61 \times 10^{-4}$ | 0.37 |
+| 8 heads, 2 tails | $9.77 \times 10^{-4}$ | $2.02 \times 10^{-3}$ | 2.07 |
+| 10 heads, 0 tails | $9.77 \times 10^{-4}$ | $9.09 \times 10^{-2}$ | 93 |
+
+With balanced data the simple model wins by a factor $1/0.37 = 2.7$, even though $\mathcal{M}_1$
+contains the fair coin as the special case $\theta = 0.5$: its maximum likelihood is the same or
+better, but its evidence is lower. Only data that the fair coin explains badly tips the balance.
+Check one entry: $8!\, 2!/11! = 2/(11 \cdot 10 \cdot 9) = 2/990 = 0.00202$.
+
+<LineChart
+	x={() => Array.from({ length: 11 }, (_, i) => i)}
+	series={[
+		{ name: "ln p(D | fair coin)", fn: () => 10 * Math.log(0.5) },
+		{ name: "ln p(D | unknown θ, uniform prior)", fn: (h) => Math.log(coinEvidence(h, 10 - h).uniform) },
+	]}
+	title="Log evidence of a particular 10-flip sequence against its number of heads"
+	xLabel="heads in 10 flips"
+	yLabel="log evidence"
+	height={250}
+/>
+
+The flexible model's evidence is a U shape: it bets a little on every outcome, so it loses in the
+middle, where the simple model concentrates its bet, and wins at the extremes. Averaging over
+models with weights $p(\mathcal{M} \mid \mathcal{D}) \propto p(\mathcal{D} \mid \mathcal{M})\, p(\mathcal{M})$
+is the model-level version of (2.118).
+
+### The evidence lower bound
+
+**The idea.** Many models explain data through a hidden, or **latent**, variable $\mathbf{z}$: which
+mixture component produced a point, or the code of a variational autoencoder. The likelihood
+then needs the sum rule, $p(\mathbf{x}) = \int p(\mathbf{x}, \mathbf{z})\, \mathrm{d}\mathbf{z}$, which is
+often intractable. The trick (Section 16.3) is to pick *any* distribution $q(\mathbf{z})$ and split
+the log likelihood into two terms with the product rule:
+
+$$
+\ln p(\mathbf{x}) = \underbrace{\int q(\mathbf{z}) \ln\frac{p(\mathbf{x}, \mathbf{z})}{q(\mathbf{z})}\, \mathrm{d}\mathbf{z}}_{\mathcal{L}(q) = \text{ELBO}} + \underbrace{\Big(-\int q(\mathbf{z}) \ln\frac{p(\mathbf{z} \mid \mathbf{x})}{q(\mathbf{z})}\, \mathrm{d}\mathbf{z}\Big)}_{\mathrm{KL}(q \,\|\, p(\mathbf{z} \mid \mathbf{x}))}. \tag{16.57–16.59}
+$$
+
+To verify it, add the two integrands: $\ln\frac{p(\mathbf{x}, \mathbf{z})}{q} - \ln\frac{p(\mathbf{z} \mid \mathbf{x})}{q} = \ln\frac{p(\mathbf{x}, \mathbf{z})}{p(\mathbf{z} \mid \mathbf{x})} = \ln p(\mathbf{x})$,
+which is constant in $\mathbf{z}$, and $q$ integrates to one. Because KL is never negative, the
+first term is a lower bound on $\ln p(\mathbf{x})$: the **evidence lower bound** (ELBO). The gap is
+exactly how far $q$ is from the true posterior, so the bound is tight when $q(\mathbf{z}) = p(\mathbf{z} \mid \mathbf{x})$.
+
+Maximising the ELBO does two jobs at once. Over $q$ it makes $q$ approximate the posterior
+(**variational inference**); over the model's parameters it raises the likelihood. Alternating the
+two exactly is the **EM algorithm**; doing both by gradient descent with a neural network for $q$
+is the **variational autoencoder** (Section 19.2), and [diffusion models](/blog/diffusion-models/)
+are trained with an ELBO too.
+
+**Worked example.** The smallest latent model: $z \in \{0, 1\}$ with $p(z = 1) = 0.3$,
+$p(x \mid z = 0) = \mathcal{N}(x \mid -1, 1)$ and $p(x \mid z = 1) = \mathcal{N}(x \mid 2, 1)$. We observe
+$x = 1$. Then $p(x) = 0.7\,\mathcal{N}(1 \mid -1, 1) + 0.3\,\mathcal{N}(1 \mid 2, 1)$, so
+$\ln p(x) = -2.2038$, and Bayes' theorem gives the posterior $p(z = 1 \mid x) = 0.658$. A guess of
+$q(z = 1) = 0.2$ gives ELBO $= -2.6447$ and KL $= 0.4409$; they add up to $-2.2038$. Setting
+$q(z = 1) = 0.658$ closes the gap.
+
+<ElboBars x={1} q={0.2} caption="Top: the two weighted components and the observed x. Bottom: ln p(x) on a number line, split into the ELBO (blue) and the KL gap (red) for the chosen q(z = 1). Move q: the total never changes, only the split. Press the button to set q to the posterior, where the gap vanishes." />
+
+### Normalizing flows
+
+**The idea.** Section 2.4 showed that pushing a density through an invertible map multiplies it by
+$|\det\mathbf{J}|$. A **normalizing flow** (Chapter 18) makes that map a neural network: sample
+$\mathbf{z}$ from a simple base density such as $\mathcal{N}(\mathbf{0}, \mathbf{I})$ and output
+$\mathbf{x} = \mathbf{f}(\mathbf{z}, \mathbf{w})$. Sampling is easy, and, unlike most generative
+models, the likelihood is exact. With $\mathbf{g} = \mathbf{f}^{-1}$,
+
+$$
+\ln p(\mathbf{x} \mid \mathbf{w}) = \ln p_{\mathbf{z}}\big(\mathbf{g}(\mathbf{x}, \mathbf{w})\big) + \ln|\det\mathbf{J}(\mathbf{x})|. \tag{18.1, 18.4}
+$$
+
+**Why stack layers?** Build $\mathbf{f}$ from simple invertible layers,
+$\mathbf{x} = \mathbf{f}_A(\mathbf{f}_B(\mathbf{z}))$. The inverse runs the layers backwards, and by the
+chain rule the Jacobian is a product of the layers' Jacobians, so its log-determinant is a **sum**
+of per-layer log-determinants (18.7). Each layer only has to be invertible with a cheap
+determinant. Purely linear layers would be pointless, because a stack of them is one linear map
+and a linear map of a Gaussian is still Gaussian (Section 18.1); the nonlinearity is what bends the
+density.
+
+**Worked example (1-D).** Base $z \sim \mathcal{N}(0, 1)$, layer $B$: $u = z + 0.8\tanh(3z)$ (always
+increasing, since its slope $1 + 2.4\operatorname{sech}^2(3z)$ is at least 1), layer $A$:
+$x = 0.5u + 1$. Evaluate the density at $x = 1.5$, running backwards:
+
+1. Undo $A$: $u = (1.5 - 1)/0.5 = 1$, and $\ln|\mathrm{d}u/\mathrm{d}x| = \ln 2 = 0.6931$.
+2. Undo $B$ numerically: $z = 0.3629$; the slope of $B$ there is $1.8778$, so $\ln|\mathrm{d}z/\mathrm{d}u| = -0.6301$.
+3. Base density: $\ln\mathcal{N}(0.3629 \mid 0, 1) = -0.9848$.
+
+Adding, $\ln p(1.5) = -0.9848 + 0.6931 - 0.6301 = -0.9218$, so $p(1.5) = 0.398$. At $x = 1$ ($z = 0$)
+layer $B$ stretches space by its maximum factor $3.4$, so $p(1) = 0.235$ is lower: one Gaussian has
+become two bumps. The chart is the exact density; a histogram of two million samples pushed
+through the flow agrees to within $0.015$.
+
+<LineChart
+	x={() => Array.from({ length: 401 }, (_, i) => -1 + i / 100)}
+	series={[
+		{ name: "flow density p(x)", fn: (x) => Math.exp(flowDensity(x).logp) },
+		{ name: "base N(x | 1, 0.5²) without the tanh layer", fn: (x) => Math.exp(-((x - 1) ** 2) * 2) / Math.sqrt(Math.PI / 2) },
+	]}
+	title="A two-layer 1-D flow turns a Gaussian into a bimodal density"
+	xLabel="x"
+	yLabel="density"
+	height={250}
+/>
+
+In high dimensions the art is in designing layers whose Jacobian determinant is cheap: real NVP's
+coupling layers make it triangular, so the determinant is a product of diagonal entries, just as in
+Exercise 2.20.
+
+## Exercises
+
+Answers to all 41 exercises, grouped by topic. Where the main text already derived a result, the
+answer recaps it briefly.
+
+#### Rules of probability (2.1–2.3)
+
+**2.1** With $p(C = 1) = 0.001$:
+$p(T = 1) = 0.9 \times 0.001 + 0.03 \times 0.999 = 0.0009 + 0.02997 = 0.03087$, so
+
+$$
+p(C = 1 \mid T = 1) = \frac{0.0009}{0.03087} = 0.0292.
+$$
+
+Fewer than 3% of positives have cancer: 30 false positives for every true one. The posterior went
+up 29-fold, as before, but from a ten times smaller prior. Set the prevalence slider in the
+screening figure to 0.001 to see it.
+
+**2.2** The book's Figure 2.16 shows Efron's dice. Call them A $= (4,4,4,4,0,0)$,
+B $= (3,3,3,3,3,3)$, C $= (6,6,2,2,2,2)$ and D $= (5,5,5,1,1,1)$; the book's cycle is B, A, D, C.
+Since the dice are independent, $p(\text{X beats Y}) = \sum_{x} p(x)\, p(Y < x)$:
+
+| contest | how it is won | probability |
+| --- | --- | ---: |
+| A beats B | A shows 4 | $4/6 = 2/3$ |
+| D beats A | D shows 5 (always wins), or D shows 1 and A shows 0 | $\frac{1}{2} + \frac{1}{2} \cdot \frac{1}{3} = 2/3$ |
+| C beats D | C shows 6, or C shows 2 and D shows 1 | $\frac{1}{3} + \frac{2}{3} \cdot \frac{1}{2} = 2/3$ |
+| B beats C | C shows 2 | $4/6 = 2/3$ |
+
+Each die beats the previous one in the cycle B → A → D → C → B with probability 2/3, so "beats
+more often than not" is not transitive.<Sidenote>The non-adjacent pairs are closer: A beats C
+with probability $4/9$ and B beats D with probability $1/2$ (computed with `beats` in
+`probTheory.ts`).</Sidenote>
+
+**2.3** Condition on $\mathbf{u}$ and use the sum and product rules:
+$p(\mathbf{y}) = \int p(\mathbf{y} \mid \mathbf{u})\, p_{\mathbf{u}}(\mathbf{u})\, \mathrm{d}\mathbf{u}$.
+Given $\mathbf{u}$, $\mathbf{y} = \mathbf{u} + \mathbf{v}$ is $\mathbf{v}$ shifted by a constant. A
+shift has Jacobian 1, so by (2.76) $p(\mathbf{y} \mid \mathbf{u}) = p_{\mathbf{v}}(\mathbf{y} - \mathbf{u})$
+(independence lets us use the unconditional $p_{\mathbf{v}}$). Hence
+$p(\mathbf{y}) = \int p_{\mathbf{u}}(\mathbf{u})\, p_{\mathbf{v}}(\mathbf{y} - \mathbf{u})\, \mathrm{d}\mathbf{u}$
+(2.119). For two uniforms on $(0, 1)$ the integrand is 1 where $0 < u < 1$ and $0 < y - u < 1$, so
+$p(y) = \min(y, 2 - y)$ on $(0, 2)$: a triangle. Adding a third uniform smooths it into a
+piecewise quadratic that already looks Gaussian (the central limit theorem at work).
+
+<LineChart
+	x={() => Array.from({ length: 401 }, (_, i) => -0.5 + i / 100)}
+	series={[
+		{ name: "u ~ U(0, 1)", fn: (y) => (y > 0 && y < 1 ? 1 : 0) },
+		{ name: "u + v (triangle)", fn: (y) => (y > 0 && y < 2 ? Math.min(y, 2 - y) : 0) },
+		{
+			name: "u + v + w",
+			fn: (y) => (y <= 0 || y >= 3 ? 0 : y < 1 ? (y * y) / 2 : y < 2 ? (-2 * y * y + 6 * y - 3) / 2 : ((3 - y) * (3 - y)) / 2),
+		},
+	]}
+	title="Convolution: sums of independent uniform variables"
+	xLabel="y"
+	yLabel="p(y)"
+	height={240}
+/>
+
+#### Densities and expectations (2.4–2.11, 2.39)
+
+**2.4** $\int_c^d \frac{1}{d - c}\, \mathrm{d}x = 1$. The mean is
+$\frac{1}{d - c}\int_c^d x\, \mathrm{d}x = \frac{d^2 - c^2}{2(d - c)} = \frac{c + d}{2}$. The second
+moment is $\frac{d^3 - c^3}{3(d - c)} = \frac{c^2 + cd + d^2}{3}$, so
+
+$$
+\operatorname{var}[x] = \frac{c^2 + cd + d^2}{3} - \frac{(c + d)^2}{4} = \frac{(d - c)^2}{12}.
+$$
+
+**2.5** Exponential: $\int_0^\infty \lambda e^{-\lambda x}\, \mathrm{d}x = [-e^{-\lambda x}]_0^\infty = 1$.
+Laplace: substitute $z = x - \mu$ and use symmetry,
+$\frac{1}{2\gamma}\int e^{-|z|/\gamma}\, \mathrm{d}z = \frac{2}{2\gamma}\int_0^\infty e^{-z/\gamma}\, \mathrm{d}z = \frac{1}{\gamma} \cdot \gamma = 1$.
+
+**2.6** $\int \frac{1}{N}\sum_n \delta(x - x_n)\, \mathrm{d}x = \frac{1}{N}\sum_n \int \delta(x - x_n)\, \mathrm{d}x = \frac{1}{N} \cdot N = 1$,
+since each delta integrates to one.
+
+**2.7** Replace $p$ in (2.39) by the empirical density and use the sifting property:
+$\int f(x) \frac{1}{N}\sum_n \delta(x - x_n)\, \mathrm{d}x = \frac{1}{N}\sum_n f(x_n)$, which is
+(2.40). The sample average is the exact expectation under the empirical distribution, and an
+approximation to the expectation under $p$ that improves as $N$ grows.
+
+**2.8** Write $\bar f = \mathbb{E}[f]$, a constant. Then
+$\mathbb{E}[(f - \bar f)^2] = \mathbb{E}[f^2] - 2\bar f\, \mathbb{E}[f] + \bar f^2 = \mathbb{E}[f^2] - \bar f^2$,
+which is (2.45).
+
+**2.9** Independence gives $p(x, y) = p(x)p(y)$, so
+$\mathbb{E}[xy] = \iint xy\, p(x)p(y)\, \mathrm{d}x\, \mathrm{d}y = \int x p(x)\, \mathrm{d}x \int y p(y)\, \mathrm{d}y = \mathbb{E}[x]\,\mathbb{E}[y]$,
+and (2.47) gives $\operatorname{cov}[x, y] = 0$.
+
+**2.10** The mean is linear whether or not the variables are independent:
+$\mathbb{E}[x + z] = \iint (x + z)\, p(x, z) = \mathbb{E}[x] + \mathbb{E}[z]$. For the variance,
+
+$$
+\operatorname{var}[x + z] = \mathbb{E}\big[\{(x - \mathbb{E}x) + (z - \mathbb{E}z)\}^2\big] = \operatorname{var}[x] + \operatorname{var}[z] + 2\operatorname{cov}[x, z],
+$$
+
+and the covariance is zero by Exercise 2.9.
+
+**2.11** For the **law of total expectation**,
+$\mathbb{E}_y[\mathbb{E}_x[x \mid y]] = \int p(y) \int x\, p(x \mid y)\, \mathrm{d}x\, \mathrm{d}y = \iint x\, p(x, y)\, \mathrm{d}x\, \mathrm{d}y = \mathbb{E}[x]$.
+For the **law of total variance**, write $m(y) = \mathbb{E}_x[x \mid y]$. Then
+$\mathbb{E}_y[\operatorname{var}_x[x \mid y]] = \mathbb{E}_y[\mathbb{E}[x^2 \mid y] - m(y)^2] = \mathbb{E}[x^2] - \mathbb{E}_y[m^2]$
+and $\operatorname{var}_y[m(y)] = \mathbb{E}_y[m^2] - (\mathbb{E}_y m)^2 = \mathbb{E}_y[m^2] - \mathbb{E}[x]^2$.
+Adding, the $\mathbb{E}_y[m^2]$ terms cancel and leave $\mathbb{E}[x^2] - \mathbb{E}[x]^2 = \operatorname{var}[x]$.
+Total variance is the average spread within each $y$ plus the spread of the means across $y$.
+
+**2.39** If $z_1, z_2$ are independent, the off-diagonal entry of the covariance matrix is
+$\operatorname{cov}[z_1, z_2] = 0$ by Exercise 2.9, so the matrix is diagonal. For the converse, let
+$y_1$ be symmetric about 0 and $y_2 = y_1^2$. Then $p(y_2 \mid y_1) = \delta(y_2 - y_1^2)$ depends on
+$y_1$, so they are dependent. Yet with $p(y_1, y_2) = p(y_1)\,\delta(y_2 - y_1^2)$,
+
+$$
+\mathbb{E}[y_1 y_2] = \iint y_1 y_2\, p(y_1)\, \delta(y_2 - y_1^2)\, \mathrm{d}y_2\, \mathrm{d}y_1 = \int y_1^3\, p(y_1)\, \mathrm{d}y_1 = 0, \qquad \mathbb{E}[y_1] = 0,
+$$
+
+since $y_1^3 p(y_1)$ and $y_1 p(y_1)$ are odd. So $\operatorname{cov}[y_1, y_2] = 0$: zero correlation
+does not imply independence. Covariance only detects linear relationships.
+
+#### The Gaussian (2.12–2.18)
+
+**2.12** Done in the main text: in polar coordinates
+$I^2 = \int_0^{2\pi}\int_0^\infty e^{-r^2/2\sigma^2} r\, \mathrm{d}r\, \mathrm{d}\theta$. The $\theta$
+integral gives $2\pi$; with $u = r^2$, $r\, \mathrm{d}r = \mathrm{d}u/2$ and
+$\int_0^\infty e^{-u/2\sigma^2}\, \mathrm{d}u/2 = \sigma^2$. So $I^2 = 2\pi\sigma^2$ and
+$I = (2\pi\sigma^2)^{1/2}$. For the Gaussian, substitute $y = x - \mu$ (unit Jacobian):
+$\int \mathcal{N}(x \mid \mu, \sigma^2)\, \mathrm{d}x = I / (2\pi\sigma^2)^{1/2} = 1$.
+
+**2.13** Mean: with $y = x - \mu$, $\mathbb{E}[x] = \int \mathcal{N}(y \mid 0, \sigma^2)(y + \mu)\, \mathrm{d}y = 0 + \mu$,
+because $y\,\mathcal{N}(y \mid 0, \sigma^2)$ is odd. Second moment: differentiate
+$\int \exp\{-(x - \mu)^2 / 2\sigma^2\}\, \mathrm{d}x = (2\pi)^{1/2}(\sigma^2)^{1/2}$ with respect to
+$\sigma^2$:
+
+$$
+\int \frac{(x - \mu)^2}{2\sigma^4} \exp\Big\{-\frac{(x - \mu)^2}{2\sigma^2}\Big\} \mathrm{d}x = \frac{(2\pi)^{1/2}}{2(\sigma^2)^{1/2}}.
+$$
+
+Multiplying by $2\sigma^4 / (2\pi\sigma^2)^{1/2}$ gives $\mathbb{E}[(x - \mu)^2] = \sigma^2$. Expanding,
+$\mathbb{E}[x^2] = \sigma^2 + 2\mu\,\mathbb{E}[x] - \mu^2 = \mu^2 + \sigma^2$ (2.53), and then
+$\operatorname{var}[x] = \mu^2 + \sigma^2 - \mu^2 = \sigma^2$ (2.54).
+
+**2.14** $\frac{\mathrm{d}}{\mathrm{d}x}\mathcal{N} = -\frac{x - \mu}{\sigma^2}\mathcal{N}$, which is zero
+only at $x = \mu$ since $\mathcal{N} > 0$. The second derivative there is
+$-\mathcal{N}(\mu \mid \mu, \sigma^2)/\sigma^2 < 0$, so it is a maximum.
+
+**2.15** Done in the main text. $\partial/\partial\mu$ of (2.56) is
+$\frac{1}{\sigma^2}\sum_n (x_n - \mu)$; zero gives $\mu_{\mathrm{ML}} = \frac{1}{N}\sum_n x_n$.
+$\partial/\partial\sigma^2$ is $\frac{1}{2\sigma^4}\sum_n (x_n - \mu)^2 - \frac{N}{2\sigma^2}$; zero,
+with $\mu = \mu_{\mathrm{ML}}$, gives (2.58). The Hessian at this point is negative definite
+(the $\mu\mu$ entry is $-N/\sigma^2$, the $\sigma^2\sigma^2$ entry is $-N/(2\sigma^4)$ and the cross
+term vanishes there), so it is a maximum.
+
+**2.16** For $n \ne m$, independence gives $\mathbb{E}[x_n x_m] = \mu^2$; for $n = m$,
+$\mathbb{E}[x_n^2] = \mu^2 + \sigma^2$; together $\mathbb{E}[x_n x_m] = \mu^2 + I_{nm}\sigma^2$ (2.128).
+Then $\mathbb{E}[\mu_{\mathrm{ML}}] = \frac{1}{N}\sum_n \mathbb{E}[x_n] = \mu$ (2.59), and, as derived in
+the main text, $\mathbb{E}[\sigma^2_{\mathrm{ML}}] = \mathbb{E}[x_n^2] - \frac{1}{N^2}\sum_{n,m}\mathbb{E}[x_n x_m] = \mu^2 + \sigma^2 - \mu^2 - \frac{\sigma^2}{N} = \frac{N - 1}{N}\sigma^2$
+(2.60).
+
+**2.17** Each term of (2.61) has $\mathbb{E}[(x_n - \mu)^2] = \operatorname{var}[x_n] = \sigma^2$, so the
+average of $N$ of them has expectation $\sigma^2$ (2.62). Nothing was fitted, so nothing is lost.
+
+**2.18** The first two terms of (2.66) involve $\sigma^2$:
+$\frac{\partial}{\partial\sigma^2} = \frac{1}{2\sigma^4}\sum_n \{y(x_n, \mathbf{w}) - t_n\}^2 - \frac{N}{2\sigma^2} = 0$,
+which with $\mathbf{w} = \mathbf{w}_{\mathrm{ML}}$ gives (2.68).
+
+#### Transformations (2.19–2.20)
+
+**2.19** For an increasing $f$, (2.71) reads $p(f(x))\, f'(x) = q(x)$, so $f$ solves the
+differential equation
+
+$$
+\frac{\mathrm{d}f}{\mathrm{d}x} = \frac{q(x)}{p(f(x))}.
+$$
+
+Integrating both sides from $-\infty$ gives $P(f(x)) = Q(x)$, where $P$ and $Q$ are the cumulative
+distribution functions, so $f = P^{-1} \circ Q$. Such an $f$ always exists: $Q$ is strictly
+increasing because $q > 0$ everywhere, so $Q(x)$ sweeps $(0, 1)$, and $P^{-1}$ maps $(0, 1)$ onto the
+support of $p$. The `DensityTransform` figure above is the picture the exercise asks for, with $q$
+Gaussian and $f$ the sigmoid. Where $f$ is steep, $q$'s mass is spread thin; where $f$ is flat it
+piles up.
+
+**2.20** Differentiating (2.78) and (2.79) with $\frac{\mathrm{d}}{\mathrm{d}u}\tanh u = \operatorname{sech}^2 u$,
+
+$$
+\frac{\partial(y_1, y_2)}{\partial(x_1, x_2)} = \begin{pmatrix} 1 + 5\operatorname{sech}^2(5x_1) & 0 \\ x_1^2 & 1 + 5\operatorname{sech}^2(5x_2) \end{pmatrix}.
+$$
+
+It is lower triangular, so its determinant is the product
+$\{1 + 5\operatorname{sech}^2(5x_1)\}\{1 + 5\operatorname{sech}^2(5x_2)\}$, always at least 1. The
+book's $\mathbf{J}$ in (2.76) is the Jacobian of the inverse map $\mathbf{x} = \mathbf{g}(\mathbf{y})$,
+which is the inverse of this matrix, so
+$p_{\mathbf{y}}(\mathbf{y}) = p_{\mathbf{x}}(\mathbf{x}) / [\{1 + 5\operatorname{sech}^2(5x_1)\}\{1 + 5\operatorname{sech}^2(5x_2)\}]$.
+The $x_1^2$ entry shears the plane but does not change areas.
+
+#### Information theory (2.21–2.38)
+
+**2.21** Two independent events with the same probability $p$ have joint probability $p^2$ and,
+by additivity, information $h(p^2) = 2h(p)$. By induction, $h(p^n) = h(p^{n-1} \cdot p) = (n - 1)h(p) + h(p) = n h(p)$.
+Applying this to $p^{1/m}$ gives $h(p) = h\big((p^{1/m})^m\big) = m\, h(p^{1/m})$, so
+$h(p^{n/m}) = n\, h(p^{1/m}) = \frac{n}{m} h(p)$. Thus $h(p^x) = x\, h(p)$ for every positive rational
+$x$, and by continuity for every positive real $x$. Finally fix some $q \in (0, 1)$ and write any
+$p = q^{x}$ with $x = \ln p / \ln q$. Then $h(p) = \frac{\ln p}{\ln q} h(q) = \frac{h(q)}{\ln q} \ln p$:
+a constant times $\ln p$. The constant must be negative for $h$ to decrease with $p$, and its value
+just sets the unit (bits or nats).
+
+**2.22** Done in the main text: the stationarity condition $-\ln p(x_i) - 1 + \lambda = 0$ makes all
+$p(x_i)$ equal, normalisation makes them $1/M$, and $\mathrm{H} = -\sum_i \frac{1}{M}\ln\frac{1}{M} = \ln M$.
+
+**2.23** $\ln$ is concave, so Jensen's inequality runs the other way:
+$\sum_i p_i \ln\frac{1}{p_i} \leqslant \ln \sum_i p_i \cdot \frac{1}{p_i} = \ln M$, summing over the
+(at most $M$) states with $p_i > 0$. So $\mathrm{H}[x] \leqslant \ln M$.
+
+**2.24** The functional (2.96) has the form $\int F(p(x), x)\, \mathrm{d}x$ with no derivatives of $p$,
+so its functional derivative is just $\partial F / \partial p = -\ln p(x) - 1 + \lambda_1 + \lambda_2 x + \lambda_3(x - \mu)^2$;
+setting it to zero gives (2.97). Complete the square in the exponent:
+$\lambda_2 x + \lambda_3(x - \mu)^2 = \lambda_3\big(x - \mu + \frac{\lambda_2}{2\lambda_3}\big)^2 + \text{const}$.
+For a normalisable density $\lambda_3 < 0$, so $p$ is a Gaussian with mean
+$\mu - \lambda_2/(2\lambda_3)$ and variance $-1/(2\lambda_3)$. The mean constraint (2.94) forces
+$\lambda_2 = 0$; the variance constraint (2.95) forces $\lambda_3 = -1/(2\sigma^2)$; then
+normalisation (2.93) requires $e^{-1 + \lambda_1} = (2\pi\sigma^2)^{-1/2}$, that is
+$\lambda_1 = 1 - \frac{1}{2}\ln(2\pi\sigma^2)$. The result is (2.98).
+
+**2.25** $-\ln \mathcal{N}(x \mid \mu, \sigma^2) = \frac{1}{2}\ln(2\pi\sigma^2) + \frac{(x - \mu)^2}{2\sigma^2}$.
+Taking the expectation and using (2.95),
+$\mathrm{H} = \frac{1}{2}\ln(2\pi\sigma^2) + \frac{\sigma^2}{2\sigma^2} = \frac{1}{2}\{1 + \ln(2\pi\sigma^2)\}$ (2.99).
+For $\sigma = 1$ this is $1.419$ nats.
+
+**2.26** With $q = \mathcal{N}(\mathbf{x} \mid \boldsymbol\mu, \boldsymbol\Sigma)$ in $D$ dimensions,
+
+$$
+\mathrm{KL}(p \,\|\, q) = \frac{1}{2}\ln|\boldsymbol\Sigma| + \frac{1}{2}\mathbb{E}_p\big[(\mathbf{x} - \boldsymbol\mu)^{\mathrm{T}}\boldsymbol\Sigma^{-1}(\mathbf{x} - \boldsymbol\mu)\big] + \frac{D}{2}\ln 2\pi + \int p \ln p.
+$$
+
+The gradient with respect to $\boldsymbol\mu$ is $-\boldsymbol\Sigma^{-1}\mathbb{E}_p[\mathbf{x} - \boldsymbol\mu]$,
+zero when $\boldsymbol\mu = \mathbb{E}_p[\mathbf{x}]$. With that $\boldsymbol\mu$, the expectation equals
+$\operatorname{Tr}(\boldsymbol\Sigma^{-1}\mathbf{S})$ with $\mathbf{S} = \operatorname{cov}_p[\mathbf{x}]$.
+Writing $\boldsymbol\Lambda = \boldsymbol\Sigma^{-1}$, the $\boldsymbol\Sigma$-dependent part is
+$-\frac{1}{2}\ln|\boldsymbol\Lambda| + \frac{1}{2}\operatorname{Tr}(\boldsymbol\Lambda\mathbf{S})$,
+whose gradient with respect to $\boldsymbol\Lambda$ is $-\frac{1}{2}\boldsymbol\Lambda^{-1} + \frac{1}{2}\mathbf{S}$
+(see the [matrix calculus post](/blog/matrix-calculus/) for $\partial \ln|\mathbf{A}| / \partial \mathbf{A}$).
+Zero gives $\boldsymbol\Sigma = \mathbf{S}$. So minimising $\mathrm{KL}(p \,\|\, q)$ over Gaussians
+**matches moments**: $q$ takes the mean and covariance of $p$.
+
+**2.27** $\mathrm{KL}(p \,\|\, q) = \mathbb{E}_p[\ln p - \ln q]$ with
+$\ln p - \ln q = \ln\frac{s}{\sigma} - \frac{(x - \mu)^2}{2\sigma^2} + \frac{(x - m)^2}{2s^2}$. Under $p$,
+$\mathbb{E}[(x - \mu)^2] = \sigma^2$ and $\mathbb{E}[(x - m)^2] = \sigma^2 + (\mu - m)^2$, so
+
+$$
+\mathrm{KL}\big(\mathcal{N}(\mu, \sigma^2) \,\|\, \mathcal{N}(m, s^2)\big) = \ln\frac{s}{\sigma} + \frac{\sigma^2 + (\mu - m)^2}{2s^2} - \frac{1}{2}.
+$$
+
+It is zero when $m = \mu$ and $s = \sigma$, and the `GaussianKl` figure checks it against numerical
+integration. With $\mu = 0, \sigma = 1, m = 1, s = 2$: $0.6931 + 0.25 - 0.5 = 0.4431$ (SciPy's
+quadrature gives the same to 16 digits).
+
+**2.28** Let $\epsilon = (1 - \alpha)/2$, so $\alpha \to 1$ means $\epsilon \to 0$ and
+$(1 + \alpha)/2 = 1 - \epsilon$. Then
+$p^{(1+\alpha)/2} q^{(1-\alpha)/2} = p\,(q/p)^\epsilon = p\{1 + \epsilon\ln(q/p) + O(\epsilon^2)\}$,
+whose integral is $1 + \epsilon\int p\ln(q/p) + O(\epsilon^2)$. Also
+$1 - \alpha^2 = (1 - \alpha)(1 + \alpha) = 4\epsilon(1 - \epsilon)$. So
+
+$$
+D_\alpha(p \,\|\, q) = \frac{1}{\epsilon(1 - \epsilon)}\Big\{-\epsilon\int p\ln\frac{q}{p} + O(\epsilon^2)\Big\} \;\to\; -\int p\ln\frac{q}{p} = \mathrm{KL}(p \,\|\, q).
+$$
+
+For $\alpha \to -1$ swap the roles: with $\epsilon = (1 + \alpha)/2$ the integrand is
+$q\,(p/q)^\epsilon$, and the same steps give $\mathrm{KL}(q \,\|\, p)$.
+
+**2.29** $\mathrm{H}[x] + \mathrm{H}[y] - \mathrm{H}[x, y] = \iint p(x, y)\ln\frac{p(x, y)}{p(x)p(y)} = \mathrm{I}[x, y] = \mathrm{KL}(p(x, y) \,\|\, p(x)p(y)) \geqslant 0$,
+with equality if and only if $p(x, y) = p(x)p(y)$.
+
+**2.30** For $\mathbf{y} = \mathbf{A}\mathbf{x}$, (2.76) gives $p_{\mathbf{y}}(\mathbf{y}) = p_{\mathbf{x}}(\mathbf{A}^{-1}\mathbf{y})/|\det\mathbf{A}|$.
+Changing the integration variable back to $\mathbf{x}$ ($\mathrm{d}\mathbf{y} = |\det\mathbf{A}|\,\mathrm{d}\mathbf{x}$),
+
+$$
+\mathrm{H}[\mathbf{y}] = -\int p_{\mathbf{x}}(\mathbf{x})\big\{\ln p_{\mathbf{x}}(\mathbf{x}) - \ln|\det\mathbf{A}|\big\}\mathrm{d}\mathbf{x} = \mathrm{H}[\mathbf{x}] + \ln|\det\mathbf{A}|.
+$$
+
+The book writes $\ln\det\mathbf{A}$; the absolute value is needed when $\det\mathbf{A} < 0$.
+Stretching space by a factor $|\det\mathbf{A}|$ adds its logarithm to the differential entropy,
+which is the $-\ln\Delta$ ambiguity of (2.90) in another guise.
+
+**2.31** $\mathrm{H}[y \mid x] = \sum_x p(x)\,\mathrm{H}[y \mid x{=}x]$ with
+$\mathrm{H}[y \mid x{=}x] = -\sum_y p(y \mid x)\ln p(y \mid x) \geqslant 0$. A sum of non-negative terms
+is zero only if every term with $p(x) > 0$ is zero. Each $-p\ln p$ is strictly positive for
+$0 < p < 1$, so $p(y \mid x)$ must be 0 or 1 for every $y$: exactly one $y$ has $p(y \mid x) = 1$,
+and $y$ is a function of $x$.
+
+**2.32** If $f'' > 0$, Taylor's theorem around $x_\lambda = \lambda a + (1 - \lambda)b$ gives
+$f(a) = f(x_\lambda) + f'(x_\lambda)(a - x_\lambda) + \frac{1}{2}f''(\xi_a)(a - x_\lambda)^2$ and
+similarly for $b$. Weighting by $\lambda$ and $1 - \lambda$, the linear terms cancel because
+$\lambda(a - x_\lambda) + (1 - \lambda)(b - x_\lambda) = 0$, leaving
+
+$$
+\lambda f(a) + (1 - \lambda)f(b) - f(x_\lambda) = \tfrac{1}{2}\big\{\lambda f''(\xi_a)(a - x_\lambda)^2 + (1 - \lambda)f''(\xi_b)(b - x_\lambda)^2\big\} > 0
+$$
+
+for $0 < \lambda < 1$: every chord lies strictly above. Conversely, if $f''(x_0) < 0$ somewhere, $f$
+is strictly concave near $x_0$ and short chords there lie below it. So chords above the function
+imply $f'' \geqslant 0$, and $f'' > 0$ implies strict convexity. The two are not quite
+equivalent: $f(x) = x^4$ is strictly convex but $f''(0) = 0$. The book's "equivalent" (and its
+remark after (2.101)) should read "non-negative" in one direction.
+
+**2.33** The case $M = 2$ is (2.101). Assume (2.102) for $M$ points and take $M + 1$ with
+$\lambda_{M+1} < 1$ (if it equals 1 there is nothing to prove). Write
+
+$$
+\sum_{i=1}^{M+1}\lambda_i x_i = \lambda_{M+1}x_{M+1} + (1 - \lambda_{M+1})\sum_{i=1}^{M}\frac{\lambda_i}{1 - \lambda_{M+1}}x_i.
+$$
+
+By (2.101) $f$ of this is at most $\lambda_{M+1}f(x_{M+1}) + (1 - \lambda_{M+1})f\big(\sum_{i \le M}\mu_i x_i\big)$
+with $\mu_i = \lambda_i/(1 - \lambda_{M+1})$, which are non-negative and sum to one. The induction
+hypothesis bounds the last term by $\sum_{i \le M}\mu_i f(x_i)$, and multiplying back gives
+$\sum_{i \le M+1}\lambda_i f(x_i)$.
+
+**2.34** With the empirical distribution (2.37) as $p$,
+$\mathrm{KL}(p \,\|\, q) = \int p\ln p - \int p\ln q(x \mid \boldsymbol\theta)$. The first term does not
+depend on $\boldsymbol\theta$ (strictly, it is infinite for delta functions, but it is the same
+infinity for every $\boldsymbol\theta$, which is what "up to an additive constant" means). By the
+sifting property the second term is $-\frac{1}{N}\sum_n \ln q(x_n \mid \boldsymbol\theta)$: the
+negative log likelihood divided by $N$.
+
+**2.35** $\mathrm{H}[x, y] = -\iint p(x, y)\ln p(x, y) = -\iint p(x, y)\{\ln p(y \mid x) + \ln p(x)\} = \mathrm{H}[y \mid x] - \int p(x)\ln p(x)\, \mathrm{d}x = \mathrm{H}[y \mid x] + \mathrm{H}[x]$,
+where the second integral used the sum rule $\int p(x, y)\, \mathrm{d}y = p(x)$.
+
+**2.36** The joint is $p(0,0) = p(0,1) = p(1,1) = \frac{1}{3}$ and $p(1,0) = 0$. The marginals are
+$p(x) = (\frac{2}{3}, \frac{1}{3})$ and $p(y) = (\frac{1}{3}, \frac{2}{3})$, and
+$p(y \mid x{=}0) = (\frac{1}{2}, \frac{1}{2})$ while $p(y \mid x{=}1) = (0, 1)$. In nats:
+
+| quantity | expression | value |
+| --- | --- | ---: |
+| (a) $\mathrm{H}[x]$ | $\ln 3 - \frac{2}{3}\ln 2$ | 0.6365 |
+| (b) $\mathrm{H}[y]$ | $\ln 3 - \frac{2}{3}\ln 2$ | 0.6365 |
+| (c) $\mathrm{H}[y \mid x]$ | $\frac{2}{3}\ln 2 + \frac{1}{3} \cdot 0$ | 0.4621 |
+| (d) $\mathrm{H}[x \mid y]$ | $\frac{1}{3} \cdot 0 + \frac{2}{3}\ln 2$ | 0.4621 |
+| (e) $\mathrm{H}[x, y]$ | $\ln 3$ | 1.0986 |
+| (f) $\mathrm{I}[x, y]$ | $\ln 3 - \frac{4}{3}\ln 2$ | 0.1744 |
+
+Check: $\mathrm{H}[x] + \mathrm{H}[y \mid x] = 0.6365 + 0.4621 = 1.0986 = \mathrm{H}[x, y]$, and
+$\mathrm{H}[x] - \mathrm{H}[x \mid y] = 0.1744 = \mathrm{I}$. The Venn diagram is the `InfoBars` figure
+above: two "circles" $\mathrm{H}[x]$ and $\mathrm{H}[y]$ overlapping in $\mathrm{I}$, their union
+$\mathrm{H}[x, y]$, and the crescents $\mathrm{H}[x \mid y]$ and $\mathrm{H}[y \mid x]$.
+
+**2.37** $\ln$ is concave, so Jensen's inequality (2.102) holds with $\geqslant$. With equal weights
+$1/M$ on positive numbers $x_1, \dots, x_M$:
+$\ln\big(\frac{1}{M}\sum_i x_i\big) \geqslant \frac{1}{M}\sum_i \ln x_i = \ln\big(\prod_i x_i\big)^{1/M}$.
+Since $\exp$ is increasing, the arithmetic mean is at least the geometric mean, with equality only
+when all $x_i$ are equal (strict concavity). The exercise says "real numbers"; they must be
+positive for the logarithm to exist.
+
+**2.38** Using $p(x, y) = p(x \mid y)\, p(y)$,
+$\mathrm{I}[x, y] = \iint p(x, y)\ln\frac{p(x \mid y)}{p(x)} = -\iint p(x, y)\ln p(x) + \iint p(x, y)\ln p(x \mid y) = \mathrm{H}[x] - \mathrm{H}[x \mid y]$,
+where the first integral used the sum rule over $y$. Writing $p(x, y) = p(y \mid x)p(x)$ instead
+gives $\mathrm{H}[y] - \mathrm{H}[y \mid x]$.
+
+#### Bayesian probabilities (2.40–2.41)
+
+**2.40** The concave side lands up with probability 0.6. Let $\mathcal{H}$ be the hypothesis
+"concave side is heads", with prior $p(\mathcal{H}) = 1 - 0.1 = 0.9$. Under $\mathcal{H}$ a flip lands
+heads with probability 0.6; otherwise with 0.4. For 8 heads and 2 tails (in any fixed order; the
+binomial coefficient cancels),
+
+$$
+\frac{p(\mathcal{H} \mid \mathcal{D})}{p(\lnot\mathcal{H} \mid \mathcal{D})} = \frac{0.9}{0.1} \cdot \frac{0.6^8\, 0.4^2}{0.4^8\, 0.6^2} = 9 \times 1.5^6 = 9 \times 11.39 = 102.5,
+$$
+
+so $p(\mathcal{H} \mid \mathcal{D}) = 102.5/103.5 = 0.9903$. The probability that the next flip lands
+heads averages over both hypotheses:
+$0.9903 \times 0.6 + 0.0097 \times 0.4 = 0.598$. The data pushed the belief that the concave side is
+heads from 0.90 to 0.99, and the prediction from $0.9 \times 0.6 + 0.1 \times 0.4 = 0.58$ to 0.598.
+
+**2.41** Substituting the prior (2.115) and the log likelihood (2.66) into (2.114),
+
+$$
+\begin{aligned}
+-\ln p(\mathbf{w} \mid \mathcal{D}) = {}& \frac{1}{2\sigma^2}\sum_n\{y(x_n, \mathbf{w}) - t_n\}^2 + \frac{N}{2}\ln(2\pi\sigma^2) \\
+&+ \frac{1}{2s^2}\mathbf{w}^{\mathrm{T}}\mathbf{w} + \frac{M + 1}{2}\ln(2\pi s^2) + \ln p(\mathcal{D}).
+\end{aligned}
+$$
+
+The second, fourth and fifth terms do not depend on $\mathbf{w}$. Dropping them leaves (2.117).
+
+## Summary
+
+- **Two rules generate everything.** The sum rule (marginalise) and the product rule (factor a
+  joint into a conditional and a marginal) follow from counting, and Bayes' theorem follows from
+  them. The screening example shows why the prior matters: a good test on a rare disease still
+  gives mostly false positives.
+- **Maximum likelihood gives familiar losses and a bias.** Gaussian noise turns maximum likelihood
+  into least squares. Fitted to the same data it is evaluated on, it underestimates the noise by
+  $(N - 1)/N$ for one Gaussian, and far more for a flexible model: over-fitting.
+- **Densities carry a Jacobian.** A change of variable multiplies a density by $|\det\mathbf{J}|$,
+  so modes are not invariant under nonlinear reparametrisation, while ordinary functions are.
+- **Entropy, KL and mutual information measure information.** Entropy is the shortest average
+  code length and is largest for the uniform (discrete) or the Gaussian (fixed variance).
+  $\mathrm{KL}(p \,\|\, q) \geqslant 0$ by Jensen's inequality, and minimising it from samples is maximum
+  likelihood. Mutual information is the KL from independence.
+- **The same rules power the advanced tools.** Conditioning Gaussians, decision theory, the
+  bias–variance split, model evidence, the ELBO and normalizing flows are the sum and product
+  rules, Bayes' theorem, KL and the change of variables applied with care.
+- **A prior is a regulariser.** MAP with a Gaussian prior is weight decay with
+  $\lambda = \sigma^2/s^2$. The fully Bayesian prediction integrates over parameters, which is
+  principled but usually too expensive for deep networks.
+
+## References
+
+- C. M. Bishop and H. Bishop, *Deep Learning: Foundations and Concepts*, Springer, 2024,
+  chapter 2 (pp. 23–63), [doi:10.1007/978-3-031-45468-4_2](https://doi.org/10.1007/978-3-031-45468-4_2).
+- T. M. Cover and J. A. Thomas, *Elements of Information Theory*, Wiley, 1991 (the eight-state
+  coding example).
+- C. E. Shannon, "A mathematical theory of communication", *Bell System Technical Journal* 27,
+  1948 (the noiseless coding theorem).
+- S. Kullback and R. A. Leibler, "On information and sufficiency", *Annals of Mathematical
+  Statistics* 22, 1951.
+- R. T. Cox, "Probability, frequency and reasonable expectation", *American Journal of Physics*
+  14, 1946.
+- D. J. C. MacKay, *Information Theory, Inference, and Learning Algorithms*, Cambridge University
+  Press, 2003.
+- B. Efron's non-transitive dice, as described in M. Gardner, "The paradox of the nontransitive
+  dice", *Scientific American*, December 1970.

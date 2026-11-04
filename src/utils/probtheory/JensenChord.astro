@@ -1,0 +1,128 @@
+---
+// Convexity and Jensen's inequality (Bishop & Bishop, Section 2.5.5, Figure 2.15). A convex
+// function f (red), the chord from (a, f(a)) to (b, f(b)) (blue) and the point x_λ = λa + (1 − λ)b
+// with f(x_λ) on the curve and λ f(a) + (1 − λ) f(b) on the chord (2.101); the vertical gap
+// between them is never negative. With two points this is also Jensen's inequality (2.102) for
+// a two-state distribution with probabilities λ and 1 − λ: f(E[x]) ⩽ E[f(x)].
+// Logic is inline (three closed-form functions).
+// Usage in .mdx:
+//   <JensenChord fn="xlnx" a={0.2} b={2.5} lambda={0.4} />
+import "../sampling/sampling.css";
+import "./probTheory.css";
+
+interface Props {
+	fn?: "xlnx" | "x2" | "neglog";
+	a?: number;
+	b?: number;
+	lambda?: number;
+	title?: string;
+	caption?: string;
+}
+
+const {
+	fn = "xlnx",
+	a = 0.2,
+	b = 2.5,
+	lambda = 0.4,
+	title,
+	caption,
+} = Astro.props;
+---
+
+<figure class="smp-fig pt-jensen">
+	{title && <div class="smp-title">{title}</div>}
+	<div class="smp-legend">
+		<span><i class="k-q"></i>f(x)</span>
+		<span><i class="k-p"></i>chord</span>
+		<span><i class="dot k-dot-p"></i>λ f(a) + (1 − λ) f(b) = E[f(x)]</span>
+		<span><i class="dot pt-k-green-dot"></i>f(x_λ) = f(E[x])</span>
+	</div>
+	<svg class="smp-svg" viewBox="0 0 640 250" role="img" aria-label="A convex function with a chord lying above it"></svg>
+	<div class="smp-controls">
+		<label>f
+			<select class="i-fn" aria-label="Convex function">
+				<option value="xlnx" selected={fn === "xlnx"}>x ln x</option>
+				<option value="x2" selected={fn === "x2"}>x²</option>
+				<option value="neglog" selected={fn === "neglog"}>− ln x</option>
+			</select>
+		</label>
+		<label class="smp-slider">a = <strong class="v-a"></strong>
+			<input type="range" class="i-a" min="0.05" max="3" step="0.05" value={a} aria-label="Left end a" />
+		</label>
+		<label class="smp-slider">b = <strong class="v-b"></strong>
+			<input type="range" class="i-b" min="0.05" max="3" step="0.05" value={b} aria-label="Right end b" />
+		</label>
+		<label class="smp-slider">λ = <strong class="v-l"></strong>
+			<input type="range" class="i-l" min="0" max="1" step="0.01" value={lambda} aria-label="Weight lambda" />
+		</label>
+	</div>
+	<div class="smp-metrics">
+		<div><span>x_λ = λa + (1 − λ)b</span><strong class="m-x"></strong></div>
+		<div><span>f(x_λ)</span><strong class="m-f"></strong></div>
+		<div><span>λ f(a) + (1 − λ) f(b)</span><strong class="m-c"></strong></div>
+		<div><span>gap (⩾ 0)</span><strong class="m-g"></strong></div>
+	</div>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import { axes, curve, el, fmt } from "../sampling/plot";
+
+	const fns: Record<string, (x: number) => number> = {
+		xlnx: (x) => x * Math.log(x),
+		x2: (x) => x * x,
+		neglog: (x) => -Math.log(x),
+	};
+
+	function attach(fig: HTMLElement) {
+		const svg = fig.querySelector("svg")!;
+		const fIn = fig.querySelector<HTMLSelectElement>(".i-fn")!;
+		const aIn = fig.querySelector<HTMLInputElement>(".i-a")!;
+		const bIn = fig.querySelector<HTMLInputElement>(".i-b")!;
+		const lIn = fig.querySelector<HTMLInputElement>(".i-l")!;
+
+		function draw() {
+			const f = fns[fIn.value];
+			const a = Number(aIn.value);
+			const b = Number(bIn.value);
+			const l = Number(lIn.value);
+			const xl = l * a + (1 - l) * b;
+			const chord = l * f(a) + (1 - l) * f(b);
+			let lo = Number.POSITIVE_INFINITY;
+			let hi = Number.NEGATIVE_INFINITY;
+			for (let i = 1; i <= 200; i++) {
+				const v = f((3.1 * i) / 200);
+				lo = Math.min(lo, v);
+				hi = Math.max(hi, v);
+			}
+			hi = Math.min(hi, 6);
+			const pad = (hi - lo) * 0.08;
+			svg.replaceChildren();
+			const A = axes(svg, { x: 40, y: 8, w: 585, h: 205 }, [0, 3.1], [lo - pad, hi + pad], { xLabel: "x", yTicks: 5 });
+			el("path", { d: curve(A, f, 400, 0.005, 3.1), class: "smp-q" }, svg);
+			el("line", { x1: A.sx(a), y1: A.sy(f(a)), x2: A.sx(b), y2: A.sy(f(b)), class: "smp-p" }, svg);
+			for (const [x, t] of [
+				[a, "a"],
+				[b, "b"],
+			] as [number, string][]) {
+				el("circle", { cx: A.sx(x), cy: A.sy(f(x)), r: 3.5, class: "smp-dot" }, svg);
+				el("text", { x: A.sx(x), y: A.sy(lo - pad) - 4, class: "smp-note", "text-anchor": "middle" }, svg, t);
+			}
+			el("line", { x1: A.sx(xl), x2: A.sx(xl), y1: A.sy(lo - pad), y2: A.sy(chord), class: "smp-guide" }, svg);
+			el("text", { x: A.sx(xl), y: A.sy(lo - pad) - 4, class: "smp-note", "text-anchor": "middle" }, svg, "x_λ");
+			el("circle", { cx: A.sx(xl), cy: A.sy(chord), r: 4.5, class: "smp-dot" }, svg);
+			el("circle", { cx: A.sx(xl), cy: A.sy(f(xl)), r: 4.5, class: "pt-green" }, svg);
+			fig.querySelector(".v-a")!.textContent = fmt(a, 2);
+			fig.querySelector(".v-b")!.textContent = fmt(b, 2);
+			fig.querySelector(".v-l")!.textContent = fmt(l, 2);
+			fig.querySelector(".m-x")!.textContent = fmt(xl, 3);
+			fig.querySelector(".m-f")!.textContent = fmt(f(xl), 4);
+			fig.querySelector(".m-c")!.textContent = fmt(chord, 4);
+			fig.querySelector(".m-g")!.textContent = fmt(chord - f(xl), 4);
+		}
+		for (const i of [fIn, aIn, bIn, lIn]) i.addEventListener("input", draw);
+		draw();
+	}
+
+	document.querySelectorAll<HTMLElement>(".pt-jensen").forEach(attach);
+</script>

@@ -1,0 +1,689 @@
+---
+title: "Gradient Descent: Geometry, Stochastic Optimization, Adam, and Normalization"
+description: "Chapter 7 of Bishop and Bishop, derived from the local quadratic model through SGD, momentum, learning-rate schedules, Adam, and normalization, with worked answers to every exercise."
+date: 2026-11-04
+tags: [Machine learning, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import LineChart from "../../utils/charts/LineChart.astro";
+import SurfacePlot from "../../utils/charts/3DSurfacePlot.astro";
+
+## Background
+
+A neural network can represent a useful function only after we choose its weights. Training turns
+that choice into an optimization problem: find the parameter vector $\mathbf w$ that makes an error
+$E(\mathbf w)$ small. Direct search wastes almost all its evaluations. A gradient says which local
+direction raises the error fastest, so its negative gives a principled direction in which to move.
+
+This post follows Chapter 7 of Bishop and Bishop's *Deep Learning: Foundations and Concepts*.
+It develops the geometry of an error surface, batch and stochastic gradient descent (SGD),
+mini-batches, initialization, momentum, schedules, RMSProp, Adam, and data, batch, and layer
+normalization. A final section gives derivations for all fourteen exercises. The next post,
+[Backpropagation](/blog/backpropagation/), explains how the gradients are computed; the third,
+[Regularization](/blog/regularization/), explains why minimizing training error is not the whole goal.
+
+## Error surfaces
+
+The **weight space** is the space whose coordinates are all weights and biases. For a small
+displacement $\delta\mathbf w$, the first-order Taylor expansion is
+
+$$
+E(\mathbf w+\delta\mathbf w)
+=E(\mathbf w)+\delta\mathbf w^T\nabla E(\mathbf w)+O(\|\delta\mathbf w\|^2).
+$$
+
+Cauchy--Schwarz gives
+$\delta\mathbf w^T\nabla E\geq-\|\delta\mathbf w\|\|\nabla E\|$, with equality when the step
+points along $-\nabla E$. Thus the negative gradient is the steepest local descent direction for a
+fixed Euclidean step length. A **stationary point** has $\nabla E=0$; it may be a minimum, maximum,
+or saddle point.
+
+### The local quadratic model
+
+Near $\widehat{\mathbf w}$,
+
+$$
+E(\mathbf w)\simeq E(\widehat{\mathbf w})
++(\mathbf w-\widehat{\mathbf w})^T\mathbf b
++\frac12(\mathbf w-\widehat{\mathbf w})^T\mathbf H(\mathbf w-\widehat{\mathbf w}),
+$$
+
+where $\mathbf b=\nabla E(\widehat{\mathbf w})$ and $\mathbf H=\nabla^2E$ is the
+**Hessian**. At a stationary point $\mathbf w^\star$, $\mathbf b=0$. Because a smooth Hessian is
+symmetric, it has orthonormal eigenvectors $\mathbf u_i$ and real eigenvalues $\lambda_i$. Write
+$\mathbf w-\mathbf w^\star=\sum_i\alpha_i\mathbf u_i$ to obtain
+
+$$
+E(\mathbf w)=E(\mathbf w^\star)+\frac12\sum_i\lambda_i\alpha_i^2.
+$$
+
+This equation is the geometry in one line. Positive eigenvalues bend upward; a negative one gives a
+descent direction; a zero one is locally flat. Constant-error contours have semi-axis lengths
+proportional to $1/\sqrt{\lambda_i}$. A large condition number
+$\kappa=\lambda_{\max}/\lambda_{\min}$ therefore produces a long, narrow valley.
+
+The surface below is the scaled-down quadratic $E(w_1,w_2)=4w_1^2+w_2^2/2$. Rotate it and compare
+the two axes. A step of the same length changes the error eight times more strongly along $w_1$
+than along $w_2$. This is why one learning rate can oscillate across a valley while making slow
+progress along it.
+
+<SurfacePlot
+	fn={(w1, w2) => 4 * w1 * w1 + 0.5 * w2 * w2}
+	x={[-2, 2]}
+	y={[-2, 2]}
+	title="An ill-conditioned quadratic error surface"
+	xLabel="stiff coordinate w₁"
+	yLabel="flat coordinate w₂"
+	zLabel="E"
+	height={390}
+/>
+
+<LineChart
+	x={() => Array.from({ length: 161 }, (_, i) => -4 + i * 0.05)}
+	series={[
+		{ name: "stiff direction: 2a²", fn: (a) => 2 * a * a },
+		{ name: "flat direction: ½a²", fn: (a) => 0.5 * a * a },
+	]}
+	title="The same quadratic minimum has different curvature along Hessian eigenvectors"
+	xLabel="eigen-coordinate a"
+	yLabel="error above the minimum"
+/>
+
+### Why equivalent minima appear
+
+Permuting $M$ hidden units leaves a layer's function unchanged if the corresponding incoming and
+outgoing weights are permuted together. With a symmetric activation, flipping one hidden unit's
+incoming signs and compensating in the next layer adds another symmetry. A two-layer network can
+therefore have $M!2^M$ parameter vectors representing the same function. This is one reason that a
+unique parameter optimum is neither expected nor required.
+
+## Gradient descent optimization
+
+Write a general iterative update as
+
+$$
+\mathbf w^{(\tau)}=\mathbf w^{(\tau-1)}+\Delta\mathbf w^{(\tau-1)}.
+$$
+
+This notation separates two questions. The iteration index $\tau$ tells us *when* a parameter
+vector is used. The update $\Delta\mathbf w^{(\tau-1)}$ tells us *how* the next vector is chosen.
+An optimizer is a rule for constructing this update from information available at the current and
+possibly earlier iterations.
+
+### Using gradient information
+
+Why compute a gradient rather than only compare function values? Suppose the parameter vector has
+$W$ components. A derivative-free search must probe directions to discover which way is downhill.
+The gradient packages the local slopes in all $W$ coordinate directions into one vector. Its inner
+product with a proposed step predicts the change in error:
+
+$$
+\Delta E \simeq \Delta\mathbf w^T\nabla E.
+$$
+
+If we constrain $\|\Delta\mathbf w\|=\epsilon$, write the angle between the update and gradient as
+$\theta$. Then $\Delta E\simeq\epsilon\|\nabla E\|\cos\theta$. The smallest value occurs at
+$\theta=\pi$, which proves that $-\nabla E$ is locally steepest. This is a local statement: a large
+step can cross a valley, enter a region where the Taylor approximation is poor, and increase the
+error.
+
+The gradient is also coordinate-dependent. “Steepest” here means steepest under Euclidean distance
+in the chosen parameterization. Rescaling one parameter changes that geometry. Data normalization,
+RMSProp, Adam, and natural-gradient methods can all be viewed as changing the relative scale of
+directions.
+
+### Batch gradient descent
+
+**Batch gradient descent** chooses
+$\Delta\mathbf w=-\eta\nabla E$, where the learning rate $\eta>0$. For the quadratic model, each
+eigen-coordinate evolves independently:
+
+$$
+\alpha_i^{(\tau)}=(1-\eta\lambda_i)\alpha_i^{(\tau-1)}.
+$$
+
+It converges without oscillatory growth exactly when
+$|1-\eta\lambda_i|<1$ for every direction, hence $0<\eta<2/\lambda_{\max}$. One global learning
+rate is limited by the stiffest direction even when progress along flat directions is slow.
+
+There are three regimes in one eigen-direction:
+
+| Learning rate | Multiplier $1-\eta\lambda_i$ | Behaviour |
+| --- | ---: | --- |
+| $0<\eta<1/\lambda_i$ | between $0$ and $1$ | approaches without crossing |
+| $1/\lambda_i<\eta<2/\lambda_i$ | between $-1$ and $0$ | crosses and oscillates with decreasing amplitude |
+| $\eta>2/\lambda_i$ | magnitude greater than $1$ | oscillations grow and training diverges |
+
+For example, let $E(w)=2w^2$, so $\nabla E=4w$ and $\lambda=4$. Starting at $w=2$ with
+$\eta=0.2$ gives $w^{(1)}=2-0.2(8)=0.4$ and $w^{(2)}=0.08$. With $\eta=0.4$, the multiplier is
+$-0.6$, so the iterates $2,-1.2,0.72,-0.432,\ldots$ cross the minimum. Both converge because
+$\eta<2/4=0.5$. At $\eta=0.6$, the multiplier is $-1.4$ and the magnitude grows.
+
+### SGD and mini-batches
+
+For independent data, $E=\sum_{n=1}^N E_n$. **Stochastic gradient descent** uses one term,
+
+$$
+\mathbf w\leftarrow\mathbf w-\eta\nabla E_n(\mathbf w).
+$$
+
+If $n$ is sampled uniformly, $N\nabla E_n$ is an unbiased estimator of $\nabla E$. Its noise can
+help leave shallow basins, but also makes the path jitter. A **mini-batch** $\mathcal B$ of size $B$
+uses $B^{-1}\sum_{n\in\mathcal B}\nabla E_n$. Independent gradient noise then has variance roughly
+$1/B$, while matrix operations become much more efficient than $B$ separate evaluations.
+
+To see the unbiasedness carefully, define the mean objective
+$\bar E=N^{-1}\sum_nE_n$ and sample an index $I$ uniformly. Then
+
+$$
+\mathbb E_I[\nabla E_I]
+=\sum_{n=1}^N\frac1N\nabla E_n
+=\nabla\bar E.
+$$
+
+For a batch sampled independently with replacement,
+$\widehat{\mathbf g}=B^{-1}\sum_{b=1}^B\nabla E_{I_b}$ has the same expectation. If each sample
+gradient has covariance $\Sigma$, independence gives
+$\operatorname{Cov}(\widehat{\mathbf g})=\Sigma/B$. The standard deviation therefore falls as
+$1/\sqrt B$, not $1/B$. Doubling a large batch gives diminishing noise reduction, which is one
+reason the largest batch that fits in memory is not automatically best.
+
+The chart separates the two rates. Variance falls as $1/B$, but the visible scatter of a gradient
+estimate is its standard deviation, which falls only as $1/\sqrt B$. Moving from batch size 1 to 16
+reduces standard deviation by four; achieving another factor of four requires batch size 256.
+
+<LineChart
+	x={() => Array.from({ length: 256 }, (_, i) => i + 1)}
+	series={[
+		{ name: "relative variance 1/B", fn: (b) => 1 / b },
+		{ name: "relative standard deviation 1/√B", fn: (b) => 1 / Math.sqrt(b) },
+	]}
+	title="Mini-batch noise has diminishing returns"
+	xLabel="batch size B"
+	yLabel="relative noise"
+	height={300}
+/>
+
+The convention matters. If the objective is a *sum*, its full gradient grows with $N$; if it is a
+*mean*, it does not. Modern libraries normally average a mini-batch loss. Changing batch size while
+summing changes the effective learning rate even if the optimizer's displayed $\eta$ is unchanged.
+
+An **epoch** is one pass through the training set. Shuffling between epochs prevents a fixed order
+from imprinting a repeated correlation on the updates. Duplicating every example doubles the cost
+of a batch step but conveys no new information; SGD exposes this redundancy directly.
+
+### Initialization
+
+Equal weights give hidden units equal activations and equal gradients, so they remain identical.
+Random initialization breaks this symmetry. Scale matters too. If a ReLU layer has fan-in $M$,
+independent zero-mean weights of variance $\epsilon^2$, and incoming second moment $\lambda^2$,
+
+$$
+\operatorname{Var}(a_i)=M\epsilon^2\mathbb E[\operatorname{ReLU}(a)^2]
+=\frac{M}{2}\epsilon^2\lambda^2.
+$$
+
+Preserving variance gives $\epsilon=\sqrt{2/M}$, the He initialization rule. It prevents signals
+from exploding or vanishing before learning begins.
+
+## Convergence and adaptive methods
+
+### Momentum
+
+**Momentum** keeps a velocity-like running update:
+
+$$
+\Delta\mathbf w^{(\tau)}=-\eta\mathbf g^{(\tau)}+\mu\Delta\mathbf w^{(\tau-1)},
+\qquad \mathbf w^{(\tau+1)}=\mathbf w^{(\tau)}+\Delta\mathbf w^{(\tau)}.
+$$
+
+When gradients keep pointing the same way, the geometric series makes the effective learning rate
+$\eta/(1-\mu)$. Across a narrow valley, alternating components cancel. Momentum therefore
+accelerates the flat direction without equally amplifying oscillation in the stiff direction.
+Nesterov momentum evaluates the gradient after a look-ahead step; to first order it reduces to
+ordinary momentum when $\eta$ and $\mu$ are small.
+
+### Learning-rate schedules
+
+A large initial rate moves quickly; a smaller late rate reduces stochastic wandering. Common
+schedules are linear decay, power-law decay, and exponential decay. The useful invariant is not
+the schedule's name but whether the observed training curve falls rapidly without becoming
+unstable. Warmup is often added when early gradients or adaptive moments are poorly calibrated.
+
+The curves below start at the same learning rate. Linear decay reaches zero at the planned horizon;
+exponential decay removes a fixed fraction per step; inverse-time decay has a longer tail. These
+are shapes to understand, not universal recommendations—the schedule must match the update budget.
+
+<LineChart
+	x={() => Array.from({ length: 101 }, (_, i) => i)}
+	series={[
+		{ name: "linear", fn: (t) => Math.max(0, 1 - t / 100) },
+		{ name: "exponential", fn: (t) => Math.pow(0.01, t / 100) },
+		{ name: "inverse time", fn: (t) => 1 / (1 + t / 10) },
+	]}
+	title="Three learning-rate schedules with η(0)=1"
+	xLabel="update t"
+	yLabel="learning rate η(t)"
+	height={300}
+/>
+
+### RMSProp and Adam
+
+RMSProp tracks an exponential average of squared gradients,
+$\mathbf r_\tau=\beta_2\mathbf r_{\tau-1}+(1-\beta_2)\mathbf g_\tau^2$, and divides componentwise by
+$\sqrt{\mathbf r_\tau}+\delta$. Directions with persistently large gradients receive smaller
+steps.
+
+Adam also tracks the first moment
+$\mathbf s_\tau=\beta_1\mathbf s_{\tau-1}+(1-\beta_1)\mathbf g_\tau$. Starting both moments at
+zero biases them low. Expanding the recursion gives
+$\mathbb E[\mathbf s_\tau]=(1-\beta_1^\tau)\mathbb E[\mathbf g]$, so Adam uses
+
+$$
+\widehat{\mathbf s}_\tau=\frac{\mathbf s_\tau}{1-\beta_1^\tau},\quad
+\widehat{\mathbf r}_\tau=\frac{\mathbf r_\tau}{1-\beta_2^\tau},\quad
+\Delta\mathbf w=-\eta\frac{\widehat{\mathbf s}_\tau}{\sqrt{\widehat{\mathbf r}_\tau}+\delta}.
+$$
+
+The square, square root, division, and addition here are elementwise. Adam changes the optimizer's
+geometry; it does not remove the need to choose a learning rate or inspect generalization.
+
+### What adaptive rescaling actually does
+
+Consider a two-parameter gradient $\mathbf g=(100,1)$. Plain gradient descent with
+$\eta=10^{-3}$ proposes $(-0.1,-0.001)$, so the first coordinate dominates. If these magnitudes
+persist, RMSProp's second moment approaches $\mathbf r=(10^4,1)$. Dividing by
+$\sqrt{\mathbf r}$ produces an approximately normalized direction $(1,1)$. The method has not
+made the first derivative smaller; it has changed the metric used to convert a derivative into a
+step.
+
+This coordinatewise treatment explains both the appeal and the limitation. It handles axis-aligned
+differences in scale, but it does not remove correlations between parameters. If a narrow valley is
+rotated relative to the coordinate axes, a diagonal preconditioner cannot align itself perfectly
+with the Hessian eigenvectors.
+
+Adam combines this rescaling with momentum. Written for one coordinate,
+
+$$
+s_\tau=\beta_1s_{\tau-1}+(1-\beta_1)g_\tau,qquad
+r_\tau=\beta_2r_{\tau-1}+(1-\beta_2)g_\tau^2.
+$$
+
+The ratio $\widehat s_\tau/\sqrt{\widehat r_\tau}$ is close to the sign of a constant gradient,
+but it becomes smaller when signs fluctuate because cancellation affects the first moment while
+squares keep the second moment large. Adam therefore favours coordinates whose gradients are both
+large *and consistent*.
+
+The stabilizer $\delta$ is not only protection against division by zero. When
+$\sqrt{\widehat r}\ll\delta$, the update is approximately
+$-\eta\widehat s/\delta$, so $\delta$ sets the effective scale in very low-gradient coordinates.
+Moving it outside rather than inside the square root changes that low-magnitude behaviour.
+
+### Convergence is not the same as generalization
+
+Optimization asks whether iterates approach a stationary point of the training objective.
+Generalization asks whether the resulting function predicts new data. A method can reduce training
+loss faster yet reach a worse test solution because the optimizer itself supplies an **implicit
+bias**. Mini-batch noise, momentum, adaptive scaling, initialization, and stopping time all affect
+which member of a large set of low-training-error solutions is selected.
+
+This is especially important in overparameterized networks. There may be many global minima with
+essentially zero training error. “The optimizer converged” therefore does not identify a unique
+function, nor does a lower final training loss prove that the learned function is better.
+
+## Normalization
+
+**Data normalization** standardizes input coordinate $i$ as
+$\widetilde x_{ni}=(x_{ni}-\mu_i)/\sigma_i$. Its sample mean is $0$ and variance is $1$. For linear
+regression this improves Hessian conditioning: changing one parameter no longer moves the output
+by a scale a million times larger than another.
+
+For a design matrix $X$, the squared-error Hessian is $X^TX$. If one feature is multiplied by
+$c$, its corresponding diagonal curvature is multiplied by $c^2$. A single learning rate must then
+be small enough for that enlarged curvature. Standardization does not guarantee perfect
+conditioning—correlated features can still create a narrow valley—but it removes arbitrary units
+as a source of poor conditioning.
+
+For a feature with training values $x_{1i},\ldots,x_{Ni}$, compute
+
+$$
+\mu_i=\frac1N\sum_nx_{ni},\qquad
+\sigma_i^2=\frac1N\sum_n(x_{ni}-\mu_i)^2.
+$$
+
+The same stored $\mu_i$ and $\sigma_i$ must transform validation, test, and production inputs.
+Recomputing them on the test set leaks information and makes the deployed mapping differ from the
+one evaluated.
+
+**Batch normalization** standardizes each hidden feature using mini-batch statistics, then learns
+an affine scale and shift. Training uses batch statistics; inference uses running population
+estimates. Its effect is not merely a cure for “internal covariate shift”: it also changes the
+optimization landscape and injects batch-dependent noise.
+
+For feature $i$ in a batch of $B$ examples,
+
+$$
+\mu_i^{\mathcal B}=\frac1B\sum_{n\in\mathcal B}a_{ni},\qquad
+(\sigma_i^{\mathcal B})^2=\frac1B\sum_{n\in\mathcal B}(a_{ni}-\mu_i^{\mathcal B})^2,
+$$
+
+$$
+\widehat a_{ni}=\frac{a_{ni}-\mu_i^{\mathcal B}}
+{\sqrt{(\sigma_i^{\mathcal B})^2+\epsilon}},\qquad
+z_{ni}=\gamma_i\widehat a_{ni}+\beta_i.
+$$
+
+The small $\epsilon$ prevents division by zero. The learned $\gamma_i$ and $\beta_i$ are essential:
+normalization would otherwise forbid the layer from representing a useful nonzero mean or scale.
+During inference, using the current example's “batch” would make the prediction depend on which
+other examples happen to accompany it. Running training estimates avoid that dependence.
+
+**Layer normalization** computes statistics across a single example's hidden coordinates. It is
+independent of batch size and uses the same rule at training and inference, which makes it natural
+for transformers and sequence models. Batch norm couples examples; layer norm couples features.
+
+If a layer has $D$ hidden coordinates, layer normalization uses
+
+$$
+\mu_n=\frac1D\sum_{i=1}^D a_{ni},\qquad
+\sigma_n^2=\frac1D\sum_{i=1}^D(a_{ni}-\mu_n)^2,
+$$
+
+followed by $z_{ni}=\gamma_i(a_{ni}-\mu_n)/\sqrt{\sigma_n^2+\epsilon}+\beta_i$. Statistics are
+computed separately for each example, so there is no running-average state and no train/inference
+mismatch. In a transformer, the normalized axes are the hidden features of one token; tokens and
+examples remain separate.
+
+## Worked exercises
+
+Each exercise is solved separately, with the intermediate argument shown.<Sidenote>The authors' Version 1.0 solution
+manual and July 2025 errata were used for cross-checking. Exercise 7.5 needs the missing minus sign
+in the first printing's cross-entropy definition; Exercise 7.9 corrects the left side of (7.20) to
+$\operatorname{var}[a_i^{(l)}]$.</Sidenote>
+
+### Exercise 7.1: diagonalizing the quadratic error
+
+> **Problem.** Starting from the quadratic approximation at a stationary point, expand the
+> displacement in the orthonormal eigenvectors of the Hessian and show that the error separates
+> into a sum $\frac12\sum_i\lambda_i\alpha_i^2$.
+
+**Solution.**
+
+At a stationary point the linear Taylor term is zero, so set
+$\Delta\mathbf w=\mathbf w-\mathbf w^\star$ and start from
+$E=E^\star+\frac12\Delta\mathbf w^T H\Delta\mathbf w$. Because the eigenvectors form a basis,
+$\Delta\mathbf w=\sum_j\alpha_j\mathbf u_j$. Substitute this expression on both sides:
+
+$$
+\Delta\mathbf w^TH\Delta\mathbf w
+=\left(\sum_i\alpha_i\mathbf u_i^T\right)
+H\left(\sum_j\alpha_j\mathbf u_j\right)
+=\sum_{i,j}\alpha_i\alpha_j\mathbf u_i^TH\mathbf u_j.
+$$
+
+Use $H\mathbf u_j=\lambda_j\mathbf u_j$, then orthonormality
+$\mathbf u_i^T\mathbf u_j=\delta_{ij}$. The Kronecker delta removes every cross term:
+
+$$
+\sum_{i,j}\alpha_i\alpha_j\lambda_j\delta_{ij}
+=\sum_i\lambda_i\alpha_i^2.
+$$
+
+Hence $E=E^\star+\frac12\sum_i\lambda_i\alpha_i^2$. Rotating into the Hessian eigenbasis has
+turned one coupled multivariable quadratic into independent one-dimensional quadratics.
+
+### Exercise 7.2: positive definiteness and eigenvalues
+
+> **Problem.** Prove both directions of the claim that a real symmetric Hessian is positive
+> definite if and only if all its eigenvalues are strictly positive.
+
+**Solution.**
+
+First assume $H$ is positive definite. Choose the nonzero test vector $\mathbf v=\mathbf u_i$.
+Then $\mathbf u_i^TH\mathbf u_i=\lambda_i\mathbf u_i^T\mathbf u_i=\lambda_i>0$. Thus every
+eigenvalue is positive.
+
+For the converse, assume all $\lambda_i>0$. Expand an arbitrary nonzero vector as
+$\mathbf v=\sum_i c_i\mathbf u_i$. Repeating the calculation from Exercise 7.1 gives
+$\mathbf v^TH\mathbf v=\sum_i\lambda_i c_i^2$. At least one $c_i$ is nonzero; every term is
+nonnegative and that term is positive. Therefore the sum is positive for every nonzero
+$\mathbf v$, which is exactly the definition of positive definiteness.
+
+### Exercise 7.3: the minimum condition
+
+> **Problem.** For the quadratic error model centred at a stationary point, prove that the point is
+> a strict minimum exactly when the Hessian is positive definite.
+
+**Solution.**
+
+If $H$ is positive definite, Exercise 7.2 gives
+$\Delta\mathbf w^TH\Delta\mathbf w>0$ whenever $\Delta\mathbf w\ne0$. Consequently
+$E(\mathbf w)>E(\mathbf w^\star)$ everywhere except at $\mathbf w^\star$, so the stationary point
+is a strict local minimum of the quadratic model.
+
+Conversely, suppose the quadratic has a strict minimum at $\mathbf w^\star$. Then its increase
+$\frac12\Delta\mathbf w^TH\Delta\mathbf w$ must be positive for every nonzero displacement.
+Since a displacement can be any vector, this is precisely $H\succ0$. The zero-gradient condition
+alone is insufficient: a negative eigenvalue would give a descending direction and mixed signs
+would make the point a saddle.
+
+### Exercise 7.4: Hessian of linear regression
+
+> **Problem.** For one-input linear regression $y(x)=wx+b$ with sum-of-squares error, derive the
+> $2\times2$ Hessian in $(w,b)$, calculate its trace and determinant, and use them to show that the
+> stationary point is a minimum for nondegenerate input data.
+
+**Solution.**
+
+Let $y_n=wx_n+b$ and $E=\frac12\sum_n(y_n-t_n)^2$. Differentiating once gives
+$E_w=\sum_n(y_n-t_n)x_n$ and $E_b=\sum_n(y_n-t_n)$. Since
+$\partial y_n/\partial w=x_n$ and $\partial y_n/\partial b=1$, differentiating again gives
+
+$$
+\mathbf H=\begin{bmatrix}\sum x_n^2&N\bar x\\N\bar x&N\end{bmatrix},\quad
+\operatorname{tr}H=\sum_nx_n^2+N>0.
+$$
+
+The determinant is
+$N\sum_nx_n^2-(\sum_nx_n)^2=N^2[(N^{-1}\sum_nx_n^2)-\bar x^2]=N^2\sigma_x^2$.
+For nonconstant inputs it is positive. A real $2\times2$ symmetric matrix has eigenvalue sum equal
+to its trace and product equal to its determinant. A positive product says the eigenvalues have the
+same sign; a positive sum says that sign is positive. Thus the unique stationary point is a minimum.
+
+### Exercise 7.5: Hessian of logistic regression
+
+> **Problem.** Repeat the Hessian calculation for a logistic-sigmoid binary classifier trained by
+> cross-entropy. Show that its trace and determinant are positive except for degenerate data, and
+> hence that its stationary point is a minimum.
+
+**Solution.**
+
+For $y_n=\sigma(wx_n+b)$ and negative cross-entropy, the sigmoid and loss derivatives cancel to
+give the same first derivatives as above: $E_w=\sum_n(y_n-t_n)x_n$ and
+$E_b=\sum_n(y_n-t_n)$. Now $partial y_n/\partial w=c_nx_n$ and
+$\partial y_n/\partial b=c_n$, where $c_n=y_n(1-y_n)>0$. Therefore
+
+$$
+H=\begin{bmatrix}\sum_nc_nx_n^2&\sum_nc_nx_n\\
+\sum_nc_nx_n&\sum_nc_n\end{bmatrix}.
+$$
+
+Its trace is positive. Let $C=\sum_nc_n$ and weighted mean
+$\mu_c=C^{-1}\sum_nc_nx_n$. Completing the square gives
+$\det H=C\sum_nc_n(x_n-\mu_c)^2>0$ unless all inputs coincide. The same trace/determinant argument
+proves both eigenvalues positive. Notice that targets disappear from the Hessian explicitly, while
+the parameters remain through $y_n$.
+
+### Exercise 7.6: axes of constant-error ellipses
+
+> **Problem.** For a positive-definite quadratic error, show that constant-error contours are
+> ellipses aligned with the Hessian eigenvectors and find how each semi-axis length depends on its
+> eigenvalue.
+
+**Solution.**
+
+In eigen-coordinates a constant rise $C$ satisfies
+$\frac12\sum_i\lambda_i\alpha_i^2=C$. Along axis $j$, set every other $\alpha_i=0$:
+$\frac12\lambda_j\alpha_j^2=C$, hence the two intercepts are
+$\alpha_j=\pm\sqrt{2C/\lambda_j}$. Therefore the axes align with eigenvectors and their semi-axis
+lengths are inversely proportional to $\sqrt{\lambda_j}$. Large curvature means a short axis.
+
+### Exercise 7.7: independent coefficients in a quadratic
+
+> **Problem.** Count the independent nonconstant coefficients in a general local quadratic error
+> function of $W$ parameters, using the symmetry of the Hessian.
+
+**Solution.**
+
+A general $W\times W$ matrix has $W^2$ entries. Symmetry leaves $W$ diagonal entries and one from
+each off-diagonal pair: $W+(W^2-W)/2=W(W+1)/2$. Add the $W$ entries of the linear coefficient
+$\mathbf b$. Ignoring the constant offset, the local quadratic therefore has
+$W(W+1)/2+W=W(W+3)/2$ independent coefficients.
+
+### Exercise 7.8: variance of the sample mean
+
+> **Problem.** Let $x_1,\ldots,x_N$ be independent samples with mean $\mu$ and variance
+> $\sigma^2$. Derive the mean squared deviation of their sample mean from $\mu$.
+
+**Solution.**
+
+For iid samples with mean $\mu$ and variance $\sigma^2$,
+$\mathbb E[x_nx_m]=\mu^2+\delta_{nm}\sigma^2$. With
+$\bar x=N^{-1}\sum_nx_n$,
+
+$$
+\mathbb E[\bar x^2]=\frac1{N^2}\sum_{n,m}\mathbb E[x_nx_m]
+=\mu^2+\frac{\sigma^2}{N}.
+$$
+
+Since $\mathbb E[\bar x]=\mu$,
+$\mathbb E[(\bar x-\mu)^2]=\mathbb E[\bar x^2]-\mu^2=\sigma^2/N$. Averaging $N$ independent
+observations reduces variance by $N$ and standard error by $\sqrt N$.
+
+### Exercise 7.9: deriving He initialization
+
+> **Problem.** Consider a ReLU layer with fan-in $M$, independent zero-mean Gaussian weights, and
+> symmetric pre-activations. Choose the weight variance so that activation variance is preserved
+> from one layer to the next.
+
+**Solution.**
+
+For $a_i^{(l)}=\sum_{j=1}^Mw_{ij}z_j^{(l-1)}$, zero-mean independent weights make
+$\mathbb E[a_i^{(l)}]=0$. Independence also makes variances add:
+
+$$
+\operatorname{Var}(a_i^{(l)})
+=M\mathbb E[w_{ij}^2]\mathbb E[(z_j^{(l-1)})^2].
+$$
+
+If $w_{ij}\sim\mathcal N(0,\epsilon^2)$, the first expectation is $\epsilon^2$. For a symmetric
+pre-activation distribution with variance $\lambda^2$, ReLU keeps the positive half, so
+$\mathbb E[\operatorname{ReLU}(a)^2]=\lambda^2/2$. Thus the next variance is
+$M\epsilon^2\lambda^2/2$. Equating it to $\lambda^2$ gives
+$\epsilon^2=2/M$ and $\epsilon=\sqrt{2/M}$.
+
+### Exercise 7.10: gradient descent in eigen-coordinates
+
+> **Problem.** For the quadratic error surface, express a gradient-descent update in the Hessian
+> eigenbasis and derive the independent recurrence obeyed by each eigen-coordinate.
+
+**Solution.**
+
+The quadratic gradient is $H(\mathbf w-\mathbf w^\star)=\sum_i\lambda_i\alpha_i\mathbf u_i$.
+Meanwhile the update is $\Delta\mathbf w=\sum_i\Delta\alpha_i\mathbf u_i$. Set this equal to
+$-\eta\nabla E$ and multiply by $\mathbf u_j^T$. Orthonormality selects one component:
+$\Delta\alpha_j=-\eta\lambda_j\alpha_j$. Hence
+$\alpha_j^{(\tau+1)}=(1-\eta\lambda_j)\alpha_j^{(\tau)}$, the recurrence used in the convergence
+analysis.
+
+### Exercise 7.11: Nesterov versus ordinary momentum
+
+> **Problem.** Taylor-expand the gradient at Nesterov's look-ahead point and show that, when the
+> learning-rate and momentum displacement are treated as small, its update agrees with ordinary
+> momentum to first order.
+
+**Solution.**
+
+Nesterov evaluates the gradient at the look-ahead point
+$\mathbf w+\mu\Delta\mathbf w_{old}$. Taylor expansion gives
+$\nabla E(\mathbf w+\mu\Delta\mathbf w_{old})
+=\nabla E(\mathbf w)+\mu H\Delta\mathbf w_{old}+O(\mu^2)$.
+Multiplying by $-\eta$ makes the difference from ordinary momentum $-\eta\mu H\Delta\mathbf w$.
+If $\eta$ and $\mu$ are both treated as small quantities of order $\varepsilon$, this is
+$O(\varepsilon^2)$ and disappears at first order. The methods differ once those higher-order
+look-ahead effects matter.
+
+### Exercise 7.12: bias correction for an exponential average
+
+> **Problem.** Starting from an exponentially weighted running mean initialized at zero, unroll the
+> recurrence, calculate its expectation for iid data, identify its finite-time bias, and construct
+> an unbiased estimator.
+
+**Solution.**
+
+Unroll $m_n=\beta m_{n-1}+(1-\beta)x_n$ from $m_0=0$:
+$m_n=(1-\beta)\sum_{k=1}^n\beta^{k-1}x_{n-k+1}$. For iid observations of mean $\mu$,
+
+$$
+\mathbb E[m_n]=(1-\beta)\mu\sum_{k=1}^n\beta^{k-1}
+=(1-\beta^n)\mu.
+$$
+
+The zero initialization biases early estimates toward zero. Division by $1-\beta^n$ gives
+$\widehat m_n=m_n/(1-\beta^n)$ with expectation $\mu$.
+
+### Exercise 7.13: orthogonality after an exact line search
+
+> **Problem.** Minimize the error along the line $\mathbf w+\lambda\mathbf d$ and prove that at an
+> exact interior line-search minimum, the new gradient is orthogonal to the search direction.
+
+**Solution.**
+
+Parameterize the search line by $\mathbf v(\lambda)=\mathbf w+\lambda\mathbf d$. The chain rule
+gives $dE(\mathbf v(\lambda))/d\lambda
+=\sum_i d_i\,\partial E/\partial v_i=\mathbf d^T\nabla E$. At an interior line-search minimum
+$\lambda^\star$, this derivative is zero. Therefore
+$\mathbf d^T\nabla E(\mathbf w+\lambda^\star\mathbf d)=0$: the new gradient is perpendicular to
+the direction just searched.
+
+### Exercise 7.14: mean and variance after standardization
+
+> **Problem.** Using the sample definitions of a feature's mean and variance, prove directly that
+> subtracting that mean and dividing by that standard deviation produces sample mean zero and
+> sample variance one.
+
+**Solution.**
+
+Let $\widetilde x_{ni}=(x_{ni}-\mu_i)/\sigma_i$, with $\mu_i$ and $\sigma_i^2$ defined from the
+same $N$ samples. Then
+$N^{-1}\sum_n\widetilde x_{ni}=(N\sigma_i)^{-1}(\sum_nx_{ni}-N\mu_i)=0$. Using that zero mean,
+
+$$
+\frac1N\sum_n\widetilde x_{ni}^2
+=\frac1{N\sigma_i^2}\sum_n(x_{ni}-\mu_i)^2=1.
+$$
+
+The result uses the population-style divisor $N$. If sample variance used $N-1$, the matching
+standardized variance convention would need the same divisor.
+
+## Summary
+
+- The Hessian eigenvectors are independent local directions; their eigenvalues set curvature and
+  the stable learning-rate range.
+- Mini-batches trade gradient variance against hardware efficiency, while initialization keeps
+  forward and backward signals at usable scales.
+- Momentum accumulates consistent directions; RMSProp and Adam rescale coordinates using running
+  gradient moments.
+- Data, batch, and layer normalization standardize different axes and solve different practical
+  problems.
+- Optimization finds low training error; regularization and validation determine whether that
+  solution predicts well.
+
+## References
+
+- C. M. Bishop and H. Bishop. [*Deep Learning: Foundations and Concepts*, Chapter 7](https://doi.org/10.1007/978-3-031-45468-4_7). Springer, 2024.
+- C. M. Bishop and H. Bishop. [*Solutions to Exercises, Chapters 2--10*, Version 1.0](https://www.bishopbook.com/Concepts_in_Deep_Learning_Solutions_v1.0.pdf), 2024.
+- D. P. Kingma and J. Ba. [Adam: A Method for Stochastic Optimization](https://arxiv.org/abs/1412.6980), 2014.
+- S. Ioffe and C. Szegedy. [Batch Normalization](https://arxiv.org/abs/1502.03167), 2015.
+

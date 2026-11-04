@@ -1,0 +1,938 @@
+---
+title: "Building a Fast Order Book in C++"
+description: "How a limit order book stores bids, asks and their queues, and how the classic designs (Selph's tree of limits, Optiver's reversed vectors, the QuantCup price array, bitmaps, Charles Cooper's ITCH book, exchange-core's radix trees) trade search, memory and worst cases, with a C++ matching engine and measured numbers."
+date: 2026-11-05
+tags: [C++/Python, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import MatchingSteps from "../../utils/orderbook/MatchingSteps.astro";
+import BookIndexSteps from "../../utils/orderbook/BookIndexSteps.astro";
+import VectorSearch from "../../utils/orderbook/VectorSearch.astro";
+import TickSearch from "../../utils/orderbook/TickSearch.astro";
+import BookBench from "../../utils/orderbook/BookBench.astro";
+import { ASK_KEYS } from "../../utils/orderbook/orderBookFigures";
+
+## Background
+
+An exchange keeps one list per stock of everyone who wants to buy and everyone who wants to
+sell, and at what price. That list is the **limit order book**. When a new order arrives, the
+exchange checks it against the book: if someone on the other side is willing to trade at that
+price, the two orders trade; if not, the new order joins the book and waits. Trading firms keep
+their own copy of the book for every instrument they trade, rebuilt from the exchange's market
+data feed one message at a time.
+
+Speed matters in both places. A busy stock produces hundreds of thousands of book updates per
+second, and a trading system that falls behind does not just react late: it drops packets on
+the network card and loses track of the book altogether.<Sidenote>David Gross (Optiver) lists
+both constraints in his CppCon 2024 keynote: the latency of the trading decision, and "not
+reading fast enough will cause the application to drop packets, causing an outage". He also
+gives the scale: "a typical stock order book has ~1000 price levels per side".</Sidenote> An
+order book update has a budget of tens of nanoseconds. At that scale the choice between a tree,
+a vector and an array is not a matter of taste. It decides whether the book keeps up.
+
+This post builds an order book in C++ several ways and explains why each design is fast or slow.
+It covers:
+
+1. what a book holds and how **price-time priority** matching works, with a worked example;
+2. the messages a book must handle and what each costs;
+3. the textbook design with `std::map` and `std::list`, and why it is slow;
+4. **W. K. Selph's tree of limits**: intrusive lists and an order index for O(1) cancels;
+5. **sorted vectors with the best price at the back** (David Gross), and linear, binary and
+   branchless search;
+6. a **flat array indexed by price** (the winning QuantCup entry), and **hierarchical bitmaps**
+   that remove its worst case;
+7. the order id index, memory pools and data layout;
+8. a complete matching engine in about 100 lines;
+9. two more designs from open-source engines (exchange-core's radix trees and Liquibook);
+10. measurements of all of them on the same message stream.
+
+## What an order book holds
+
+### Bids, asks and price levels
+
+A **limit order** says: buy (or sell) this many shares, at this price or better. A buy order is
+a **bid**, a sell order is an **ask** (or offer). Prices are integers here: a price is a number
+of **ticks**, the smallest price step the exchange allows (one cent for most US stocks). Using
+integer ticks instead of floating-point dollars keeps comparisons exact and lets a price be an
+array index, which matters later.
+
+All resting orders at the same price on the same side form a **price level**. A level has a
+price, a total quantity (the sum over its orders) and a queue of the orders in arrival order.
+The highest bid is the **best bid**, the lowest ask is the **best ask**, and the gap between them
+is the **spread**. Together the best bid and best ask are the **BBO** (best bid and offer), also
+called the **top of book** or **inside**.
+
+A book where every resting bid is below every resting ask is **uncrossed**. A matching engine
+keeps it that way: an order that would cross the spread trades instead of resting.
+
+### Price-time priority and matching
+
+When a buy order arrives, the engine looks for asks at or below its limit price. It takes them
+in **price-time priority**: best price first, and at the same price, oldest order first. Each
+fill is a **trade** at the resting order's price. The order that was resting is the **maker**,
+the one that arrived and traded is the **taker**. Whatever quantity is left over rests in the
+book at the order's limit price, at the back of that level's queue.
+
+The figure runs eleven messages through the engine built later in this post. Bids are on the
+left and asks on the right, each queue starts next to the price column, and a chip's width is
+proportional to its quantity. Step to message `#8`: a buy of 7 at 102 crosses the spread and
+eats the whole 101 level (#3, then #4, in time order) before taking 1 of the 6 shares of #5 at
+102. Consumed orders are struck through.
+
+<MatchingSteps />
+
+Check one entry by hand. Before `#8`, the asks were 4 + 2 = 6 at 101 and 6 at 102. Buying 7
+takes all 6 at 101 and 7 − 6 = 1 at 102, which leaves #5 with 6 − 1 = 5, as the figure shows.
+Message `#9` then shows the other case: a sell of 8 at 98 takes #1 and #6 (5 + 2 = 7) and rests
+the last share as a new ask at 98, so the best ask moves from 102 down to 98.
+
+### Two kinds of order book
+
+The same data structure appears in two programs, with different jobs.
+
+- A **matching engine** runs at the exchange. It receives orders, matches them as above and
+  sends out the results. It must track every order and its queue position, and it decides what
+  trades.
+- A **market data book** runs at a trading firm. It never matches anything: the exchange
+  publishes every change to its book, and the firm replays those changes to keep a copy. A feed
+  that sends every order is **market by order** (MBO, also called level 3); a feed that sends
+  only the total per price is **market by price** (MBP, level 2).
+
+Nasdaq's ITCH 5.0 feed is the standard MBO example. The messages that change the book are:
+
+| Type | Message | Fields used by the book | Bytes |
+| --- | --- | --- | ---: |
+| `A` | Add order | order reference, side, shares, price | 36 |
+| `F` | Add order with market participant id | same as `A` | 40 |
+| `E` | Order executed | order reference, executed shares | 31 |
+| `C` | Order executed with price | order reference, executed shares, price | 36 |
+| `X` | Order cancel (partial) | order reference, cancelled shares | 23 |
+| `D` | Order delete | order reference | 19 |
+| `U` | Order replace | original reference, new reference, shares, price | 35 |
+
+Only an add carries the price and side. Every later message names the order by its
+**reference number** and nothing else, so the book has to remember where each order is. This is
+the first design constraint: whatever structure holds the levels, an index from order id to
+order is needed next to it.<Sidenote>Gross makes the same point on his slide "Initial
+Observation": "No matter what data structure we choose for our Order Book – we need a hash
+table."</Sidenote> Message sizes are from the ITCH 5.0 specification as encoded in
+[Charles Cooper's book](https://github.com/charles-cooper/itch-order-book/blob/095ac97ef46c72411a62dd9148d96d2e3ace3305/itch.h).
+
+## The operations and their costs
+
+Every design in this post implements the same five operations. Write $M$ for the number of
+price levels on a side and $N$ for the number of resting orders.
+
+| Operation | What it does | How often |
+| --- | --- | --- |
+| add | put an order at the back of its level's queue, creating the level if needed | very often |
+| cancel / delete | remove an order from anywhere in a queue | very often |
+| reduce / execute | lower an order's quantity, removing it at zero | often |
+| best bid / ask | read the top of each side | after every message |
+| match (engines only) | walk the other side from the best price, filling | per aggressive order |
+
+Selph's 2011 post observes that "the vast majority of the activity in a book is usually made up
+of add and cancel operations as market makers jockey for position, with executions a distant
+third". So a book is judged by its add and cancel paths, and by how cheaply it finds the new best
+price when the best level empties.
+
+The second observation, which shapes every fast design below, is where those adds land. Most
+orders arrive at or near the best price, because that is where trading happens. The figure counts,
+for each add in the synthetic streams used for the measurements at the end of this post, how many
+existing levels on its side were better than its price.
+
+<BookBench chart="depth" title="Where adds land: better levels in front of each new order" caption="Synthetic streams of 2 million messages each (described under Measurements). touch: 17 levels per side; deep: 338; sparse: 627, with wide gaps between levels." />
+
+In the "touch" stream, 39.9% of adds go to the best level itself (no better level in front) and
+92.2% have at most four better levels. Even in the "deep" stream, with 338 levels per side, 52.7%
+of adds land within five levels of the top. Only the "sparse" stream, built to be hostile, spreads
+them out. Gross's advice is to look at this distribution for your own data before picking a
+structure ("Principle #2: Understanding your problem (by looking at data!)").
+
+## A first implementation: node containers
+
+The direct translation of the definitions uses the standard library's ordered map for levels and
+a list for each queue. Bids are sorted high to low and asks low to high, so `begin()` is the best
+price on both sides.
+
+```cpp
+struct Order { OrderId id; Qty qty; };
+struct Level { Qty total = 0; std::list<Order> orders; };
+
+std::map<Price, Level, std::greater<Price>> bids;   // best bid = bids.begin()
+std::map<Price, Level, std::less<Price>>    asks;   // best ask = asks.begin()
+
+struct Loc { Side side; Price price; std::list<Order>::iterator it; };
+std::unordered_map<OrderId, Loc> index;             // order id -> where it lives
+
+void add(OrderId id, Side s, Price p, Qty q) {
+  auto addTo = [&](auto& m) {
+    Level& l = m[p];                                // O(log M) tree descent, maybe a new node
+    l.total += q;
+    l.orders.push_back({id, q});                    // heap allocation for the list node
+    index.emplace(id, Loc{s, p, std::prev(l.orders.end())});  // and one for the hash node
+  };
+  s == Side::Bid ? addTo(bids) : addTo(asks);
+}
+
+void reduce(OrderId id, Qty q) {                    // partial cancel or execution
+  auto& loc = index.find(id)->second;
+  auto doIt = [&](auto& m) {
+    auto lv = m.find(loc.price);                    // O(log M) again
+    lv->second.total -= q;
+    loc.it->qty -= q;
+    if (loc.it->qty == 0) {
+      lv->second.orders.erase(loc.it);              // O(1): list iterators are stable
+      if (lv->second.orders.empty()) m.erase(lv);
+      index.erase(id);
+    }
+  };
+  loc.side == Side::Bid ? doIt(bids) : doIt(asks);
+}
+```
+
+This is correct and its complexity looks fine: O(log M) to find a level, O(1) to unlink an order.
+It is also the slowest design measured here, at 71 to 104 ns per message. Three things cost
+time, and none of them shows up in the O-notation:
+
+- **Allocation.** Every add allocates a list node and a hash node, and every new price allocates
+  a tree node. Every delete frees them again. `malloc` and `free` are tens of nanoseconds each
+  and touch allocator metadata.
+- **Pointer chasing.** A tree descent is $\log_2 M$ dependent loads to nodes scattered across the
+  heap. Each one can miss the cache, and the CPU cannot start the next load before the previous
+  one returns, because it needs the pointer.
+- **Repeated searches.** `reduce` finds the level again by price even though the order was put
+  there earlier.
+
+Gross's first principle is "Most of the time, you don't want node containers". The rest of the
+post removes these costs one at a time.<Sidenote>Liquibook, an open-source C++ matching engine,
+goes one step further in the node-container direction: one `std::multimap<ComparablePrice,
+Tracker>` per side with one entry per *order*, relying on the multimap keeping equal keys in
+insertion order for time priority. A cancel does `find(price)` and then walks the entries at that
+price until it meets the order
+([`find_on_market`](https://github.com/enewhuis/liquibook/blob/2427613b32f1667abae68a01df6af9ba8270f8e7/src/book/order_book.h)).
+It supports stop, all-or-none and immediate-or-cancel orders, which the designs here leave out.</Sidenote>
+
+## The tree of limits
+
+W. K. Selph's post "How to Build a Fast Limit Order Book" (2011) is the most cited description
+of a book, and most open-source books follow it. It defines three objects:
+
+```text
+Order                     Limit  // a single limit price      Book
+  int idNumber;             int limitPrice;                     Limit *buyTree;
+  bool buyOrSell;           int size;                           Limit *sellTree;
+  int shares;               int totalVolume;                    Limit *lowestSell;
+  int limit;                Limit *parent;                      Limit *highestBuy;
+  int entryTime;            Limit *leftChild;
+  int eventTime;            Limit *rightChild;
+  Order *nextOrder;         Order *headOrder;
+  Order *prevOrder;         Order *tailOrder;
+  Limit *parentLimit;
+```
+
+"The idea is to have a binary tree of Limit objects sorted by limitPrice, each of which is itself
+a doubly linked list of Order objects." Three details make it fast:
+
+1. **The list is intrusive.** The `nextOrder` / `prevOrder` links live inside the `Order` itself,
+   so adding an order to a queue allocates nothing, and removing one only rewrites two neighbours.
+2. **Every order points to its level** (`parentLimit`). A cancel goes from the id index to the
+   order to its level without searching.
+3. **Two hash maps sit beside the trees**: "each order is also an entry in a map keyed off
+   idNumber, and each Limit is also an entry in a map keyed off limitPrice". An add at an existing
+   price finds its `Limit` by hash. Only the first order at a new price walks the tree.
+
+Selph's costs follow: add is O(log M) for the first order at a price and O(1) after that; cancel,
+execute, volume at a price and best bid / offer are all O(1). The tree is touched only when a
+level appears or disappears. `highestBuy` and `lowestSell` are cached, and the `parent` pointer
+lets them move to the in-order neighbour when the best level is deleted.
+
+The figure shows the three structures holding the worked example's book after its first seven
+messages. Each side's tree is drawn sideways: rows are sorted by price and a node's depth grows to
+the right. Step through the two cancels and the add. Watch what each one touches: cancelling #6
+never reaches the tree, and only emptying the 98 level or creating the 103 level does.
+
+<BookIndexSteps />
+
+In C++ the queue is a small struct of two handles and a total, and the two operations are a
+handful of stores. The code stores 32-bit **pool handles** (indices into one array of orders)
+rather than pointers, for reasons covered under [memory](#memory-pools-handles-and-layout):
+
+```cpp
+constexpr uint32_t NIL = UINT32_MAX;
+
+struct PoolOrder {
+  Qty qty;
+  uint32_t next, prev;   // neighbours in the level's FIFO
+  uint32_t level;        // which level this order belongs to
+  Price price;
+  Side side;
+};
+
+struct Fifo {            // one price level's queue
+  Qty total = 0;
+  uint32_t head = NIL, tail = NIL;
+  uint32_t count = 0;
+
+  void push(OrderPool& pool, uint32_t h) {       // add at the back: time priority
+    pool[h].prev = tail; pool[h].next = NIL;
+    if (tail != NIL) pool[tail].next = h; else head = h;
+    tail = h; total += pool[h].qty; ++count;
+  }
+  void unlink(OrderPool& pool, uint32_t h) {     // remove from anywhere: O(1)
+    auto& o = pool[h];
+    if (o.prev != NIL) pool[o.prev].next = o.next; else head = o.next;
+    if (o.next != NIL) pool[o.next].prev = o.prev; else tail = o.prev;
+    --count;
+  }
+};
+```
+
+Measured on the same streams, this design takes 7.9 to 16.4 ns per message, against 71 to 104 ns
+for the node-container version. The asymptotics are the same; the difference is allocation and
+repeated searches.
+
+The tree is still there, though, and it still costs pointer chases whenever a level is created or
+removed. In the sparse stream, 10.4% of adds create a level, and that is where this design slows
+down (16.4 ns against 7.9 ns in the touch stream).
+
+## Sorted vectors, best price at the back
+
+### Why a vector
+
+A book has few levels, about a thousand per side for a typical stock. A thousand
+`(price, volume)` pairs of 8-byte integers is 16 KB, which fits in the L1 data cache of current
+CPUs (32 to 128 KB). Gross's approach in
+his keynote is to drop the tree and keep each side as a sorted `std::vector` of
+`(price, volume)` pairs:
+
+```cpp
+std::vector<std::pair<Price, Volume>> mBidLevels;
+std::vector<std::pair<Price, Volume>> mAskLevels;
+
+template <class T, class Compare>
+void AddOrder(T& levels, Price price, Volume volume, Compare comp) {
+  auto it = std::lower_bound(levels.begin(), levels.end(), price,
+      [comp](const auto& p, Price price) { return comp(p.first, price); });
+  if (it != levels.end() && it->first == price)
+    it->second += volume;
+  else
+    levels.insert(it, {price, volume});
+}
+```
+
+Searching is still O(log M), but over contiguous memory: the hardware prefetcher can help, and
+there are no allocations except when the vector grows. The cost moves to `insert` and `erase`,
+which shift every element after the insertion point: O(M) copies. Gross also notes that pointers
+into the vector cannot be stored with the order, because an insert invalidates them, so a modify
+or delete has to search again.
+
+### Put the best price at the back
+
+Sorted the natural way (bids high to low, asks low to high), the best price is at index 0. But
+most inserts and erases happen near the best price, so each one shifts nearly the whole vector.
+Gross's fix is to sort the other way round, so that the best price is the **last** element:
+
+```cpp
+void AddOrder(Side side, Price price, Volume volume) {
+  if (side == Side::Bid)
+    return AddOrder(bidLevels, price, volume, std::less<Price>());     // ascending: best at back
+  else
+    return AddOrder(askLevels, price, volume, std::greater<Price>());  // descending: best at back
+}
+auto GetBestPrices() const {
+  return {mBidLevels.rbegin().first, mAskLevels.rbegin().first};
+}
+```
+
+"Counter-intuitive ordering – our 'best price' or 'top' is at the end of the collection… But we
+minimize our number of copies!" An insert at the best price is now a `push_back`, and an insert
+$k$ levels from the top shifts only $k$ elements.
+
+### Linear, binary and branchless search
+
+With the best price at the back and most activity near it, searching from the back is the
+obvious next step. A **linear search** from the back stops after about as many comparisons as
+there are better levels, which the depth figure showed is usually zero to four. Step through
+finding 98 in a 13-level bid side: three comparisons, all in the same cache line.
+
+<VectorSearch target={98} kind="linear" title="Linear search from the back: 98 is near the top" />
+
+The same scan for a price deep in the book walks almost the whole vector. Here 85 is new and
+belongs at index 1, after thirteen comparisons, and inserting it shifts twelve elements:
+
+<VectorSearch target={85} kind="linear" title="Linear search from the back: 85 is deep" />
+
+`std::lower_bound` does four comparisons whatever the target. But each one lands far from the
+last, and whether it goes left or right is a branch the CPU predicts no better than a coin flip:
+
+<VectorSearch target={98} kind="binary" title="std::lower_bound: four probes, jumping around" />
+
+Gross removes the branch. In a **branchless binary search**, the loop always runs
+$\lceil\log_2(n+1)\rceil$ times and the comparison result is used as a number, not as a
+condition:
+
+```cpp
+template <class ForwardIt, class T, class Compare>
+ForwardIt branchless_lower_bound(ForwardIt first, ForwardIt last, const T& value, Compare comp) {
+  auto length = last - first;
+  while (length > 0) {
+    auto half = length / 2;
+    // multiplication (by 1) is needed for GCC to generate CMOV
+    first += comp(first[half], value) * (length - half);
+    length = half;
+  }
+  return first;
+}
+```
+
+The compiler turns the multiply into a conditional move (`cmov` on x86, `csel` on ARM). The CPU
+then never mispredicts, because there is nothing to predict: it waits for the comparison, but it
+never throws away work it started on a wrong guess. The loop's trip count depends only on the
+length, so the loop branch itself is predicted perfectly.
+
+Which search wins depends on the data. In the measurements below, linear search is as fast as the
+others when activity hugs the top (touch: 10.2 ns), and loses badly when it does not (sparse:
+33.3 ns, with 46 levels compared per message on average). The branchless search is the fastest
+vector variant in all three streams (8.1, 9.6 and 13.3 ns). Gross's talk ends up with linear
+search for his data (his later slides use `std::ranges::find_if`), under the principle
+"Simplicity is the ultimate sophistication"; the point is to measure on your own feed.<Sidenote>The keynote's benchmark charts are images in the
+slides, so their numbers are not quoted here. The measurements in this post are from a different
+machine (Apple M4 Pro) and synthetic data, so they need not agree with his.</Sidenote>
+
+### Asks as negative prices
+
+Two vectors sorted in opposite directions need two comparators and two copies of every function.
+Charles Cooper's ITCH book removes one of them: it stores ask prices **negated**. A bid at 99 has
+key 99, an ask at 101 has key −101. Both sides are then ascending with the best price at the back,
+and one function handles both. The sign of the stored price is the side:
+
+```cpp
+enum class sprice_t : int32_t {};
+bool constexpr is_bid(sprice_t const x) { return int32_t(x) >= 0; }
+```
+
+The figure searches the ask side of the worked example, stored as −104, −102, −101, for a new
+ask at 103 (key −103) with the branchless loop. It takes two halvings and finds the insertion point
+between −104 and −102, exactly as a bid search would.
+
+<VectorSearch keys={ASK_KEYS} target={-103} kind="branchless" title="Branchless search on negated ask prices" caption="ask levels stored as −price" />
+
+Cooper's book combines this with the order-to-level link: the vector holds `(price, level
+handle)` pairs and the level's quantity lives in a separate pool, so an execute or partial cancel
+updates the quantity through the handle stored in the order, without searching. Only a new or
+emptied level touches the vector. The README reports about 61 ns per message on a 2012 Core
+i7-3820, for a book that tracks only quantity per level, not queue position.
+
+## A flat array indexed by price
+
+### The QuantCup design
+
+If prices are integer ticks in a known range, the level for price $p$ can be found with no
+search at all: it is `levels[p - lo]`. The winning entry of the first QuantCup contest (2011, by
+Andrey Ermolinskiy, who entered as "voyager") is built on this idea.<Sidenote>QuantCup was a
+contest to write the fastest price-time matching engine for a fixed simulated order feed. The
+entry's source, with its design notes, is
+[engine.c](https://github.com/andrey-ermolinskiy/quantcup/blob/bfb99b1ca220268fb850d74fd7a98daf013cf34d/engine.c).</Sidenote>
+"The limit order book is represented using a flat linear array (pricePoints), indexed by the
+numeric price value":
+
+```cpp
+typedef struct orderBookEntry {
+  t_size size;                     /* Order size                        */
+  struct orderBookEntry *next;     /* Next entry in the pricePoint list */
+  char trader[4];
+} orderBookEntry_t;
+
+typedef struct pricePoint {
+  orderBookEntry_t *listHead;
+  orderBookEntry_t *listTail;
+} pricePoint_t;
+
+static pricePoint_t pricePoints[MAX_PRICE + 1];        /* the whole book */
+static orderBookEntry_t arenaBookEntries[MAX_NUM_ORDERS];
+static unsigned int askMin;                            /* lowest price with a sell */
+static unsigned int bidMax;                            /* highest price with a buy */
+```
+
+A buy order starts at `askMin` and walks up the array while it still crosses, filling the
+orders in each list. Whatever is left is appended to `pricePoints[price]`:
+
+```cpp
+if (price >= askMin) {
+  ppEntry = pricePoints + askMin;
+  do {
+    bookEntry = ppEntry->listHead;
+    while (bookEntry != NULL) {
+      if (bookEntry->size < orderSize) {       /* take the whole resting order */
+        EXECUTE_TRADE(order.symbol, order.trader, bookEntry->trader, price, bookEntry->size);
+        orderSize -= bookEntry->size;
+        bookEntry = bookEntry->next;
+      } else {                                 /* incoming order is filled here */
+        EXECUTE_TRADE(order.symbol, order.trader, bookEntry->trader, price, orderSize);
+        if (bookEntry->size > orderSize) bookEntry->size -= orderSize;
+        else bookEntry = bookEntry->next;
+        ppEntry->listHead = bookEntry;
+        return ++curOrderID;
+      }
+    }
+    ppEntry->listHead = NULL;                  /* level exhausted: move up a tick */
+    ppEntry++;
+    askMin++;
+  } while (price >= askMin);
+}
+```
+
+Three more tricks from the entry are worth copying:
+
+- **Arena allocation.** Orders live in a static array, and "allocating a new entry is simply a
+  matter of bumping up the orderID counter". The order id *is* the array index, so the id index
+  is free.
+- **Lazy cancel.** "To cancel an order, we simply set its size to zero", one store. The entry
+  stays in its list, and the matching loop skips zero-sized entries (`EXECUTE_TRADE` returns
+  early when the size is 0). The cost moves from cancel, which is common, to matching, which
+  touches the dead entry once.
+- **Singly linked lists.** Since nothing is ever unlinked from the middle, each entry needs only
+  `next`: an entry is a size, one pointer and a 4-character trader id.
+
+The design depends on its data. The notes say the walk "may, in degenerate cases, require
+scanning a large number of array slots", but on the contest feed "the vast majority of incoming
+limit orders can be handled by examining no more than two distinct price points and no order
+requires examining more than five price points".<Sidenote>One detail not to copy: the entry
+reports each trade at the *incoming* order's limit price (`EXECUTE_TRADE(..., price, ...)`). Real
+exchanges, and the engine in this post, trade at the resting order's price.</Sidenote>
+
+### Finding the next best price
+
+A flat array makes add, cancel and lookup O(1), but it gives up one thing the tree and the
+vector had for free: the neighbour of a level. When the best bid empties, the new best bid is the
+next occupied tick below it, and the array has no idea where that is. The QuantCup engine walks
+one tick at a time.
+
+The figure shows 64 ticks of a bid side, scaled down from a real range, where the best level
+(tick 150) has just emptied and the next occupied tick is 121. The walk examines 29 cells:
+
+<TickSearch title="Next best bid by walking the array: one cell per tick" />
+
+The cost of the walk is the gap in ticks between levels, not the number of levels. For a stock
+with a one-cent tick and a deep book the gap is usually 1. For an instrument where levels are far
+apart (a high-priced stock, or a crypto pair with a tiny tick) the walk becomes the bottleneck.
+The measured cost of an add followed by a cancel that empties the best level grows linearly with
+the gap, from 6.8 ns at a gap of 1 tick to 20,598 ns at 60,000 ticks:
+
+<BookBench chart="gap" title="Next best level after the best empties: walk vs bitmap" caption="One resting bid at tick 1000; each repetition adds a bid at 1000 + gap and cancels it. Best of 5 runs of 200,000 repetitions." />
+
+### Hierarchical bitmaps
+
+A **bitmap** keeps one bit per tick: 1 if the level has orders. Finding the next occupied tick
+below $i$ is then a question about bits, and CPUs answer those in one instruction: count leading
+zeros (`std::countl_zero`, `lzcnt` on x86, `clz` on ARM) gives the highest set bit of a 64-bit
+word. One word covers 64 ticks at once.
+
+A large gap still means many zero words. The fix is a second level: one **summary** bit per
+64-bit word, set when that word is non-zero. A third level summarises the summary. With 64-bit
+words, three levels cover $64^3 = 262{,}144$ ticks, and a search reads at most five words
+(up the levels and back down), whatever the gap. This is the same idea as a van Emde Boas tree or the bitmaps that kernel
+schedulers use to find the highest-priority run queue. The figure uses 8-bit words so all 64
+ticks fit:
+
+<TickSearch bitmap title="The same search with a two-level bitmap (8-bit words in the figure)" />
+
+Step 1 masks the word that holds tick 149 to the bits at or below it: zero, so nothing is near.
+Step 2 masks the summary to the words below word 6 and takes the highest set bit: word 2. Step 3
+takes the highest set bit of word 2: tick 121. Three reads instead of 29, and still three reads if
+the gap were 29,000. The C++ version, with 64-bit words and a third level in one register:
+
+```cpp
+struct Bitmap2 {
+  std::vector<uint64_t> l0;  // one bit per tick
+  std::vector<uint64_t> l1;  // one bit per l0 word
+  uint64_t top = 0;          // one bit per l1 word: up to 64^3 ticks
+
+  void set(int i) {
+    l0[i >> 6]  |= 1ull << (i & 63);
+    l1[i >> 12] |= 1ull << ((i >> 6) & 63);
+    top         |= 1ull << (i >> 12);
+  }
+  void clear(int i) {        // go up only while words become zero
+    if ((l0[i >> 6] &= ~(1ull << (i & 63))) == 0)
+      if ((l1[i >> 12] &= ~(1ull << ((i >> 6) & 63))) == 0) top &= ~(1ull << (i >> 12));
+  }
+  int prevSet(int i) const { // highest set bit <= i, or -1
+    if (i < 0) return -1;
+    int w = i >> 6;
+    uint64_t m = l0[w] & (~0ull >> (63 - (i & 63)));  // bits <= i
+    if (m) return (w << 6) | (63 - std::countl_zero(m));
+    int w1 = w >> 6;                                   // l1 word holding w
+    uint64_t m1 = (w & 63) ? l1[w1] & (~0ull >> (64 - (w & 63))) : 0;
+    if (!m1) {
+      uint64_t mt = w1 ? top & (~0ull >> (64 - w1)) : 0;
+      if (!mt) return -1;
+      w1 = 63 - std::countl_zero(mt);
+      m1 = l1[w1];
+    }
+    int ww = (w1 << 6) | (63 - std::countl_zero(m1));
+    return (ww << 6) | (63 - std::countl_zero(l0[ww]));
+  }
+};
+```
+
+`nextSet` for the ask side is the mirror image with `countr_zero` and masks above $i$. The book
+calls `set` when a level gets its first order and `clear` when it loses its last, and calls
+`prevSet` / `nextSet` only when the best level empties. Measured, the bitmap search stays between
+6.9 and 14.3 ns for every gap from 1 to 60,000 ticks (the chart above), and on the full streams
+the bitmap book costs about 0.3 to 0.8 ns per message more than the plain array, the price of
+keeping the bits up to date.<Sidenote>Both `prevSet` and `nextSet` were checked against a
+`std::set` on 1.2 million random set / clear / query operations for array sizes 64 to 262,144,
+under AddressSanitizer and UBSan.</Sidenote>
+
+The bitmap also answers range questions cheaply: the number of occupied levels between two prices
+is a `popcount` over the words in between.
+
+### Bounding the price range
+
+A flat array needs to know the price range in advance. 65,536 ticks of 24-byte levels is 1.5 MB,
+more than the L2 cache of many CPUs, and a firm may track thousands of instruments. Three common ways to keep
+it small:
+
+- **Use the exchange's limits.** Many exchanges reject orders outside a band around a reference
+  price (limit-up / limit-down in the US, static and dynamic collars elsewhere), so the range is
+  known each morning.
+- **A sliding window.** Keep an array of, say, 4,096 ticks around the current mid price, and send
+  the rare far-away orders to a small `std::map`. When the mid drifts, re-centre the window by
+  moving levels between the two.
+- **A ring buffer.** Index the array by `price & (N - 1)`: shifting the window moves only the
+  levels that fall off one end, not the whole array.
+
+## The order id index
+
+Every cancel, execute and replace starts by turning an order id into an order. The choice of
+structure depends on what the ids look like.
+
+- **A flat array.** ITCH order references are assigned in increasing order through the day.
+  Cooper's book notes that they do not go "past a max id of several hundred million", so it
+  stores order metadata in a `std::vector` indexed directly by id: "looking up the order metadata
+  is a single dereference". A side benefit: orders added at about the same time sit next to each
+  other in memory, so their pages are already in the TLB. The QuantCup arena is the same idea,
+  with ids assigned by the engine.
+- **An open-addressing hash map** when ids are sparse or reused, such as the 64-bit client order
+  ids a matching engine receives. Open addressing stores entries in one flat array, with no node
+  per entry, so a lookup is usually one cache miss. `std::unordered_map` allocates a node per
+  entry and chains them, which is why it hurt the first design.
+- **A radix tree**, which exchange-core uses (below).
+
+The benchmarks here map the id to a 32-bit pool handle through a flat vector, because the
+synthetic ids are dense like ITCH's.
+
+## Memory: pools, handles and layout
+
+The fast designs share a few habits that matter as much as the choice of level structure.
+
+**Allocate nothing on the hot path.** Orders come from a pool: a vector of slots and a free list
+of recycled slot numbers. Allocating pops the free list, or appends if it is empty; freeing pushes.
+The pool grows only when the book is bigger than it has ever been, so in steady state no message
+calls `malloc`. This is Cooper's `pool<T, ptr_t, SIZE_HINT>`, and the code below uses the same
+scheme:
+
+```cpp
+struct OrderPool {
+  std::vector<PoolOrder> slots;
+  std::vector<uint32_t> freeList;
+  std::vector<uint32_t> byId;                    // order id -> slot
+
+  uint32_t alloc(OrderId id) {
+    uint32_t h;
+    if (freeList.empty()) { h = (uint32_t)slots.size(); slots.emplace_back(); }
+    else { h = freeList.back(); freeList.pop_back(); }   // LIFO: reuse a slot that is warm in cache
+    if (id >= byId.size()) byId.resize(std::max<size_t>(id + 1, byId.size() * 2), NIL);
+    byId[id] = h;
+    return h;
+  }
+  void release(OrderId id, uint32_t h) { byId[id] = NIL; freeList.push_back(h); }
+};
+```
+
+**Use 32-bit handles, not pointers.** A handle is an index into the pool. It is half the size of a
+pointer, so more orders fit per cache line, and it stays valid when the vector grows and moves,
+which a pointer would not. Cooper wraps each handle in its own `enum class` (`order_id_t`,
+`level_id_t`, `book_id_t`) so the compiler rejects mixing them up.
+
+**Keep the order small.** The engine's order is 24 bytes: id, quantity, price, two links and the
+side. Fields the matching loop never reads (the trader, timestamps, the client's own id) belong
+in a separate array indexed by the same handle. This split of hot and cold fields is a
+**structure of arrays** layout: the loop that walks a queue pulls in only the bytes it uses.
+
+**Keep the hot path's code small too.** Gross shows two techniques for instruction-cache misses:
+mark the rare branch `[[unlikely]]`, and move error handling into a lambda marked `noinline` and
+`cold`, called on the spot (an immediately invoked function expression), so its code is laid out
+away from the fast path:
+
+```cpp
+if (!(it != levels.end() && it->first == price)) [[unlikely]]
+{
+  [&]() __attribute__((noinline, cold)) { HandleError(); }();
+}
+```
+
+## A matching engine in C++
+
+Putting the pieces together gives a complete price-time matching engine: a flat array of levels
+indexed by tick, intrusive FIFOs, a pool of orders with a free list, and an id index. It is the
+engine behind the [step-through figure](#price-time-priority-and-matching); the figure's
+TypeScript port reproduces its trades and book after each of the eleven messages exactly.
+
+The data:
+
+```cpp
+using Price = int32_t;
+using Qty = int32_t;
+using OrderId = uint32_t;
+enum class Side : uint8_t { Buy, Sell };
+constexpr uint32_t NIL = UINT32_MAX;
+
+struct Order {          // 24 bytes
+  OrderId id;
+  Qty qty;
+  Price price;
+  uint32_t next, prev;  // neighbours in the price level's FIFO (pool indices)
+  Side side;
+};
+struct Level {
+  Qty total = 0;        // sum of qty over the queue
+  uint32_t head = NIL, tail = NIL;
+};
+struct Trade { OrderId taker, maker; Price price; Qty qty; };
+
+class Engine {
+  // ... methods below ...
+  Price lo_;
+  std::vector<Level> levels_;      // one per tick in [lo, hi]
+  Price bestBid_, bestAsk_;        // lo-1 / hi+1 when that side is empty
+  std::vector<Order> pool_;        // every resting order
+  std::vector<uint32_t> free_;     // recycled pool slots
+  std::vector<uint32_t> byId_;     // order id -> pool slot
+};
+```
+
+An empty side is encoded by putting its best price just outside the array (`lo - 1` for bids,
+`hi + 1` for asks). Then "is there an ask at or below my price?" is the single comparison
+`bestAsk_ <= price`, with no separate emptiness check.
+
+A limit order matches first and rests whatever is left:
+
+```cpp
+void limit(OrderId id, Side side, Price price, Qty qty, std::vector<Trade>& out) {
+  if (side == Side::Buy) {
+    while (qty > 0 && bestAsk_ <= price) qty = fillLevel(id, bestAsk_, qty, out);
+  } else {
+    while (qty > 0 && bestBid_ >= price) qty = fillLevel(id, bestBid_, qty, out);
+  }
+  if (qty > 0) rest(id, side, price, qty);
+}
+```
+
+`fillLevel` takes orders from the head of one level's queue until either the level or the
+incoming order runs out. Every trade is at the level's price, the resting order's price. When
+the level empties, `fixBest` moves the best price on to the next level, so the loop in `limit`
+continues at the right place:
+
+```cpp
+Qty fillLevel(OrderId taker, Price p, Qty qty, std::vector<Trade>& out) {
+  Level& l = level(p);
+  Side makerSide = pool_[l.head].side;
+  while (qty > 0 && l.head != NIL) {
+    uint32_t h = l.head;
+    Order& m = pool_[h];
+    Qty q = m.qty < qty ? m.qty : qty;
+    out.push_back({taker, m.id, p, q});   // trade at the resting order's price
+    m.qty -= q; l.total -= q; qty -= q;
+    if (m.qty == 0) { unlink(l, h); free(h); }
+  }
+  if (l.head == NIL) fixBest(makerSide, p);
+  return qty;
+}
+```
+
+Resting appends to the tail of the level's queue and raises the best price if needed. Cancel
+is the same unlink as in Selph's design:
+
+```cpp
+void rest(OrderId id, Side side, Price price, Qty qty) {
+  uint32_t h = alloc();
+  pool_[h] = {id, qty, price, NIL, NIL, side};
+  if (id >= byId_.size()) byId_.resize(id + 1, NIL);
+  byId_[id] = h;
+  Level& l = level(price);
+  pool_[h].prev = l.tail;                 // append: time priority
+  if (l.tail != NIL) pool_[l.tail].next = h; else l.head = h;
+  l.tail = h;
+  l.total += qty;
+  if (side == Side::Buy && price > bestBid_) bestBid_ = price;
+  if (side == Side::Sell && price < bestAsk_) bestAsk_ = price;
+}
+
+void cancel(OrderId id) {
+  uint32_t h = byId_[id];
+  if (h == NIL) return;                   // unknown or already filled
+  Order& o = pool_[h];
+  Level& l = level(o.price);
+  l.total -= o.qty;
+  unlink(l, h);
+  if (l.head == NIL) fixBest(o.side, o.price);
+  free(h);
+}
+```
+
+Finally, the walk to the next best level. This is the QuantCup walk; swapping in the bitmap's
+`prevSet` / `nextSet` from the previous section removes its worst case:
+
+```cpp
+void fixBest(Side side, Price p) {
+  Price hi = lo_ + (Price)levels_.size() - 1;
+  if (side == Side::Buy && p == bestBid_)
+    while (bestBid_ >= lo_ && level(bestBid_).head == NIL) --bestBid_;
+  if (side == Side::Sell && p == bestAsk_)
+    while (bestAsk_ <= hi && level(bestAsk_).head == NIL) ++bestAsk_;
+}
+```
+
+`unlink`, `alloc`, `free` and `level` are the few lines shown earlier. A production engine adds
+more: order types (market, immediate-or-cancel, fill-or-kill, stop), self-trade prevention,
+modify with its priority rules (a size decrease usually keeps queue position, a price change or
+size increase loses it), and an output that is published to a feed rather than a vector.
+
+## Two more designs from open-source engines
+
+### exchange-core: radix trees and one list per side
+
+exchange-core is a Java matching engine built for low latency; its `OrderBookDirectImpl` makes
+two unusual choices
+([source](https://github.com/exchange-core/exchange-core/blob/2f8548749839e9095c8dc597e4b61521d259fa5d/src/main/java/exchange/core2/core/orderbook/OrderBookDirectImpl.java)).
+
+First, both indexes, price to level and order id to order, are `LongAdaptiveRadixTreeMap`s, an
+**adaptive radix tree** (ART). A radix tree walks the key one byte at a time, so a 64-bit key
+takes at most 8 steps whatever the number of entries, and keys stay sorted, so "next price above
+$p$" is a tree walk, as with `std::map`. "Adaptive" means each node is sized to its number of
+children: 4, 16, 48 or 256 slots. Nodes stay small where the tree is sparse, and dense ranges of
+prices or ids, which are common, share long paths.<Sidenote>The data structure is from Leis,
+Kemper and Neumann, "The ART of indexing: the adaptive radix tree for main-memory databases",
+ICDE 2013.</Sidenote>
+
+Second, all orders on a side form **one doubly linked list across every price level**, ordered
+in matching sequence. A level (`Bucket`) holds only its volume, its order count and a pointer to
+its `tail` order. The book keeps `bestAskOrder` and `bestBidOrder`. Matching walks the list from
+the best order and crosses level boundaries without going back to the tree; the tree is used only
+to find where a new order goes and to remove empty levels.
+
+### Market by price only
+
+When a firm needs only the quantity at each price (a level 2 view), the per-order queue
+disappears. Cooper's ITCH book keeps for each order only its quantity and a handle to its level,
+and for each level only its price and total. It "does not track the queue depth for each order".
+An execute or cancel is then a subtraction through two handles. This is smaller and faster, but
+it cannot answer "where is my order in the queue?", which a market maker needs to estimate when
+its order will fill.
+
+## Measurements
+
+Every design above was implemented with the same interface (add, delete, reduce, best bid and
+ask) and run on the same synthetic message streams. After every message, each book's best prices
+and the quantities at them were compared with the `std::map` book. All of them agreed on all
+6 million messages, and the benchmark also ran clean under AddressSanitizer and UBSan.
+
+The streams imitate an ITCH feed but are **synthetic**, and their parameters are assumptions:
+
+- 2 million messages each: about 45% adds, 40% deletes, 7% partial cancels and 8% executions
+  against the head of a best level. The add rate rises when the book is below a target size, so
+  the book hovers around it.
+- A new order's price is the opposite best price plus a geometrically distributed distance (mean
+  1.5 ticks for "touch", 6 for "deep", 60 for "sparse"), with a small chance of a far-away order
+  (2% up to 3,000 ticks away for deep, 5% up to 20,000 for sparse).
+- Each run is a single thread on an Apple M4 Pro, Apple clang 17 with `-O2 -march=native`, best
+  of 5 runs. The time per message includes reading the best bid after every message. Repeated
+  runs moved individual numbers by up to about 5%.
+
+<BookBench chart="ns" title="Mean nanoseconds per message" caption="Same message stream for every design within a group. The std::map + std::list bars are cut off at 40 ns; their values are printed." />
+
+| Design | touch (17 levels) | deep (338 levels) | sparse (627 levels) |
+| --- | ---: | ---: | ---: |
+| `std::map` + `std::list` + `unordered_map` | 71.1 | 103.7 | 88.2 |
+| tree of limits (Selph) | 7.9 | 11.0 | 16.4 |
+| reversed vector, linear search | 10.2 | 12.5 | 33.3 |
+| reversed vector, `std::lower_bound` | 8.1 | 12.2 | 15.8 |
+| reversed vector, branchless | 8.1 | 9.6 | 13.3 |
+| flat array (QuantCup walk) | 7.3 | 7.3 | 7.7 |
+| flat array + bitmap | 7.6 | 7.6 | 8.5 |
+
+What the numbers say:
+
+- **Removing allocation is the big win.** Going from node containers to pools and intrusive lists
+  cuts the cost by about 5 to 9 times. The differences between the remaining designs are smaller:
+  at most about 4×, and under 1.5× in the touch stream.
+- **The flat array is flat.** It costs 7.3 to 7.7 ns whatever the depth, because nothing in it
+  depends on the number of levels. On these streams the walk is short (0.03 to 0.1 ticks walked
+  per message), so the bitmap only adds bookkeeping. Its value is the worst case: the gap chart
+  showed the walk reaching 20 µs, which this average hides.
+- **Linear search depends on where orders land.** In the touch stream it compares 1.1 levels per
+  message and ties with binary search; in the sparse stream it compares 46 and is the slowest of
+  the fast designs.
+- **The tree of limits is competitive** when levels rarely appear or disappear (touch: 0.04% of
+  adds create a level), and slows as that share grows (sparse: 10.4%).
+
+Averages hide tails. A trading system cares about the slowest messages too: the add that lands
+600 levels deep, the cancel that empties the best level in a gappy book, the vector that has to
+grow. A real evaluation records percentiles per message type, on a recorded feed, on the target
+machine. These measurements cannot replace that; they show where each design's costs come from.
+
+## Practical considerations
+
+- **One thread per book.** An order book is updated by one thread, with no locks. Parallelism
+  comes from partitioning: different instruments, or different exchanges, go to different cores.
+  Messages reach that thread through a single-producer single-consumer ring buffer.
+- **Integer ticks everywhere.** Convert prices to ticks once, when parsing the message, and never
+  use floating point in the book.
+- **Replay testing.** Record a day of the real feed and replay it through the fast book and a
+  simple reference book, comparing the top levels after every message. That is how the books in
+  this post were checked, and it catches the bugs that unit tests miss: a best price that does
+  not move when its level empties, a level that is left behind with zero orders.
+- **Handle what the feed does.** Feeds have gaps (a lost packet means the book is wrong until a
+  snapshot arrives), replaces that move an order to a new id, and executions at a price other
+  than the order's own (ITCH's `C` message).
+- **Measure on your own data.** Every design here wins on some feed and loses on another. The
+  depth histogram and the gap between levels decide which one fits.
+
+## Summary
+
+- An order book is three structures: an ordered set of price levels per side, a FIFO of orders
+  per level for time priority, and an index from order id to order. Every message after an add
+  names only the order id.
+- The textbook `std::map` + `std::list` + `std::unordered_map` book has good O-notation and is
+  slow because of allocations and pointer chasing. Pools, intrusive lists and orders that point to
+  their level (Selph's tree of limits) make cancels O(1) and remove most of the cost.
+- Most activity is near the best price. Sorted vectors with the best price at the back exploit
+  that, and the right search (linear, binary or branchless) depends on how deep the activity goes.
+- A flat array indexed by price makes every lookup O(1). Its weak spot, finding the next level
+  across a wide gap, is fixed by a two- or three-level bitmap and count-leading-zeros.
+- Measure on your own feed: the distribution of order depth and the gaps between levels decide
+  which design is fastest.
+
+## References
+
+- W. K. Selph, "How to Build a Fast Limit Order Book", 2011.
+  [Archived copy](https://web.archive.org/web/20110410160306/http://howtohft.wordpress.com/2011/02/15/how-to-build-a-fast-limit-order-book);
+  the text is also quoted in the README of
+  [Crypto-toolbox/HFT-Orderbook](https://github.com/Crypto-toolbox/HFT-Orderbook/tree/df10c9da18705bdeed3c7c37532970a58def9912).
+- David Gross, "When Nanoseconds Matter: Ultrafast Trading Systems in C++", CppCon 2024 keynote.
+  [Slides](https://github.com/CppCon/CppCon2024/blob/b91dd839946b909ad773f67f0e11944287045fd3/Presentations/When_Nanoseconds_Matter.pdf).
+- Andrey Ermolinskiy ("voyager"), QuantCup 1 winning entry:
+  [engine.c](https://github.com/andrey-ermolinskiy/quantcup/blob/bfb99b1ca220268fb850d74fd7a98daf013cf34d/engine.c).
+- Charles Cooper, ITCH order book:
+  [order_book.h](https://github.com/charles-cooper/itch-order-book/blob/095ac97ef46c72411a62dd9148d96d2e3ace3305/order_book.h).
+- exchange-core,
+  [OrderBookDirectImpl.java](https://github.com/exchange-core/exchange-core/blob/2f8548749839e9095c8dc597e4b61521d259fa5d/src/main/java/exchange/core2/core/orderbook/OrderBookDirectImpl.java).
+- Liquibook,
+  [order_book.h](https://github.com/enewhuis/liquibook/blob/2427613b32f1667abae68a01df6af9ba8270f8e7/src/book/order_book.h).
+- Nasdaq, [TotalView-ITCH 5.0 specification](https://www.nasdaqtrader.com/content/technicalsupport/specifications/dataproducts/NQTVITCHSpecification.pdf).
+- V. Leis, A. Kemper, T. Neumann, "The ART of indexing: the adaptive radix tree for main-memory
+  databases", ICDE 2013.

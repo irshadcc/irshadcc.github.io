@@ -1,0 +1,34 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import ConversionTable from "../../utils/layout/ConversionTable.astro";
+import LinearLayoutExplorer from "../../utils/layout/LinearLayoutExplorer.astro";
+import ShuffleSteps from "../../utils/layout/ShuffleSteps.astro";
+import SwizzleBanks from "../../utils/layout/SwizzleBanks.astro";
+import {
+	conversionCases,
+	explorerPresets,
+	shuffleDst,
+	shuffleSrc,
+} from "../../utils/layout/linearLayoutFigures";
+---
+
+<Layout title="Linear layout components demo">
+	<h1>Linear layout components</h1>
+
+	<h2>LinearLayoutExplorer, every preset</h2>
+	<p>Hover a cell to see which matrix columns XOR to its coordinates; click a column header to flip that bit.</p>
+	<LinearLayoutExplorer presets={explorerPresets.map((p) => p.key)} select="r1 t9 w0" title="Triton layouts as F2 matrices" />
+
+	<h2>One preset</h2>
+	<LinearLayoutExplorer presets={["swizzled"]} select="o9" />
+
+	<h2>ConversionTable</h2>
+	<ConversionTable cases={conversionCases} caption="16 × 16 tensor, 2 warps of 32 threads." />
+
+	<h2>ShuffleSteps (paper's Figure 4)</h2>
+	<ShuffleSteps src={shuffleSrc} dst={shuffleDst} step={1} title="8 elements, 4 threads" />
+
+	<h2>SwizzleBanks</h2>
+	<SwizzleBanks example="transpose32" title="fp32 transpose through shared memory" />
+	<SwizzleBanks example="fp16cm" option={2} access="load" title="fp16 row-major to column-major" />
+</Layout>

@@ -1,0 +1,213 @@
+---
+// FlexAttention's BlockMask on a small sequence. The element mask is drawn as a grid of
+// queries (rows) by keys (columns), cut into sparse blocks tinted by kind: full (no mask_mod
+// needed), partial (mask_mod needed) or empty (skipped). Below it are the BlockMask tensors
+// (kv_num_blocks, kv_indices, full_kv_*; or the transposed q_* in backward mode). Click or hover a
+// block row (forward) or column (backward) to pick one program: its tiles are numbered in the
+// order the Triton template visits them, partial loop first, with get_offset_for_next_block's
+// steps listed. Controls: mask, sequence length, block size, tile size and direction.
+// Logic in blockMask.ts (checked against create_block_mask), drawing in blockMaskDraw.ts.
+// Usage in .mdx:
+//   <BlockMaskExplorer preset="sliding" len={16} block={4} tile={2} line={3} />
+//   <BlockMaskExplorer preset="causal" dir="bwd" line={1} title="dK/dV walks a column" />
+import {
+	type MaskPreset,
+	buildBlockMask,
+	defaultSpec,
+	presetLabel,
+	visitOrder,
+} from "./blockMask";
+import { describe, drawMask, drawTable } from "./blockMaskDraw";
+
+interface Props {
+	preset?: MaskPreset;
+	/** Query and key length (same for both). */
+	len?: 8 | 12 | 16 | 24 | 32;
+	/** Sparse block size, the BLOCK_SIZE of create_block_mask. */
+	block?: 2 | 4 | 8;
+	/** Tile the kernel loads per step: BLOCK_N forward, BLOCK_M1 backward. Must divide block. */
+	tile?: 1 | 2 | 4 | 8;
+	dir?: "fwd" | "bwd";
+	/** Block row (forward) or column (backward) selected on load. */
+	line?: number;
+	title?: string;
+}
+
+const {
+	preset = "causal",
+	len = 16,
+	block = 4,
+	tile = 2,
+	dir = "fwd",
+	line = 2,
+	title,
+} = Astro.props;
+if (block % tile !== 0)
+	throw new Error("BlockMaskExplorer: tile must divide block");
+const bm = buildBlockMask(defaultSpec(preset, len), len, len, block, block);
+const sel = Math.min(line, (dir === "fwd" ? bm.rows : bm.cols) - 1);
+const tiles = visitOrder(bm, sel, tile, dir);
+const presets = Object.keys(presetLabel) as MaskPreset[];
+---
+
+<figure class="bmx" data-line={sel}>
+	{title && <figcaption class="bmx-title">{title}</figcaption>}
+	<div class="bmx-controls">
+		<label
+			>mask
+			<select name="preset">
+				{presets.map((p) => <option value={p} selected={p === preset}>{presetLabel[p]}</option>)}
+			</select>
+		</label>
+		<label
+			>length
+			<select name="len">
+				{[8, 12, 16, 24, 32].map((n) => <option value={n} selected={n === len}>{n}</option>)}
+			</select>
+		</label>
+		<label
+			>BLOCK_SIZE
+			<select name="block">
+				{[2, 4, 8].map((n) => <option value={n} selected={n === block}>{n}</option>)}
+			</select>
+		</label>
+		<label
+			>tile
+			<select name="tile">
+				{[1, 2, 4, 8].map((n) => <option value={n} selected={n === tile}>{n}</option>)}
+			</select>
+		</label>
+		<label
+			>pass
+			<select name="dir">
+				<option value="fwd" selected={dir === "fwd"}>forward (rows)</option>
+				<option value="bwd" selected={dir === "bwd"}>backward dK/dV (columns)</option>
+			</select>
+		</label>
+	</div>
+	<div class="bmx-body">
+		<div class="bmx-canvas" set:html={drawMask(bm, sel, tiles, dir, tile)} />
+		<div class="bmx-side">
+			<div class="bmx-legend" aria-hidden="true">
+				<span><i class="full"></i>full block</span>
+				<span><i class="partial"></i>partial block</span>
+				<span><i class="empty"></i>empty block</span>
+				<span><i class="el"></i>mask_mod = True</span>
+			</div>
+			<div class="bmx-table" set:html={drawTable(bm, sel, dir)} />
+		</div>
+	</div>
+	<div class="bmx-panel" aria-live="polite" set:html={describe(bm, sel, tiles, dir, tile)} />
+</figure>
+
+<script>
+	import { type MaskPreset, buildBlockMask, defaultSpec, visitOrder } from "./blockMask";
+	import { describe, drawMask, drawTable } from "./blockMaskDraw";
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".bmx")) {
+		const q = <T extends Element>(s: string) => fig.querySelector<T>(s);
+		const canvas = q<HTMLElement>(".bmx-canvas");
+		const table = q<HTMLElement>(".bmx-table");
+		const panel = q<HTMLElement>(".bmx-panel");
+		const val = (n: string) => q<HTMLSelectElement>(`[name=${n}]`)?.value ?? "";
+		let line = Number(fig.dataset.line ?? 0);
+
+		const render = () => {
+			const preset = val("preset") as MaskPreset;
+			const len = Number(val("len"));
+			const block = Number(val("block"));
+			const tileSel = q<HTMLSelectElement>("[name=tile]");
+			// Keep the tile a divisor of the block, as the kernel's static_assert requires.
+			for (const o of tileSel?.options ?? []) o.disabled = block % Number(o.value) !== 0;
+			if (tileSel && block % Number(tileSel.value) !== 0) tileSel.value = String(Math.min(block, 2));
+			const tile = Number(val("tile"));
+			const dir = val("dir") as "fwd" | "bwd";
+			const bm = buildBlockMask(defaultSpec(preset, len), len, len, block, block);
+			line = Math.min(line, (dir === "fwd" ? bm.rows : bm.cols) - 1);
+			const tiles = visitOrder(bm, line, tile, dir);
+			if (canvas) canvas.innerHTML = drawMask(bm, line, tiles, dir, tile);
+			if (table) table.innerHTML = drawTable(bm, line, dir);
+			if (panel) panel.innerHTML = describe(bm, line, tiles, dir, tile);
+		};
+		const pickFrom = (el: Element | null) => {
+			const dir = val("dir");
+			const blk = el?.closest<SVGRectElement>(".bm-blk");
+			const row = el?.closest<HTMLTableRowElement>("tr[data-i]");
+			let next: number | undefined;
+			if (blk) next = Number(dir === "fwd" ? blk.dataset.r : blk.dataset.k);
+			if (row) next = Number(row.dataset.i);
+			if (next !== undefined && next !== line) {
+				line = next;
+				render();
+			}
+		};
+		for (const s of fig.querySelectorAll("select")) s.addEventListener("change", render);
+		canvas?.addEventListener("click", (e) => pickFrom(e.target as Element));
+		canvas?.addEventListener("mouseover", (e) => pickFrom(e.target as Element));
+		table?.addEventListener("click", (e) => pickFrom(e.target as Element));
+		table?.addEventListener("mouseover", (e) => pickFrom(e.target as Element));
+	}
+</script>
+
+<style>
+	.bmx {
+		--bm-full: #2f8a5b;
+		--bm-part: #b8742a;
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+	}
+	@media (prefers-color-scheme: dark) {
+		.bmx {
+			--bm-full: #63bf8d;
+			--bm-part: #e0a35e;
+		}
+	}
+	.bmx-title { text-align: center; font-size: 0.9rem; font-weight: 600; margin-bottom: 0.4rem; }
+	.bmx-controls { display: flex; flex-wrap: wrap; gap: 0.4rem 1rem; align-items: center; font-size: 0.78rem; color: var(--muted); margin-bottom: 0.5rem; }
+	.bmx-controls label { display: inline-flex; gap: 0.35rem; align-items: center; }
+	.bmx-controls select { font: 0.78rem var(--mono); color: var(--text); background: var(--bg); border: 1px solid var(--faint); border-radius: 6px; padding: 0.1rem 0.3rem; }
+	.bmx-body { display: flex; flex-wrap: wrap; gap: 0.8rem; align-items: flex-start; }
+	.bmx-canvas { flex: none; max-width: 100%; overflow-x: auto; padding: 0.5rem; border: 1px solid var(--faint); border-radius: 10px; background: var(--surface); }
+	.bmx-canvas :global(svg) { display: block; max-width: none; }
+	.bmx-side { flex: 1 1 16rem; min-width: 0; }
+	.bmx-canvas :global(.bm-blk) { cursor: pointer; fill: transparent; }
+	.bmx-canvas :global(.bm-blk.full) { fill: color-mix(in oklch, var(--bm-full) 22%, var(--bg)); }
+	.bmx-canvas :global(.bm-blk.partial) { fill: color-mix(in oklch, var(--bm-part) 22%, var(--bg)); }
+	.bmx-canvas :global(.bm-blk.empty) { fill: var(--bg); }
+	.bmx-canvas :global(.bm-blk.on) { stroke: var(--text); stroke-width: 0.6; }
+	.bmx-canvas :global(.bm-el) { fill: color-mix(in oklch, var(--text) 55%, transparent); pointer-events: none; }
+	.bmx-canvas :global(.bm-grid) { stroke: var(--muted); stroke-width: 1; pointer-events: none; }
+	.bmx-canvas :global(.bm-lab) { font: 600 9px var(--mono); fill: var(--muted); text-anchor: middle; }
+	.bmx-canvas :global(.bm-lab.bm-row) { text-anchor: end; }
+	.bmx-canvas :global(.bm-lab.on) { fill: var(--accent); }
+	.bmx-canvas :global(.bm-tick) { font: 7px var(--mono); fill: var(--muted); }
+	.bmx-canvas :global(.bm-tile) { fill: none; stroke-width: 2; pointer-events: none; }
+	.bmx-canvas :global(.bm-tile.partial) { stroke: var(--bm-part); stroke-dasharray: 3 2; }
+	.bmx-canvas :global(.bm-tile.full) { stroke: var(--bm-full); }
+	.bmx-canvas :global(.bm-num) { pointer-events: none; }
+	.bmx-canvas :global(.bm-num.partial) { fill: var(--bm-part); }
+	.bmx-canvas :global(.bm-num.full) { fill: var(--bm-full); }
+	.bmx-canvas :global(.bm-numt) { font-family: var(--sans); font-weight: 700; fill: var(--bg); text-anchor: middle; pointer-events: none; }
+	.bmx-legend { display: flex; flex-wrap: wrap; gap: 0.3rem 0.9rem; margin-bottom: 0.4rem; font-size: 0.72rem; color: var(--muted); }
+	.bmx-legend span { display: inline-flex; align-items: center; gap: 0.3rem; }
+	.bmx-legend i { display: inline-block; width: 0.75rem; height: 0.75rem; border-radius: 2px; border: 1px solid var(--faint); }
+	.bmx-legend i.full { background: color-mix(in oklch, var(--bm-full) 22%, var(--bg)); }
+	.bmx-legend i.partial { background: color-mix(in oklch, var(--bm-part) 22%, var(--bg)); }
+	.bmx-legend i.empty { background: var(--bg); }
+	.bmx-legend i.el { background: color-mix(in oklch, var(--text) 55%, transparent); }
+	.bmx-table { overflow-x: auto; }
+	.bmx-table :global(table) { border-collapse: collapse; font: 0.7rem var(--mono); width: auto; margin: 0; }
+	.bmx-table :global(th), .bmx-table :global(td) { padding: 0.12rem 0.4rem; border-bottom: 1px solid var(--faint); text-align: left; white-space: nowrap; }
+	.bmx-table :global(thead th) { font: 600 0.66rem var(--sans); color: var(--muted); }
+	.bmx-table :global(td.num) { text-align: right; }
+	.bmx-table :global(tbody tr) { cursor: pointer; }
+	.bmx-table :global(tbody tr.on) { background: var(--accent-soft); }
+	.bmx-table :global(.dead) { color: var(--faint); }
+	.bmx-panel { margin-top: 0.5rem; font-size: 0.8rem; }
+	.bmx-panel :global(p) { margin: 0.3rem 0; }
+	.bmx-panel :global(.bm-steps) { display: flex; flex-wrap: wrap; gap: 0.25rem 0.5rem; margin: 0.3rem 0 0; padding: 0; list-style: none; font: 0.7rem var(--mono); }
+	.bmx-panel :global(.bm-steps li) { margin: 0; padding: 0.1rem 0.4rem; border-radius: 4px; border-left: 3px solid; background: var(--surface); }
+	.bmx-panel :global(.bm-steps li.partial) { border-color: var(--bm-part); }
+	.bmx-panel :global(.bm-steps li.full) { border-color: var(--bm-full); }
+	.bmx-panel :global(.bm-steps span) { color: var(--muted); }
+</style>

@@ -1,0 +1,257 @@
+---
+// Step-through of one program of FlexAttention's forward Triton template on a scaled-down
+// example (8 tokens, head dim 4, BLOCK_M = 4, BLOCK_N = 2, sparse blocks of 4, ALiBi score_mod,
+// causal mask_mod; data and logic in flexKernel.ts). Top: the template's loop, condensed, with
+// the lines each step runs highlighted. Left: the 8 × 8 score matrix with its blocks (amber
+// partial, green full, blank empty), the program's rows and the current tile. Right: the tile's
+// numbers: scores through score_mod, mask_mod and the change to base 2, or the online-softmax
+// state (m_i, alpha, p, l_i, acc) before and after the update; the last step compares the output
+// and LSE with a dense softmax.
+// Usage in .mdx:
+//   <FlexKernelSteps />
+//   <FlexKernelSteps step={3} title="One program, four tiles" />
+import StepControls from "../compiler/StepControls.astro";
+import {
+	BLOCK_M,
+	BLOCK_N,
+	CODE,
+	type KernelStep,
+	type Mat,
+	Q,
+	Q_START,
+	SEQ,
+	SPARSE,
+	blockMask,
+	buildSteps,
+	fmt,
+} from "./flexKernel";
+
+interface Props {
+	step?: number;
+	title?: string;
+}
+
+const { step = 0, title } = Astro.props;
+const steps = buildSteps();
+const at = Math.max(0, Math.min(steps.length - 1, step));
+const bm = blockMask();
+const rows = Array.from({ length: BLOCK_M }, (_, i) => Q_START * BLOCK_M + i);
+const C = 18;
+const OFF = 16;
+const mapSize = OFF + SEQ * C + 2;
+
+interface Table {
+	name: string;
+	sub?: string;
+	cols: string[];
+	data: Mat;
+	/** Highlight cells that changed against this matrix. */
+	prev?: Mat;
+}
+const vec = (v: number[]) => v.map((x) => [x]);
+const tables = (s: KernelStep): Table[] => {
+	const tc = (s.cols ?? []).map((n) => `n=${n}`);
+	if (s.kind === "load")
+		return [
+			{
+				name: "q",
+				sub: "query rows",
+				cols: ["d0", "d1", "d2", "d3"],
+				data: rows.map((r) => Q[r]),
+			},
+			{ name: "m_i", cols: [""], data: vec(s.m ?? []) },
+			{ name: "l_i", cols: [""], data: vec(s.l ?? []) },
+			{ name: "acc", cols: ["v0", "v1"], data: s.acc ?? [] },
+		];
+	if (s.kind === "scores") {
+		const t: Table[] = [
+			{ name: "qk · SM_SCALE", cols: tc, data: s.qk ?? [] },
+			{
+				name: "+ score_mod",
+				sub: "+ 0.5 (n − m)",
+				cols: tc,
+				data: s.mod ?? [],
+			},
+		];
+		if (s.masked)
+			t.push({
+				name: "mask_mod",
+				sub: "m ≥ n else −∞",
+				cols: tc,
+				data: s.masked,
+			});
+		t.push({ name: "× RCP_LN2", sub: "base 2", cols: tc, data: s.base2 ?? [] });
+		return t;
+	}
+	if (s.kind === "update")
+		return [
+			{
+				name: "m_i",
+				sub: "before → after",
+				cols: ["old", "new"],
+				data: (s.mPrev ?? []).map((x, i) => [x, (s.m ?? [])[i]]),
+			},
+			{ name: "alpha", cols: [""], data: vec(s.alpha ?? []) },
+			{ name: "p", sub: "exp2(s − m_new)", cols: tc, data: s.p ?? [] },
+			{
+				name: "l_i",
+				sub: "before → after",
+				cols: ["old", "new"],
+				data: (s.lPrev ?? []).map((x, i) => [x, (s.l ?? [])[i]]),
+			},
+			{ name: "v", sub: "tile rows", cols: ["v0", "v1"], data: s.v ?? [] },
+			{
+				name: "acc",
+				sub: "after",
+				cols: ["v0", "v1"],
+				data: s.acc ?? [],
+				prev: s.accPrev,
+			},
+		];
+	return [
+		{ name: "out = acc / l_i", cols: ["v0", "v1"], data: s.out ?? [] },
+		{
+			name: "reference",
+			sub: "dense softmax",
+			cols: ["v0", "v1"],
+			data: s.refOut ?? [],
+		},
+		{ name: "lse (base 2)", cols: [""], data: vec(s.lse2 ?? []) },
+		{ name: "lse × ln 2", cols: [""], data: vec(s.lse ?? []) },
+		{
+			name: "reference",
+			sub: "logsumexp",
+			cols: [""],
+			data: vec(s.refLse ?? []),
+		},
+	];
+};
+const isRow = (r: number) => rows.includes(r);
+---
+
+<figure class="fks" data-step={at} tabindex="0">
+	{title && <figcaption class="fks-title">{title}</figcaption>}
+	<pre class="fks-code" aria-label="Forward template loop, condensed"><code>{CODE.map((l, i) => <span class:list={["ln", { cmt: l.trimStart().startsWith("#"), on: steps[at].lines.includes(i) }]} data-line={i}>{l}{"\n"}</span>)}</code></pre>
+	<StepControls labels={steps.map((s) => s.label)} step={at} />
+	<div class="fks-stages">
+		{
+			steps.map((s, i) => (
+				<div class="fks-stage" data-i={i} data-lines={s.lines.join(" ")} hidden={i !== at}>
+					<svg class="fks-map" viewBox={`0 0 ${mapSize} ${mapSize}`} width={mapSize} height={mapSize} role="img" aria-label="Score matrix with blocks and the current tile">
+						{bm.kind.map((row, r) =>
+							row.map((k, c) => (
+								<rect class:list={["blk", k]} x={OFF + c * SPARSE * C} y={OFF + r * SPARSE * C} width={SPARSE * C} height={SPARSE * C} />
+							)),
+						)}
+						{Array.from({ length: SEQ }, (_, q) =>
+							Array.from({ length: SEQ }, (_, n) =>
+								q >= n ? <rect class:list={["el", { mine: isRow(q) }]} x={OFF + n * C + 3} y={OFF + q * C + 3} width={C - 6} height={C - 6} /> : null,
+							),
+						)}
+						<rect class="band" x={OFF} y={OFF + rows[0] * C} width={SEQ * C} height={BLOCK_M * C} />
+						{s.cols && <rect class:list={["tile", s.tile?.full ? "full" : "partial"]} x={OFF + s.cols[0] * C} y={OFF + rows[0] * C} width={BLOCK_N * C} height={BLOCK_M * C} />}
+						{Array.from({ length: SEQ }, (_, n) => (
+							<text class="ax" x={OFF + n * C + C / 2} y={OFF - 4}>{n}</text>
+						))}
+						{Array.from({ length: SEQ }, (_, q) => (
+							<text class="ax row" x={OFF - 3} y={OFF + q * C + C / 2 + 3}>{q}</text>
+						))}
+					</svg>
+					<div class="fks-tables">
+						{tables(s).map((t) => (
+							<div class="mat">
+								<p class="mat-head">
+									<code>{t.name}</code>
+									{t.sub && <span>{t.sub}</span>}
+								</p>
+								<table>
+									{t.cols.some((c) => c) && (
+										<thead>
+											<tr>
+												<th />
+												{t.cols.map((c) => <th>{c}</th>)}
+											</tr>
+										</thead>
+									)}
+									<tbody>
+										{t.data.map((r, ri) => (
+											<tr>
+												<th>m={rows[ri]}</th>
+												{r.map((x, ci) => (
+													<td class:list={{ inf: x === Number.NEGATIVE_INFINITY, chg: t.prev !== undefined && Math.abs(t.prev[ri][ci] - x) > 1e-9 }}>{fmt(x)}</td>
+												))}
+											</tr>
+										))}
+									</tbody>
+								</table>
+							</div>
+						))}
+					</div>
+					<p class="fks-note">{s.note}</p>
+				</div>
+			))
+		}
+	</div>
+</figure>
+
+<script>
+	import { bindStepper } from "../compiler/stepper";
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".fks")) {
+		const stages = [...fig.querySelectorAll<HTMLElement>(".fks-stage")];
+		const lines = [...fig.querySelectorAll<HTMLElement>(".fks-code .ln")];
+		bindStepper(fig, stages.length, (i) => {
+			stages.forEach((s, k) => {
+				s.hidden = k !== i;
+			});
+			const on = new Set((stages[i].dataset.lines ?? "").split(" ").filter(Boolean).map(Number));
+			lines.forEach((l, k) => l.classList.toggle("on", on.has(k)));
+		});
+	}
+</script>
+
+<style>
+	.fks {
+		--fk-full: #2f8a5b;
+		--fk-part: #b8742a;
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+		outline: none;
+	}
+	@media (prefers-color-scheme: dark) {
+		.fks {
+			--fk-full: #63bf8d;
+			--fk-part: #e0a35e;
+		}
+	}
+	.fks-title { text-align: center; font-size: 0.9rem; font-weight: 600; margin-bottom: 0.4rem; }
+	.fks-code { margin: 0 0 0.3rem; padding: 0.5rem 0.7rem; border: 1px solid var(--faint); border-radius: 8px; background: var(--surface); font: 0.7rem/1.5 var(--mono); overflow-x: auto; }
+	.fks-code .ln { display: block; padding: 0 0.3rem; border-radius: 3px; color: var(--muted); }
+	.fks-code .ln.cmt { font-style: italic; }
+	.fks-code .ln.on { background: var(--accent-soft); color: var(--text); box-shadow: inset 3px 0 var(--accent); }
+	.fks-stage { display: flex; flex-wrap: wrap; gap: 0.8rem; align-items: flex-start; }
+	.fks-stage[hidden] { display: none; }
+	.fks-map { flex: none; display: block; }
+	.fks-map .blk { stroke: var(--muted); stroke-width: 1; fill: var(--bg); }
+	.fks-map .blk.full { fill: color-mix(in oklch, var(--fk-full) 22%, var(--bg)); }
+	.fks-map .blk.partial { fill: color-mix(in oklch, var(--fk-part) 22%, var(--bg)); }
+	.fks-map .el { fill: color-mix(in oklch, var(--text) 25%, transparent); }
+	.fks-map .el.mine { fill: color-mix(in oklch, var(--text) 60%, transparent); }
+	.fks-map .band { fill: none; stroke: var(--accent); stroke-width: 1.5; stroke-dasharray: 2 2; }
+	.fks-map .tile { fill: none; stroke-width: 3; }
+	.fks-map .tile.partial { stroke: var(--fk-part); }
+	.fks-map .tile.full { stroke: var(--fk-full); }
+	.fks-map .ax { font: 8px var(--mono); fill: var(--muted); text-anchor: middle; }
+	.fks-map .ax.row { text-anchor: end; }
+	.fks-tables { flex: 1 1 18rem; min-width: 0; display: flex; flex-wrap: wrap; gap: 0.5rem 0.8rem; }
+	.mat-head { margin: 0 0 0.15rem; font-size: 0.68rem; color: var(--muted); display: flex; gap: 0.35rem; align-items: baseline; }
+	.mat-head code { font-size: 0.7rem; color: var(--text); }
+	.mat table { border-collapse: collapse; font: 0.68rem var(--mono); margin: 0; width: auto; }
+	.mat th, .mat td { padding: 0.08rem 0.35rem; border-bottom: 1px solid var(--faint); white-space: nowrap; }
+	.mat thead th { font: 600 0.62rem var(--sans); color: var(--muted); text-align: right; }
+	.mat tbody th { font: 0.62rem var(--mono); color: var(--muted); text-align: left; }
+	.mat td { text-align: right; font-variant-numeric: tabular-nums; }
+	.mat td.inf { color: var(--muted); }
+	.mat td.chg { background: var(--accent-soft); }
+	.fks-note { flex-basis: 100%; margin: 0; font-size: 0.8rem; color: var(--text); }
+</style>

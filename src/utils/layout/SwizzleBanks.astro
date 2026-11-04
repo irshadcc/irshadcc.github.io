@@ -1,0 +1,447 @@
+---
+// Shared memory for a layout conversion that goes through shared memory: a warp stores a tile in
+// layout A and loads it back in layout B. The grid is the shared buffer, one row per 128-byte line
+// (32 banks of 4 bytes); each cell is one element, tinted by the tensor row it holds, so a swizzle
+// shows up as a diagonal pattern. Pick the shared layout (unswizzled, Triton's XOR swizzle with
+// given vec / perPhase / maxPhase, or the one the linear-layouts algorithm computes), the access
+// (store in A or load in B) and one instruction: the cells its 32 lanes touch are outlined with
+// their lane number, and cells in a bank asked for two or more different words in the same phase
+// are marked as conflicts. The table compares instruction counts and wavefronts for every layout.
+// Logic in simulateAccess / optimalSwizzle (linearLayout.ts); cases in linearLayoutFigures.ts.
+// Usage in .mdx:
+//   <SwizzleBanks example="transpose32" />
+import {
+	type LinearLayout,
+	apply,
+	asOffsetLayout,
+	optimalSwizzle,
+	simulateAccess,
+	swizzledShared,
+	transposeOuts,
+} from "./linearLayout";
+import { swizzleCases } from "./linearLayoutFigures";
+
+interface Props {
+	example: string;
+	title?: string;
+	/** Option shown on load: index into [unswizzled, ...swizzles, optimal]. */
+	option?: number;
+	access?: "store" | "load";
+	instruction?: number;
+}
+
+const {
+	example,
+	title,
+	option = 0,
+	access = "load",
+	instruction = 0,
+} = Astro.props;
+const ex = swizzleCases.find((c) => c.key === example);
+if (!ex) throw new Error(`unknown swizzle example ${example}`);
+const rm = (L: LinearLayout) => transposeOuts(L, ["dim1", "dim0"]);
+const A = rm(ex.store);
+const B = rm(ex.load);
+const [rows, cols] = ex.shape;
+const n = rows * cols;
+const bits = ex.elemBits;
+const opt = optimalSwizzle(A, B, bits);
+const options: { name: string; M: LinearLayout; vec?: number[] }[] = [
+	{ name: "unswizzled", M: rm(swizzledShared(1, 1, 1, ex.shape)) },
+	...ex.swizzles.map(([v, p, m]) => ({
+		name: `XOR swizzle (vec ${v}, perPhase ${p}, maxPhase ${m})`,
+		M: rm(swizzledShared(v, p, m, ex.shape)),
+	})),
+	{ name: "linear-layout optimum", M: opt.smem, vec: opt.vec },
+];
+const perLine = 1024 / bits;
+const lines = n / perLine;
+const elemsPerWord = 32 / bits;
+
+const data = options.map((o) => {
+	const M = asOffsetLayout(o.M);
+	// Tensor row of the element at each offset (flattened row-major: x = i * cols + j).
+	const rowAt = Array.from({ length: n }, (_, off) =>
+		Math.floor(apply(M, { offset: off })[0] / cols),
+	);
+	const report = (L: LinearLayout) => {
+		const r = simulateAccess(L, o.M, bits, o.vec);
+		const bytes = (r.vec * bits) / 8;
+		const lanesPerPhase = bytes > 4 ? 128 / bytes : 32;
+		return {
+			vec: r.vec,
+			wavefronts: r.wavefronts,
+			ideal: r.ideal,
+			instr: r.instructions.map((ins) => {
+				// Conflicted offsets: in a bank that serves 2+ distinct words in the same phase.
+				const bad: number[] = [];
+				for (let p = 0; p < 32; p += lanesPerPhase) {
+					const words = new Map<number, Set<number>>();
+					for (let l = p; l < p + lanesPerPhase; l++)
+						for (const off of ins.offsets[l]) {
+							const w = Math.floor(off / elemsPerWord);
+							if (!words.has(w % 32)) words.set(w % 32, new Set());
+							words.get(w % 32)?.add(w);
+						}
+					for (let l = p; l < p + lanesPerPhase; l++)
+						for (const off of ins.offsets[l])
+							if (
+								(words.get(Math.floor(off / elemsPerWord) % 32)?.size ?? 0) > 1
+							)
+								bad.push(off);
+				}
+				return { offsets: ins.offsets, wf: ins.wavefronts, bad };
+			}),
+		};
+	};
+	return { name: o.name, rowAt, store: report(A), load: report(B) };
+});
+
+const cw = Math.max(8, Math.min(16, Math.floor(560 / perLine)));
+const chh = 14;
+const left = 30;
+const top = 16;
+const width = left + perLine * cw + 4;
+const height = top + lines * chh + 4;
+---
+
+<figure class="swb" data-data={JSON.stringify(data)} data-option={option} data-access={access} data-instruction={instruction} data-rows={rows}>
+	{title && <figcaption class="swb-title">{title}</figcaption>}
+	<p class="swb-desc">
+		{rows} × {cols} tile of {bits}-bit elements. Store: {ex.storeText}. Load: {ex.loadText}.
+	</p>
+	<div class="swb-controls">
+		<label>
+			Shared layout
+			<select name="option">
+				{data.map((d, k) => <option value={k} selected={k === option}>{d.name}</option>)}
+			</select>
+		</label>
+		<div class="swb-seg" role="group" aria-label="Access">
+			<button type="button" data-access="store" aria-pressed={String(access === "store")}>store A</button>
+			<button type="button" data-access="load" aria-pressed={String(access === "load")}>load B</button>
+		</div>
+		<label>
+			instruction <input type="range" name="instruction" min="0" max="0" value={instruction} />
+			<output name="k" />
+		</label>
+	</div>
+	<div class="swb-scroll">
+		<svg viewBox={`0 0 ${width} ${height}`} width={width} role="img" aria-label="Shared memory lines by bank">
+			{
+				Array.from({ length: 32 }, (_, b) => (
+					<text class="swb-bank" x={left + (b * elemsPerWord + elemsPerWord / 2) * cw} y={top - 5}>
+						{b % 4 === 0 ? `b${b}` : ""}
+					</text>
+				))
+			}
+			{
+				Array.from({ length: lines }, (_, l) => (
+					<text class="swb-line" x={left - 4} y={top + l * chh + chh / 2 + 3}>
+						{l}
+					</text>
+				))
+			}
+			<g class="swb-cells" data-geo={JSON.stringify({ n, perLine, cw, chh, left, top })}></g>
+			{
+				Array.from({ length: 33 }, (_, b) => (
+					<line class="swb-sep" x1={left + b * elemsPerWord * cw} x2={left + b * elemsPerWord * cw} y1={top} y2={top + lines * chh} />
+				))
+			}
+		</svg>
+	</div>
+	<p class="swb-readout" aria-live="polite"></p>
+	<div class="swb-table">
+		<table>
+			<thead>
+				<tr>
+					<th>Shared layout</th>
+					<th>store: instr × vec</th>
+					<th>store wavefronts</th>
+					<th>load: instr × vec</th>
+					<th>load wavefronts</th>
+				</tr>
+			</thead>
+			<tbody>
+				{
+					data.map((d) => (
+						<tr>
+							<td>{d.name}</td>
+							<td class="num">
+								{d.store.instr.length} × {d.store.vec}
+							</td>
+							<td class:list={["num", { bad: d.store.wavefronts > d.store.ideal }]}>
+								{d.store.wavefronts} / {d.store.ideal}
+							</td>
+							<td class="num">
+								{d.load.instr.length} × {d.load.vec}
+							</td>
+							<td class:list={["num", { bad: d.load.wavefronts > d.load.ideal }]}>
+								{d.load.wavefronts} / {d.load.ideal}
+							</td>
+						</tr>
+					))
+				}
+			</tbody>
+		</table>
+		<p class="swb-foot">Wavefronts taken / wavefronts a conflict-free access of the same width would take.</p>
+	</div>
+</figure>
+
+<script>
+	interface Ins {
+		offsets: number[][];
+		wf: number;
+		bad: number[];
+	}
+	interface Rep {
+		vec: number;
+		wavefronts: number;
+		ideal: number;
+		instr: Ins[];
+	}
+	interface Opt {
+		name: string;
+		rowAt: number[];
+		store: Rep;
+		load: Rep;
+	}
+	for (const fig of document.querySelectorAll<HTMLElement>(".swb")) {
+		const data: Opt[] = JSON.parse(fig.dataset.data ?? "[]");
+		const rows = Number(fig.dataset.rows);
+		let option = Number(fig.dataset.option ?? 0);
+		let access: "store" | "load" = fig.dataset.access === "store" ? "store" : "load";
+		let k = Number(fig.dataset.instruction ?? 0);
+		// Cells are drawn here rather than in the markup: thousands of them would bloat the page.
+		const holder = fig.querySelector<SVGGElement>(".swb-cells");
+		const geo = JSON.parse(holder?.dataset.geo ?? "{}");
+		const ns = "http://www.w3.org/2000/svg";
+		const cells: SVGGElement[] = [];
+		for (let off = 0; off < geo.n; off++) {
+			const l = Math.floor(off / geo.perLine);
+			const c = off % geo.perLine;
+			const g = document.createElementNS(ns, "g");
+			g.setAttribute("class", "swb-cell");
+			g.dataset.off = String(off);
+			const r = document.createElementNS(ns, "rect");
+			r.setAttribute("x", String(geo.left + c * geo.cw + 0.5));
+			r.setAttribute("y", String(geo.top + l * geo.chh + 0.5));
+			r.setAttribute("width", String(geo.cw - 1));
+			r.setAttribute("height", String(geo.chh - 1));
+			r.setAttribute("rx", "1.5");
+			const t = document.createElementNS(ns, "text");
+			t.setAttribute("x", String(geo.left + c * geo.cw + geo.cw / 2));
+			t.setAttribute("y", String(geo.top + l * geo.chh + geo.chh / 2 + 3));
+			g.append(r, t);
+			holder?.append(g);
+			cells.push(g);
+		}
+		const slider = fig.querySelector<HTMLInputElement>("input[name=instruction]");
+		const out = fig.querySelector<HTMLOutputElement>("output[name=k]");
+		const readout = fig.querySelector<HTMLElement>(".swb-readout");
+		const buttons = [...fig.querySelectorAll<HTMLButtonElement>("button[data-access]")];
+		const render = () => {
+			const d = data[option];
+			const rep = d[access];
+			k = Math.min(k, rep.instr.length - 1);
+			if (slider) {
+				slider.max = String(rep.instr.length - 1);
+				slider.value = String(k);
+			}
+			if (out) out.textContent = `${k + 1} / ${rep.instr.length}`;
+			const ins = rep.instr[k];
+			const laneOf = new Map<number, number>();
+			ins.offsets.forEach((offs, lane) => {
+				for (const o of offs) laneOf.set(o, lane);
+			});
+			const bad = new Set(ins.bad);
+			for (const c of cells) {
+				const off = Number(c.dataset.off);
+				c.style.setProperty("--h", String((d.rowAt[off] * 360) / rows));
+				const lane = laneOf.get(off);
+				c.classList.toggle("hit", lane !== undefined);
+				c.classList.toggle("bad", bad.has(off));
+				const t = c.querySelector("text");
+				if (t) t.textContent = lane !== undefined ? String(lane) : "";
+			}
+			for (const b of buttons) b.setAttribute("aria-pressed", String(b.dataset.access === access));
+			const phases = rep.ideal / rep.instr.length;
+			if (readout)
+				readout.textContent = `${access === "store" ? "Store" : "Load"} instruction ${k + 1}: each lane moves ${rep.vec} element${rep.vec > 1 ? "s" : ""}; ${ins.wf} wavefront${ins.wf > 1 ? "s" : ""} (conflict-free would be ${phases}).`;
+		};
+		fig.querySelector<HTMLSelectElement>("select[name=option]")?.addEventListener("change", (e) => {
+			option = Number((e.target as HTMLSelectElement).value);
+			render();
+		});
+		for (const b of buttons)
+			b.addEventListener("click", () => {
+				access = b.dataset.access === "store" ? "store" : "load";
+				render();
+			});
+		slider?.addEventListener("input", () => {
+			k = Number(slider.value);
+			render();
+		});
+		render();
+	}
+</script>
+
+<style>
+	.swb {
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+		--cell-l: 0.9;
+		--cell-c: 0.06;
+		--bad: #c0392b;
+	}
+	@media (prefers-color-scheme: dark) {
+		.swb {
+			--cell-l: 0.33;
+			--cell-c: 0.05;
+			--bad: #ff7b6b;
+		}
+	}
+	.swb-title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+	}
+	.swb-desc {
+		margin: 0.2rem 0 0.5rem;
+		font-size: 0.78rem;
+		color: var(--muted);
+		text-align: center;
+	}
+	.swb-controls {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.5rem 1rem;
+		justify-content: center;
+		align-items: center;
+		font-size: 0.78rem;
+		color: var(--muted);
+		margin-bottom: 0.5rem;
+	}
+	.swb-controls label {
+		display: flex;
+		gap: 0.4rem;
+		align-items: center;
+	}
+	.swb-controls select {
+		font: inherit;
+		color: var(--text);
+		background: var(--bg);
+		border: 1px solid var(--faint);
+		border-radius: 6px;
+		padding: 0.15rem 0.3rem;
+		max-width: 16rem;
+	}
+	.swb-controls output {
+		font-family: var(--mono);
+		min-width: 3.5rem;
+	}
+	.swb-seg {
+		display: inline-flex;
+		border: 1px solid var(--faint);
+		border-radius: 6px;
+		overflow: hidden;
+	}
+	.swb-seg button {
+		font: inherit;
+		border: none;
+		background: var(--bg);
+		color: var(--muted);
+		padding: 0.15rem 0.6rem;
+		cursor: pointer;
+	}
+	.swb-seg button[aria-pressed="true"] {
+		background: var(--accent-soft);
+		color: var(--text);
+		font-weight: 600;
+	}
+	.swb-scroll {
+		overflow-x: auto;
+		display: flex;
+		justify-content: center;
+	}
+	.swb-scroll svg {
+		display: block;
+		max-width: 100%;
+		height: auto;
+	}
+	.swb-bank,
+	.swb-line {
+		font-size: 8px;
+		fill: var(--muted);
+		text-anchor: middle;
+		font-family: var(--mono);
+	}
+	.swb-line {
+		text-anchor: end;
+	}
+	.swb :global(.swb-cell rect) {
+		fill: oklch(var(--cell-l) var(--cell-c) var(--h, 0));
+		stroke: none;
+	}
+	.swb :global(.swb-cell.hit rect) {
+		stroke: var(--text);
+		stroke-width: 1.2;
+	}
+	.swb :global(.swb-cell.bad rect) {
+		stroke: var(--bad);
+		stroke-width: 1.6;
+	}
+	.swb :global(.swb-cell text) {
+		font-size: 6.5px;
+		font-family: var(--mono);
+		fill: var(--text);
+		text-anchor: middle;
+		pointer-events: none;
+	}
+	.swb :global(.swb-cell.bad text) {
+		fill: var(--bad);
+		font-weight: 700;
+	}
+	.swb-sep {
+		stroke: var(--faint);
+		stroke-width: 0.4;
+	}
+	.swb-readout {
+		margin: 0.5rem 0;
+		text-align: center;
+		font-size: 0.78rem;
+	}
+	.swb-table {
+		overflow-x: auto;
+	}
+	.swb-table table {
+		width: 100%;
+		border-collapse: collapse;
+		margin: 0;
+		font-size: 0.74rem;
+	}
+	.swb-table th,
+	.swb-table td {
+		padding: 0.25rem 0.5rem;
+		border-bottom: 1px solid var(--faint);
+		text-align: left;
+	}
+	.swb-table th {
+		color: var(--muted);
+		font-weight: 600;
+	}
+	.swb-table .num {
+		text-align: right;
+		font-family: var(--mono);
+	}
+	.swb-table .bad {
+		color: var(--bad);
+		font-weight: 600;
+	}
+	.swb-foot {
+		margin: 0.3rem 0 0;
+		font-size: 0.7rem;
+		color: var(--muted);
+		text-align: center;
+	}
+</style>

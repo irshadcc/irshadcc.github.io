@@ -1,0 +1,135 @@
+---
+// Polynomial regression seen probabilistically (Bishop & Bishop, Sections 2.3.4 and 2.6.2).
+// Ten points from sin 2πx plus Gaussian noise (σ = 0.3) are fitted by an order-M polynomial
+// minimising ½ Σ {y(x_n, w) − t_n}² + (λ/2) wᵀw. With "maximum likelihood" ticked λ = 0 (2.67);
+// otherwise λ = σ²/s² is the MAP solution under the Gaussian prior (2.115), set on a log scale.
+// The plot shows the data, sin 2πx (dashed), the fit y(x, w) and the band y ± σ_ML of the
+// predictive distribution (2.69), with σ²_ML from (2.68); at x0 the density p(t | x0, w, σ²) is
+// drawn sideways as in Figure 2.11. The table lists the coefficients. Logic in probTheory.ts.
+// Usage in .mdx:
+//   <MapRegression order={9} lnLambda={-18} />
+import "../sampling/sampling.css";
+import "./probTheory.css";
+
+interface Props {
+	order?: number;
+	/** ln λ at the start; omit (or ml) for maximum likelihood. */
+	lnLambda?: number;
+	ml?: boolean;
+	x0?: number;
+	seed?: number;
+	title?: string;
+	caption?: string;
+}
+
+const {
+	order = 9,
+	lnLambda = -18,
+	ml = false,
+	x0 = 0.6,
+	seed = 7,
+	title,
+	caption,
+} = Astro.props;
+---
+
+<figure class="smp-fig pt-map-reg" data-seed={seed} data-x0={x0}>
+	{title && <div class="smp-title">{title}</div>}
+	<div class="smp-legend">
+		<span><i class="dot k-dot-p"></i>training data</span>
+		<span><i class="k-qd"></i>sin 2πx</span>
+		<span><i class="k-p"></i>y(x, w)</span>
+		<span><i class="box k-hist"></i>y ± σ_ML</span>
+		<span><i class="k-model"></i>p(t | x0, w, σ²_ML)</span>
+	</div>
+	<svg class="smp-svg" viewBox="0 0 640 270" role="img" aria-label="Polynomial fit with its Gaussian noise band"></svg>
+	<div class="smp-controls">
+		<label>M
+			<select class="i-m" aria-label="Polynomial order">
+				{[0, 1, 3, 6, 9].map((m) => <option value={m} selected={m === order}>{m}</option>)}
+			</select>
+		</label>
+		<label><input type="checkbox" class="i-ml" checked={ml} /> maximum likelihood (λ = 0)</label>
+		<label class="smp-slider">ln λ = <strong class="v-l"></strong>
+			<input type="range" class="i-l" min="-30" max="4" step="0.5" value={lnLambda} aria-label="Log regularisation coefficient" />
+		</label>
+	</div>
+	<div class="smp-metrics">
+		<div><span>E(w) = ½ Σ (y − t)²</span><strong class="m-e"></strong></div>
+		<div><span>σ²_ML (2.68)</span><strong class="m-s2"></strong></div>
+		<div><span>wᵀw</span><strong class="m-w"></strong></div>
+		<div><span>test RMS vs sin 2πx</span><strong class="m-rms"></strong></div>
+	</div>
+	<table class="smp-table pt-w"></table>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import { fitPoly, gauss, poly, sineData } from "./probTheory";
+	import { axes, curve, el, fmt } from "../sampling/plot";
+
+	function attach(fig: HTMLElement) {
+		const svg = fig.querySelector("svg")!;
+		const mIn = fig.querySelector<HTMLSelectElement>(".i-m")!;
+		const mlIn = fig.querySelector<HTMLInputElement>(".i-ml")!;
+		const lIn = fig.querySelector<HTMLInputElement>(".i-l")!;
+		const table = fig.querySelector(".pt-w")!;
+		const x0 = Number(fig.dataset.x0) || 0.6;
+		const d = sineData(10, Number(fig.dataset.seed) || 7);
+
+		function draw() {
+			const M = Number(mIn.value);
+			const lam = mlIn.checked ? 0 : Math.exp(Number(lIn.value));
+			lIn.disabled = mlIn.checked;
+			const f = fitPoly(d.x, d.t, M, lam);
+			const sd = Math.sqrt(Math.max(f.s2, 1e-6));
+			const y = (x: number) => poly(f.w, x);
+			svg.replaceChildren();
+			const A = axes(svg, { x: 40, y: 8, w: 585, h: 225 }, [-0.02, 1.02], [-1.6, 1.6], { xLabel: "x", yLabel: "t" });
+			// Band y ± σ: upper edge left to right, lower edge right to left.
+			const clampY = (v: number) => Math.max(A.box.y, Math.min(A.box.y + A.box.h, A.sy(v)));
+			const xs = Array.from({ length: 301 }, (_, i) => i / 300);
+			const band = `${xs.map((x, i) => `${i ? "L" : "M"}${A.sx(x).toFixed(1)},${clampY(y(x) + sd).toFixed(1)}`).join("")}${xs
+				.reverse()
+				.map((x) => `L${A.sx(x).toFixed(1)},${clampY(y(x) - sd).toFixed(1)}`)
+				.join("")}Z`;
+			el("path", { d: band, class: "smp-p-area" }, svg);
+			el("path", { d: curve(A, (x) => Math.sin(2 * Math.PI * x), 300, 0, 1), class: "smp-q-dash" }, svg);
+			el("path", { d: curve(A, y, 400, 0, 1), class: "smp-p" }, svg);
+			// Sideways density at x0, scaled to a fixed width.
+			const mu0 = y(x0);
+			const peak = gauss(mu0, mu0, f.s2 || 1e-6);
+			const wpx = 70;
+			let dd = "";
+			for (let i = 0; i <= 120; i++) {
+				const t = mu0 - 3.5 * sd + (7 * sd * i) / 120;
+				const px = A.sx(x0) + (gauss(t, mu0, f.s2 || 1e-6) / peak) * wpx;
+				const py = Math.max(A.box.y, Math.min(A.box.y + A.box.h, A.sy(t)));
+				dd += `${i ? "L" : "M"}${px.toFixed(1)},${py.toFixed(1)}`;
+			}
+			if (sd > 0.002) {
+				el("line", { x1: A.sx(x0), x2: A.sx(x0), y1: A.box.y, y2: A.box.y + A.box.h, class: "smp-muted-line" }, svg);
+				el("path", { d: dd, class: "smp-model" }, svg);
+				el("text", { x: A.sx(x0) + 4, y: A.box.y + A.box.h - 4, class: "smp-note" }, svg, "x0");
+			}
+			d.x.forEach((xi, i) => el("circle", { cx: A.sx(xi), cy: A.sy(d.t[i]), r: 4, class: "smp-dot" }, svg));
+
+			let rms = 0;
+			for (let i = 0; i <= 100; i++) rms += (y(i / 100) - Math.sin((2 * Math.PI * i) / 100)) ** 2;
+			rms = Math.sqrt(rms / 101);
+			fig.querySelector(".v-l")!.textContent = mlIn.checked ? "−∞" : fmt(Number(lIn.value), 1);
+			fig.querySelector(".m-e")!.textContent = f.sse < 1e-6 ? "≈ 0" : fmt(f.sse, 4);
+			fig.querySelector(".m-s2")!.textContent = f.s2 < 1e-6 ? "≈ 0" : fmt(f.s2, 4);
+			fig.querySelector(".m-w")!.textContent = f.norm2 > 1e4 ? f.norm2.toExponential(2) : fmt(f.norm2, 3);
+			fig.querySelector(".m-rms")!.textContent = fmt(rms, 3);
+			const fw = (v: number) => (Math.abs(v) >= 1e4 ? v.toExponential(2) : fmt(v, 2));
+			table.innerHTML =
+				`<tr><th>coefficient</th>${f.w.map((_, j) => `<th>w${j}</th>`).join("")}</tr>` +
+				`<tr><td>value</td>${f.w.map((v) => `<td>${fw(v)}</td>`).join("")}</tr>`;
+		}
+		for (const i of [mIn, mlIn, lIn]) i.addEventListener("input", draw);
+		draw();
+	}
+
+	document.querySelectorAll<HTMLElement>(".pt-map-reg").forEach(attach);
+</script>
