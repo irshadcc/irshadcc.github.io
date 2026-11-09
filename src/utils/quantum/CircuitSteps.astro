@@ -1,0 +1,236 @@
+---
+// Step-through quantum circuit on a small state vector. Top: the circuit, with the current
+// step highlighted and later steps faded (click a column to jump to it). Middle: one bar per
+// basis state, either its probability |a|² with a phase dial under it (view="prob"), or its
+// amplitude as a signed bar with the mean amplitude dashed (view="amp", the picture for
+// Grover's "inversion about the mean"). Bottom: each qubit's P(1) and Bloch vector; a vector
+// shorter than 1 means the qubit is entangled with the others. Up to 4 qubits every basis state
+// is drawn; above that only states that are ever non-zero (at most 16).
+// Big-endian labels: qubit 0 is the leftmost bit. Simulation in quantum.ts, done at build time.
+// Usage in .mdx:
+//   import { bell } from "../../utils/quantum/quantumFigures";
+//   <CircuitSteps {...bell} title="Making a Bell pair" />
+//   <CircuitSteps n={1} steps={["H 0 | superpose", "H 0 | interfere"]} view="amp" />
+import Player from "../sampling/Player.astro";
+import "../sampling/sampling.css";
+import "./quantum.css";
+import { circuitSvg, layoutCircuit } from "./circuitLayout";
+import { blochOf, ket, prob, probOne, runCircuit } from "./quantum";
+
+interface Props {
+	n: number;
+	/** One string per step: gates separated by ";", then "| narration". See quantum.ts. */
+	steps: string[];
+	/** Initial basis state as a bit string, default all zeros. */
+	init?: string;
+	/** Wire labels, default q0, q1, ... */
+	labels?: string[];
+	view?: "prob" | "amp";
+	/** Step shown on load (0 = the input state). */
+	start?: number;
+	title?: string;
+	caption?: string;
+}
+
+const {
+	n,
+	steps,
+	init = "",
+	labels,
+	view = "prob",
+	start = 0,
+	title,
+	caption,
+} = Astro.props;
+if (n < 1 || n > 6) throw new Error("CircuitSteps: n must be 1..6");
+const run = runCircuit(n, steps, init);
+const names = labels ?? Array.from({ length: n }, (_, q) => `q${q}`);
+const nice = (s: string) => s.replace(/\|([^|<>]*)>/g, "|$1⟩");
+
+let shown = Array.from({ length: 2 ** n }, (_, i) => i);
+if (n > 4) {
+	shown = shown.filter((i) => run.states.some((s) => prob(s, i) > 1e-12));
+	if (shown.length > 16)
+		throw new Error("CircuitSteps: more than 16 non-zero basis states");
+}
+const r6 = (v: number) => Math.round(v * 1e6) / 1e6;
+const data = {
+	n,
+	kets: shown.map((i) => ket(i, n)),
+	amps: run.states.map((s) => shown.map((i) => [r6(s.re[i]), r6(s.im[i])])),
+	bloch: run.states.map((s) => names.map((_, q) => blochOf(s, n, q).map(r6))),
+	p1: run.states.map((s) => names.map((_, q) => r6(probOne(s, n, q)))),
+	notes: run.steps.map((s) => nice(s.note)),
+	names,
+};
+const L = layoutCircuit(
+	n,
+	run.steps,
+	Math.max(48, 14 + Math.max(...names.map((s) => s.length)) * 8 + 24),
+);
+const svg = circuitSvg(n, L, names, init.padEnd(n, "0"));
+---
+
+<figure class="smp-fig qc-fig qc-steps" data-q={JSON.stringify(data)} data-start={start} data-view={view}>
+	{title && <div class="smp-title">{title}</div>}
+	<svg class="qc-circuit" viewBox={`0 0 ${L.width} ${L.height}`} role="img" aria-label="Quantum circuit" set:html={svg} style={`max-width:${Math.round(L.width * 1.5)}px`}></svg>
+	<div class="smp-legend">
+		<span><i class="box qc-legend-pos"></i>{view === "amp" ? "positive amplitude" : "probability |a|²"}</span>
+		<span class="leg-neg"><i class="box qc-legend-neg"></i>negative amplitude</span>
+		<span class="leg-mean"><i class="qc-legend-mean"></i>mean amplitude</span>
+		<span>dial: phase of the amplitude (right = +, left = −)</span>
+	</div>
+	<svg class="smp-svg qc-amps" viewBox="0 0 640 202" role="img" aria-label="Amplitudes of the basis states"></svg>
+	<div class="smp-controls">
+		<Player />
+		<span class="qc-stepno"></span>
+		<label>show
+			<select class="i-view" aria-label="Bar view">
+				<option value="prob">probabilities</option>
+				<option value="amp">amplitudes</option>
+			</select>
+		</label>
+	</div>
+	<p class="smp-narration"></p>
+	<table class="smp-table qc-qubits">
+		<thead><tr><th>qubit</th><th>P(1)</th><th>Bloch x</th><th>y</th><th>z</th><th>length</th></tr></thead>
+		<tbody></tbody>
+	</table>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import { bindPlayer, el, fmt } from "../sampling/plot";
+	import { fmtComplex } from "./quantum";
+
+	interface Data {
+		n: number;
+		kets: string[];
+		amps: [number, number][][];
+		bloch: number[][][];
+		p1: number[][];
+		notes: string[];
+		names: string[];
+	}
+
+	function attach(fig: HTMLElement) {
+		const d: Data = JSON.parse(fig.dataset.q ?? "{}");
+		const K = d.notes.length;
+		const svg = fig.querySelector<SVGSVGElement>(".qc-amps")!;
+		const viewSel = fig.querySelector<HTMLSelectElement>(".i-view")!;
+		viewSel.value = fig.dataset.view ?? "prob";
+		const cols = [...fig.querySelectorAll<SVGGElement>(".qc-col")];
+		const body = fig.querySelector(".qc-qubits tbody")!;
+		let k = Math.min(Number(fig.dataset.start) || 0, K);
+
+		function drawBars() {
+			const amps = d.amps[k];
+			const ampView = viewSel.value === "amp";
+			svg.replaceChildren();
+			const m = amps.length;
+			const x0 = 30, x1 = 630;
+			const slot = (x1 - x0) / m;
+			const bw = Math.min(42, slot * 0.62);
+			const top = 14, bottom = ampView ? 146 : 140;
+			const base = ampView ? (top + bottom) / 2 : bottom;
+			const scale = ampView ? (bottom - top) / 2 : bottom - top;
+			const real = amps.every(([, im]) => Math.abs(im) < 1e-9);
+			el("line", { x1: x0 - 4, x2: x1, y1: base, y2: base, class: "qc-base" }, svg);
+			for (const t of ampView ? [1, -1] : [1]) {
+				el("line", { x1: x0 - 4, x2: x1, y1: base - t * scale, y2: base - t * scale, class: "smp-grid" }, svg);
+				el("text", { x: x0 - 8, y: base - t * scale + 3.5, class: "smp-tick", "text-anchor": "end" }, svg, String(t));
+			}
+			el("text", { x: x0 - 8, y: base + 3.5, class: "smp-tick", "text-anchor": "end" }, svg, "0");
+			amps.forEach(([re, im], i) => {
+				const cx = x0 + slot * (i + 0.5);
+				const mag = Math.hypot(re, im);
+				const p = mag * mag;
+				const neg = real && re < -1e-9;
+				const v = ampView ? (real ? re : mag) : p;
+				const h = Math.abs(v) * scale;
+				if (h > 0.2)
+					el("rect", { x: cx - bw / 2, y: v >= 0 ? base - h : base, width: bw, height: h, class: `qc-bar${neg ? " neg" : ""}${!real && ampView ? " cplx" : ""}`, rx: 1.5 }, svg);
+				// Under each bar: ket, value, phase dial (values never cross the mean line).
+				const small = m > 8 ? " small" : "";
+				const ky = bottom + 16;
+				el("text", { x: cx, y: ky, class: `qc-ket${small}`, "text-anchor": "middle" }, svg, `|${d.kets[i]}⟩`);
+				if (mag > 1e-9)
+					el("text", { x: cx, y: ky + 14, class: `qc-val${small}`, "text-anchor": "middle" }, svg, ampView ? fmtComplex(re, im) : fmt(p, 3));
+				const dy = ky + 30;
+				el("circle", { cx, cy: dy, r: 7, class: "qc-dial" }, svg);
+				if (mag > 1e-9) {
+					const a = Math.atan2(im, re);
+					const hx = cx + 7 * Math.cos(a);
+					const hy = dy - 7 * Math.sin(a);
+					el("line", { x1: cx, y1: dy, x2: hx, y2: hy, class: "qc-hand" }, svg);
+					el("circle", { cx: hx, cy: hy, r: 1.8, class: "qc-dot-tip" }, svg);
+				}
+			});
+			if (ampView && real) {
+				const mean = amps.reduce((s, [re]) => s + re, 0) / m;
+				el("line", { x1: x0, x2: x1, y1: base - mean * scale, y2: base - mean * scale, class: "qc-mean" }, svg);
+			}
+			fig.querySelector<HTMLElement>(".leg-mean")!.hidden = !(ampView && real);
+			fig.querySelector<HTMLElement>(".leg-neg")!.hidden = !(ampView && real && amps.some(([re]) => re < -1e-9));
+		}
+
+		function draw() {
+			cols.forEach((c) => {
+				const s = Number(c.dataset.step);
+				c.classList.toggle("now", s === k);
+				c.classList.toggle("future", s > k);
+			});
+			drawBars();
+			fig.querySelector(".qc-stepno")!.textContent = `step ${k} / ${K}`;
+			fig.querySelector(".smp-narration")!.textContent = k
+				? d.notes[k - 1]
+				: `Input state |${d.kets.length === 2 ** d.n ? "0".repeat(d.n) : d.kets[0]}⟩. Step forward to apply the first gates, or click a column of the circuit.`;
+			body.replaceChildren();
+			d.names.forEach((name, q) => {
+				const b = d.bloch[k][q];
+				const len = Math.hypot(b[0], b[1], b[2]);
+				const tr = document.createElement("tr");
+				for (const t of [name, fmt(d.p1[k][q], 3), fmt(b[0], 3), fmt(b[1], 3), fmt(b[2], 3), fmt(len, 3)]) {
+					const td = document.createElement("td");
+					td.textContent = t;
+					tr.append(td);
+				}
+				body.append(tr);
+			});
+		}
+
+		bindPlayer(
+			fig,
+			(dir) => {
+				const m = k + dir;
+				if (m < 0 || m > K) return false;
+				k = m;
+				draw();
+				return k < K;
+			},
+			() => {
+				k = 0;
+				draw();
+			},
+			1100,
+		);
+		const jump = (c: SVGGElement) => {
+			const s = Number(c.dataset.step);
+			k = k === s ? s - 1 : s;
+			draw();
+		};
+		cols.forEach((c) => {
+			c.addEventListener("click", () => jump(c));
+			c.addEventListener("keydown", (e) => {
+				if (e.key === "Enter" || e.key === " ") {
+					e.preventDefault();
+					jump(c);
+				}
+			});
+		});
+		viewSel.addEventListener("change", drawBars);
+		draw();
+	}
+
+	document.querySelectorAll<HTMLElement>(".qc-steps").forEach(attach);
+</script>

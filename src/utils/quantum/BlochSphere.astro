@@ -1,0 +1,211 @@
+---
+// One qubit on the Bloch sphere. The state cos(θ/2)|0> + e^{iφ} sin(θ/2)|1> is the point
+// (sin θ cos φ, sin θ sin φ, cos θ). Set θ and φ with sliders, or press a gate button: the
+// vector turns about the gate's rotation axis (drawn dashed) by the gate's angle, leaving a
+// trail, and the gate is added to the history. Readouts give α, β, P(0), P(1) and (x, y, z).
+// Rotations in quantum.ts (GATE_ROTATIONS); the animation respects prefers-reduced-motion.
+// Usage in .mdx:
+//   <BlochSphere />
+//   <BlochSphere theta={Math.PI / 2} phi={0} gates={["Z", "S", "T", "H"]} title="Phase gates turn about z" />
+import "../sampling/sampling.css";
+import "./quantum.css";
+
+interface Props {
+	theta?: number;
+	phi?: number;
+	/** Gate buttons, from X Y Z H S SDG T TDG "RX(π/4)" "RY(π/4)". */
+	gates?: string[];
+	title?: string;
+	caption?: string;
+}
+
+const {
+	theta = 0,
+	phi = 0,
+	gates = ["X", "Y", "Z", "H", "S", "T", "RX(π/4)", "RY(π/4)"],
+	title,
+	caption,
+} = Astro.props;
+const text = (g: string) => g.replace("SDG", "S†").replace("TDG", "T†");
+---
+
+<figure class="smp-fig qc-fig qc-bloch" data-theta={theta} data-phi={phi}>
+	{title && <div class="smp-title">{title}</div>}
+	<div class="smp-row">
+		<svg class="smp-svg" viewBox="0 0 320 300" role="img" aria-label="Bloch sphere with the qubit's state vector"></svg>
+		<div>
+			<div class="qc-gates">
+				{gates.map((g) => <button type="button" data-gate={g}>{text(g)}</button>)}
+				<button type="button" data-reset>reset |0⟩</button>
+			</div>
+			<div class="qc-history">gates applied: none</div>
+			<div class="smp-controls">
+				<label class="smp-slider">θ = <strong class="v-t"></strong>
+					<input type="range" class="i-t" min="0" max="180" step="1" aria-label="Polar angle theta in degrees" />
+				</label>
+				<label class="smp-slider">φ = <strong class="v-p"></strong>
+					<input type="range" class="i-p" min="0" max="359" step="1" aria-label="Azimuthal angle phi in degrees" />
+				</label>
+			</div>
+			<div class="smp-metrics">
+				<div><span>α (amplitude of |0⟩)</span><strong class="m-a"></strong></div>
+				<div><span>β (amplitude of |1⟩)</span><strong class="m-b"></strong></div>
+				<div><span>P(0) / P(1)</span><strong class="m-p"></strong></div>
+				<div><span>Bloch (x, y, z)</span><strong class="m-v"></strong></div>
+			</div>
+		</div>
+	</div>
+	<p class="smp-narration"></p>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import { el, fmt } from "../sampling/plot";
+	import { anglesFromBloch, blochFromAngles, fmtComplex, GATE_ROTATIONS, rotate } from "./quantum";
+
+	const AZ = (28 * Math.PI) / 180;
+	const EL = (18 * Math.PI) / 180;
+	const CX = 160, CY = 150, RAD = 112;
+	/** Screen position and depth (>0 = towards the viewer) of a point on or in the sphere. */
+	function proj(v: number[]) {
+		const sx = -v[0] * Math.sin(AZ) + v[1] * Math.cos(AZ);
+		const d = v[0] * Math.cos(AZ) + v[1] * Math.sin(AZ);
+		const sy = v[2] * Math.cos(EL) - d * Math.sin(EL);
+		return { x: CX + RAD * sx, y: CY - RAD * sy, depth: d * Math.cos(EL) + v[2] * Math.sin(EL) };
+	}
+	const deg = (r: number) => `${Math.round((r * 180) / Math.PI)}°`;
+
+	function attach(fig: HTMLElement) {
+		const svg = fig.querySelector<SVGSVGElement>("svg")!;
+		const tIn = fig.querySelector<HTMLInputElement>(".i-t")!;
+		const pIn = fig.querySelector<HTMLInputElement>(".i-p")!;
+		const hist = fig.querySelector(".qc-history")!;
+		const buttons = [...fig.querySelectorAll<HTMLButtonElement>(".qc-gates button")];
+		const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+		let v = blochFromAngles(Number(fig.dataset.theta) || 0, Number(fig.dataset.phi) || 0);
+		let trail: number[][] = [];
+		let axis: number[] | null = null;
+		let applied: string[] = [];
+		let note = "Press a gate to rotate the state, or drag the sliders.";
+
+		function ring(f: (t: number) => number[]) {
+			let front = "", back = "";
+			let pf = false, pb = false;
+			for (let i = 0; i <= 120; i++) {
+				const p = proj(f((i / 120) * 2 * Math.PI));
+				const isFront = p.depth >= -1e-9;
+				front += isFront ? `${pf ? "L" : "M"}${p.x.toFixed(1)},${p.y.toFixed(1)}` : "";
+				back += !isFront ? `${pb ? "L" : "M"}${p.x.toFixed(1)},${p.y.toFixed(1)}` : "";
+				pf = isFront;
+				pb = !isFront;
+			}
+			el("path", { d: back, class: "qc-ring back" }, svg);
+			el("path", { d: front, class: "qc-ring" }, svg);
+		}
+
+		function draw() {
+			svg.replaceChildren();
+			el("circle", { cx: CX, cy: CY, r: RAD, class: "qc-sphere" }, svg);
+			ring((t) => [Math.cos(t), Math.sin(t), 0]);
+			ring((t) => [Math.sin(t), 0, Math.cos(t)]);
+			ring((t) => [0, Math.sin(t), Math.cos(t)]);
+			const axes: [number[], string][] = [
+				[[0, 0, 1], "|0⟩"], [[0, 0, -1], "|1⟩"], [[1, 0, 0], "|+⟩ x"], [[-1, 0, 0], "|−⟩"],
+				[[0, 1, 0], "|+i⟩ y"], [[0, -1, 0], "|−i⟩"],
+			];
+			const o = proj([0, 0, 0]);
+			for (const [a, lab] of axes) {
+				const p = proj(a);
+				el("line", { x1: o.x, y1: o.y, x2: p.x, y2: p.y, class: "qc-axis" }, svg);
+				const q = proj(a.map((c) => c * 1.16));
+				el("text", { x: q.x, y: q.y + 4, class: "qc-axlabel", "text-anchor": "middle" }, svg, lab);
+			}
+			if (axis) {
+				const a = proj(axis.map((c) => c * 1.05));
+				const b = proj(axis.map((c) => -c * 1.05));
+				el("line", { x1: b.x, y1: b.y, x2: a.x, y2: a.y, class: "qc-rotaxis" }, svg);
+			}
+			if (trail.length > 1)
+				el("path", { d: trail.map((t, i) => `${i ? "L" : "M"}${proj(t).x.toFixed(1)},${proj(t).y.toFixed(1)}`).join(""), class: "qc-trail" }, svg);
+			// Drop line to the equator plane shows θ and φ.
+			const foot = proj([v[0], v[1], 0]);
+			const tip = proj(v);
+			el("line", { x1: tip.x, y1: tip.y, x2: foot.x, y2: foot.y, class: "qc-proj" }, svg);
+			el("line", { x1: o.x, y1: o.y, x2: foot.x, y2: foot.y, class: "qc-proj" }, svg);
+			el("line", { x1: o.x, y1: o.y, x2: tip.x, y2: tip.y, class: "qc-vec" }, svg);
+			el("circle", { cx: tip.x, cy: tip.y, r: tip.depth >= 0 ? 5.5 : 4, class: "qc-tip" }, svg);
+
+			const { theta, phi } = anglesFromBloch(v);
+			tIn.value = String(Math.round((theta * 180) / Math.PI));
+			pIn.value = String(Math.round((phi * 180) / Math.PI) % 360);
+			fig.querySelector(".v-t")!.textContent = deg(theta);
+			fig.querySelector(".v-p")!.textContent = deg(phi);
+			const a = Math.cos(theta / 2), s = Math.sin(theta / 2);
+			fig.querySelector(".m-a")!.textContent = fmt(a, 3);
+			fig.querySelector(".m-b")!.textContent = fmtComplex(s * Math.cos(phi), s * Math.sin(phi));
+			fig.querySelector(".m-p")!.textContent = `${fmt(a * a, 3)} / ${fmt(s * s, 3)}`;
+			fig.querySelector(".m-v")!.textContent = `(${fmt(v[0], 2)}, ${fmt(v[1], 2)}, ${fmt(v[2], 2)})`;
+			hist.textContent = `gates applied: ${applied.length ? applied.join(" → ") : "none"}`;
+			fig.querySelector(".smp-narration")!.textContent = note;
+		}
+
+		function apply(g: string) {
+			const r = GATE_ROTATIONS[g];
+			if (!r) return;
+			const start = v;
+			axis = r.axis;
+			applied = [...applied, g.replace("SDG", "S†").replace("TDG", "T†")].slice(-12);
+			const axisName = g === "H" ? "the (x + z)/√2 axis" : `the ${["x", "y", "z"][r.axis.findIndex((c) => Math.abs(c) > 0.9)]} axis`;
+			note = `${g.replace("SDG", "S†").replace("TDG", "T†")} turns the sphere by ${deg(Math.abs(r.angle))} about ${axisName}.`;
+			const finish = () => {
+				v = rotate(start, r.axis, r.angle);
+				buttons.forEach((b) => (b.disabled = false));
+				draw();
+			};
+			if (reduce) {
+				trail = [start, rotate(start, r.axis, r.angle)];
+				return finish();
+			}
+			buttons.forEach((b) => (b.disabled = true));
+			trail = [start];
+			const t0 = performance.now();
+			const dur = 450 + 350 * (Math.abs(r.angle) / Math.PI);
+			const frame = (now: number) => {
+				const f = Math.min(1, (now - t0) / dur);
+				const e = f < 0.5 ? 2 * f * f : 1 - (-2 * f + 2) ** 2 / 2;
+				v = rotate(start, r.axis, r.angle * e);
+				trail.push(v);
+				draw();
+				if (f < 1) requestAnimationFrame(frame);
+				else finish();
+			};
+			requestAnimationFrame(frame);
+		}
+
+		buttons.forEach((b) =>
+			b.addEventListener("click", () => {
+				if (b.dataset.reset !== undefined) {
+					v = [0, 0, 1];
+					trail = [];
+					axis = null;
+					applied = [];
+					note = "Back to |0⟩, the north pole.";
+					return draw();
+				}
+				apply(b.dataset.gate ?? "");
+			}),
+		);
+		const onSlide = () => {
+			v = blochFromAngles((Number(tIn.value) * Math.PI) / 180, (Number(pIn.value) * Math.PI) / 180);
+			trail = [];
+			axis = null;
+			note = "θ sets the balance between |0⟩ and |1⟩ (P(1) = sin²(θ/2)); φ is the relative phase, invisible to a measurement in the 0/1 basis.";
+			draw();
+		};
+		tIn.addEventListener("input", onSlide);
+		pIn.addEventListener("input", onSlide);
+		draw();
+	}
+
+	document.querySelectorAll<HTMLElement>(".qc-bloch").forEach(attach);
+</script>

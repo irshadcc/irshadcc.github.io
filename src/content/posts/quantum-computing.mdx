@@ -1,0 +1,1277 @@
+---
+title: "Quantum Computing from the Ground Up"
+description: "Qubits, measurement, gates and entanglement; the Deutsch, Bernstein–Vazirani, Grover, Shor and teleportation circuits stepped through on real state vectors; variational algorithms; programming with Qiskit and Cirq, compilation and noise; quantum error correction; and the hardware and error-correction milestones of 2024–2026."
+date: 2026-11-09
+tags: [Quantum computing, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import LineChart from "../../utils/charts/LineChart.astro";
+import BasisMeasurement from "../../utils/quantum/BasisMeasurement.astro";
+import BlochSphere from "../../utils/quantum/BlochSphere.astro";
+import CircuitSteps from "../../utils/quantum/CircuitSteps.astro";
+import ProbabilityBars from "../../utils/quantum/ProbabilityBars.astro";
+import {
+	bell,
+	bernsteinVazirani,
+	bitFlipCode,
+	chshS,
+	deutsch,
+	grover,
+	grover64,
+	interference,
+	rabiP1,
+	ramseyX,
+	shor15,
+	shor21,
+	T1_US,
+	T2_US,
+	teleportation,
+	vqeEnergy,
+} from "../../utils/quantum/quantumFigures";
+
+## Background
+
+A classical computer stores a bit as 0 or 1 and changes bits with logic gates. Every program,
+from a spreadsheet to a large language model, is built from those two ingredients. A
+**quantum computer** replaces the bit with a **qubit**, whose state is a list of two *complex
+numbers* rather than one binary value. A register of $n$ qubits is described by $2^n$ complex
+numbers at once, and quantum gates change all of them in a single step.
+
+That sounds like free parallelism, and it is not. When you read a qubit you get a single 0 or
+1, chosen at random, and the $2^n$ numbers are gone. A quantum algorithm has to arrange,
+before the measurement, for the wrong answers to cancel and the right one to reinforce, the
+way waves interfere. This works for a few problems with the right structure. Shor's algorithm
+factors integers exponentially faster than the best known classical method, which is why
+governments are replacing the public-key cryptography the internet runs on. Grover's
+algorithm searches $N$ items in about $\sqrt{N}$ steps instead of $N$. For most other
+problems there is no known speed-up.
+
+This post builds the subject from nothing but linear algebra, including the physics that
+justifies the rules. It covers, in order:
+
+1. **Qubits**: state vectors, measurement and the Bloch sphere.
+2. **Gates**: single-qubit rotations, interference, many-qubit states and entanglement.
+3. **The quantum mechanics underneath**: Dirac notation and the linear algebra behind it, the
+   four postulates, observables and the uncertainty principle, the Schrödinger equation and Rabi
+   oscillation, density matrices and decoherence, and Bell's theorem.
+4. **Algorithms**: phase kickback (Deutsch and Bernstein–Vazirani), Grover's search, the
+   quantum Fourier transform and Shor's algorithm, teleportation and variational algorithms.
+   Every circuit is a figure you can step through, with the real amplitudes after each gate.
+5. **Programming**: Qiskit and Cirq code, compiling to the gates a chip supports, shots and
+   noise.
+6. **Error correction**: the three-qubit code and the surface code.
+7. **Recent advancements**: what hardware and error correction achieved in 2024–2026.
+
+Every number in the post comes from a script. The figures run on a small state-vector
+simulator written for this post, and each step of every circuit was checked against Qiskit's
+`Statevector`.<Sidenote>The simulator is `src/utils/quantum/quantum.ts`. A scratch script ran
+every circuit in the post, plus a 13-step circuit using every other gate it supports (QFT,
+controlled phase, SWAP, Toffoli, CCZ, CY, CH), through Qiskit 2.6.2 and compared the states.
+All matched to $10^{-9}$, up to global phase.</Sidenote>
+
+## Qubits
+
+### State vectors and measurement
+
+A classical bit is in state 0 or state 1. A **qubit** is in a **superposition**
+
+$$
+|\psi\rangle = \alpha\,|0\rangle + \beta\,|1\rangle, \qquad \alpha, \beta \in \mathbb{C}, \qquad |\alpha|^2 + |\beta|^2 = 1.
+$$
+
+The notation $|\cdot\rangle$, read "ket", is **Dirac notation** for a column vector:
+$|0\rangle = (1, 0)^T$ and $|1\rangle = (0, 1)^T$, so $|\psi\rangle = (\alpha, \beta)^T$. The
+complex numbers $\alpha$ and $\beta$ are **amplitudes**. They are not probabilities. They can
+be negative or complex, and that is what lets them cancel.
+
+**Measurement** is the only way to get information out. Measuring $|\psi\rangle$ gives 0
+with probability $|\alpha|^2$ and 1 with probability $|\beta|^2$. This is the **Born rule**.
+Afterwards the qubit *is* $|0\rangle$ or $|1\rangle$, whichever was seen. The amplitudes are
+destroyed, so you cannot measure twice to learn more.
+
+Worked example: take
+
+$$
+|\psi\rangle = \tfrac{1}{2}|0\rangle + \tfrac{\sqrt{3}}{2}\,i\,|1\rangle .
+$$
+
+The squared magnitudes are $|1/2|^2 = 0.25$ and $|\sqrt{3}i/2|^2 = 3/4 = 0.75$, which sum
+to 1, as they must. Measured 1000 times (preparing a fresh copy each time), the state gives
+about 250 zeros and 750 ones. The factor $i$ changes nothing here. It is a **relative phase**,
+invisible to this measurement but visible to the gates that come next.
+
+Two vectors that differ only by an overall factor $e^{i\gamma}$, a **global phase**, give
+identical probabilities for every possible experiment. They are the same physical state.
+
+### The Bloch sphere
+
+A global phase can be removed, and $|\alpha|^2 + |\beta|^2 = 1$ ties the two magnitudes
+together. That leaves two real numbers, and every qubit state can be written as
+
+$$
+|\psi\rangle = \cos\tfrac{\theta}{2}\,|0\rangle + e^{i\varphi}\sin\tfrac{\theta}{2}\,|1\rangle, \qquad 0 \le \theta \le \pi,\; 0 \le \varphi < 2\pi .
+$$
+
+Read $\theta$ and $\varphi$ as the latitude and longitude of a point on a unit sphere, the
+**Bloch sphere**, at $(\sin\theta\cos\varphi,\ \sin\theta\sin\varphi,\ \cos\theta)$. The north
+pole is $|0\rangle$ and the south pole is $|1\rangle$. The equator holds the equal
+superpositions: $|+\rangle = (|0\rangle + |1\rangle)/\sqrt2$ on the $+x$ axis,
+$|-\rangle = (|0\rangle - |1\rangle)/\sqrt2$ on $-x$, and $|{\pm i}\rangle$ on $\pm y$.
+The height of the point gives the measurement statistics: $P(1) = \sin^2(\theta/2) = (1 - z)/2$.
+
+The example state above has $\cos(\theta/2) = 1/2$, so $\theta = 120°$, and its phase $i$ means
+$\varphi = 90°$. The figure opens on that state. The orange vector points below the equator,
+towards $|1\rangle$, and the readout gives $P(0)/P(1) = 0.25 / 0.75$. Move the $\varphi$
+slider: the vector circles the $z$ axis and the probabilities do not change.
+
+<BlochSphere theta={(2 * Math.PI) / 3} phi={Math.PI / 2} title="A qubit as a point on the Bloch sphere" caption="Opens on ½|0⟩ + (√3/2)i|1⟩ (θ = 120°, φ = 90°). Sliders set θ and φ; each gate button rotates the vector about the dashed axis." />
+
+## Gates
+
+### Single-qubit gates
+
+A quantum gate on one qubit is a $2 \times 2$ **unitary** matrix $U$, one with
+$U^\dagger U = I$ ($U^\dagger$ is the conjugate transpose). Unitary matrices preserve length,
+so probabilities still sum to 1, and every gate can be undone by $U^\dagger$. On the Bloch
+sphere every single-qubit gate is a **rotation**. The table lists the common ones.
+
+| Gate | Matrix | Bloch-sphere rotation | Effect |
+| --- | --- | --- | --- |
+| $X$ (NOT) | $\begin{pmatrix}0&1\\1&0\end{pmatrix}$ | 180° about $x$ | $\lvert 0\rangle \leftrightarrow \lvert 1\rangle$ |
+| $Z$ | $\begin{pmatrix}1&0\\0&-1\end{pmatrix}$ | 180° about $z$ | sign of $\lvert 1\rangle$ flips |
+| $Y$ | $\begin{pmatrix}0&-i\\i&0\end{pmatrix}$ | 180° about $y$ | bit and phase flip |
+| $H$ (Hadamard) | $\tfrac{1}{\sqrt2}\begin{pmatrix}1&1\\1&-1\end{pmatrix}$ | 180° about $(x+z)/\sqrt2$ | $\lvert 0\rangle \to \lvert +\rangle$, $\lvert 1\rangle \to \lvert -\rangle$ |
+| $S$ | $\begin{pmatrix}1&0\\0&i\end{pmatrix}$ | 90° about $z$ | $\lvert +\rangle \to \lvert {+i}\rangle$ |
+| $T$ | $\begin{pmatrix}1&0\\0&e^{i\pi/4}\end{pmatrix}$ | 45° about $z$ | quarter of a $Z$ |
+| $R_x(\theta)$ | $\begin{pmatrix}\cos\frac\theta2&-i\sin\frac\theta2\\-i\sin\frac\theta2&\cos\frac\theta2\end{pmatrix}$ | $\theta$ about $x$ | continuous rotation |
+| $R_y(\theta)$ | $\begin{pmatrix}\cos\frac\theta2&-\sin\frac\theta2\\\sin\frac\theta2&\cos\frac\theta2\end{pmatrix}$ | $\theta$ about $y$ | real amplitudes only |
+
+Worked example: apply $H$ to a general state.
+
+$$
+H\begin{pmatrix}\alpha\\\beta\end{pmatrix} = \frac{1}{\sqrt2}\begin{pmatrix}\alpha+\beta\\\alpha-\beta\end{pmatrix}.
+$$
+
+For $|0\rangle$ ($\alpha = 1, \beta = 0$) this gives $(1, 1)/\sqrt2 = |+\rangle$, the fair
+coin. For the example state, $\alpha = 0.5$ and $\beta = 0.866i$, the new amplitude of
+$|0\rangle$ is $(0.5 + 0.866i)/\sqrt2 = 0.354 + 0.612i$. Check: $0.354^2 + 0.612^2 = 0.5$.
+The $H$ gate turned a 25/75 state into a 50/50 one.
+
+The phase gates $Z$, $S$ and $T$ do not change $P(1)$ at all. They only turn the state about
+the vertical axis. Start the figure below at $|+\rangle$ and press $S$: the vector moves a
+quarter turn to $|{+i}\rangle$. Press $H$ and it moves off the equator. A phase gate followed
+by $H$ is how phases become measurable probabilities.
+
+<BlochSphere theta={Math.PI / 2} phi={0} gates={["H", "X", "Z", "S", "SDG", "T", "TDG"]} title="Phase gates turn the state about z" caption="Starts at |+⟩. S and T change only the phase φ; H converts a phase difference into a difference in P(1)." />
+
+With $H$, $S$, $T$ and one two-qubit gate (below) you can approximate any unitary on any
+number of qubits to any accuracy. Such a finite set is called a **universal gate
+set**.<Sidenote>The Solovay–Kitaev theorem says the approximation needs only
+$O(\log^c(1/\epsilon))$ gates for accuracy $\epsilon$. Without $T$, the set $\{H, S,
+\text{CNOT}\}$ generates the **Clifford group**, and by the Gottesman–Knill theorem those
+circuits can be simulated efficiently on a classical computer. The $T$ gate is the
+ingredient that makes quantum computation hard to simulate, and, in error-corrected machines,
+the expensive one.</Sidenote>
+
+### Interference
+
+Apply $H$ twice. The first $H$ gives a 50/50 superposition, and measuring it would give a
+random bit. The second $H$ brings the qubit back to $|0\rangle$ with certainty:
+
+$$
+H|+\rangle = \tfrac{1}{\sqrt2}\left(H|0\rangle + H|1\rangle\right) = \tfrac{1}{2}\left(|0\rangle + |1\rangle\right) + \tfrac{1}{2}\left(|0\rangle - |1\rangle\right) = |0\rangle .
+$$
+
+The two contributions to $|1\rangle$, $+\tfrac12$ and $-\tfrac12$, cancel. This is
+**destructive interference**. The two contributions to $|0\rangle$ add, which is
+**constructive interference**. A coin flipped twice is still random. A qubit
+"flipped" twice is not, because amplitudes add before they are squared.
+
+Step through the figure below. Each bar is a basis state's probability. The dial under it is
+the amplitude's phase: pointing right means positive, left means negative. Switch the view to
+"amplitudes" to see the signs directly.
+
+<CircuitSteps {...interference} title="Two Hadamards interfere back to |0⟩" />
+
+Every quantum speed-up comes from this effect. An algorithm sets up many paths to each
+answer and arranges the phases so that wrong answers cancel and the right one reinforces.
+
+### Many qubits
+
+Two qubits have four basis states, $|00\rangle, |01\rangle, |10\rangle, |11\rangle$, and the
+state is a vector of four amplitudes. In general $n$ qubits need $2^n$ amplitudes. Independent
+qubits combine by the **tensor product** $\otimes$: if $q_0$ is $|+\rangle$ and $q_1$ is
+$|0\rangle$,
+
+$$
+|+\rangle \otimes |0\rangle = \tfrac{1}{\sqrt2}\left(|0\rangle + |1\rangle\right) \otimes |0\rangle = \tfrac{1}{\sqrt2}\left(|00\rangle + |10\rangle\right) = \left(\tfrac{1}{\sqrt2},\, 0,\, \tfrac{1}{\sqrt2},\, 0\right)^T .
+$$
+
+This post labels basis states **big-endian**: in $|q_0 q_1\rangle$ the leftmost bit is qubit
+0, as in most textbooks.<Sidenote>Qiskit uses the opposite, **little-endian** convention: its
+bit strings print qubit 0 *rightmost*. The Qiskit outputs later in this post are in Qiskit's
+convention. Mixing the two up is the most common bug in quantum programs.</Sidenote> A gate on
+one qubit of many acts as $U \otimes I$: it mixes pairs of amplitudes that differ only in that
+qubit's bit.
+
+The exponential size of the state is what makes quantum computers hard to simulate. Storing
+$2^n$ amplitudes as double-precision complex numbers (16 bytes each) takes:
+
+| Qubits $n$ | Amplitudes $2^n$ | Memory |
+| ---: | ---: | ---: |
+| 10 | 1,024 | 16 KiB |
+| 20 | $1.0 \times 10^6$ | 16 MiB |
+| 30 | $1.1 \times 10^9$ | 16 GiB |
+| 40 | $1.1 \times 10^{12}$ | 16 TiB |
+| 50 | $1.1 \times 10^{15}$ | 16 PiB |
+
+A laptop simulates 30 qubits, and a supercomputer stalls in the mid-40s with this method.
+Cleverer simulators (tensor networks, stabiliser methods) go further for circuits with
+little entanglement or few $T$ gates, which is why "quantum advantage" claims are argued over
+for years.
+
+### Entanglement
+
+The **CNOT** (controlled-NOT, CX) gate flips its *target* qubit when its *control* qubit is 1.
+In big-endian order (control $q_0$, target $q_1$) it swaps the amplitudes of $|10\rangle$ and
+$|11\rangle$:
+
+$$
+\text{CNOT} = \begin{pmatrix}1&0&0&0\\0&1&0&0\\0&0&0&1\\0&0&1&0\end{pmatrix}.
+$$
+
+Apply $H$ to $q_0$, then CNOT. The state goes
+$|00\rangle \to (|00\rangle + |10\rangle)/\sqrt2 \to (|00\rangle + |11\rangle)/\sqrt2$.
+That last state is a **Bell state**, and it is **entangled**: it cannot be written as (state
+of $q_0$) $\otimes$ (state of $q_1$).<Sidenote>Proof: suppose $(a|0\rangle + b|1\rangle)
+\otimes (c|0\rangle + d|1\rangle) = (|00\rangle + |11\rangle)/\sqrt2$. Matching coefficients
+gives $ac = bd = 1/\sqrt2$ and $ad = bc = 0$. From $ad = 0$, either $a = 0$, contradicting
+$ac \ne 0$, or $d = 0$, contradicting $bd \ne 0$.</Sidenote>
+
+Step through it below and watch two things. The bars end on $|00\rangle$ and $|11\rangle$,
+0.5 each: the qubits always agree when measured. The table under the bars gives each qubit's
+Bloch vector. Before the CNOT, $q_0$'s vector has length 1, a definite point on its sphere.
+After it, both vectors have length 0. Each qubit on its own is a perfectly random coin with no
+state of its own. All the information is in the correlation.
+
+<CircuitSteps {...bell} title="H then CNOT makes a Bell pair" />
+
+Entanglement is not a way to send messages. Alice measuring her half of a Bell pair sees a
+random bit whatever Bob does, so no information travels faster than light. What it does give
+is correlations no classical system can reproduce (Bell's theorem), and, inside a computer, a
+state whose description really needs all $2^n$ amplitudes.
+
+Three limits follow from the rules so far. They shape every algorithm:
+
+- **You cannot read the amplitudes.** A measurement returns one basis state. Estimating a
+  probability $p$ from $S$ repeated runs has error about $\sqrt{p(1-p)/S}$.
+- **Measurement disturbs.** It collapses the superposition, so it comes at the end, or is used
+  deliberately (as in error correction).
+- **You cannot copy an unknown state.** No unitary maps $|\psi\rangle|0\rangle \to
+  |\psi\rangle|\psi\rangle$ for every $|\psi\rangle$. This is the **no-cloning
+  theorem**.<Sidenote>Suppose $U$ copies both $|\psi\rangle$ and $|\phi\rangle$. Unitaries
+  preserve inner products, so $\langle\psi|\phi\rangle = \langle\psi|\phi\rangle^2$, which
+  forces $\langle\psi|\phi\rangle$ to be 0 or 1: only orthogonal or identical states can be
+  copied. CNOT copies $|0\rangle$ and $|1\rangle$, but turns $|+\rangle|0\rangle$ into a Bell
+  state, not $|+\rangle|+\rangle$.</Sidenote> Error correction therefore cannot just keep
+  backup copies.
+
+## The quantum mechanics underneath
+
+The rules so far (amplitudes, unitary gates, the Born rule, tensor products) were stated for
+qubits. They are special cases of **quantum mechanics**, the theory of how microscopic systems
+behave. A qubit is any physical system with two distinguishable states: the spin of an electron
+(up or down along a magnet's field), the polarisation of a photon (horizontal or vertical), two
+energy levels of an ion, or two charge states of a superconducting circuit. This section gives
+the general theory, with the qubit as the running example. It covers the mathematics, the four
+postulates, observables and uncertainty, time evolution, density matrices and decoherence, and
+Bell's theorem.
+
+Why such strange rules? Experiments forced them. In the **Stern–Gerlach experiment** (1922)
+silver atoms pass through an uneven magnetic field and land in exactly two spots, "spin up" or
+"spin down". Nothing in between appears. Filter out only the "up" atoms, measure them along a
+sideways axis, and they split 50/50 into "left" and "right". Measure those along the vertical
+axis again and they split 50/50 into up and down, even though they were all "up" before. No
+classical picture of a little spinning arrow with definite components explains this. The
+mathematics below does, exactly.
+
+### Linear algebra in Dirac notation
+
+The state of a quantum system is a vector in a complex vector space with an inner product, a
+**Hilbert space**.<Sidenote>For finitely many levels, as in quantum computing, the Hilbert
+space is just $\mathbb{C}^d$. Position and momentum of a particle need infinite-dimensional
+spaces of functions, where the sums below become integrals. The finite case is enough for
+everything in this post.</Sidenote> For one qubit it is $\mathbb{C}^2$. Dirac's notation names
+each object by its shape:
+
+| Notation | Name | Meaning | Qubit example |
+| --- | --- | --- | --- |
+| $\lvert\psi\rangle$ | ket | column vector | $\lvert +\rangle = \tfrac{1}{\sqrt2}(1, 1)^T$ |
+| $\langle\psi\rvert$ | bra | conjugate transpose of the ket, a row vector | $\langle +\rvert = \tfrac{1}{\sqrt2}(1, 1)$ |
+| $\langle\phi\vert\psi\rangle$ | inner product | $\sum_i \phi_i^{*}\psi_i$, a complex number | $\langle 0\vert +\rangle = 1/\sqrt2$ |
+| $\lvert\psi\rangle\langle\phi\rvert$ | outer product | a matrix | $\lvert 0\rangle\langle 0\rvert = \begin{pmatrix}1&0\\0&0\end{pmatrix}$ |
+| $A^\dagger$ | adjoint | conjugate transpose of $A$ | $Y^\dagger = Y$ |
+
+The inner product measures overlap. $\langle\psi\vert\psi\rangle = \lVert\psi\rVert^2 = 1$ for
+a state, and $\langle\phi\vert\psi\rangle = 0$ means the two states are **orthogonal**: perfectly
+distinguishable by some measurement. An **orthonormal basis** $\{\lvert i\rangle\}$ satisfies
+$\langle i\vert j\rangle = \delta_{ij}$ and the **completeness relation**
+
+$$
+\sum_i \lvert i\rangle\langle i\rvert = I ,
+$$
+
+which lets you expand any state: $\lvert\psi\rangle = \sum_i \lvert i\rangle\langle i\vert\psi\rangle$.
+The coefficient $\langle i\vert\psi\rangle$ is the amplitude of $\lvert\psi\rangle$ on basis
+state $i$. The matrix $P_i = \lvert i\rangle\langle i\rvert$ is a **projector**: it keeps the
+component along $\lvert i\rangle$ and discards the rest, and $P_i^2 = P_i$.
+
+Two kinds of matrix (in physics, **operators**) do all the work:
+
+- A **Hermitian** operator satisfies $A = A^\dagger$. Its eigenvalues are real and its
+  eigenvectors can be chosen orthonormal. The **spectral theorem** writes it as
+  $A = \sum_k a_k P_k$: eigenvalues times projectors onto the eigenvectors. Hermitian operators
+  are the measurable quantities.
+- A **unitary** operator satisfies $U^\dagger U = I$. It preserves inner products, so it maps
+  states to states and orthogonal states to orthogonal states. Unitary operators are the
+  evolutions. Every unitary can be written $U = e^{-iH}$ with $H$ Hermitian.
+
+The four **Pauli matrices** $I, X, Y, Z$ are both Hermitian and unitary, and they form a basis
+for all $2 \times 2$ matrices. Their algebra is worth knowing by heart:
+
+$$
+X^2 = Y^2 = Z^2 = I, \qquad XY = iZ,\quad YZ = iX,\quad ZX = iY, \qquad XZ = -ZX .
+$$
+
+Each has eigenvalues $\pm 1$. The eigenvectors of $Z$ are $\lvert 0\rangle, \lvert 1\rangle$,
+those of $X$ are $\lvert\pm\rangle$, and those of $Y$ are $\lvert{\pm i}\rangle$. These are the
+six points where the Bloch-sphere axes meet the surface.
+
+### The postulates
+
+Quantum mechanics rests on four postulates. Everything else in this post follows from them.
+
+| Postulate | Statement | Qubit form |
+| --- | --- | --- |
+| 1. State | An isolated system is described by a unit vector $\lvert\psi\rangle$ in a Hilbert space, up to a global phase | $\alpha\lvert 0\rangle + \beta\lvert 1\rangle$ |
+| 2. Evolution | Between measurements the state evolves by a unitary, $\lvert\psi'\rangle = U\lvert\psi\rangle$, generated by the Schrödinger equation | gates |
+| 3. Measurement | Measuring observable $A = \sum_k a_k P_k$ gives $a_k$ with probability $\langle\psi\rvert P_k\lvert\psi\rangle$, and leaves the state $P_k\lvert\psi\rangle / \lVert P_k\lvert\psi\rangle\rVert$ | Born rule, collapse |
+| 4. Composition | The state space of a joint system is the tensor product of the parts' spaces | $2^n$ amplitudes |
+
+Postulate 3 is the strange one. Measurement is not a unitary process: it is random, and it
+changes the state abruptly ("collapse"). For the standard basis, $P_0 = \lvert 0\rangle\langle 0\rvert$
+and $\langle\psi\rvert P_0\lvert\psi\rangle = \lvert\alpha\rvert^2$, the Born rule from the start
+of this post. If the outcome is 0, the state becomes $\alpha\lvert 0\rangle/\lvert\alpha\rvert$,
+which is $\lvert 0\rangle$ up to a phase. Measuring again gives 0 with certainty.<Sidenote>How
+and why collapse happens is the **measurement problem**, and the interpretations of quantum
+mechanics disagree about it. In Copenhagen-style views collapse is a real update. In the
+many-worlds view all outcomes occur and the observer becomes entangled with the system. In
+QBism the state is an agent's belief. All of them predict the same statistics, so none of
+this changes how a quantum computer is programmed.</Sidenote>
+
+### Observables, expectation values and uncertainty
+
+You are not limited to measuring in the $\{\lvert 0\rangle, \lvert 1\rangle\}$ basis. Any
+Hermitian operator is an observable, and measuring it means measuring in its eigenbasis. On a
+qubit, the observable for the Bloch-sphere direction $\vec n$ is
+
+$$
+A = \vec n \cdot \vec\sigma = n_x X + n_y Y + n_z Z ,
+$$
+
+with eigenvalues $\pm 1$ and eigenvectors at the two ends of $\vec n$ on the sphere. Physically,
+this is turning the Stern–Gerlach magnet to point along $\vec n$. On hardware it is a rotation
+followed by an ordinary $Z$ measurement. For example, measuring $X$ is $H$ then measure, because
+$H$ swaps the $x$ and $z$ axes.
+
+The average of many measurements is the **expectation value**:
+
+$$
+\langle A\rangle = \sum_k a_k\, p_k = \langle\psi\rvert A\lvert\psi\rangle , \qquad (\Delta A)^2 = \langle A^2\rangle - \langle A\rangle^2 .
+$$
+
+For the Pauli observables the expectation values are exactly the Bloch-vector components:
+$\langle X\rangle = x$, $\langle Y\rangle = y$, $\langle Z\rangle = z$. Worked example with the
+state $\lvert\psi\rangle = \tfrac12\lvert 0\rangle + \tfrac{\sqrt3}{2}i\lvert 1\rangle$ from
+earlier:
+
+- $\langle Z\rangle = \lvert\alpha\rvert^2 - \lvert\beta\rvert^2 = 0.25 - 0.75 = -0.5$.
+- $\langle X\rangle = 2\,\mathrm{Re}(\alpha^{*}\beta) = 2\,\mathrm{Re}(0.433i) = 0$.
+- $\langle Y\rangle = 2\,\mathrm{Im}(\alpha^{*}\beta) = 2 \times 0.433 = 0.866$.
+
+That is the Bloch vector $(0, 0.866, -0.5)$ the first figure showed. Measuring $X$ on this state
+gives $\pm 1$ with probability $\lvert\langle +\vert\psi\rangle\rvert^2 = \lvert(0.5 +
+0.866i)/\sqrt2\rvert^2 = 0.5$ each.
+
+In general, for a state at angle $\theta$ and a measurement axis at angle $\alpha$ in the same
+plane through the sphere, $P(+1) = \cos^2\!\big((\theta-\alpha)/2\big)$,
+$\langle A\rangle = \cos(\theta - \alpha)$ and $\Delta A = \lvert\sin(\theta - \alpha)\rvert$.
+The figure draws this. The expectation value is where the state projects onto the axis (the
+hollow dot). Take single shots to see collapse: the outcome is always an end of the axis, never
+the projection. Take 100 shots to see the frequencies approach the prediction. The figure opens
+on the example state in the $y$–$z$ plane, measured along $Z$.
+
+<BasisMeasurement theta={(2 * Math.PI) / 3} alpha={0} plane="yz" seed={7} title="Measuring a qubit along a chosen axis" caption="State ½|0⟩ + (√3/2)i|1⟩ at θ = 120° in the y–z plane. Along Z (α = 0°): P(+1) = 0.25, ⟨Z⟩ = −0.5. Press 'Y axis': ⟨Y⟩ = 0.866. Shots are seeded, so the counts repeat on every load." />
+
+Two observables generally cannot both have definite values. The **commutator** $[A, B] = AB - BA$
+measures how much they clash, and the **Robertson uncertainty relation** bounds the product of
+their spreads:
+
+$$
+\Delta A\,\Delta B \;\ge\; \tfrac12\,\big\lvert\langle[A, B]\rangle\big\rvert .
+$$
+
+For $X$ and $Z$, $[X, Z] = -2iY$, so $\Delta X\,\Delta Z \ge \lvert\langle Y\rangle\rvert$. Check
+it on the example state: $\Delta Z = \sqrt{1 - 0.25} = 0.866$ and $\Delta X = \sqrt{1 - 0} = 1$, so
+the product is $0.866$. The bound is $\lvert\langle Y\rangle\rvert = 0.866$, met with equality.
+The state is as sharp in $X$ and $Z$ together as quantum mechanics allows. This is the same
+mathematics as Heisenberg's $\Delta x\,\Delta p \ge \hbar/2$, which follows from $[x, p] = i\hbar$.
+Uncertainty is not clumsy measurement. A state with a definite $Z$ value, $\lvert 0\rangle$,
+simply has no definite $X$ value, which is the Stern–Gerlach result.
+
+### Time evolution: the Schrödinger equation
+
+Postulate 2 says how states change. The generator is the **Hamiltonian** $\mathcal H$, the
+Hermitian operator for the system's energy, through the **Schrödinger equation**
+
+$$
+i\hbar\,\frac{d}{dt}\lvert\psi(t)\rangle = \mathcal H\,\lvert\psi(t)\rangle
+\quad\Longrightarrow\quad
+\lvert\psi(t)\rangle = e^{-i\mathcal H t/\hbar}\,\lvert\psi(0)\rangle .
+$$
+
+Here $\hbar$ is the reduced Planck constant. Because $\mathcal H$ is Hermitian, $e^{-i\mathcal H t/\hbar}$
+is unitary, which is why every gate is unitary. Write $\mathcal H = \sum_k E_k P_k$: each energy
+eigenstate just gains a phase $e^{-iE_k t/\hbar}$. Dynamics is the *relative* phases between
+energy levels turning at rates set by their energy differences.
+
+Take a qubit whose two levels differ in energy by $\hbar\omega$: $\mathcal H = \tfrac{\hbar\omega}{2}Z$.
+Then $e^{-i\mathcal H t/\hbar} = e^{-i\omega t Z/2} = R_z(\omega t)$. The Bloch vector
+**precesses** about the $z$ axis at angular frequency $\omega$, a few gigahertz for
+superconducting qubits. Control electronics track this rotating frame in software, which is why
+$R_z$ gates are free.
+
+To flip the qubit, shine on it a microwave (or laser) field at the qubit's frequency. In the
+frame rotating with the qubit the Hamiltonian becomes $\mathcal H = \tfrac{\hbar}{2}(\Delta Z +
+\Omega X)$. Here $\Omega$ is the **Rabi frequency**, set by the drive strength, and $\Delta$ is
+the **detuning**, the drive frequency's error. On resonance ($\Delta = 0$) the evolution is
+$R_x(\Omega t)$, and $P(1)$ oscillates as $\sin^2(\Omega t/2)$: **Rabi oscillation**. A pulse of
+length $t = \pi/\Omega$, a **π pulse**, is an $X$ gate (up to a global phase $-i$). With detuning:
+
+$$
+P_1(t) = \frac{\Omega^2}{\Omega^2 + \Delta^2}\,\sin^2\!\left(\frac{\sqrt{\Omega^2 + \Delta^2}\;t}{2}\right).
+$$
+
+Worked example: with $\Omega/2\pi = 25$ MHz, the π pulse takes $\pi/\Omega = 20$ ns, a typical
+single-qubit gate time on superconducting hardware. Mistune the drive by $\Delta = \Omega$ and
+after the same 20 ns $P(1)$ is only $0.317$, not 1, and it never exceeds $\Omega^2/(\Omega^2 +
+\Delta^2) = 0.5$. Calibrating frequencies and pulse lengths is a large part of running a quantum
+computer.<Sidenote>Checked by integrating the Schrödinger equation numerically
+(`scipy.linalg.expm` of $-i\mathcal H t$): $P_1 = 0.5000$ at 10 ns and $1.0000$ at 20 ns on
+resonance, $0.4014$ and $0.3166$ at $\Delta = \Omega$, $0.1932$ and $0.0263$ at
+$\Delta = 2\Omega$, all equal to the formula.</Sidenote>
+
+<LineChart
+	x={() => Array.from({ length: 161 }, (_, i) => i * 0.5)}
+	series={[
+		{ name: "Δ = 0 (on resonance)", fn: (t) => rabiP1(t * 1e-9, 0) },
+		{ name: "Δ = Ω", fn: (t) => rabiP1(t * 1e-9, 1) },
+		{ name: "Δ = 2Ω", fn: (t) => rabiP1(t * 1e-9, 2) },
+	]}
+	xLabel="pulse length t (ns), Ω/2π = 25 MHz"
+	yLabel="P(1)"
+	title="Rabi oscillation: a drive pulse rotates |0⟩ towards |1⟩"
+	height={280}
+/>
+
+### Density matrices, entanglement and decoherence
+
+A state vector describes a system we know everything about. Often we don't: a qubit that is
+$\lvert 0\rangle$ or $\lvert 1\rangle$ with probability ½ each, because of a coin flip in the lab
+or because we ignore part of a larger system. The **density matrix** handles both cases:
+
+$$
+\rho = \sum_i p_i\,\lvert\psi_i\rangle\langle\psi_i\rvert, \qquad \operatorname{Tr}\rho = 1,\quad \rho = \rho^\dagger,\quad \rho \succeq 0 .
+$$
+
+The rules carry over: evolution is $\rho \to U\rho U^\dagger$, measurement gives outcome $k$
+with probability $\operatorname{Tr}(P_k\rho)$, and $\langle A\rangle = \operatorname{Tr}(A\rho)$.
+A state is **pure** (a single vector) when $\operatorname{Tr}\rho^2 = 1$, and **mixed**
+otherwise. For a qubit every density matrix has the form
+
+$$
+\rho = \tfrac12\left(I + xX + yY + zZ\right), \qquad x^2 + y^2 + z^2 \le 1, \qquad \operatorname{Tr}\rho^2 = \tfrac12\left(1 + \lvert\vec r\rvert^2\right).
+$$
+
+Pure states are on the Bloch sphere's surface. Mixed states fill the inside, the **Bloch
+ball**. The centre, $\rho = I/2$, is the **maximally mixed state**: a fair coin and nothing
+else.
+
+A **mixture** is not a **superposition**. Compare the 50/50 mixture of $\lvert 0\rangle$ and
+$\lvert 1\rangle$ with $\lvert +\rangle$:
+
+| State | $\rho$ | $\langle Z\rangle$ | $\langle X\rangle$ | $\operatorname{Tr}\rho^2$ |
+| --- | --- | ---: | ---: | ---: |
+| 50/50 mixture | $\tfrac12\begin{pmatrix}1&0\\0&1\end{pmatrix}$ | 0 | 0 | 0.5 |
+| $\lvert +\rangle$ | $\tfrac12\begin{pmatrix}1&1\\1&1\end{pmatrix}$ | 0 | 1 | 1 |
+
+Measured in the $Z$ basis they look the same, 50/50. Measured along $X$, $\lvert +\rangle$ gives
+$+1$ every time while the mixture still gives 50/50. The off-diagonal entries of $\rho$, the
+**coherences**, carry the phase information that interference needs.
+
+Density matrices explain the "length 0" Bloch vectors in the Bell-pair figure. The state of one
+part of a joint system is its **reduced density matrix**, found by the **partial trace**, which
+sums over the other part's basis:
+$\rho_A = \operatorname{Tr}_B\,\lvert\Phi\rangle\langle\Phi\rvert$. For the Bell state
+$\lvert\Phi\rangle = (\lvert 00\rangle + \lvert 11\rangle)/\sqrt2$:
+
+$$
+\rho_A = \tfrac12\left(\lvert 0\rangle\langle 0\rvert + \lvert 1\rangle\langle 1\rvert\right) = \tfrac{I}{2} .
+$$
+
+The pair as a whole is pure, yet each half is maximally mixed. That is what entanglement is: the
+whole is more definite than its parts. The Bloch-vector lengths in the `CircuitSteps` tables are
+$\lvert\vec r\rvert$ of each qubit's reduced density matrix, and 1 means "not entangled with the
+rest".
+
+**Decoherence** is the same effect, unwanted. A qubit interacts slightly with its surroundings
+(stray photons, defects in the chip, magnetic noise), becomes entangled with them, and its
+reduced state drifts into the Bloch ball. Two time constants describe the drift:
+
+$$
+\rho(t) = \begin{pmatrix} 1 - \rho_{11}e^{-t/T_1} & \rho_{01}e^{-t/T_2} \\ \rho_{10}e^{-t/T_2} & \rho_{11}e^{-t/T_1} \end{pmatrix} .
+$$
+
+- **$T_1$, relaxation**: the excited state leaks energy, and $P(1)$ decays as $e^{-t/T_1}$.
+- **$T_2$, dephasing**: the coherences decay as $e^{-t/T_2}$, so interference fades even when no
+  energy is lost. Always $T_2 \le 2T_1$.
+
+With illustrative values $T_1 = 100\ \mu$s and $T_2 = 80\ \mu$s (not a specific device), a
+circuit of 1,000 gates of 50 ns each lasts 50 µs, and the coherence has fallen to
+$e^{-50/80} = 0.54$ of its starting value. This is the physical reason behind the gate-count
+limits in the noise table below, and why error correction is necessary.
+
+<LineChart
+	x={() => Array.from({ length: 201 }, (_, i) => i)}
+	series={[
+		{ name: "P(1) = e^(−t/T1), T1 = 100 µs", fn: (t) => Math.exp(-t / T1_US) },
+		{ name: "coherence e^(−t/T2), T2 = 80 µs", fn: (t) => Math.exp(-t / T2_US) },
+		{ name: "Ramsey fringe (25 kHz detuning)", fn: ramseyX },
+	]}
+	xLabel="time t (µs)"
+	yLabel="value"
+	title="Relaxation and dephasing"
+	height={280}
+/>
+
+The third curve is how $T_2$ is measured, by a **Ramsey experiment**: put the qubit on the equator
+with a $\pi/2$ pulse, wait $t$, apply another $\pi/2$ pulse and measure. A small detuning makes
+the result oscillate, and the oscillation's envelope decays with $T_2$.
+
+### Bell's theorem
+
+Could the randomness be ignorance? Perhaps each particle carries hidden instructions ("if
+measured along $a$, answer $+1$") and quantum mechanics is just incomplete. John Bell showed in
+1964 that no such **local hidden-variable** theory can reproduce quantum predictions. The
+cleanest form is the **CHSH inequality** (Clauser, Horne, Shimony and Holt, 1969).
+
+Alice measures her particle along direction $a$ or $a'$, and Bob measures his along $b$ or $b'$.
+Each result is $\pm 1$. Let $E(a, b)$ be the average product of their results, and define
+
+$$
+S = E(a, b) - E(a, b') + E(a', b) + E(a', b') .
+$$
+
+If each particle carries predetermined answers $A, A', B, B' \in \{\pm 1\}$, then
+$A(B - B') + A'(B + B')$ is always $\pm 2$, because one bracket is 0 and the other is $\pm 2$.
+Averages of numbers that are always $\pm 2$ obey $\lvert S\rvert \le 2$.<Sidenote>"Local" means
+Alice's result cannot depend on Bob's choice of setting. Experiments enforce this by choosing the
+settings randomly after the particles have separated, so that no light-speed signal could carry
+the choice across. A brute-force check over all 16 assignments of $A, A', B, B'$ gives a maximum
+of exactly 2.</Sidenote>
+
+Quantum mechanics predicts more. For the **singlet** state $(\lvert 01\rangle - \lvert 10\rangle)/\sqrt2$
+and measurement directions in one plane, $E(a, b) = -\cos(a - b)$. Choose the angles
+$a = 0$, $b = \theta$, $a' = 2\theta$, $b' = 3\theta$:
+
+$$
+\lvert S\rvert = \lvert 3\cos\theta - \cos 3\theta\rvert ,
+$$
+
+which reaches $2\sqrt2 \approx 2.828$ at $\theta = 45°$. Check: at $\theta = 45°$,
+$3(0.707) - (-0.707) = 2.828$. No quantum strategy can exceed $2\sqrt2$ (**Tsirelson's bound**).
+The chart marks the classical limit 2.
+
+<LineChart
+	x={() => Array.from({ length: 181 }, (_, i) => i)}
+	series={[
+		{ name: "quantum |S|, singlet", fn: chshS },
+		{ name: "local hidden variables: |S| ≤ 2", fn: () => 2 },
+		{ name: "Tsirelson bound 2√2", fn: () => 2 * Math.SQRT2 },
+	]}
+	xLabel="angle step θ (degrees)"
+	yLabel="|S|"
+	title="CHSH: quantum correlations beat every local hidden-variable model"
+	height={260}
+/>
+
+Experiments agree with quantum mechanics. In 2015 the first **loophole-free** Bell tests (Delft,
+Vienna and NIST) closed the detection and locality loopholes together. The 2022 Nobel Prize in
+Physics went to Aspect, Clauser and Zeilinger for this line of experiments. The conclusion is
+that the correlations of entangled particles are not pre-written instructions. Yet, as noted in
+the entanglement section, they cannot carry messages either. Bell violations are now used
+directly: as a test that a quantum device is really quantum, and in device-independent
+cryptography and certified random-number generation.
+
+With the theory in hand, everything in the rest of this post is applied linear algebra:
+prepare a state, apply unitaries generated by Hamiltonians the hardware can produce, and
+measure, while fighting decoherence.
+
+## Algorithms
+
+Quantum algorithms are usually stated in the **oracle model**. A function $f$ is given as a
+black-box circuit $U_f$, and we count how many times the algorithm calls it. The
+**oracle** acts as $U_f|x\rangle|y\rangle = |x\rangle|y \oplus f(x)\rangle$, where $\oplus$
+is XOR. That form keeps it reversible, and therefore unitary.
+
+### Phase kickback
+
+If the output qubit $y$ starts in $|-\rangle = (|0\rangle - |1\rangle)/\sqrt2$, XOR-ing it
+with $f(x)$ either leaves it alone ($f(x) = 0$) or swaps $|0\rangle$ and $|1\rangle$, which
+multiplies $|-\rangle$ by $-1$. So
+
+$$
+U_f\,|x\rangle|-\rangle = (-1)^{f(x)}\,|x\rangle|-\rangle .
+$$
+
+The answer $f(x)$ ends up as a *sign* on $|x\rangle$, and $y$ is unchanged. This is **phase
+kickback**, and most oracle algorithms use it. With $|x\rangle$ in superposition, one oracle
+call puts a sign on every input at once. A final layer of $H$ gates turns the pattern of signs
+into a basis state that can be measured.
+
+#### Deutsch's algorithm
+
+Given $f:\{0,1\}\to\{0,1\}$, decide whether it is *constant* ($f(0) = f(1)$) or *balanced*
+($f(0) \ne f(1)$). Classically you must evaluate $f$ twice. Deutsch's circuit does it in one
+call. The figure uses the balanced $f(x) = x$, whose oracle is one CNOT. In step 3 the oracle
+flips the signs of $|10\rangle$ and $|11\rangle$, the states with $x = 1$. After the final $H$,
+$x$ reads 1 with certainty: "balanced".
+
+<CircuitSteps {...deutsch} view="amp" title="Deutsch's algorithm, balanced f(x) = x" />
+
+#### Bernstein–Vazirani
+
+Now $f(x) = s \cdot x \bmod 2$ for a hidden $n$-bit string $s$. Classically each query reveals
+one bit of $s$, so you need $n$ queries. The quantum circuit uses one. After phase kickback the
+input register holds
+
+$$
+\frac{1}{\sqrt{2^n}}\sum_x (-1)^{s\cdot x}|x\rangle = H^{\otimes n}|s\rangle ,
+$$
+
+so one more layer of $H$ gives $|s\rangle$ exactly. In the figure, $s = 101$. The oracle is
+one CNOT from each input qubit where $s$ has a 1 (qubits 0 and 2) onto the ancilla. Step 4
+leaves $|101\rangle$ on the inputs, with the ancilla still in $|-\rangle$ (the $|1010\rangle$
+and $|1011\rangle$ bars).
+
+<CircuitSteps {...bernsteinVazirani} title="Bernstein–Vazirani with hidden s = 101" />
+
+These problems are artificial, but they show the pattern every later algorithm follows:
+superpose, encode the answer in phases, interfere.
+
+### Grover's search
+
+**Grover's algorithm** finds a marked item among $N = 2^n$ when the only access is an oracle
+that recognises it. Classically you check items one by one: $(N+1)/2$ queries on average. Grover
+needs about $\frac{\pi}{4}\sqrt{N}$.
+
+It repeats two reflections, starting from the uniform superposition $|s\rangle$:
+
+1. The **oracle** flips the sign of the marked state $|w\rangle$: $|w\rangle \to -|w\rangle$.
+2. The **diffusion** operator $2|s\rangle\langle s| - I$ reflects every amplitude about the mean
+   amplitude: $a_x \to 2\bar a - a_x$.
+
+Worked example with $n = 3$ ($N = 8$) and marked state $|101\rangle$:
+
+| After | Marked amplitude | Each other amplitude | Mean | $P(101)$ |
+| --- | ---: | ---: | ---: | ---: |
+| $H^{\otimes 3}$ | 0.354 | 0.354 | 0.354 | 0.125 |
+| oracle | −0.354 | 0.354 | 0.265 | 0.125 |
+| diffusion | 0.884 | 0.177 | 0.265 | 0.781 |
+| oracle | −0.884 | 0.177 | 0.044 | 0.781 |
+| diffusion | 0.972 | −0.088 | 0.044 | 0.945 |
+
+Check one entry: after the first oracle the mean is $(7 \times 0.354 - 0.354)/8 = 0.265$, so
+the marked amplitude becomes $2(0.265) - (-0.354) = 0.884$, and $0.884^2 = 0.781$. The figure
+opens in amplitude view. The dashed line is the mean, and each diffusion step reflects every
+bar about it.
+
+<CircuitSteps {...grover} view="amp" title="Grover's search on 3 qubits, marked |101⟩" />
+
+Geometrically, each oracle + diffusion pair rotates the state by an angle $2\theta$ towards
+$|w\rangle$, where $\sin\theta = 1/\sqrt N$. After $k$ rounds
+$P(\text{success}) = \sin^2\!\big((2k+1)\theta\big)$. The rotation does not stop at the target.
+Too many rounds overshoot, as the bars for $N = 64$ show: the best is $k = 6$ with
+$P = 0.997$, and by $k = 12$ it has fallen to 0.0001, almost back to zero.
+
+<ProbabilityBars values={grover64} highlight={[6]} labels={grover64.map((_, k) => String(k))} xLabel="Grover iterations k (N = 64)" yLabel="P(success)" yMax={1.05} digits={3} title="Grover's success probability oscillates" />
+
+| Qubits $n$ | $N$ | Grover iterations $\lfloor \pi/4\theta \rfloor$ | $P(\text{success})$ | Classical average $(N+1)/2$ |
+| ---: | ---: | ---: | ---: | ---: |
+| 3 | 8 | 2 | 0.9453 | 4.5 |
+| 6 | 64 | 6 | 0.9966 | 32.5 |
+| 10 | 1,024 | 25 | 0.9995 | 512.5 |
+| 20 | 1,048,576 | 804 | 1.0000 | 524,288.5 |
+
+The speed-up is quadratic, and provably the best possible for unstructured
+search.<Sidenote>Bennett, Bernstein, Brassard and Vazirani (1997) proved that any quantum
+algorithm needs $\Omega(\sqrt N)$ oracle queries. For practical problems the quadratic gain is
+easily eaten by the slowdown of error-corrected gates. Grover is not expected to beat a GPU
+on real search workloads soon.</Sidenote>
+
+### The quantum Fourier transform and Shor's algorithm
+
+#### The quantum Fourier transform
+
+The **quantum Fourier transform** (QFT) is the discrete Fourier transform applied to the
+amplitudes. On $t$ qubits, with $Q = 2^t$,
+
+$$
+\text{QFT}\,|x\rangle = \frac{1}{\sqrt Q}\sum_{y=0}^{Q-1} e^{2\pi i\, xy/Q}\,|y\rangle .
+$$
+
+A classical FFT of $Q$ numbers costs $O(Q\log Q) = O(t\,2^t)$ operations. The QFT circuit uses
+$O(t^2)$ gates: a Hadamard and a ladder of controlled phase rotations on each qubit. The catch
+is the same as always: you cannot read the $Q$ output amplitudes, only sample from them. The
+QFT is useful when the input is **periodic**, because then the output is concentrated on a few
+peaks, and sampling a peak tells you the period.
+
+#### Shor's algorithm
+
+**Shor's algorithm** factors an integer $N$. The quantum part finds the **period** $r$ of
+$f(x) = a^x \bmod N$ for a random $a$. The rest is classical number theory: if $r$ is even and
+$a^{r/2} \not\equiv -1 \pmod N$, then $\gcd(a^{r/2} \pm 1, N)$ are factors of $N$.
+
+Take $N = 15$ and $a = 7$. The powers $7^x \bmod 15$ for $x = 0, 1, 2, \dots$ are
+$1, 7, 4, 13, 1, 7, 4, 13, \dots$, so $r = 4$. The circuit works like this:
+
+1. Put a $t$-qubit **counting register** in uniform superposition over $x = 0, \dots, Q-1$.
+2. Compute $a^x \bmod N$ into a second **work register**, giving $\frac{1}{\sqrt Q}\sum_x
+   |x\rangle|a^x \bmod N\rangle$. This modular exponentiation is by far the most expensive part.
+3. Apply the QFT to the counting register and measure it.
+
+Measuring the work register, even notionally, would leave the counting register holding the
+$x$ values with the same $f(x)$, spaced exactly $r$ apart. A periodic comb transforms into
+another comb with peaks at multiples of $Q/r$. With $t = 4$ ($Q = 16$) and $r = 4$, the peaks
+are at $y = 0, 4, 8, 12$, each with probability exactly $1/4$:
+
+<ProbabilityBars values={shor15} highlight={[0, 4, 8, 12]} xLabel="counting register y" yLabel="P(y)" yMax={0.3} title="Shor's algorithm, N = 15, a = 7, 4 counting qubits" caption="Exact distribution of the counting register after the QFT (computed by summing over the work register). Every y has the form 16k/4." />
+
+Reading $y = 4$ gives $y/Q = 4/16 = 1/4$, so $r = 4$. Then $7^2 = 49 \equiv 4 \pmod{15}$, and
+$\gcd(4 - 1, 15) = 3$, $\gcd(4 + 1, 15) = 5$. Indeed $15 = 3 \times 5$.
+
+When $r$ does not divide $Q$, the peaks are blurred. Take $N = 21$, $a = 2$: the powers
+are $1, 2, 4, 8, 16, 11, 1, \dots$, so $r = 6$, and $Q/r = 64/6 \approx 10.67$ with $t = 6$.
+The peaks sit at the integers nearest $0, 10.67, 21.33, 32, 42.67, 53.33$:
+
+<ProbabilityBars values={shor21} highlight={[11, 21, 43, 53]} alt={[0, 32]} xLabel="counting register y" yLabel="P(y)" legend={["near a multiple of 64/6", "exact multiple of 64/6"]} title="Shor's algorithm, N = 21, a = 2, 6 counting qubits" caption="y = 0 and 32 (exact multiples) have probability 0.167 each; 11, 21, 43, 53 have 0.114 each; together the six peaks hold 0.791 of the probability." />
+
+To recover $r$ from a blurred peak, expand $y/Q$ as a **continued fraction** and take the
+convergents with denominators below $N$. Suppose we measure $y = 11$:
+
+$$
+\frac{11}{64} = \cfrac{1}{5 + \cfrac{1}{1 + \cfrac{1}{4 + \cfrac{1}{2}}}}, \qquad \text{convergents } \frac{1}{5},\ \frac{1}{6},\ \frac{5}{29},\ \frac{11}{64}.
+$$
+
+The candidates below 21 are 5 and 6. $2^5 \bmod 21 = 11$, so not 5. $2^6 \bmod 21 = 1$, so
+$r = 6$. Then $2^3 = 8$, and $\gcd(7, 21) = 7$, $\gcd(9, 21) = 3$: $21 = 3 \times 7$. Some
+outcomes give only a divisor of $r$. $y = 43$ gives $2/3$, so a candidate of 3, and $y = 32$
+gives $1/2$. Trying small multiples, or combining two runs with a least common multiple,
+fixes that.<Sidenote>The textbook choice is $Q \ge N^2$ ($t = 9$ for $N = 21$), which
+guarantees that the right fraction appears among the convergents. The 6-qubit version is
+scaled down so its 64 bars are readable. With $t = 9$ the four blurred peaks are at 85, 171,
+341 and 427, still with probability 0.114 each.</Sidenote>
+
+Shor's algorithm uses a polynomial number of gates in the number of bits of $N$, roughly
+$O(n^3)$ for straightforward arithmetic. The best known classical algorithm, the general
+number field sieve, takes time $\exp\!\big(O(n^{1/3}(\log n)^{2/3})\big)$. RSA and
+elliptic-curve cryptography depend on that gap, which is why the resource estimates in the
+last section matter.
+
+### Teleportation
+
+**Quantum teleportation** moves an unknown qubit state from Alice to Bob using one shared Bell
+pair and two classical bits. No-cloning is respected: Alice's copy is destroyed in the process.
+
+1. Alice and Bob share a Bell pair: qubits $a$ (Alice) and $b$ (Bob).
+2. Alice applies CNOT from $\psi$ to $a$, then $H$ to $\psi$, and measures both. She gets one of
+   four bit pairs, each with probability $1/4$.
+3. She sends the two bits to Bob. Depending on them, Bob applies $X$, $Z$, both or neither, and
+   his qubit becomes $|\psi\rangle$.
+
+The figure uses $|\psi\rangle = 0.866|0\rangle + 0.5i|1\rangle$, whose Bloch vector is
+$(0, 0.866, 0.5)$. Bob's corrections are drawn as controlled gates. By the **principle of
+deferred measurement**, a classically controlled gate after a measurement is equivalent to a
+quantum-controlled gate followed by the measurement. Watch the qubit table. Bob's vector has
+length 0 until his corrections begin. After the $X$ correction it is $(0, 0, 0.5)$, and after
+the $Z$ correction it is exactly $(0, 0.866, 0.5)$. Alice's two qubits
+end at $(1, 0, 0)$, with no trace of $\psi$.
+
+<CircuitSteps {...teleportation} title="Teleporting 0.866|0⟩ + 0.5i|1⟩" />
+
+Teleportation is not a curiosity. Quantum networks and modular computers use it to move
+qubits between chips, and error-corrected machines use a cousin, **gate teleportation**, to
+apply $T$ gates.
+
+### Variational algorithms
+
+Today's machines have hundreds of qubits but too much noise for long circuits like Shor's.
+**Variational quantum algorithms** use short circuits with tunable parameters inside a
+classical optimisation loop. In the **variational quantum eigensolver** (VQE), the goal is the
+lowest energy (smallest eigenvalue) of a Hamiltonian $\mathcal H$, for example a molecule's:
+
+1. Prepare $|\psi(\boldsymbol\theta)\rangle$ with a parameterised circuit, the **ansatz**.
+2. Estimate $E(\boldsymbol\theta) = \langle\psi(\boldsymbol\theta)|\mathcal H|\psi(\boldsymbol\theta)\rangle$
+   from repeated measurements.
+3. A classical optimiser updates $\boldsymbol\theta$, and the loop repeats.
+
+The smallest possible example is one qubit, $\mathcal H = Z + X$ and ansatz $R_y(\theta)|0\rangle$.
+That state has Bloch vector $(\sin\theta, 0, \cos\theta)$, and $\langle Z\rangle = z$,
+$\langle X\rangle = x$, so
+
+$$
+E(\theta) = \cos\theta + \sin\theta = \sqrt2\,\sin(\theta + \pi/4).
+$$
+
+Its minimum is $-\sqrt2 \approx -1.414$ at $\theta = 5\pi/4$ (225°), which is exactly the
+smallest eigenvalue of $\begin{pmatrix}1&1\\1&-1\end{pmatrix}$.
+
+On hardware there is no autograd, so gradients come from the **parameter-shift rule**. For
+gates of the form $e^{-i\theta P/2}$ with $P$ a Pauli matrix,
+
+$$
+\frac{dE}{d\theta} = \frac{E(\theta + \pi/2) - E(\theta - \pi/2)}{2},
+$$
+
+which is exact, not a finite-difference approximation. Check at $\theta = \pi/2$:
+$E(\pi) = -1$ and $E(0) = 1$, so the rule gives $(-1 - 1)/2 = -1$. The analytic derivative is
+$\cos\theta - \sin\theta = 0 - 1 = -1$.
+
+<LineChart
+	x={() => Array.from({ length: 145 }, (_, i) => (i * 2 * Math.PI) / 144)}
+	series={[
+		{ name: "E(θ) = cos θ + sin θ", fn: vqeEnergy },
+		{ name: "parameter-shift dE/dθ", fn: (t) => (vqeEnergy(t + Math.PI / 2) - vqeEnergy(t - Math.PI / 2)) / 2 },
+	]}
+	xLabel="θ (radians)"
+	yLabel="value"
+	title="VQE energy landscape for H = Z + X"
+	height={280}
+/>
+
+Real VQE and its combinatorial cousin QAOA face hard problems. With many qubits, energy
+landscapes become exponentially flat (**barren plateaus**). Estimating $E$ to accuracy
+$\epsilon$ needs about $1/\epsilon^2$ shots. And no variational algorithm has yet shown a clear
+advantage over classical methods on a useful problem.
+
+## Programming a quantum computer
+
+A quantum program is a classical program that builds a circuit, sends it to a quantum
+processor (or simulator), and gets back measurement counts. The stack looks like this:
+
+| Layer | What happens | Examples |
+| --- | --- | --- |
+| Algorithm | Problem → circuit of logical gates | Grover, VQE, Shor |
+| SDK | Build, simulate, inspect circuits in Python | Qiskit, Cirq, PennyLane, CUDA-Q |
+| Compiler (transpiler) | Map to the chip's qubits, insert SWAPs, rewrite into native gates, optimise | Qiskit transpiler, `cirq.optimize_for_target_gateset` |
+| Control system | Turn native gates into timed microwave or laser pulses | vendor firmware |
+| Hardware | Run the pulses many times (**shots**), return counts | superconducting chips, ion traps, neutral-atom arrays |
+
+### Writing circuits in Qiskit and Cirq
+
+The Bell pair in **Qiskit**, IBM's open-source SDK (version 2.6.2 here), run on its local
+statevector sampler:
+
+```python
+from qiskit import QuantumCircuit
+from qiskit.primitives import StatevectorSampler
+
+qc = QuantumCircuit(2)
+qc.h(0)
+qc.cx(0, 1)
+qc.measure_all()
+
+sampler = StatevectorSampler(seed=7)
+result = sampler.run([qc], shots=1000).result()
+print(result[0].data.meas.get_counts())
+print(qc.draw())
+```
+
+```text
+{'11': 498, '00': 502}
+        ┌───┐      ░ ┌─┐
+   q_0: ┤ H ├──■───░─┤M├───
+        └───┘┌─┴─┐ ░ └╥┘┌─┐
+   q_1: ─────┤ X ├─░──╫─┤M├
+             └───┘ ░  ║ └╥┘
+meas: 2/══════════════╩══╩═
+                      0  1
+```
+
+Only `00` and `11` appear. The split is 502/498 rather than 500/500 because 1000 shots
+estimate $p = 0.5$ with standard error $\sqrt{0.25/1000} \approx 0.016$, or about 16 counts.
+To run on IBM hardware, you swap the local sampler for `SamplerV2` from `qiskit_ibm_runtime` and
+transpile for the backend first (next section).
+
+Grover's three-qubit search, built from basic gates. The CCZ (doubly controlled $Z$) is written
+as $H$, Toffoli ($CCX$), $H$ on the target:
+
+```python
+from qiskit import QuantumCircuit
+from qiskit.quantum_info import Statevector
+
+def oracle(qc):          # flip the sign of |101> (Qiskit bit string "101")
+    qc.x(1)
+    qc.h(2); qc.ccx(0, 1, 2); qc.h(2)   # CCZ
+    qc.x(1)
+
+def diffusion(qc):       # 2|s><s| - I, up to a global phase
+    qc.h([0, 1, 2]); qc.x([0, 1, 2])
+    qc.h(2); qc.ccx(0, 1, 2); qc.h(2)
+    qc.x([0, 1, 2]); qc.h([0, 1, 2])
+
+qc = QuantumCircuit(3)
+qc.h([0, 1, 2])
+for _ in range(2):
+    oracle(qc)
+    diffusion(qc)
+
+probs = Statevector(qc).probabilities_dict()
+print({str(k): round(float(v), 4) for k, v in probs.items()})
+```
+
+```text
+{'000': 0.0078, '001': 0.0078, '010': 0.0078, '011': 0.0078, '100': 0.0078, '101': 0.9453, '110': 0.0078, '111': 0.0078}
+```
+
+$P(101) = 0.9453$, matching the table above, and each other state has $(1 - 0.9453)/7 =
+0.0078$. The marked string `101` is a palindrome, so Qiskit's reversed bit order does not
+change it here.
+
+The same Bell circuit in Google's **Cirq** (1.7.0). Measurement results come back as integers,
+so `3` is the bit string `11`:
+
+```python
+import cirq
+
+q0, q1 = cirq.LineQubit.range(2)
+circuit = cirq.Circuit(
+    cirq.H(q0),
+    cirq.CNOT(q0, q1),
+    cirq.measure(q0, q1, key="m"),
+)
+print(circuit)
+result = cirq.Simulator(seed=7).run(circuit, repetitions=1000)
+print(result.histogram(key="m"))
+```
+
+```text
+0: ───H───@───M('m')───
+          │   │
+1: ───────X───M────────
+Counter({0: 512, 3: 488})
+```
+
+### Compiling to hardware
+
+A real chip has two constraints that the circuits above ignore:
+
+- **Native gates.** A chip implements only a few gates directly, for example $R_z$, $\sqrt X$
+  (`sx`), $X$ and CZ. Every other gate must be rewritten in terms of these. $R_z$ is usually
+  free, done in software as a change of reference frame.
+- **Connectivity.** On most superconducting chips a two-qubit gate works only between
+  neighbouring qubits. A gate between distant qubits needs SWAPs, and each SWAP costs three
+  two-qubit gates.
+
+The **transpiler** solves both. It chooses a **layout** (which physical qubit plays each logical
+qubit), **routes** by inserting SWAPs, and rewrites into native gates. Here is a three-qubit
+circuit whose second CNOT joins qubits 0 and 2, compiled for a line of qubits 0 — 1 — 2:
+
+```python
+from qiskit import QuantumCircuit, transpile
+from qiskit.transpiler import CouplingMap
+
+qc = QuantumCircuit(3)
+qc.h(0)
+qc.cx(0, 1)
+qc.cx(0, 2)          # qubits 0 and 2 are not neighbours on the chip below
+
+line = CouplingMap.from_line(3)          # physical qubits 0 - 1 - 2
+basis = ["rz", "sx", "x", "cz"]          # native gates of the chip
+
+print("logical:  ", dict(qc.count_ops()), "depth", qc.depth())
+for name, layout in [("fixed", [0, 1, 2]), ("chosen", None)]:
+    tqc = transpile(qc, coupling_map=line, basis_gates=basis, initial_layout=layout,
+                    optimization_level=1, seed_transpiler=1)
+    print(f"{name:9s}:", dict(tqc.count_ops()), "depth", tqc.depth(),
+          "layout", tqc.layout.initial_index_layout())
+```
+
+```text
+logical:   {'cx': 2, 'h': 1} depth 3
+fixed    : {'rz': 10, 'sx': 10, 'cz': 5} depth 16 layout [0, 1, 2]
+chosen   : {'rz': 10, 'sx': 5, 'cz': 2} depth 8 layout [1, 0, 2]
+```
+
+With the layout fixed as logical = physical, the transpiler must insert a SWAP. That adds 3
+CZ gates for a total of 5 and doubles the depth to 16. Left free, it places logical qubit 0
+on physical qubit 1, the middle of the line. Both CNOTs then join neighbours: 2 CZs, depth 8.
+Two-qubit gates are the main source of error, so this choice matters a great deal on real
+hardware.
+
+### Shots and noise
+
+Physical qubits are fragile. Besides the coherence times $T_1$ and $T_2$ (see
+[decoherence](#density-matrices-entanglement-and-decoherence) above), the number that matters
+most is **gate fidelity**: the probability that a gate does the right thing. Two-qubit gates are
+typically about 10× worse than single-qubit gates.
+
+A rough rule: if each two-qubit gate fails with probability $e$, a circuit with $g$ of them
+succeeds with probability about $(1-e)^g$.
+
+| Two-qubit error $e$ | 100 gates | 1,000 gates | 10,000 gates |
+| ---: | ---: | ---: | ---: |
+| 1% | 0.366 | $4.3 \times 10^{-5}$ | $2 \times 10^{-44}$ |
+| 0.5% | 0.606 | 0.0067 | $2 \times 10^{-22}$ |
+| 0.1% | 0.905 | 0.368 | $4.5 \times 10^{-5}$ |
+
+Even at 99.9% fidelity, about the best two-qubit gates available today, a 10,000-gate circuit
+almost never runs without an error. Shor's algorithm for RSA-2048 needs billions of gates.
+**Error mitigation** (extrapolating to zero noise, probabilistic error cancellation) stretches
+what noisy machines can do, at the price of many more shots. The real fix is error correction.
+
+## Error correction
+
+Classical error correction copies bits and takes a majority vote. Quantum error correction
+cannot copy (no-cloning) or look (measurement collapses the state), and it must fix
+continuous errors, not just flips. It works anyway, by encoding one **logical qubit** in
+many **physical qubits** and measuring only *parities*. A parity measurement reveals where an
+error occurred and nothing about the encoded state.
+
+### The three-qubit bit-flip code
+
+Encode $\alpha|0\rangle + \beta|1\rangle$ as $\alpha|000\rangle + \beta|111\rangle$ with two
+CNOTs. This is not three copies: the three qubits are entangled. Suppose noise flips the middle
+qubit, giving $\alpha|010\rangle + \beta|101\rangle$. Two ancilla qubits record the
+**syndrome**, the parities $s_1 = d_0 \oplus d_1$ and $s_2 = d_1 \oplus d_2$. Both branches give
+$s = 11$, so measuring $s$ says "$d_1$ flipped" and nothing about $\alpha$ or $\beta$. A Toffoli
+gate controlled on $s = 11$ flips $d_1$ back.
+
+The figure runs this on five qubits with $\alpha = 0.866$, $\beta = 0.5$. With more than four
+qubits, only the basis states that are ever non-zero are drawn. At the end the data qubits hold
+$0.866|000\rangle + 0.5|111\rangle$ (bars $|00011\rangle$ = 0.75 and $|11111\rangle$ = 0.25, the
+last two bits being the syndrome 11).
+
+<CircuitSteps {...bitFlipCode} title="Detecting and fixing a bit flip without reading the data" />
+
+The bit-flip code does not protect against phase flips ($Z$ errors). Shor's 9-qubit code
+handles both by nesting a phase-flip code inside a bit-flip code. Because any single-qubit
+error is a combination of $I$, $X$, $Z$ and $XZ$, correcting $X$ and $Z$ corrects everything:
+the syndrome measurement collapses a continuous error onto one of these discrete cases.
+
+### The surface code and the threshold
+
+The **surface code** is the leading practical code. Data qubits sit on a $d \times d$ grid,
+and $d^2 - 1$ **measure qubits** between them repeatedly check the $X$ or $Z$ parity of their
+four neighbours. One **cycle** measures every check. A **decoder**, classical software running
+in real time, reads the stream of syndromes and infers the most likely errors. The **distance**
+$d$ is the smallest number of physical errors that can cause an undetected logical error. A
+patch uses $2d^2 - 1$ qubits: 17 for $d = 3$, 49 for $d = 5$, 97 for $d = 7$.
+
+The **threshold theorem** says that if the physical error rate $p$ is below a threshold
+$p_{\text{th}}$ (about 1% for the surface code), the logical error rate falls exponentially
+with distance:
+
+$$
+\varepsilon_d \approx A \left(\frac{p}{p_{\text{th}}}\right)^{(d+1)/2} .
+$$
+
+Each step $d \to d + 2$ divides the logical error by $\Lambda = p_{\text{th}}/p$. Above
+threshold ($\Lambda < 1$), adding qubits makes things *worse*. Google's Willow chip measured
+$\Lambda = 2.14$ and a logical error of 0.143% per cycle at $d = 7$ (December 2024, details
+below). Assuming $\Lambda$ stays at 2.14 as the code grows, which is an extrapolation rather
+than a measurement, gives:
+
+| Distance $d$ | Physical qubits $2d^2 - 1$ | Logical error per cycle |
+| ---: | ---: | ---: |
+| 7 (measured) | 97 | $1.4 \times 10^{-3}$ |
+| 11 | 241 | $3.1 \times 10^{-4}$ |
+| 15 | 449 | $6.8 \times 10^{-5}$ |
+| 21 | 881 | $7.0 \times 10^{-6}$ |
+| 27 | 1,457 | $7.1 \times 10^{-7}$ |
+
+Reaching the $10^{-6}$ range useful for long algorithms takes on the order of a thousand
+physical qubits per logical qubit at this $\Lambda$. That overhead is why a machine with
+"millions of qubits" may hold only a few thousand logical ones, and why better codes and
+better physical qubits (a larger $\Lambda$) both matter. Surface-code operations ("lattice
+surgery") give the Clifford gates cheaply. $T$ gates need **magic states**, prepared by
+distillation or the newer **cultivation** protocols, and these dominate the cost of
+fault-tolerant algorithms.
+
+## Recent advancements
+
+The field moved quickly between 2024 and late 2026. This section sticks to peer-reviewed
+results and primary announcements, and labels vendor claims as such.
+
+#### Hardware platforms
+
+| Platform | Qubit | Strengths | Weaknesses | Examples |
+| --- | --- | --- | --- | --- |
+| Superconducting | Microwave circuit at ~10 mK | Fast gates (tens of ns), fabricated like chips | Nearest-neighbour wiring, short coherence, cryogenics | Google Willow (105 qubits), IBM Heron, Nighthawk (120 qubits, 218 tunable couplers) |
+| Trapped ions | Atomic ion in an electromagnetic trap | Highest fidelities, all-to-all connectivity by moving ions | Slow gates (µs–ms) | Quantinuum H2, Helios (98 barium ions) |
+| Neutral atoms | Atom held by optical tweezers | Thousands of qubits, atoms can be rearranged mid-circuit | Slower cycles, atom loss | Harvard / MIT / QuEra, Caltech, Atom Computing, Pasqal |
+| Bosonic (cat) qubits | Microwave resonator state | Bit flips suppressed in hardware | Phase errors still need a code | AWS Ocelot, Alice & Bob |
+| Topological | Majorana zero modes | Errors suppressed in principle | Existence still disputed | Microsoft Majorana 1 |
+
+#### Error correction milestones
+
+- **Below threshold (Google, December 2024).** On the 105-qubit Willow chip, surface-code
+  memories at distance 3, 5 and 7 showed logical error falling by $\Lambda = 2.14 \pm 0.02$ per
+  distance step. At $d = 7$ (101 qubits) the error was 0.143% per cycle, and the logical qubit
+  lived about twice as long as the best physical qubit. A $d = 5$ code also ran with a real-time
+  decoder (63 µs average latency). The same paper notes that rare correlated error bursts,
+  about once an hour, limit repetition-code performance.
+- **Logical-qubit arrays (Harvard / QuEra, December 2023).** Up to 48 logical qubits on a
+  reconfigurable neutral-atom array ran logical circuits, with error *detection* and
+  post-selection rather than full real-time correction.
+- **Cat qubits (AWS Ocelot, February 2025).** Five cat qubits in a repetition code against
+  phase flips. The logical error was 1.72% per cycle at distance 3 and 1.65% at distance 5:
+  barely below break-even, but with a claimed 5–10× lower overhead than standard approaches if
+  it scales.
+- **More efficient codes (IBM).** The bivariate-bicycle "gross" code ($[[144, 12, 12]]$) keeps
+  12 logical qubits in 288 physical qubits, roughly 10× fewer than surface codes at the same
+  distance, but needs longer-range connections. IBM's experimental Loon chip (November 2025)
+  adds such couplers. Its roadmap targets a fault-tolerant machine, Starling, with 200 logical
+  qubits by 2029.
+- **Large logical circuits (IBM and the University of Chicago, July 2026).** 70 logical qubits
+  ran 2,415 logical two-qubit gates and 468 logical $T$ gates in about 15 minutes, on a
+  structured variant of random circuit sampling. IBM reports logical error rates 10× below the
+  physical ones, plus a certified lower bound on the fidelity. The press release does not name
+  the code. Paper: arXiv:2607.25941.
+- **Record logical fidelity (Quantinuum, September–October 2026; press release).** On Helios,
+  a "Helix" code using 10 physical qubits per logical qubit, then a color code (up to 37 physical
+  per logical) with a reported logical fidelity of 99.9995%, about $5 \times 10^{-6}$ error. Logical
+  errors fell 12× per increase in code distance. These are vendor figures, not yet compared
+  against the other results on the same footing.
+
+#### Quantum advantage claims
+
+**Quantum advantage** means a quantum computer doing a well-defined task faster than any
+known classical method. Since Google's 2019 random-circuit-sampling experiment, each claim
+has been followed by improved classical simulations. The recent emphasis is on tasks whose
+answers can be *checked*:
+
+- **Quantum Echoes (Google, October 2025, Nature).** On 65 qubits of Willow, Google measured a
+  second-order out-of-time-order correlator, OTOC(2): evolve forward, perturb one qubit, evolve
+  backward, and measure the interference. Google estimates 3.2 years on the Frontier
+  supercomputer against about 2 hours on the chip, roughly 13,000×. Because the result is an
+  expectation value rather than random samples, it can in principle be checked by another
+  quantum computer or a physical experiment. A related demonstration extracted structural
+  information from NMR data on two molecules.
+- **Verified logical sampling (IBM / UChicago, July 2026).** Described above. The novelty is
+  running the advantage-scale task on *error-corrected* qubits with a fidelity bound.
+
+None of these solves a problem anyone needs solved. They are milestones of control and scale.
+
+#### Scale, resource estimates and cryptography
+
+- **Qubit counts.** Caltech trapped 6,100 neutral-atom qubits in a tweezer array (Nature,
+  September 2025), with 12.6-second coherence and 99.98% single-qubit accuracy, though without
+  entangling gates across the array yet. Harvard reported a 3,000-qubit atom array kept running
+  for over two hours by reloading lost atoms (Nature, 2025). Quantinuum's Helios (November
+  2025) has 98 qubits with reported 99.921% two-qubit and 99.9975% single-qubit gate fidelity.
+- **Cheaper Shor.** Craig Gidney (Google, May 2025) estimated that RSA-2048 could be factored
+  in under a week with under one million noisy qubits. That is 20× fewer qubits than his 2019
+  estimate with Ekerå (20 million qubits, 8 hours). The estimate assumes a 0.1% gate error, a
+  1 µs surface-code cycle and a 10 µs control reaction time. The savings come from approximate
+  residue arithmetic, yoked surface codes and magic-state cultivation.
+- **Post-quantum cryptography.** NIST published its first post-quantum standards in August
+  2024: FIPS 203 (ML-KEM, key exchange), FIPS 204 (ML-DSA) and FIPS 205 (SLH-DSA, both
+  signatures). In March 2025 it selected HQC as a backup key-exchange scheme. Data encrypted
+  today can be stored and decrypted later ("harvest now, decrypt later"), so migration is
+  happening now, well before a machine that can run Shor exists.
+- **Contested claims.** Microsoft's Majorana 1 (February 2025) claimed a topological qubit. Many
+  physicists doubt the evidence, and a critique of its "topological gap protocol" has since
+  been published in Nature. Treat topological qubits as unproven.
+
+## Summary
+
+- Quantum mechanics is linear algebra over $\mathbb{C}$. States are unit vectors (or density
+  matrices), evolution is unitary ($e^{-i\mathcal H t/\hbar}$ from the Schrödinger equation),
+  observables are Hermitian operators whose eigenvalues are the possible results, and
+  measurement collapses onto an eigenvector. Incompatible observables obey uncertainty
+  relations, and Bell tests show that entangled correlations are not hidden instructions.
+- A qubit's state is a unit vector of complex **amplitudes**. Measurement returns one basis
+  state with probability $|\text{amplitude}|^2$ and destroys the rest. One qubit is a point on
+  the **Bloch sphere**, and gates are rotations of it.
+- $n$ qubits carry $2^n$ amplitudes, and **entanglement** makes that description necessary.
+  But you only ever read $n$ bits, so algorithms must use **interference** to steer probability
+  to the answer.
+- **Phase kickback** turns oracle answers into signs. **Grover** gives a quadratic speed-up
+  for search, and **Shor** an exponential one for factoring, by finding periods with the
+  **quantum Fourier transform**.
+- A quantum program is a circuit compiled to a chip's **native gates and connectivity**, then
+  sampled with many **shots**. Gate errors compound like $(1-e)^g$, which caps circuits on
+  noisy hardware at a few thousand gates.
+- **Error correction** below threshold now works: logical errors shrink exponentially with code
+  distance. The open problems are overhead (about a thousand physical qubits per logical qubit
+  for the surface code), fast decoding and cheap $T$ gates. Meanwhile, cryptography is moving
+  to post-quantum standards.
+
+## References
+
+- M. A. Nielsen and I. L. Chuang, *Quantum Computation and Quantum Information*, 10th
+  anniversary edition, Cambridge University Press, 2010. The standard text, and the source of
+  this post's big-endian convention.
+- J. J. Sakurai and J. Napolitano, *Modern Quantum Mechanics*, 3rd edition, Cambridge
+  University Press, 2020. Stern–Gerlach, Dirac notation, the postulates and time evolution.
+- J. S. Bell, "On the Einstein Podolsky Rosen paradox", *Physics* 1, 195 (1964). J. F. Clauser,
+  M. A. Horne, A. Shimony and R. A. Holt, "Proposed experiment to test local hidden-variable
+  theories", *Phys. Rev. Lett.* 23, 880 (1969).
+- B. Hensen et al., "Loophole-free Bell inequality violation using electron spins separated by
+  1.3 kilometres", *Nature* 526, 682 (2015). [arXiv:1508.05949](https://arxiv.org/abs/1508.05949).
+- L. K. Grover, "A fast quantum mechanical algorithm for database search", 1996.
+  [arXiv:quant-ph/9605043](https://arxiv.org/abs/quant-ph/9605043).
+- P. W. Shor, "Polynomial-time algorithms for prime factorization and discrete logarithms on a
+  quantum computer", 1995. [arXiv:quant-ph/9508027](https://arxiv.org/abs/quant-ph/9508027).
+- Google Quantum AI and collaborators, "Quantum error correction below the surface code
+  threshold", *Nature* 638, 920–926 (2025).
+  [doi:10.1038/s41586-024-08449-y](https://www.nature.com/articles/s41586-024-08449-y).
+- D. Bluvstein et al., "Logical quantum processor based on reconfigurable atom arrays", *Nature*
+  626 (2024). [arXiv:2312.03982](https://arxiv.org/abs/2312.03982).
+- S. Bravyi et al., "High-threshold and low-overhead fault-tolerant quantum memory", *Nature*
+  627 (2024). [arXiv:2308.07915](https://arxiv.org/abs/2308.07915).
+- C. Gidney, "How to factor 2048 bit RSA integers with less than a million noisy qubits", 2025.
+  [arXiv:2505.15917](https://arxiv.org/abs/2505.15917).
+- AWS / Caltech, "Hardware-efficient quantum error correction via concatenated bosonic qubits",
+  *Nature* (February 2025). [EurekAlert release](https://www.eurekalert.org/news-releases/1075254).
+- Quantinuum, "Helios: A 98-qubit trapped-ion quantum computer", 2025.
+  [arXiv:2511.05465](https://arxiv.org/abs/2511.05465).
+- H. J. Manetsch et al. (Endres group, Caltech), "A tweezer array with 6100 highly coherent atomic qubits", *Nature*
+  (2025). [Caltech record](https://authors.library.caltech.edu/records/x3ttz-tkb28).
+- Google Quantum Echoes coverage, October 2025.
+  [The Quantum Insider](https://thequantuminsider.com/2025/10/22/google-quantum-ai-shows-13000x-speedup-over-worlds-fastest-supercomputer-in-physics-simulation/).
+- IBM, "IBM and The University of Chicago demonstrate quantum advantage ...", 30 July 2026.
+  [Press release](https://newsroom.ibm.com/2026-07-30-ibm-and-the-university-of-chicago-demonstrate-quantum-advantage,-establishing-trusted-quantum-computation-on-logical-circuits);
+  paper [arXiv:2607.25941](https://arxiv.org/abs/2607.25941).
+- Quantinuum, "Quantinuum breaks error-correction world record by 10x ...", 19 October 2026.
+  [Press release](https://www.quantinuum.com/press-releases/quantinuum-breaks-error-correction-world-record-by-10x-validating-its-leading-path-to-fault-tolerant-quantum-computing-by-2029).
+- IBM Nighthawk and Loon, November 2025.
+  [Engadget](https://www.engadget.com/science/ibm-announces-nighthawk-and-loon-quantum-chips-213603769.html).
+- Science News, "Physicists are mostly unconvinced by Microsoft's new topological quantum chip",
+  2025. [Article](https://www.sciencenews.org/article/microsoft-topological-quantum-majorana).
+- NIST, "Post-quantum cryptography FIPS approved", August 2024.
+  [CSRC news](https://csrc.nist.gov/news/2024/postquantum-cryptography-fips-approved).
+- Qiskit [github.com/Qiskit/qiskit](https://github.com/Qiskit/qiskit) and Cirq
+  [github.com/quantumlib/Cirq](https://github.com/quantumlib/Cirq).

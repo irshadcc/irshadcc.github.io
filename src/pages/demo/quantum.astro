@@ -1,0 +1,36 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import BasisMeasurement from "../../utils/quantum/BasisMeasurement.astro";
+import BlochSphere from "../../utils/quantum/BlochSphere.astro";
+import CircuitSteps from "../../utils/quantum/CircuitSteps.astro";
+import ProbabilityBars from "../../utils/quantum/ProbabilityBars.astro";
+import {
+	bell,
+	bitFlipCode,
+	grover,
+	grover64,
+	shor21,
+	teleportation,
+} from "../../utils/quantum/quantumFigures";
+---
+
+<Layout title="Quantum computing figures">
+	<main>
+		<h1>Quantum computing figures</h1>
+		<h2>BlochSphere</h2>
+		<BlochSphere />
+		<BlochSphere theta={Math.PI / 2} phi={0} gates={["Z", "S", "SDG", "T", "TDG", "H"]} title="Phase gates on |+⟩" />
+		<h2>BasisMeasurement</h2>
+		<BasisMeasurement theta={Math.PI / 3} alpha={0} />
+		<BasisMeasurement theta={(2 * Math.PI) / 3} alpha={Math.PI / 2} plane="yz" title="y–z plane" />
+		<h2>CircuitSteps</h2>
+		<CircuitSteps {...bell} title="Bell pair" />
+		<CircuitSteps {...grover} view="amp" start={3} title="Grover, amplitude view" />
+		<CircuitSteps {...teleportation} title="Teleportation (deferred measurement)" />
+		<CircuitSteps {...bitFlipCode} title="Five qubits: only non-zero states drawn" />
+		<CircuitSteps n={3} steps={["H 0; H 1; H 2", "CP(pi/2) 0 1; SWAP 1 2", "QFT 0 1 2 | QFT on three qubits", "IQFT 0 1 2", "CCZ 0 1 2; M 0 1"]} title="Every gate kind" />
+		<h2>ProbabilityBars</h2>
+		<ProbabilityBars values={shor21} highlight={[11, 21, 43, 53]} alt={[0, 32]} xLabel="y" yLabel="P(y)" legend={["highlighted", "alt"]} />
+		<ProbabilityBars values={grover64} highlight={[6]} xLabel="iterations k" yLabel="P(success)" />
+	</main>
+</Layout>

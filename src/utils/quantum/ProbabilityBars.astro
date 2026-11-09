@@ -1,0 +1,108 @@
+---
+// A static bar chart of a discrete distribution, for measurement outcomes (Shor's counting
+// register, Grover's success probability per iteration, shot counts). Bars listed in
+// `highlight` are drawn solid, `alt` bars in the second colour; hover a bar for its value.
+// Rendered at build time; no script.
+// Usage in .mdx:
+//   <ProbabilityBars values={[0.25, 0, 0, 0, 0.25]} highlight={[0, 4]} xLabel="y" yLabel="P(y)" />
+import "../sampling/sampling.css";
+import "./quantum.css";
+
+interface Props {
+	values: number[];
+	/** Labels under the bars; default the index. Long series label every `labelEvery`-th bar. */
+	labels?: string[];
+	labelEvery?: number;
+	highlight?: number[];
+	alt?: number[];
+	/** Write each highlighted bar's value above it. */
+	showValues?: boolean;
+	xLabel?: string;
+	yLabel?: string;
+	yMax?: number;
+	digits?: number;
+	title?: string;
+	caption?: string;
+	/** Text for the legend of highlighted / alt bars. */
+	legend?: [string, string?];
+}
+
+const {
+	values,
+	labels,
+	labelEvery = values.length > 24 ? Math.ceil(values.length / 16) : 1,
+	highlight = [],
+	alt = [],
+	showValues = true,
+	xLabel,
+	yLabel,
+	digits = 3,
+	title,
+	caption,
+	legend,
+} = Astro.props;
+const top = Astro.props.yMax ?? Math.max(...values) * 1.15;
+const W = 640;
+const H = 230;
+const box = { x: 52, y: 14, w: 572, h: 170 };
+const slot = box.w / values.length;
+const bw = Math.max(1.5, slot * (values.length > 40 ? 0.8 : 0.66));
+const sy = (v: number) => box.y + box.h - (v / top) * box.h;
+const step = (() => {
+	const raw = top / 4;
+	const p = 10 ** Math.floor(Math.log10(raw));
+	const m = raw / p;
+	return (m < 1.5 ? 1 : m < 3.5 ? 2 : m < 7.5 ? 5 : 10) * p;
+})();
+const ticks: number[] = [];
+for (let t = 0; t <= top + 1e-12; t += step) ticks.push(t);
+const tickDigits = Math.max(0, -Math.floor(Math.log10(step) + 1e-9));
+const lab = (i: number) => labels?.[i] ?? String(i);
+const fmt = (v: number) => Number(v.toFixed(digits)).toString();
+---
+
+<figure class="smp-fig qc-fig">
+	{title && <div class="smp-title">{title}</div>}
+	{
+		legend && (
+			<div class="smp-legend">
+				<span><i class="box qc-legend-pos"></i>{legend[0]}</span>
+				{legend[1] && <span><i class="box qc-legend-neg"></i>{legend[1]}</span>}
+			</div>
+		)
+	}
+	<svg class="smp-svg" viewBox={`0 0 ${W} ${H}`} role="img" aria-label={title ?? yLabel ?? "Bar chart"}>
+		{
+			ticks.map((t) => (
+				<>
+					<line class="smp-grid" x1={box.x} x2={box.x + box.w} y1={sy(t)} y2={sy(t)} />
+					<text class="smp-tick" x={box.x - 5} y={sy(t) + 3.5} text-anchor="end">{t.toFixed(tickDigits)}</text>
+				</>
+			))
+		}
+		<rect class="smp-plotbox" x={box.x} y={box.y} width={box.w} height={box.h} />
+		{
+			values.map((v, i) => {
+				const cx = box.x + slot * (i + 0.5);
+				const hl = highlight.includes(i);
+				const cls = `qc-pbar${hl ? " hl" : ""}${alt.includes(i) ? " alt" : ""}`;
+				return (
+					<>
+						<rect class={cls} x={cx - bw / 2} y={sy(v)} width={bw} height={box.y + box.h - sy(v)}>
+							<title>{`${lab(i)}: ${fmt(v)}`}</title>
+						</rect>
+						{showValues && (hl || alt.includes(i)) && v > 0 && (
+							<text class="qc-val" x={cx} y={sy(v) - 4} text-anchor="middle">{fmt(v)}</text>
+						)}
+						{i % labelEvery === 0 && (
+							<text class="smp-tick" x={cx} y={box.y + box.h + 13} text-anchor="middle">{lab(i)}</text>
+						)}
+					</>
+				);
+			})
+		}
+		{xLabel && <text class="smp-label" x={box.x + box.w / 2} y={box.y + box.h + 30} text-anchor="middle">{xLabel}</text>}
+		{yLabel && <text class="smp-label" x={14} y={box.y + box.h / 2} text-anchor="middle" transform={`rotate(-90 14 ${box.y + box.h / 2})`}>{yLabel}</text>}
+	</svg>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>

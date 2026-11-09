@@ -1,0 +1,203 @@
+---
+// Measuring one qubit along an axis. Left: a great circle of the Bloch sphere with the state
+// (orange arrow, angle θ from |0⟩) and the measurement axis n (blue line, angle α); its two ends
+// are the eigenstates of the observable A = n·σ, with eigenvalues +1 and −1. The dashed drop
+// from the state onto the axis lands at ⟨A⟩ = cos(θ − α). Right: predicted P(+1) =
+// cos²((θ − α)/2) and P(−1) against the observed frequencies of simulated shots. A single shot
+// shows the collapse: the dashed red arrow is the state right after the measurement, an
+// eigenstate. Readouts: ⟨A⟩, ΔA = |sin(θ − α)| and the sample mean ± its standard error.
+// Shots use a seeded generator (mulberry32), so a page load always replays the same outcomes.
+// Logic in quantum.ts (axisMeasurement).
+// Usage in .mdx:
+//   <BasisMeasurement theta={Math.PI / 3} alpha={0} />
+//   <BasisMeasurement theta={Math.PI / 2} alpha={Math.PI / 2} plane="xz" title="Measuring |+⟩ along X" />
+import "../sampling/sampling.css";
+import "./quantum.css";
+
+interface Props {
+	/** State angle from |0⟩ in radians. */
+	theta?: number;
+	/** Measurement-axis angle from |0⟩ in radians. */
+	alpha?: number;
+	/** Which great circle: "xz" (real amplitudes) or "yz" (phase i). */
+	plane?: "xz" | "yz";
+	seed?: number;
+	title?: string;
+	caption?: string;
+}
+
+const {
+	theta = Math.PI / 3,
+	alpha = 0,
+	plane = "xz",
+	seed = 7,
+	title,
+	caption,
+} = Astro.props;
+const deg = (r: number) => Math.round((r * 180) / Math.PI);
+const side = plane === "xz" ? ["|+⟩ (x)", "|−⟩"] : ["|+i⟩ (y)", "|−i⟩"];
+---
+
+<figure class="smp-fig qc-fig qc-meas" data-seed={seed} data-plane={plane}>
+	{title && <div class="smp-title">{title}</div>}
+	<div class="smp-row">
+		<svg class="smp-svg qc-meas-circle" viewBox="0 0 300 290" role="img" aria-label="State and measurement axis on a great circle of the Bloch sphere" data-side={JSON.stringify(side)}></svg>
+		<svg class="smp-svg qc-meas-bars" viewBox="0 0 300 290" role="img" aria-label="Predicted and observed outcome probabilities"></svg>
+	</div>
+	<div class="smp-legend">
+		<span><i class="qc-legend-state"></i>state</span>
+		<span><i class="k-p"></i>measurement axis (eigenstates ±1)</span>
+		<span><i class="dot qc-legend-foot"></i>⟨A⟩, where the state projects onto the axis</span>
+		<span><i class="box qc-legend-pos"></i>predicted</span>
+		<span><i class="box qc-legend-neg"></i>observed</span>
+	</div>
+	<div class="smp-controls">
+		<label class="smp-slider">state θ = <strong class="v-t"></strong>
+			<input type="range" class="i-t" min="0" max="360" step="1" value={deg(theta)} aria-label="State angle in degrees" />
+		</label>
+		<label class="smp-slider">axis α = <strong class="v-a"></strong>
+			<input type="range" class="i-a" min="0" max="360" step="1" value={deg(alpha)} aria-label="Measurement axis angle in degrees" />
+		</label>
+		<button type="button" class="smp-btn" data-axis="0">Z axis</button>
+		<button type="button" class="smp-btn" data-axis="90">{plane === "xz" ? "X axis" : "Y axis"}</button>
+		<button type="button" class="smp-btn" data-shots="1">measure once</button>
+		<button type="button" class="smp-btn" data-shots="100">100 shots</button>
+		<button type="button" class="smp-btn" data-clear>clear</button>
+	</div>
+	<div class="smp-metrics">
+		<div><span>⟨A⟩ = cos(θ − α)</span><strong class="m-mean"></strong></div>
+		<div><span>ΔA = |sin(θ − α)|</span><strong class="m-sd"></strong></div>
+		<div><span>shots (+1 / −1)</span><strong class="m-n"></strong></div>
+		<div><span>sample mean ± std. error</span><strong class="m-est"></strong></div>
+	</div>
+	<p class="smp-narration"></p>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import { el, fmt } from "../sampling/plot";
+	import { axisMeasurement, mulberry32 } from "./quantum";
+
+	const CX = 150, CY = 145, R = 105;
+	/** Angle φ from |0⟩ (up), turning towards the side axis (right). */
+	const pt = (a: number, r = R) => ({ x: CX + r * Math.sin(a), y: CY - r * Math.cos(a) });
+	const rad = (d: number) => (d * Math.PI) / 180;
+
+	function attach(fig: HTMLElement) {
+		const circle = fig.querySelector<SVGSVGElement>(".qc-meas-circle")!;
+		const bars = fig.querySelector<SVGSVGElement>(".qc-meas-bars")!;
+		const side: string[] = JSON.parse(circle.dataset.side ?? "[]");
+		const tIn = fig.querySelector<HTMLInputElement>(".i-t")!;
+		const aIn = fig.querySelector<HTMLInputElement>(".i-a")!;
+		const seed = Number(fig.dataset.seed) || 7;
+		let rng = mulberry32(seed);
+		let plus = 0, minus = 0;
+		let last: number | null = null;
+		let note = "Pick an axis and take shots. Each shot re-prepares the state, measures it, and records +1 or −1.";
+
+		function draw() {
+			const th = rad(Number(tIn.value));
+			const al = rad(Number(aIn.value));
+			const m = axisMeasurement(th, al);
+			fig.querySelector(".v-t")!.textContent = `${tIn.value}°`;
+			fig.querySelector(".v-a")!.textContent = `${aIn.value}°`;
+
+			circle.replaceChildren();
+			el("circle", { cx: CX, cy: CY, r: R, class: "qc-ring" }, circle);
+			el("line", { x1: CX, y1: CY - R, x2: CX, y2: CY + R, class: "qc-axis" }, circle);
+			el("line", { x1: CX - R, y1: CY, x2: CX + R, y2: CY, class: "qc-axis" }, circle);
+			const labels: [number, string][] = [[0, "|0⟩"], [Math.PI, "|1⟩"], [Math.PI / 2, side[0]], [-Math.PI / 2, side[1]]];
+			for (const [a, t] of labels) {
+				const p = pt(a, R + 16);
+				el("text", { x: p.x, y: p.y + 4, class: "qc-axlabel", "text-anchor": Math.abs(Math.sin(a)) > 0.5 ? (Math.sin(a) > 0 ? "start" : "end") : "middle", dx: Math.sin(a) > 0.5 ? -8 : Math.sin(a) < -0.5 ? 8 : 0 }, circle, t);
+			}
+			const e1 = pt(al), e2 = pt(al + Math.PI);
+			el("line", { x1: e2.x, y1: e2.y, x2: e1.x, y2: e1.y, class: "qc-meas-axis" }, circle);
+			el("circle", { cx: e1.x, cy: e1.y, r: 5, class: "qc-eig" }, circle);
+			el("circle", { cx: e2.x, cy: e2.y, r: 5, class: "qc-eig" }, circle);
+			const l1 = pt(al, R - 18), l2 = pt(al + Math.PI, R - 18);
+			el("text", { x: l1.x + 8, y: l1.y, class: "qc-eig-label" }, circle, "+1");
+			el("text", { x: l2.x + 8, y: l2.y, class: "qc-eig-label" }, circle, "−1");
+			const tip = pt(th);
+			const foot = { x: CX + m.mean * R * Math.sin(al), y: CY - m.mean * R * Math.cos(al) };
+			el("line", { x1: tip.x, y1: tip.y, x2: foot.x, y2: foot.y, class: "qc-proj" }, circle);
+			if (last !== null) {
+				const g = pt(last > 0 ? al : al + Math.PI, R);
+				el("line", { x1: CX, y1: CY, x2: g.x, y2: g.y, class: "qc-ghost" }, circle);
+				el("circle", { cx: g.x, cy: g.y, r: 4, class: "qc-ghost-tip" }, circle);
+			}
+			el("line", { x1: CX, y1: CY, x2: tip.x, y2: tip.y, class: "qc-vec" }, circle);
+			el("circle", { cx: tip.x, cy: tip.y, r: 5, class: "qc-tip" }, circle);
+			el("circle", { cx: foot.x, cy: foot.y, r: 4.5, class: "qc-foot" }, circle);
+
+			bars.replaceChildren();
+			const n = plus + minus;
+			const base = 240, H = 200;
+			el("line", { x1: 30, x2: 290, y1: base, y2: base, class: "qc-base" }, bars);
+			for (const t of [0.5, 1]) {
+				el("line", { x1: 30, x2: 290, y1: base - t * H, y2: base - t * H, class: "smp-grid" }, bars);
+				el("text", { x: 26, y: base - t * H + 3.5, class: "smp-tick", "text-anchor": "end" }, bars, String(t));
+			}
+			[["+1", m.pPlus, n ? plus / n : 0], ["−1", 1 - m.pPlus, n ? minus / n : 0]].forEach(([lab, p, f], i) => {
+				const cx = 95 + i * 130;
+				const hp = (p as number) * H, hf = (f as number) * H;
+				el("rect", { x: cx - 34, y: base - hp, width: 32, height: hp, class: "qc-bar", rx: 1.5 }, bars);
+				if (n) el("rect", { x: cx + 2, y: base - hf, width: 32, height: hf, class: "qc-obs", rx: 1.5 }, bars);
+				el("text", { x: cx - 18, y: base - hp - 4, class: "qc-val", "text-anchor": "middle" }, bars, fmt(p as number, 3));
+				if (n) el("text", { x: cx + 18, y: base - hf - 4, class: "qc-val", "text-anchor": "middle" }, bars, fmt(f as number, 3));
+				el("text", { x: cx, y: base + 18, class: "qc-ket", "text-anchor": "middle" }, bars, `outcome ${lab}`);
+			});
+
+			fig.querySelector(".m-mean")!.textContent = fmt(m.mean, 3);
+			fig.querySelector(".m-sd")!.textContent = fmt(m.sd, 3);
+			fig.querySelector(".m-n")!.textContent = `${n} (${plus} / ${minus})`;
+			if (n) {
+				const mean = (plus - minus) / n;
+				const se = n > 1 ? Math.sqrt(Math.max(0, 1 - mean * mean) / n) : 0;
+				fig.querySelector(".m-est")!.textContent = `${fmt(mean, 3)} ± ${fmt(se, 3)}`;
+			} else fig.querySelector(".m-est")!.textContent = "—";
+			fig.querySelector(".smp-narration")!.textContent = note;
+		}
+
+		function shoot(k: number) {
+			const m = axisMeasurement(rad(Number(tIn.value)), rad(Number(aIn.value)));
+			for (let i = 0; i < k; i++) {
+				last = rng() < m.pPlus ? 1 : -1;
+				if (last > 0) plus++;
+				else minus++;
+			}
+			note =
+				k === 1
+					? `Outcome ${last! > 0 ? "+1" : "−1"}. The state has collapsed onto the ${last! > 0 ? "+1" : "−1"} eigenstate (dashed red); measuring again along the same axis would repeat ${last! > 0 ? "+1" : "−1"} with certainty. The next shot starts from a fresh copy of the orange state.`
+					: `${k} more shots. The observed frequencies approach cos²((θ − α)/2) and the sample mean approaches ⟨A⟩, with error shrinking like 1/√shots.`;
+			draw();
+		}
+		const clear = () => {
+			plus = minus = 0;
+			last = null;
+			rng = mulberry32(seed);
+		};
+		const onSlide = () => {
+			clear();
+			note = "The prediction depends only on the angle between the state and the axis: P(+1) = cos²((θ − α)/2).";
+			draw();
+		};
+		tIn.addEventListener("input", onSlide);
+		aIn.addEventListener("input", onSlide);
+		fig.querySelectorAll<HTMLButtonElement>("[data-axis]").forEach((b) =>
+			b.addEventListener("click", () => {
+				aIn.value = b.dataset.axis ?? "0";
+				onSlide();
+			}),
+		);
+		fig.querySelectorAll<HTMLButtonElement>("[data-shots]").forEach((b) => b.addEventListener("click", () => shoot(Number(b.dataset.shots))));
+		fig.querySelector("[data-clear]")!.addEventListener("click", () => {
+			clear();
+			note = "Counts cleared.";
+			draw();
+		});
+		draw();
+	}
+
+	document.querySelectorAll<HTMLElement>(".qc-meas").forEach(attach);
+</script>

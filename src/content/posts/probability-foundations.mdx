@@ -1229,47 +1229,117 @@ Exercise 2.20.
 
 ## Exercises
 
-Answers to all 41 exercises, grouped by topic. Where the main text already derived a result, the
-answer recaps it briefly.
+Answers to all 41 exercises, grouped by topic. Each answer starts with the question in italics
+(paraphrased from the book), works through it in short labelled steps that name the rule used, and
+ends with what the result means. Answers to exercises the main text already solved repeat the
+derivation in full, so each one can be read on its own.<Sidenote>Every number in these answers was
+computed with a script (exact fractions where possible, NumPy and SciPy otherwise), not by
+hand.</Sidenote>
 
 #### Rules of probability (2.1–2.3)
 
-**2.1** With $p(C = 1) = 0.001$:
-$p(T = 1) = 0.9 \times 0.001 + 0.03 \times 0.999 = 0.0009 + 0.02997 = 0.03087$, so
+**Exercise 2.1.** *The screening example used a prevalence of $p(C = 1) = 0.01$. Real cancers are
+much rarer. Redo the calculation with $p(C = 1) = 0.001$ and find $p(C = 1 \mid T = 1)$.*
+
+The test is unchanged: $p(T = 1 \mid C = 1) = 0.9$ (sensitivity) and $p(T = 1 \mid C = 0) = 0.03$
+(false-positive rate). Only the prior moves, to $p(C = 1) = 0.001$, so $p(C = 0) = 0.999$.
+
+**Step 1: how often is a test positive?** A positive result arrives by one of two routes: the
+person is sick and the test fires, or the person is healthy and the test fires anyway. The sum rule
+adds the routes, and the product rule gives the probability of each:
 
 $$
-p(C = 1 \mid T = 1) = \frac{0.0009}{0.03087} = 0.0292.
+\begin{aligned}
+p(T = 1) &= p(T = 1 \mid C = 1)\, p(C = 1) + p(T = 1 \mid C = 0)\, p(C = 0) \\
+&= 0.9 \times 0.001 + 0.03 \times 0.999 \\
+&= 0.0009 + 0.02997 = 0.03087.
+\end{aligned}
 $$
 
-Fewer than 3% of positives have cancer: 30 false positives for every true one. The posterior went
-up 29-fold, as before, but from a ten times smaller prior. Set the prevalence slider in the
-screening figure to 0.001 to see it.
+**Step 2: Bayes' theorem.** The posterior is the share of all positives that took the sick route:
 
-**2.2** The book's Figure 2.16 shows Efron's dice. Call them A $= (4,4,4,4,0,0)$,
-B $= (3,3,3,3,3,3)$, C $= (6,6,2,2,2,2)$ and D $= (5,5,5,1,1,1)$; the book's cycle is B, A, D, C.
-Since the dice are independent, $p(\text{X beats Y}) = \sum_{x} p(x)\, p(Y < x)$:
+$$
+p(C = 1 \mid T = 1) = \frac{p(T = 1 \mid C = 1)\, p(C = 1)}{p(T = 1)} = \frac{0.0009}{0.03087} = 0.0292.
+$$
 
-| contest | how it is won | probability |
+**Step 3: check with counts.** Picture a million people. 1,000 are sick and 900 of them test
+positive. 999,000 are healthy and 3% of them, 29,970, also test positive. Of the 30,870 positives
+only 900 are sick: $900 / 30\,870 = 0.0292$, the same answer. There are about 33 false positives
+for every true one.
+
+**What it means.** The test multiplied the probability of cancer by about 29 (from 0.001 to
+0.0292), similar to the factor of 23 with 1% prevalence, but it started from a number ten times
+smaller. When a disease is rare, the 3% of the huge healthy group swamps the sick. Set the
+prevalence slider in the screening figure to 0.001 to see it.
+
+**Exercise 2.2.** *Efron's four dice (the book's Figure 2.16) are arranged in a cycle. Show that
+each die rolls a higher number than the previous die in the cycle with probability 2/3.*
+
+**Step 1: the dice.** Call them A $= (4,4,4,4,0,0)$, B $= (3,3,3,3,3,3)$, C $= (6,6,2,2,2,2)$ and
+D $= (5,5,5,1,1,1)$. The book's cycle is B, A, D, C, then back to B.
+
+**Step 2: a recipe for "X beats Y".** The two dice are rolled independently, so the product rule
+gives $p(X = x, Y = y) = p(x)\, p(y)$. Summing over the faces of X with the sum rule,
+
+$$
+p(\text{X beats Y}) = \sum_{x} p(X = x)\, p(Y < x).
+$$
+
+In words: for each face of X, multiply its probability by the chance that Y comes out lower.
+
+**Step 3: the four contests.**
+
+| contest | faces of the winner and the chance the loser is lower | probability |
 | --- | --- | ---: |
-| A beats B | A shows 4 | $4/6 = 2/3$ |
-| D beats A | D shows 5 (always wins), or D shows 1 and A shows 0 | $\frac{1}{2} + \frac{1}{2} \cdot \frac{1}{3} = 2/3$ |
-| C beats D | C shows 6, or C shows 2 and D shows 1 | $\frac{1}{3} + \frac{2}{3} \cdot \frac{1}{2} = 2/3$ |
-| B beats C | C shows 2 | $4/6 = 2/3$ |
+| A beats B | A = 4 (prob. 4/6): B always shows 3, lower. A = 0: never wins | $\frac{4}{6} \cdot 1 = \frac{2}{3}$ |
+| D beats A | D = 5 (prob. 1/2): A shows 4 or 0, always lower. D = 1 (prob. 1/2): wins only if A = 0 (prob. 1/3) | $\frac{1}{2} \cdot 1 + \frac{1}{2} \cdot \frac{1}{3} = \frac{2}{3}$ |
+| C beats D | C = 6 (prob. 1/3): always wins. C = 2 (prob. 2/3): wins only if D = 1 (prob. 1/2) | $\frac{1}{3} \cdot 1 + \frac{2}{3} \cdot \frac{1}{2} = \frac{2}{3}$ |
+| B beats C | B always shows 3: wins exactly when C = 2 (prob. 4/6) | $1 \cdot \frac{4}{6} = \frac{2}{3}$ |
 
-Each die beats the previous one in the cycle B → A → D → C → B with probability 2/3, so "beats
-more often than not" is not transitive.<Sidenote>The non-adjacent pairs are closer: A beats C
-with probability $4/9$ and B beats D with probability $1/2$ (computed with `beats` in
-`probTheory.ts`).</Sidenote>
+**What it means.** Going round the cycle B → A → D → C → B, each die beats the one before it two
+times in three. So "usually rolls higher" is not transitive, unlike "is larger than" for ordinary
+numbers. Whichever die your opponent picks, you can pick one that beats it.<Sidenote>The two
+non-adjacent pairs are closer: A beats C with probability $\frac{2}{3} \cdot \frac{2}{3} = 4/9$
+(A shows 4 and C shows 2), and B beats D with probability $1/2$ (D shows 1). Computed with `beats`
+in `probTheory.ts` and checked with exact fractions over all 36 face pairs.</Sidenote>
 
-**2.3** Condition on $\mathbf{u}$ and use the sum and product rules:
-$p(\mathbf{y}) = \int p(\mathbf{y} \mid \mathbf{u})\, p_{\mathbf{u}}(\mathbf{u})\, \mathrm{d}\mathbf{u}$.
-Given $\mathbf{u}$, $\mathbf{y} = \mathbf{u} + \mathbf{v}$ is $\mathbf{v}$ shifted by a constant. A
-shift has Jacobian 1, so by (2.76) $p(\mathbf{y} \mid \mathbf{u}) = p_{\mathbf{v}}(\mathbf{y} - \mathbf{u})$
-(independence lets us use the unconditional $p_{\mathbf{v}}$). Hence
-$p(\mathbf{y}) = \int p_{\mathbf{u}}(\mathbf{u})\, p_{\mathbf{v}}(\mathbf{y} - \mathbf{u})\, \mathrm{d}\mathbf{u}$
-(2.119). For two uniforms on $(0, 1)$ the integrand is 1 where $0 < u < 1$ and $0 < y - u < 1$, so
-$p(y) = \min(y, 2 - y)$ on $(0, 2)$: a triangle. Adding a third uniform smooths it into a
-piecewise quadratic that already looks Gaussian (the central limit theorem at work).
+**Exercise 2.3.** *Let $y = u + v$ where $u \sim p_u$ and $v \sim p_v$ are independent. Show that
+$p(y) = \int p_u(u)\, p_v(y - u)\, \mathrm{d}u$ (2.119), the **convolution** of the two
+densities.*
+
+**Step 1: bring in $u$.** We do not know $u$, so we sum (integrate) over it. The sum rule and then
+the product rule give
+
+$$
+p(y) = \int p(y, u)\, \mathrm{d}u = \int p(y \mid u)\, p_u(u)\, \mathrm{d}u.
+$$
+
+**Step 2: the conditional $p(y \mid u)$.** Once $u$ is fixed, $y = u + v$ is just $v$ shifted by
+the constant $u$. Because $u$ and $v$ are independent, knowing $u$ does not change the
+distribution of $v$, so $v$ still has density $p_v$. A shift moves the density without stretching
+it (its Jacobian is $\mathrm{d}y / \mathrm{d}v = 1$ in (2.76)), so $y$ takes the value $y$ exactly
+when $v$ takes the value $y - u$:
+
+$$
+p(y \mid u) = p_v(y - u).
+$$
+
+**Step 3: substitute.** Putting Step 2 into Step 1 gives (2.119):
+
+$$
+p(y) = \int p_u(u)\, p_v(y - u)\, \mathrm{d}u.
+$$
+
+**Worked example: two uniforms.** Let $u, v \sim \mathcal{U}(0, 1)$, so each density is 1 on
+$(0, 1)$ and 0 elsewhere. The integrand is 1 when both $0 < u < 1$ and $0 < y - u < 1$, and 0
+otherwise, so $p(y)$ is the length of the interval of $u$ that satisfies both:
+
+- for $0 < y \leqslant 1$, the second condition is $u < y$, so $u \in (0, y)$ and $p(y) = y$;
+- for $1 < y < 2$, the second condition is $u > y - 1$, so $u \in (y - 1, 1)$ and $p(y) = 2 - y$.
+
+That is a triangle, $p(y) = \min(y, 2 - y)$ on $(0, 2)$. Check one value: at $y = 1$ the whole
+interval $(0, 1)$ works, so $p(1) = 1$, the peak. Convolving with a third uniform smooths the
+triangle into a piecewise quadratic that already looks Gaussian, the central limit theorem at work.
 
 <LineChart
 	x={() => Array.from({ length: 401 }, (_, i) => -0.5 + i / 100)}
@@ -1289,316 +1359,1142 @@ piecewise quadratic that already looks Gaussian (the central limit theorem at wo
 
 #### Densities and expectations (2.4–2.11, 2.39)
 
-**2.4** $\int_c^d \frac{1}{d - c}\, \mathrm{d}x = 1$. The mean is
-$\frac{1}{d - c}\int_c^d x\, \mathrm{d}x = \frac{d^2 - c^2}{2(d - c)} = \frac{c + d}{2}$. The second
-moment is $\frac{d^3 - c^3}{3(d - c)} = \frac{c^2 + cd + d^2}{3}$, so
+**Exercise 2.4.** *Check that the uniform density $p(x) = 1/(d - c)$ on $(c, d)$ (2.33) is
+normalised, and find its mean and variance.*
+
+**Step 1: normalisation.** The density is a constant over an interval of length $d - c$, so its
+integral is height times width:
 
 $$
-\operatorname{var}[x] = \frac{c^2 + cd + d^2}{3} - \frac{(c + d)^2}{4} = \frac{(d - c)^2}{12}.
+\int_c^d \frac{1}{d - c}\, \mathrm{d}x = \frac{1}{d - c}\,(d - c) = 1.
 $$
 
-**2.5** Exponential: $\int_0^\infty \lambda e^{-\lambda x}\, \mathrm{d}x = [-e^{-\lambda x}]_0^\infty = 1$.
-Laplace: substitute $z = x - \mu$ and use symmetry,
-$\frac{1}{2\gamma}\int e^{-|z|/\gamma}\, \mathrm{d}z = \frac{2}{2\gamma}\int_0^\infty e^{-z/\gamma}\, \mathrm{d}z = \frac{1}{\gamma} \cdot \gamma = 1$.
-
-**2.6** $\int \frac{1}{N}\sum_n \delta(x - x_n)\, \mathrm{d}x = \frac{1}{N}\sum_n \int \delta(x - x_n)\, \mathrm{d}x = \frac{1}{N} \cdot N = 1$,
-since each delta integrates to one.
-
-**2.7** Replace $p$ in (2.39) by the empirical density and use the sifting property:
-$\int f(x) \frac{1}{N}\sum_n \delta(x - x_n)\, \mathrm{d}x = \frac{1}{N}\sum_n f(x_n)$, which is
-(2.40). The sample average is the exact expectation under the empirical distribution, and an
-approximation to the expectation under $p$ that improves as $N$ grows.
-
-**2.8** Write $\bar f = \mathbb{E}[f]$, a constant. Then
-$\mathbb{E}[(f - \bar f)^2] = \mathbb{E}[f^2] - 2\bar f\, \mathbb{E}[f] + \bar f^2 = \mathbb{E}[f^2] - \bar f^2$,
-which is (2.45).
-
-**2.9** Independence gives $p(x, y) = p(x)p(y)$, so
-$\mathbb{E}[xy] = \iint xy\, p(x)p(y)\, \mathrm{d}x\, \mathrm{d}y = \int x p(x)\, \mathrm{d}x \int y p(y)\, \mathrm{d}y = \mathbb{E}[x]\,\mathbb{E}[y]$,
-and (2.47) gives $\operatorname{cov}[x, y] = 0$.
-
-**2.10** The mean is linear whether or not the variables are independent:
-$\mathbb{E}[x + z] = \iint (x + z)\, p(x, z) = \mathbb{E}[x] + \mathbb{E}[z]$. For the variance,
+**Step 2: mean.** Integrate $x$ times the density:
 
 $$
-\operatorname{var}[x + z] = \mathbb{E}\big[\{(x - \mathbb{E}x) + (z - \mathbb{E}z)\}^2\big] = \operatorname{var}[x] + \operatorname{var}[z] + 2\operatorname{cov}[x, z],
+\mathbb{E}[x] = \frac{1}{d - c}\int_c^d x\, \mathrm{d}x = \frac{1}{d - c} \cdot \frac{d^2 - c^2}{2} = \frac{(d - c)(d + c)}{2(d - c)} = \frac{c + d}{2},
 $$
 
-and the covariance is zero by Exercise 2.9.
+using $d^2 - c^2 = (d - c)(d + c)$. The mean is the midpoint, as symmetry says it must be.
 
-**2.11** For the **law of total expectation**,
-$\mathbb{E}_y[\mathbb{E}_x[x \mid y]] = \int p(y) \int x\, p(x \mid y)\, \mathrm{d}x\, \mathrm{d}y = \iint x\, p(x, y)\, \mathrm{d}x\, \mathrm{d}y = \mathbb{E}[x]$.
-For the **law of total variance**, write $m(y) = \mathbb{E}_x[x \mid y]$. Then
-$\mathbb{E}_y[\operatorname{var}_x[x \mid y]] = \mathbb{E}_y[\mathbb{E}[x^2 \mid y] - m(y)^2] = \mathbb{E}[x^2] - \mathbb{E}_y[m^2]$
-and $\operatorname{var}_y[m(y)] = \mathbb{E}_y[m^2] - (\mathbb{E}_y m)^2 = \mathbb{E}_y[m^2] - \mathbb{E}[x]^2$.
-Adding, the $\mathbb{E}_y[m^2]$ terms cancel and leave $\mathbb{E}[x^2] - \mathbb{E}[x]^2 = \operatorname{var}[x]$.
-Total variance is the average spread within each $y$ plus the spread of the means across $y$.
-
-**2.39** If $z_1, z_2$ are independent, the off-diagonal entry of the covariance matrix is
-$\operatorname{cov}[z_1, z_2] = 0$ by Exercise 2.9, so the matrix is diagonal. For the converse, let
-$y_1$ be symmetric about 0 and $y_2 = y_1^2$. Then $p(y_2 \mid y_1) = \delta(y_2 - y_1^2)$ depends on
-$y_1$, so they are dependent. Yet with $p(y_1, y_2) = p(y_1)\,\delta(y_2 - y_1^2)$,
+**Step 3: second moment.** In the same way, with $d^3 - c^3 = (d - c)(d^2 + cd + c^2)$,
 
 $$
-\mathbb{E}[y_1 y_2] = \iint y_1 y_2\, p(y_1)\, \delta(y_2 - y_1^2)\, \mathrm{d}y_2\, \mathrm{d}y_1 = \int y_1^3\, p(y_1)\, \mathrm{d}y_1 = 0, \qquad \mathbb{E}[y_1] = 0,
+\mathbb{E}[x^2] = \frac{1}{d - c}\int_c^d x^2\, \mathrm{d}x = \frac{d^3 - c^3}{3(d - c)} = \frac{c^2 + cd + d^2}{3}.
 $$
 
-since $y_1^3 p(y_1)$ and $y_1 p(y_1)$ are odd. So $\operatorname{cov}[y_1, y_2] = 0$: zero correlation
-does not imply independence. Covariance only detects linear relationships.
+**Step 4: variance.** Use $\operatorname{var}[x] = \mathbb{E}[x^2] - \mathbb{E}[x]^2$ and put both
+terms over the common denominator 12:
+
+$$
+\operatorname{var}[x] = \frac{4(c^2 + cd + d^2) - 3(c + d)^2}{12} = \frac{c^2 - 2cd + d^2}{12} = \frac{(d - c)^2}{12}.
+$$
+
+**Check with numbers.** On $(2, 5)$: $\mathbb{E}[x^2] = (4 + 10 + 25)/3 = 13$ and
+$\mathbb{E}[x]^2 = 3.5^2 = 12.25$, so the variance is $0.75$, and the formula gives
+$3^2 / 12 = 0.75$ too. The variance depends only on the width of the interval, not on where it sits.
+
+**Exercise 2.5.** *Check that the exponential density $\lambda e^{-\lambda x}$ on $x \geqslant 0$
+(2.34) and the Laplace density $\frac{1}{2\gamma}e^{-|x - \mu|/\gamma}$ (2.35) are normalised.*
+
+**Exponential.** The antiderivative of $\lambda e^{-\lambda x}$ is $-e^{-\lambda x}$, so
+
+$$
+\int_0^\infty \lambda e^{-\lambda x}\, \mathrm{d}x = \Big[-e^{-\lambda x}\Big]_0^\infty = 0 - (-1) = 1.
+$$
+
+**Laplace, step 1: centre it.** Substitute $z = x - \mu$. This is a shift, so
+$\mathrm{d}x = \mathrm{d}z$ and the limits stay $\pm\infty$:
+
+$$
+\int_{-\infty}^{\infty} \frac{1}{2\gamma} e^{-|x - \mu|/\gamma}\, \mathrm{d}x = \frac{1}{2\gamma}\int_{-\infty}^{\infty} e^{-|z|/\gamma}\, \mathrm{d}z.
+$$
+
+**Laplace, step 2: use symmetry.** $e^{-|z|/\gamma}$ takes the same value at $z$ and $-z$, so the
+integral over the whole line is twice the integral over $z \geqslant 0$, where $|z| = z$:
+
+$$
+\frac{1}{2\gamma} \cdot 2\int_0^\infty e^{-z/\gamma}\, \mathrm{d}z = \frac{1}{\gamma}\Big[-\gamma e^{-z/\gamma}\Big]_0^\infty = \frac{1}{\gamma} \cdot \gamma = 1.
+$$
+
+Note that the half of the Laplace density on $z \geqslant 0$ is an exponential with
+$\lambda = 1/\gamma$, scaled by one half.
+
+**Exercise 2.6.** *Show that the empirical density
+$p(x) = \frac{1}{N}\sum_{n=1}^N \delta(x - x_n)$ (2.37) is normalised.*
+
+**Step 1: swap the sum and the integral.** Integration is linear, so the integral of a sum is the
+sum of the integrals, and the constant $1/N$ comes out:
+
+$$
+\int \frac{1}{N}\sum_{n=1}^N \delta(x - x_n)\, \mathrm{d}x = \frac{1}{N}\sum_{n=1}^N \int \delta(x - x_n)\, \mathrm{d}x.
+$$
+
+**Step 2: each delta has unit area.** The Dirac delta $\delta(x - x_n)$ is zero away from $x_n$
+and integrates to one, so each of the $N$ integrals is 1:
+
+$$
+\frac{1}{N}\sum_{n=1}^N 1 = \frac{N}{N} = 1.
+$$
+
+The empirical density puts a point mass of $1/N$ on each data point, and $N$ masses of $1/N$ add
+up to one.
+
+**Exercise 2.7.** *Using the empirical density, show that the expectation
+$\mathbb{E}[f] = \int p(x) f(x)\, \mathrm{d}x$ (2.39) can be approximated by the sample average
+$\frac{1}{N}\sum_n f(x_n)$ (2.40).*
+
+**Step 1: replace $p$ by the empirical density** built from samples $x_1, \dots, x_N$ drawn from
+$p$:
+
+$$
+\mathbb{E}[f] \simeq \int f(x)\, \frac{1}{N}\sum_{n=1}^N \delta(x - x_n)\, \mathrm{d}x = \frac{1}{N}\sum_{n=1}^N \int f(x)\, \delta(x - x_n)\, \mathrm{d}x.
+$$
+
+**Step 2: the sifting property.** Integrating a function against $\delta(x - x_n)$ picks out its
+value at $x_n$: $\int f(x)\, \delta(x - x_n)\, \mathrm{d}x = f(x_n)$. So
+
+$$
+\mathbb{E}[f] \simeq \frac{1}{N}\sum_{n=1}^N f(x_n).
+$$
+
+**What it means.** The sample average is the exact expectation under the empirical distribution.
+It approximates the expectation under $p$, and the approximation improves as $N$ grows because the
+empirical distribution looks more and more like $p$.
+
+**Exercise 2.8.** *Starting from the definition
+$\operatorname{var}[f] = \mathbb{E}[(f(x) - \mathbb{E}[f(x)])^2]$ (2.44), show that
+$\operatorname{var}[f] = \mathbb{E}[f(x)^2] - \mathbb{E}[f(x)]^2$ (2.45).*
+
+**Step 1: name the constant.** Write $\bar f = \mathbb{E}[f(x)]$. It is a number, not a function of
+$x$.
+
+**Step 2: expand the square** inside the expectation:
+$(f - \bar f)^2 = f^2 - 2\bar f f + \bar f^2$.
+
+**Step 3: take expectations term by term.** Expectation is linear and constants come out of it,
+so $\mathbb{E}[2\bar f f] = 2\bar f\, \mathbb{E}[f] = 2\bar f^2$ and $\mathbb{E}[\bar f^2] = \bar f^2$:
+
+$$
+\operatorname{var}[f] = \mathbb{E}[f^2] - 2\bar f^2 + \bar f^2 = \mathbb{E}[f^2] - \bar f^2 = \mathbb{E}[f(x)^2] - \mathbb{E}[f(x)]^2.
+$$
+
+**Exercise 2.9.** *Show that if $x$ and $y$ are independent, their covariance is zero.*
+
+**Step 1: what covariance needs.** By (2.47),
+$\operatorname{cov}[x, y] = \mathbb{E}[xy] - \mathbb{E}[x]\,\mathbb{E}[y]$, so we must show that
+$\mathbb{E}[xy] = \mathbb{E}[x]\,\mathbb{E}[y]$.
+
+**Step 2: factor the joint density.** Independence means $p(x, y) = p(x)\, p(y)$. The integrand
+$xy\, p(x)\, p(y)$ then splits into a part that depends only on $x$ and a part that depends only on
+$y$, so the double integral is a product of two single integrals:
+
+$$
+\mathbb{E}[xy] = \iint xy\, p(x)\, p(y)\, \mathrm{d}x\, \mathrm{d}y = \Big(\int x\, p(x)\, \mathrm{d}x\Big)\Big(\int y\, p(y)\, \mathrm{d}y\Big) = \mathbb{E}[x]\,\mathbb{E}[y].
+$$
+
+**Step 3: conclude.** $\operatorname{cov}[x, y] = \mathbb{E}[x]\,\mathbb{E}[y] - \mathbb{E}[x]\,\mathbb{E}[y] = 0$.
+The converse is false; Exercise 2.39 below gives a counterexample.
+
+**Exercise 2.10.** *For independent $x$ and $z$, show that
+$\mathbb{E}[x + z] = \mathbb{E}[x] + \mathbb{E}[z]$ (2.120) and
+$\operatorname{var}[x + z] = \operatorname{var}[x] + \operatorname{var}[z]$ (2.121).*
+
+**Step 1: the mean.** Split the integral in two, then integrate out the variable that does not
+appear in each part (the sum rule, $\int p(x, z)\, \mathrm{d}z = p(x)$):
+
+$$
+\mathbb{E}[x + z] = \iint x\, p(x, z)\, \mathrm{d}x\, \mathrm{d}z + \iint z\, p(x, z)\, \mathrm{d}x\, \mathrm{d}z = \int x\, p(x)\, \mathrm{d}x + \int z\, p(z)\, \mathrm{d}z = \mathbb{E}[x] + \mathbb{E}[z].
+$$
+
+This step never used independence: the mean of a sum is always the sum of the means.
+
+**Step 2: centre each variable.** Write $a = x - \mathbb{E}[x]$ and $b = z - \mathbb{E}[z]$. By
+Step 1, $x + z - \mathbb{E}[x + z] = a + b$, so
+
+$$
+\operatorname{var}[x + z] = \mathbb{E}[(a + b)^2] = \mathbb{E}[a^2] + \mathbb{E}[b^2] + 2\,\mathbb{E}[ab] = \operatorname{var}[x] + \operatorname{var}[z] + 2\operatorname{cov}[x, z].
+$$
+
+**Step 3: use independence.** By Exercise 2.9, $\operatorname{cov}[x, z] = 0$, which leaves
+(2.121). Without independence the covariance term stays: two perfectly correlated copies
+$z = x$ give $\operatorname{var}[2x] = 4\operatorname{var}[x]$, not $2\operatorname{var}[x]$.
+
+**Exercise 2.11.** *For any joint $p(x, y)$, prove the **law of total expectation**
+$\mathbb{E}[x] = \mathbb{E}_y[\mathbb{E}_x[x \mid y]]$ (2.122) and the **law of total variance**
+$\operatorname{var}[x] = \mathbb{E}_y[\operatorname{var}_x[x \mid y]] + \operatorname{var}_y[\mathbb{E}_x[x \mid y]]$
+(2.123).*
+
+**Step 1: total expectation.** Write out both expectations, then recombine
+$p(x \mid y)\, p(y) = p(x, y)$ with the product rule and integrate out $y$ with the sum rule:
+
+$$
+\mathbb{E}_y[\mathbb{E}_x[x \mid y]] = \int p(y)\Big(\int x\, p(x \mid y)\, \mathrm{d}x\Big)\mathrm{d}y = \iint x\, p(x, y)\, \mathrm{d}x\, \mathrm{d}y = \int x\, p(x)\, \mathrm{d}x = \mathbb{E}[x].
+$$
+
+**Step 2: name the conditional mean.** Write $m(y) = \mathbb{E}_x[x \mid y]$. It is a function of
+$y$, so it is a random variable when $y$ is random. Step 1 says $\mathbb{E}_y[m] = \mathbb{E}[x]$.
+The same argument with $x^2$ in place of $x$ gives
+$\mathbb{E}_y[\mathbb{E}_x[x^2 \mid y]] = \mathbb{E}[x^2]$.
+
+**Step 3: the first term.** Apply Exercise 2.8 to the conditional distribution,
+$\operatorname{var}_x[x \mid y] = \mathbb{E}_x[x^2 \mid y] - m(y)^2$, and average over $y$ using
+Step 2:
+
+$$
+\mathbb{E}_y[\operatorname{var}_x[x \mid y]] = \mathbb{E}[x^2] - \mathbb{E}_y[m^2].
+$$
+
+**Step 4: the second term.** Apply Exercise 2.8 to $m(y)$ and use $\mathbb{E}_y[m] = \mathbb{E}[x]$:
+
+$$
+\operatorname{var}_y[m] = \mathbb{E}_y[m^2] - \mathbb{E}_y[m]^2 = \mathbb{E}_y[m^2] - \mathbb{E}[x]^2.
+$$
+
+**Step 5: add.** The $\mathbb{E}_y[m^2]$ terms cancel, leaving
+$\mathbb{E}[x^2] - \mathbb{E}[x]^2 = \operatorname{var}[x]$.
+
+**Check with numbers.** Take the joint of Exercise 2.36: $p(x, y) = \frac{1}{3}$ for
+$(x, y) = (0, 0), (0, 1), (1, 1)$ and $0$ for $(1, 0)$. Then $\mathbb{E}[x] = \frac{1}{3}$ and
+$\operatorname{var}[x] = \frac{1}{3} - \frac{1}{9} = \frac{2}{9}$. Conditioning on $y$:
+
+| $y$ | $p(y)$ | $p(x = 1 \mid y)$ | $m(y)$ | $\operatorname{var}[x \mid y]$ |
+| --- | ---: | ---: | ---: | ---: |
+| 0 | 1/3 | 0 | 0 | 0 |
+| 1 | 2/3 | 1/2 | 1/2 | 1/4 |
+
+The average within-group variance is $\frac{2}{3} \cdot \frac{1}{4} = \frac{1}{6}$. The means
+$m(y)$ average to $\frac{2}{3} \cdot \frac{1}{2} = \frac{1}{3} = \mathbb{E}[x]$ (total expectation)
+and have variance $\frac{2}{3} \cdot \frac{1}{4} - \frac{1}{9} = \frac{1}{18}$. Together
+$\frac{1}{6} + \frac{1}{18} = \frac{4}{18} = \frac{2}{9}$, as the law says.
+
+**What it means.** Total variance is the average spread within each group (fixed $y$) plus the
+spread of the group means.
+
+**Exercise 2.39.** *Show that independent $z_1, z_2$ have a diagonal covariance matrix. Then take
+$y_1$ symmetric about 0 and $y_2 = y_1^2$: show that they are dependent but still have a diagonal
+covariance matrix.*
+
+**Step 1: independence ⇒ uncorrelated.** The covariance matrix has the variances on its diagonal
+and $\operatorname{cov}[z_1, z_2]$ off it. Exercise 2.9 showed that the off-diagonal entry is zero
+for independent variables, so the matrix is diagonal.
+
+**Step 2: $y_1$ and $y_2$ are dependent.** Given $y_1$, the value of $y_2$ is certain, so its
+conditional density is a spike at $y_1^2$:
+
+$$
+p(y_2 \mid y_1) = \delta(y_2 - y_1^2).
+$$
+
+This changes with $y_1$ (the spike moves), so $p(y_2 \mid y_1) \neq p(y_2)$ and the variables are
+not independent. Knowing $y_1 = 2$ tells you $y_2 = 4$ exactly.
+
+**Step 3: their covariance is zero anyway.** Use the product rule
+$p(y_1, y_2) = p(y_1)\, \delta(y_2 - y_1^2)$ and do the $y_2$ integral first with the sifting
+property (it replaces $y_2$ by $y_1^2$):
+
+$$
+\mathbb{E}[y_1 y_2] = \int\Big(\int y_1 y_2\, \delta(y_2 - y_1^2)\, \mathrm{d}y_2\Big) p(y_1)\, \mathrm{d}y_1 = \int y_1^3\, p(y_1)\, \mathrm{d}y_1.
+$$
+
+Because $p(y_1)$ is symmetric, $y_1^3\, p(y_1)$ is an odd function, and its integral is zero. For
+the same reason $\mathbb{E}[y_1] = \int y_1\, p(y_1)\, \mathrm{d}y_1 = 0$. So
+
+$$
+\operatorname{cov}[y_1, y_2] = \mathbb{E}[y_1 y_2] - \mathbb{E}[y_1]\,\mathbb{E}[y_2] = 0 - 0 \cdot \mathbb{E}[y_2] = 0.
+$$
+
+**Check with numbers.** Let $y_1$ be $-1$, $0$ or $1$ with probability $1/3$ each. Then $y_2$ is
+$1$, $0$, $1$, and $y_1 y_2 = y_1^3$ is $-1, 0, 1$, whose average is 0, as is the average of $y_1$.
+
+**What it means.** Zero covariance does not imply independence. Covariance only measures a
+*linear* trend, and the parabola $y_2 = y_1^2$ has none: it goes down on the left as much as it goes
+up on the right.
 
 #### The Gaussian (2.12–2.18)
 
-**2.12** Done in the main text: in polar coordinates
-$I^2 = \int_0^{2\pi}\int_0^\infty e^{-r^2/2\sigma^2} r\, \mathrm{d}r\, \mathrm{d}\theta$. The $\theta$
-integral gives $2\pi$; with $u = r^2$, $r\, \mathrm{d}r = \mathrm{d}u/2$ and
-$\int_0^\infty e^{-u/2\sigma^2}\, \mathrm{d}u/2 = \sigma^2$. So $I^2 = 2\pi\sigma^2$ and
-$I = (2\pi\sigma^2)^{1/2}$. For the Gaussian, substitute $y = x - \mu$ (unit Jacobian):
-$\int \mathcal{N}(x \mid \mu, \sigma^2)\, \mathrm{d}x = I / (2\pi\sigma^2)^{1/2} = 1$.
+**Exercise 2.12.** *Show that $I = \int_{-\infty}^{\infty} \exp(-x^2 / 2\sigma^2)\, \mathrm{d}x = (2\pi\sigma^2)^{1/2}$
+(2.126) by squaring it and moving to polar coordinates. Then show that
+$\mathcal{N}(x \mid \mu, \sigma^2)$ is normalised.*
 
-**2.13** Mean: with $y = x - \mu$, $\mathbb{E}[x] = \int \mathcal{N}(y \mid 0, \sigma^2)(y + \mu)\, \mathrm{d}y = 0 + \mu$,
-because $y\,\mathcal{N}(y \mid 0, \sigma^2)$ is odd. Second moment: differentiate
-$\int \exp\{-(x - \mu)^2 / 2\sigma^2\}\, \mathrm{d}x = (2\pi)^{1/2}(\sigma^2)^{1/2}$ with respect to
-$\sigma^2$:
+**Step 1: square it.** The name of the integration variable does not matter, so write the second
+copy with $y$. The product of two integrals is a double integral, and the exponents add:
 
 $$
-\int \frac{(x - \mu)^2}{2\sigma^4} \exp\Big\{-\frac{(x - \mu)^2}{2\sigma^2}\Big\} \mathrm{d}x = \frac{(2\pi)^{1/2}}{2(\sigma^2)^{1/2}}.
+I^2 = \int_{-\infty}^{\infty}\int_{-\infty}^{\infty} \exp\Big(-\frac{x^2 + y^2}{2\sigma^2}\Big)\, \mathrm{d}x\, \mathrm{d}y.
 $$
 
-Multiplying by $2\sigma^4 / (2\pi\sigma^2)^{1/2}$ gives $\mathbb{E}[(x - \mu)^2] = \sigma^2$. Expanding,
-$\mathbb{E}[x^2] = \sigma^2 + 2\mu\,\mathbb{E}[x] - \mu^2 = \mu^2 + \sigma^2$ (2.53), and then
-$\operatorname{var}[x] = \mu^2 + \sigma^2 - \mu^2 = \sigma^2$ (2.54).
+**Step 2: polar coordinates.** The integrand depends only on $r^2 = x^2 + y^2$. With
+$x = r\cos\theta$, $y = r\sin\theta$ the area element becomes $\mathrm{d}x\, \mathrm{d}y = r\, \mathrm{d}r\, \mathrm{d}\theta$
+(the Jacobian of the polar map is $r$), and the plane is covered by $r \in [0, \infty)$,
+$\theta \in [0, 2\pi)$:
 
-**2.14** $\frac{\mathrm{d}}{\mathrm{d}x}\mathcal{N} = -\frac{x - \mu}{\sigma^2}\mathcal{N}$, which is zero
-only at $x = \mu$ since $\mathcal{N} > 0$. The second derivative there is
-$-\mathcal{N}(\mu \mid \mu, \sigma^2)/\sigma^2 < 0$, so it is a maximum.
+$$
+I^2 = \int_0^{2\pi}\int_0^\infty e^{-r^2 / 2\sigma^2}\, r\, \mathrm{d}r\, \mathrm{d}\theta = 2\pi \int_0^\infty e^{-r^2 / 2\sigma^2}\, r\, \mathrm{d}r,
+$$
 
-**2.15** Done in the main text. $\partial/\partial\mu$ of (2.56) is
-$\frac{1}{\sigma^2}\sum_n (x_n - \mu)$; zero gives $\mu_{\mathrm{ML}} = \frac{1}{N}\sum_n x_n$.
-$\partial/\partial\sigma^2$ is $\frac{1}{2\sigma^4}\sum_n (x_n - \mu)^2 - \frac{N}{2\sigma^2}$; zero,
-with $\mu = \mu_{\mathrm{ML}}$, gives (2.58). The Hessian at this point is negative definite
-(the $\mu\mu$ entry is $-N/\sigma^2$, the $\sigma^2\sigma^2$ entry is $-N/(2\sigma^4)$ and the cross
-term vanishes there), so it is a maximum.
+since nothing depends on $\theta$.
 
-**2.16** For $n \ne m$, independence gives $\mathbb{E}[x_n x_m] = \mu^2$; for $n = m$,
-$\mathbb{E}[x_n^2] = \mu^2 + \sigma^2$; together $\mathbb{E}[x_n x_m] = \mu^2 + I_{nm}\sigma^2$ (2.128).
-Then $\mathbb{E}[\mu_{\mathrm{ML}}] = \frac{1}{N}\sum_n \mathbb{E}[x_n] = \mu$ (2.59), and, as derived in
-the main text, $\mathbb{E}[\sigma^2_{\mathrm{ML}}] = \mathbb{E}[x_n^2] - \frac{1}{N^2}\sum_{n,m}\mathbb{E}[x_n x_m] = \mu^2 + \sigma^2 - \mu^2 - \frac{\sigma^2}{N} = \frac{N - 1}{N}\sigma^2$
-(2.60).
+**Step 3: substitute $u = r^2$.** Then $\mathrm{d}u = 2r\, \mathrm{d}r$, so $r\, \mathrm{d}r = \mathrm{d}u / 2$.
+That extra $r$ from Step 2 is exactly what makes the integral easy:
 
-**2.17** Each term of (2.61) has $\mathbb{E}[(x_n - \mu)^2] = \operatorname{var}[x_n] = \sigma^2$, so the
-average of $N$ of them has expectation $\sigma^2$ (2.62). Nothing was fitted, so nothing is lost.
+$$
+I^2 = 2\pi \cdot \frac{1}{2}\int_0^\infty e^{-u / 2\sigma^2}\, \mathrm{d}u = \pi \Big[-2\sigma^2 e^{-u / 2\sigma^2}\Big]_0^\infty = \pi \cdot 2\sigma^2 = 2\pi\sigma^2.
+$$
 
-**2.18** The first two terms of (2.66) involve $\sigma^2$:
-$\frac{\partial}{\partial\sigma^2} = \frac{1}{2\sigma^4}\sum_n \{y(x_n, \mathbf{w}) - t_n\}^2 - \frac{N}{2\sigma^2} = 0$,
-which with $\mathbf{w} = \mathbf{w}_{\mathrm{ML}}$ gives (2.68).
+Taking the positive square root, $I = (2\pi\sigma^2)^{1/2}$.
+
+**Step 4: the Gaussian.** Substitute $y = x - \mu$ (a shift, so $\mathrm{d}x = \mathrm{d}y$):
+
+$$
+\int_{-\infty}^{\infty} \mathcal{N}(x \mid \mu, \sigma^2)\, \mathrm{d}x = \frac{1}{(2\pi\sigma^2)^{1/2}}\int_{-\infty}^{\infty} e^{-y^2 / 2\sigma^2}\, \mathrm{d}y = \frac{I}{(2\pi\sigma^2)^{1/2}} = 1.
+$$
+
+**Exercise 2.13.** *Show that the Gaussian has mean $\mu$ (2.52) by changing variables. Then
+differentiate the normalisation condition with respect to $\sigma^2$ to get
+$\mathbb{E}[x^2] = \mu^2 + \sigma^2$ (2.53), and deduce $\operatorname{var}[x] = \sigma^2$ (2.54).*
+
+**Step 1: the mean.** Substitute $y = x - \mu$, so $x = y + \mu$, and split the integral:
+
+$$
+\mathbb{E}[x] = \int \mathcal{N}(y \mid 0, \sigma^2)\,(y + \mu)\, \mathrm{d}y = \int y\, \mathcal{N}(y \mid 0, \sigma^2)\, \mathrm{d}y + \mu \int \mathcal{N}(y \mid 0, \sigma^2)\, \mathrm{d}y.
+$$
+
+The first integrand is odd ($y$ times a function symmetric about 0), so it integrates to 0. The
+second integral is 1 by Exercise 2.12. So $\mathbb{E}[x] = \mu$.
+
+**Step 2: the trick.** Exercise 2.12 says that, for every $\sigma^2 > 0$,
+
+$$
+\int \exp\Big\{-\frac{(x - \mu)^2}{2\sigma^2}\Big\}\, \mathrm{d}x = (2\pi)^{1/2}(\sigma^2)^{1/2}.
+$$
+
+Both sides are functions of $\sigma^2$, so their derivatives with respect to $\sigma^2$ are equal
+too. On the left, the derivative of the exponent $-(x - \mu)^2 / (2\sigma^2)$ is
+$(x - \mu)^2 / (2\sigma^4)$. On the right, the derivative of $(\sigma^2)^{1/2}$ is
+$\frac{1}{2}(\sigma^2)^{-1/2}$:
+
+$$
+\int \frac{(x - \mu)^2}{2\sigma^4} \exp\Big\{-\frac{(x - \mu)^2}{2\sigma^2}\Big\}\, \mathrm{d}x = \frac{(2\pi)^{1/2}}{2(\sigma^2)^{1/2}}.
+$$
+
+**Step 3: turn it into an expectation.** Multiply both sides by $2\sigma^4 / (2\pi\sigma^2)^{1/2}$.
+On the left this turns the exponential into the Gaussian density; on the right it leaves
+$\sigma^4 / \sigma^2 = \sigma^2$:
+
+$$
+\int (x - \mu)^2\, \mathcal{N}(x \mid \mu, \sigma^2)\, \mathrm{d}x = \sigma^2, \qquad \text{that is,} \qquad \mathbb{E}[(x - \mu)^2] = \sigma^2.
+$$
+
+**Step 4: the second moment.** Expand $(x - \mu)^2 = x^2 - 2\mu x + \mu^2$ and use
+$\mathbb{E}[x] = \mu$ from Step 1:
+$\sigma^2 = \mathbb{E}[x^2] - 2\mu^2 + \mu^2$, so $\mathbb{E}[x^2] = \mu^2 + \sigma^2$ (2.53).
+
+**Step 5: the variance.** $\operatorname{var}[x] = \mathbb{E}[x^2] - \mathbb{E}[x]^2 = \mu^2 + \sigma^2 - \mu^2 = \sigma^2$ (2.54).
+
+**Exercise 2.14.** *Show that the mode (the maximum) of the Gaussian is at $\mu$.*
+
+**Step 1: differentiate.** The density is a constant times $\exp\{-(x - \mu)^2 / 2\sigma^2\}$, and
+the chain rule gives
+
+$$
+\frac{\mathrm{d}}{\mathrm{d}x}\mathcal{N}(x \mid \mu, \sigma^2) = -\frac{x - \mu}{\sigma^2}\, \mathcal{N}(x \mid \mu, \sigma^2).
+$$
+
+**Step 2: find where it is zero.** $\mathcal{N}$ is never zero, so the derivative vanishes only
+where $x - \mu = 0$, that is at $x = \mu$.
+
+**Step 3: confirm a maximum.** For $x < \mu$ the derivative is positive (the density rises), and
+for $x > \mu$ it is negative (the density falls), so $x = \mu$ is a maximum. Equivalently, the
+second derivative at $\mu$ is $-\mathcal{N}(\mu \mid \mu, \sigma^2) / \sigma^2 < 0$.
+
+**Exercise 2.15.** *Set the derivatives of the log likelihood (2.56) with respect to $\mu$ and
+$\sigma^2$ to zero to obtain $\mu_{\mathrm{ML}}$ (2.57) and $\sigma^2_{\mathrm{ML}}$ (2.58).*
+
+The log likelihood of $N$ independent points is
+
+$$
+\ln p(\mathbf{x} \mid \mu, \sigma^2) = -\frac{1}{2\sigma^2}\sum_{n=1}^N (x_n - \mu)^2 - \frac{N}{2}\ln \sigma^2 - \frac{N}{2}\ln(2\pi). \tag{2.56}
+$$
+
+**Step 1: derivative with respect to $\mu$.** Only the first term involves $\mu$, and
+$\frac{\partial}{\partial\mu}(x_n - \mu)^2 = -2(x_n - \mu)$:
+
+$$
+\frac{\partial}{\partial\mu}\ln p = \frac{1}{\sigma^2}\sum_{n=1}^N (x_n - \mu) = \frac{1}{\sigma^2}\Big(\sum_{n=1}^N x_n - N\mu\Big).
+$$
+
+Setting it to zero gives $\mu_{\mathrm{ML}} = \frac{1}{N}\sum_n x_n$, the sample mean (2.57). It
+does not depend on $\sigma^2$, so we can find it first.
+
+**Step 2: derivative with respect to $\sigma^2$.** Treat $\sigma^2$ as the variable. Then
+$\frac{\partial}{\partial\sigma^2}(1/\sigma^2) = -1/\sigma^4$ and
+$\frac{\partial}{\partial\sigma^2}\ln\sigma^2 = 1/\sigma^2$:
+
+$$
+\frac{\partial}{\partial\sigma^2}\ln p = \frac{1}{2\sigma^4}\sum_{n=1}^N (x_n - \mu)^2 - \frac{N}{2\sigma^2}.
+$$
+
+**Step 3: solve.** Multiply the zero condition by $2\sigma^4$ to get
+$\sum_n (x_n - \mu)^2 - N\sigma^2 = 0$. Putting in $\mu = \mu_{\mathrm{ML}}$ from Step 1,
+
+$$
+\sigma^2_{\mathrm{ML}} = \frac{1}{N}\sum_{n=1}^N (x_n - \mu_{\mathrm{ML}})^2. \tag{2.58}
+$$
+
+**Step 4: it is a maximum.** At this point the second derivatives are
+$\partial^2/\partial\mu^2 = -N/\sigma^2$, $\partial^2/(\partial\sigma^2)^2 = -N/(2\sigma^4)$ and
+the cross derivative $-\frac{1}{\sigma^4}\sum_n (x_n - \mu_{\mathrm{ML}}) = 0$. A diagonal Hessian
+with negative entries is negative definite, so the stationary point is a maximum. The
+`GaussianLikelihood` figure shows it as the peak of the heat map.
+
+**Exercise 2.16.** *Using (2.52) and (2.53), show that $\mathbb{E}[x_n x_m] = \mu^2 + I_{nm}\sigma^2$
+(2.128) for i.i.d. Gaussian samples, where $I_{nm}$ is 1 if $n = m$ and 0 otherwise. Hence prove
+$\mathbb{E}[\mu_{\mathrm{ML}}] = \mu$ (2.59) and $\mathbb{E}[\sigma^2_{\mathrm{ML}}] = \frac{N - 1}{N}\sigma^2$ (2.60).*
+
+**Step 1: $\mathbb{E}[x_n x_m]$.** Two cases:
+
+- $n \neq m$: the samples are independent, so by Exercise 2.9
+  $\mathbb{E}[x_n x_m] = \mathbb{E}[x_n]\,\mathbb{E}[x_m] = \mu \cdot \mu = \mu^2$;
+- $n = m$: $\mathbb{E}[x_n^2] = \mu^2 + \sigma^2$ by (2.53).
+
+Both cases are captured by $\mathbb{E}[x_n x_m] = \mu^2 + I_{nm}\sigma^2$.
+
+**Step 2: the mean estimate is unbiased.** By linearity,
+$\mathbb{E}[\mu_{\mathrm{ML}}] = \frac{1}{N}\sum_n \mathbb{E}[x_n] = \frac{1}{N} \cdot N\mu = \mu$.
+
+**Step 3: rewrite the variance estimate.** Exactly as in Exercise 2.8 (with the sample average in
+place of the expectation),
+
+$$
+\sigma^2_{\mathrm{ML}} = \frac{1}{N}\sum_{n} (x_n - \mu_{\mathrm{ML}})^2 = \frac{1}{N}\sum_n x_n^2 - \mu_{\mathrm{ML}}^2, \qquad \mu_{\mathrm{ML}}^2 = \frac{1}{N^2}\sum_{n}\sum_{m} x_n x_m.
+$$
+
+**Step 4: take expectations.** The first term gives $\mu^2 + \sigma^2$. In the double sum of
+$N^2$ terms, all of them contribute $\mu^2$ and the $N$ diagonal ones ($n = m$) add $\sigma^2$
+each:
+
+$$
+\mathbb{E}[\mu_{\mathrm{ML}}^2] = \frac{1}{N^2}\big(N^2\mu^2 + N\sigma^2\big) = \mu^2 + \frac{\sigma^2}{N}.
+$$
+
+**Step 5: subtract.**
+
+$$
+\mathbb{E}[\sigma^2_{\mathrm{ML}}] = \mu^2 + \sigma^2 - \mu^2 - \frac{\sigma^2}{N} = \frac{N - 1}{N}\sigma^2.
+$$
+
+**What it means.** The term $\sigma^2 / N$ is the variance of the sample mean. Measuring spread
+around the sample mean, which is fitted to the same data, always looks a little tighter than
+around the true mean. With $N = 2$ the estimate is half the true variance on average, which is what
+the `MlBias` figure shows.
+
+**Exercise 2.17.** *Show that the estimator that uses the true mean,
+$\sigma^2_\mu = \frac{1}{N}\sum_n (x_n - \mu)^2$ (2.61), has expectation $\sigma^2$ (2.62).*
+
+**Step 1: linearity.** $\mathbb{E}[\sigma^2_\mu] = \frac{1}{N}\sum_n \mathbb{E}[(x_n - \mu)^2]$.
+
+**Step 2: each term is a variance.** Every $x_n$ has mean $\mu$, so
+$\mathbb{E}[(x_n - \mu)^2] = \operatorname{var}[x_n] = \sigma^2$.
+
+**Step 3: average.** $\mathbb{E}[\sigma^2_\mu] = \frac{1}{N} \cdot N\sigma^2 = \sigma^2$.
+
+**What it means.** Compare with Exercise 2.16: the bias came entirely from using the fitted mean.
+Here nothing is fitted, so nothing is lost.
+
+**Exercise 2.18.** *Show that maximising the regression log likelihood (2.66) with respect to
+$\sigma^2$ gives (2.68).*
+
+The regression log likelihood is (2.56) with the mean $\mu$ replaced by the model's prediction
+$y(x_n, \mathbf{w})$:
+
+$$
+\ln p(\mathbf{t} \mid \mathbf{x}, \mathbf{w}, \sigma^2) = -\frac{1}{2\sigma^2}\sum_{n=1}^N \{y(x_n, \mathbf{w}) - t_n\}^2 - \frac{N}{2}\ln\sigma^2 - \frac{N}{2}\ln(2\pi). \tag{2.66}
+$$
+
+**Step 1: differentiate.** Exactly as in Step 2 of Exercise 2.15,
+
+$$
+\frac{\partial}{\partial\sigma^2}\ln p = \frac{1}{2\sigma^4}\sum_{n=1}^N \{y(x_n, \mathbf{w}) - t_n\}^2 - \frac{N}{2\sigma^2}.
+$$
+
+**Step 2: solve.** Set it to zero, multiply by $2\sigma^4$ and divide by $N$. The weights are
+found first (they do not depend on $\sigma^2$), so use $\mathbf{w} = \mathbf{w}_{\mathrm{ML}}$:
+
+$$
+\sigma^2_{\mathrm{ML}} = \frac{1}{N}\sum_{n=1}^N \{y(x_n, \mathbf{w}_{\mathrm{ML}}) - t_n\}^2. \tag{2.68}
+$$
+
+The noise variance is the mean squared residual of the fitted model.
 
 #### Transformations (2.19–2.20)
 
-**2.19** For an increasing $f$, (2.71) reads $p(f(x))\, f'(x) = q(x)$, so $f$ solves the
-differential equation
+**Exercise 2.19.** *Show that any density $p(y)$ can be obtained from a fixed, everywhere non-zero
+density $q(x)$ by a monotonic change of variable $y = f(x)$. Write down the differential equation
+for $f$ and draw a diagram of the transformation.*
+
+**Step 1: conserve probability.** For an increasing $f$, the small interval
+$(x, x + \delta x)$ maps to $(y, y + \delta y)$ with $\delta y = f'(x)\, \delta x$. Both intervals
+hold the same probability, so $p(y)\, \delta y = q(x)\, \delta x$, which is (2.71):
+
+$$
+p(f(x))\, f'(x) = q(x).
+$$
+
+**Step 2: the differential equation.** Solve for the slope:
 
 $$
 \frac{\mathrm{d}f}{\mathrm{d}x} = \frac{q(x)}{p(f(x))}.
 $$
 
-Integrating both sides from $-\infty$ gives $P(f(x)) = Q(x)$, where $P$ and $Q$ are the cumulative
-distribution functions, so $f = P^{-1} \circ Q$. Such an $f$ always exists: $Q$ is strictly
-increasing because $q > 0$ everywhere, so $Q(x)$ sweeps $(0, 1)$, and $P^{-1}$ maps $(0, 1)$ onto the
-support of $p$. The `DensityTransform` figure above is the picture the exercise asks for, with $q$
-Gaussian and $f$ the sigmoid. Where $f$ is steep, $q$'s mass is spread thin; where $f$ is flat it
-piles up.
+Where $q$ has a lot of mass and $p$ has little, $f$ must be steep to spread that mass out.
 
-**2.20** Differentiating (2.78) and (2.79) with $\frac{\mathrm{d}}{\mathrm{d}u}\tanh u = \operatorname{sech}^2 u$,
+**Step 3: solve it.** Integrate both sides of Step 1 from $-\infty$ to $x$. On the left, substitute
+$y' = f(x')$ (so $\mathrm{d}y' = f'(x')\, \mathrm{d}x'$):
+
+$$
+\int_{-\infty}^{f(x)} p(y')\, \mathrm{d}y' = \int_{-\infty}^{x} q(x')\, \mathrm{d}x', \qquad \text{that is,} \qquad P(f(x)) = Q(x),
+$$
+
+where $P$ and $Q$ are the cumulative distribution functions. Applying $P^{-1}$ gives
+$f = P^{-1} \circ Q$.
+
+**Step 4: it always exists.** $q > 0$ everywhere, so $Q$ is strictly increasing and takes every
+value in $(0, 1)$. $P^{-1}$ then maps $(0, 1)$ onto the region where $p > 0$, so $f$ is defined
+everywhere and increasing.
+
+**Worked example.** Turn $q = \mathcal{N}(0, 1)$ into the exponential density $p(y) = e^{-y}$.
+Then $P(y) = 1 - e^{-y}$, so $P^{-1}(u) = -\ln(1 - u)$ and $f(x) = -\ln(1 - \Phi(x))$, where $\Phi$
+is the Gaussian CDF. Check one value: $\Phi(0) = 0.5$, so $f(0) = \ln 2 = 0.693$, the median of
+the exponential, as it should be since 0 is the median of $q$.
+
+**The diagram.** The `DensityTransform` figure above is the picture the exercise asks for, with
+$q$ Gaussian and $f$ the sigmoid. Where $f$ is steep, $q$'s mass is spread thin; where $f$ is
+flat, it piles up.
+
+**Exercise 2.20.** *Find the Jacobian matrix of the map $y_1 = x_1 + \tanh(5x_1)$ (2.78),
+$y_2 = x_2 + \tanh(5x_2) + x_1^3 / 3$ (2.79).*
+
+**Step 1: the derivative of $\tanh$.** $\frac{\mathrm{d}}{\mathrm{d}u}\tanh u = \operatorname{sech}^2 u$,
+so by the chain rule $\frac{\mathrm{d}}{\mathrm{d}x}\tanh(5x) = 5\operatorname{sech}^2(5x)$.
+
+**Step 2: the four partial derivatives.**
+
+| entry | why | value |
+| --- | --- | --- |
+| $\partial y_1 / \partial x_1$ | derivative of $x_1 + \tanh(5x_1)$ | $1 + 5\operatorname{sech}^2(5x_1)$ |
+| $\partial y_1 / \partial x_2$ | $y_1$ does not involve $x_2$ | $0$ |
+| $\partial y_2 / \partial x_1$ | only $x_1^3/3$ involves $x_1$ | $x_1^2$ |
+| $\partial y_2 / \partial x_2$ | derivative of $x_2 + \tanh(5x_2)$ | $1 + 5\operatorname{sech}^2(5x_2)$ |
+
+So
 
 $$
 \frac{\partial(y_1, y_2)}{\partial(x_1, x_2)} = \begin{pmatrix} 1 + 5\operatorname{sech}^2(5x_1) & 0 \\ x_1^2 & 1 + 5\operatorname{sech}^2(5x_2) \end{pmatrix}.
 $$
 
-It is lower triangular, so its determinant is the product
-$\{1 + 5\operatorname{sech}^2(5x_1)\}\{1 + 5\operatorname{sech}^2(5x_2)\}$, always at least 1. The
-book's $\mathbf{J}$ in (2.76) is the Jacobian of the inverse map $\mathbf{x} = \mathbf{g}(\mathbf{y})$,
-which is the inverse of this matrix, so
-$p_{\mathbf{y}}(\mathbf{y}) = p_{\mathbf{x}}(\mathbf{x}) / [\{1 + 5\operatorname{sech}^2(5x_1)\}\{1 + 5\operatorname{sech}^2(5x_2)\}]$.
-The $x_1^2$ entry shears the plane but does not change areas.
+**Step 3: the determinant.** The matrix is lower triangular, so its determinant is the product of
+the diagonal entries, $\{1 + 5\operatorname{sech}^2(5x_1)\}\{1 + 5\operatorname{sech}^2(5x_2)\}$.
+Since $\operatorname{sech}^2 > 0$ it is always greater than 1: the map stretches every region.
+At the origin $\operatorname{sech}^2 0 = 1$, so areas grow by $6 \times 6 = 36$.
+
+**Step 4: the density.** The book's $\mathbf{J}$ in (2.76) is the Jacobian of the inverse map
+$\mathbf{x} = \mathbf{g}(\mathbf{y})$, which is the inverse of this matrix, and the determinant of
+an inverse is the reciprocal. So
+
+$$
+p_{\mathbf{y}}(\mathbf{y}) = \frac{p_{\mathbf{x}}(\mathbf{x})}{\{1 + 5\operatorname{sech}^2(5x_1)\}\{1 + 5\operatorname{sech}^2(5x_2)\}}.
+$$
+
+The off-diagonal $x_1^2$ shears the plane (it bends lines of constant $x_2$) but does not change
+areas, because it does not enter the determinant.
 
 #### Information theory (2.21–2.38)
 
-**2.21** Two independent events with the same probability $p$ have joint probability $p^2$ and,
-by additivity, information $h(p^2) = 2h(p)$. By induction, $h(p^n) = h(p^{n-1} \cdot p) = (n - 1)h(p) + h(p) = n h(p)$.
-Applying this to $p^{1/m}$ gives $h(p) = h\big((p^{1/m})^m\big) = m\, h(p^{1/m})$, so
-$h(p^{n/m}) = n\, h(p^{1/m}) = \frac{n}{m} h(p)$. Thus $h(p^x) = x\, h(p)$ for every positive rational
-$x$, and by continuity for every positive real $x$. Finally fix some $q \in (0, 1)$ and write any
-$p = q^{x}$ with $x = \ln p / \ln q$. Then $h(p) = \frac{\ln p}{\ln q} h(q) = \frac{h(q)}{\ln q} \ln p$:
-a constant times $\ln p$. The constant must be negative for $h$ to decrease with $p$, and its value
-just sets the unit (bits or nats).
+**Exercise 2.21.** *The information $h(p)$ gained from observing an event of probability $p$ adds
+for independent events. Show that $h(p^2) = 2h(p)$, then $h(p^n) = n\,h(p)$, then
+$h(p^{n/m}) = \frac{n}{m}h(p)$, and finally that $h(p) \propto \ln p$.*
 
-**2.22** Done in the main text: the stationarity condition $-\ln p(x_i) - 1 + \lambda = 0$ makes all
-$p(x_i)$ equal, normalisation makes them $1/M$, and $\mathrm{H} = -\sum_i \frac{1}{M}\ln\frac{1}{M} = \ln M$.
+**Step 1: two events.** Two independent events, each of probability $p$, happen together with
+probability $p \cdot p = p^2$. Their information adds, so $h(p^2) = h(p) + h(p) = 2h(p)$.
 
-**2.23** $\ln$ is concave, so Jensen's inequality runs the other way:
-$\sum_i p_i \ln\frac{1}{p_i} \leqslant \ln \sum_i p_i \cdot \frac{1}{p_i} = \ln M$, summing over the
-(at most $M$) states with $p_i > 0$. So $\mathrm{H}[x] \leqslant \ln M$.
+**Step 2: induction on $n$.** Suppose $h(p^{n-1}) = (n - 1)h(p)$. The event of probability $p^n$
+is an event of probability $p^{n-1}$ together with an independent event of probability $p$, so
+$h(p^n) = h(p^{n-1}) + h(p) = (n - 1)h(p) + h(p) = n\,h(p)$.
 
-**2.24** The functional (2.96) has the form $\int F(p(x), x)\, \mathrm{d}x$ with no derivatives of $p$,
-so its functional derivative is just $\partial F / \partial p = -\ln p(x) - 1 + \lambda_1 + \lambda_2 x + \lambda_3(x - \mu)^2$;
-setting it to zero gives (2.97). Complete the square in the exponent:
-$\lambda_2 x + \lambda_3(x - \mu)^2 = \lambda_3\big(x - \mu + \frac{\lambda_2}{2\lambda_3}\big)^2 + \text{const}$.
-For a normalisable density $\lambda_3 < 0$, so $p$ is a Gaussian with mean
-$\mu - \lambda_2/(2\lambda_3)$ and variance $-1/(2\lambda_3)$. The mean constraint (2.94) forces
-$\lambda_2 = 0$; the variance constraint (2.95) forces $\lambda_3 = -1/(2\sigma^2)$; then
-normalisation (2.93) requires $e^{-1 + \lambda_1} = (2\pi\sigma^2)^{-1/2}$, that is
-$\lambda_1 = 1 - \frac{1}{2}\ln(2\pi\sigma^2)$. The result is (2.98).
-
-**2.25** $-\ln \mathcal{N}(x \mid \mu, \sigma^2) = \frac{1}{2}\ln(2\pi\sigma^2) + \frac{(x - \mu)^2}{2\sigma^2}$.
-Taking the expectation and using (2.95),
-$\mathrm{H} = \frac{1}{2}\ln(2\pi\sigma^2) + \frac{\sigma^2}{2\sigma^2} = \frac{1}{2}\{1 + \ln(2\pi\sigma^2)\}$ (2.99).
-For $\sigma = 1$ this is $1.419$ nats.
-
-**2.26** With $q = \mathcal{N}(\mathbf{x} \mid \boldsymbol\mu, \boldsymbol\Sigma)$ in $D$ dimensions,
+**Step 3: fractions.** Apply Step 2 to the number $p^{1/m}$ with exponent $m$:
+$h(p) = h\big((p^{1/m})^m\big) = m\,h(p^{1/m})$, so $h(p^{1/m}) = h(p) / m$. Applying Step 2 again
+with exponent $n$:
 
 $$
-\mathrm{KL}(p \,\|\, q) = \frac{1}{2}\ln|\boldsymbol\Sigma| + \frac{1}{2}\mathbb{E}_p\big[(\mathbf{x} - \boldsymbol\mu)^{\mathrm{T}}\boldsymbol\Sigma^{-1}(\mathbf{x} - \boldsymbol\mu)\big] + \frac{D}{2}\ln 2\pi + \int p \ln p.
+h(p^{n/m}) = h\big((p^{1/m})^n\big) = n\,h(p^{1/m}) = \frac{n}{m}h(p).
 $$
 
-The gradient with respect to $\boldsymbol\mu$ is $-\boldsymbol\Sigma^{-1}\mathbb{E}_p[\mathbf{x} - \boldsymbol\mu]$,
-zero when $\boldsymbol\mu = \mathbb{E}_p[\mathbf{x}]$. With that $\boldsymbol\mu$, the expectation equals
-$\operatorname{Tr}(\boldsymbol\Sigma^{-1}\mathbf{S})$ with $\mathbf{S} = \operatorname{cov}_p[\mathbf{x}]$.
-Writing $\boldsymbol\Lambda = \boldsymbol\Sigma^{-1}$, the $\boldsymbol\Sigma$-dependent part is
-$-\frac{1}{2}\ln|\boldsymbol\Lambda| + \frac{1}{2}\operatorname{Tr}(\boldsymbol\Lambda\mathbf{S})$,
-whose gradient with respect to $\boldsymbol\Lambda$ is $-\frac{1}{2}\boldsymbol\Lambda^{-1} + \frac{1}{2}\mathbf{S}$
-(see the [matrix calculus post](/blog/matrix-calculus/) for $\partial \ln|\mathbf{A}| / \partial \mathbf{A}$).
-Zero gives $\boldsymbol\Sigma = \mathbf{S}$. So minimising $\mathrm{KL}(p \,\|\, q)$ over Gaussians
-**matches moments**: $q$ takes the mean and covariance of $p$.
+**Step 4: all real exponents.** So $h(p^x) = x\,h(p)$ for every positive rational $x$. Every
+positive real number is a limit of rationals, so if $h$ is continuous the rule holds for every
+positive real $x$.
 
-**2.27** $\mathrm{KL}(p \,\|\, q) = \mathbb{E}_p[\ln p - \ln q]$ with
-$\ln p - \ln q = \ln\frac{s}{\sigma} - \frac{(x - \mu)^2}{2\sigma^2} + \frac{(x - m)^2}{2s^2}$. Under $p$,
-$\mathbb{E}[(x - \mu)^2] = \sigma^2$ and $\mathbb{E}[(x - m)^2] = \sigma^2 + (\mu - m)^2$, so
+**Step 5: the logarithm.** Fix any $q \in (0, 1)$. Every $p \in (0, 1)$ can be written as
+$p = q^x$ with $x = \ln p / \ln q > 0$. Then
+
+$$
+h(p) = h(q^x) = x\,h(q) = \frac{h(q)}{\ln q}\,\ln p,
+$$
+
+a constant times $\ln p$. Rare events must carry more information, so $h$ decreases with $p$ and
+the constant is negative. Its size only sets the unit: $h = -\log_2 p$ in bits, $h = -\ln p$ in
+nats.
+
+**Exercise 2.22.** *Use a Lagrange multiplier to show that maximising the entropy
+$\mathrm{H} = -\sum_i p(x_i)\ln p(x_i)$ (2.86) of an $M$-state variable makes all probabilities
+equal, with entropy $\ln M$.*
+
+**Step 1: the Lagrangian.** Add the constraint $\sum_i p(x_i) = 1$ with a multiplier $\lambda$:
+
+$$
+\tilde{\mathrm{H}} = -\sum_i p(x_i)\ln p(x_i) + \lambda\Big(\sum_i p(x_i) - 1\Big).
+$$
+
+**Step 2: differentiate with respect to one $p(x_i)$.** Only the $i$-th terms depend on it, and
+$\frac{\mathrm{d}}{\mathrm{d}p}(p\ln p) = \ln p + 1$:
+
+$$
+\frac{\partial\tilde{\mathrm{H}}}{\partial p(x_i)} = -\ln p(x_i) - 1 + \lambda = 0 \quad\Longrightarrow\quad p(x_i) = e^{\lambda - 1}.
+$$
+
+**Step 3: all equal.** The right-hand side does not depend on $i$, so every $p(x_i)$ is the same
+constant. Normalisation then forces $p(x_i) = 1/M$.
+
+**Step 4: the entropy.** $\mathrm{H} = -\sum_{i=1}^M \frac{1}{M}\ln\frac{1}{M} = -\ln\frac{1}{M} = \ln M$.
+The main text checks that this stationary point is a maximum (the Hessian is diagonal with
+negative entries $-1/p_i$).
+
+**Exercise 2.23.** *Use Jensen's inequality (2.102) to show that the entropy of an $M$-state
+variable satisfies $\mathrm{H}[x] \leqslant \ln M$.*
+
+**Step 1: write entropy as an average.** $\mathrm{H}[x] = \sum_i p_i \ln(1/p_i)$ is the average,
+under $p$, of the quantity $1/p_i$ passed through $\ln$. Sum only over states with $p_i > 0$; there
+are at most $M$ of them.
+
+**Step 2: apply Jensen.** $\ln$ is concave (its second derivative $-1/x^2$ is negative), so
+Jensen's inequality runs the other way from the convex case: the average of $\ln$ is at most
+$\ln$ of the average.
+
+$$
+\sum_i p_i \ln\frac{1}{p_i} \leqslant \ln\Big(\sum_i p_i \cdot \frac{1}{p_i}\Big) = \ln\Big(\sum_{i:\, p_i > 0} 1\Big) \leqslant \ln M.
+$$
+
+**Check with numbers.** The distribution $(\frac{1}{2}, \frac{1}{4}, \frac{1}{8}, \frac{1}{8})$ has
+$\mathrm{H} = 1.213$ nats, below $\ln 4 = 1.386$. Equality in Jensen needs all the $1/p_i$ to be
+equal, which is the uniform distribution of Exercise 2.22.
+
+**Exercise 2.24.** *Use the calculus of variations to show that the stationary point of the
+functional (2.96) is (2.97). Then use the three constraints to eliminate the multipliers and show
+that the result is the Gaussian (2.98).*
+
+**Step 1: differentiate the functional.** Every term of (2.96) is an integral of something that
+depends on $p(x)$ at a single point, with no derivatives of $p$. For such a functional the
+functional derivative is the ordinary derivative of the integrand with respect to $p$:
+
+$$
+\frac{\delta}{\delta p(x)} = -\ln p(x) - 1 + \lambda_1 + \lambda_2 x + \lambda_3 (x - \mu)^2.
+$$
+
+**Step 2: solve.** Setting it to zero and exponentiating gives (2.97):
+
+$$
+p(x) = \exp\{-1 + \lambda_1 + \lambda_2 x + \lambda_3 (x - \mu)^2\}.
+$$
+
+**Step 3: recognise a Gaussian.** The exponent is a quadratic in $x$. Complete the square:
+
+$$
+\lambda_2 x + \lambda_3 (x - \mu)^2 = \lambda_3\Big(x - \mu + \frac{\lambda_2}{2\lambda_3}\Big)^2 + \text{const},
+$$
+
+where the constant does not depend on $x$. For $p$ to be normalisable the exponent must go to
+$-\infty$, so $\lambda_3 < 0$, and $p$ is a Gaussian with mean $\mu - \lambda_2 / (2\lambda_3)$ and
+variance $-1/(2\lambda_3)$ (match $\lambda_3$ to the $-1/(2\sigma^2)$ in a Gaussian's exponent).
+
+**Step 4: the mean constraint (2.94)** says the mean is $\mu$, so
+$\mu - \lambda_2/(2\lambda_3) = \mu$, giving $\lambda_2 = 0$.
+
+**Step 5: the variance constraint (2.95)** says the variance is $\sigma^2$, so
+$-1/(2\lambda_3) = \sigma^2$, giving $\lambda_3 = -1/(2\sigma^2)$.
+
+**Step 6: normalisation (2.93).** Now $p(x) = e^{-1 + \lambda_1}\exp\{-(x - \mu)^2 / (2\sigma^2)\}$.
+By Exercise 2.12 the exponential integrates to $(2\pi\sigma^2)^{1/2}$, so normalisation needs
+$e^{-1 + \lambda_1} = (2\pi\sigma^2)^{-1/2}$, that is $\lambda_1 = 1 - \frac{1}{2}\ln(2\pi\sigma^2)$.
+The result is
+
+$$
+p(x) = \frac{1}{(2\pi\sigma^2)^{1/2}}\exp\Big\{-\frac{(x - \mu)^2}{2\sigma^2}\Big\}. \tag{2.98}
+$$
+
+**Exercise 2.25.** *Use the constraints (2.94) and (2.95) to show that the entropy of the Gaussian
+is $\frac{1}{2}\{1 + \ln(2\pi\sigma^2)\}$ (2.99).*
+
+**Step 1: the log density.** Take minus the log of (2.98):
+
+$$
+-\ln\mathcal{N}(x \mid \mu, \sigma^2) = \frac{1}{2}\ln(2\pi\sigma^2) + \frac{(x - \mu)^2}{2\sigma^2}.
+$$
+
+**Step 2: average it.** Entropy is $\mathbb{E}[-\ln p(x)]$. The first term is a constant. The
+second has $\mathbb{E}[(x - \mu)^2] = \sigma^2$ by (2.95):
+
+$$
+\mathrm{H}[x] = \frac{1}{2}\ln(2\pi\sigma^2) + \frac{\sigma^2}{2\sigma^2} = \frac{1}{2}\{1 + \ln(2\pi\sigma^2)\}.
+$$
+
+**Check with numbers.** For $\sigma = 1$, $\mathrm{H} = \frac{1}{2}(1 + 1.838) = 1.419$ nats. The
+entropy grows like $\ln\sigma$: doubling $\sigma$ adds $\ln 2 = 0.693$ nats. It does not depend on
+$\mu$, since shifting a density does not change its spread.
+
+**Exercise 2.26.** *Approximate a fixed $p(\mathbf{x})$ by a Gaussian
+$q(\mathbf{x}) = \mathcal{N}(\mathbf{x} \mid \boldsymbol\mu, \boldsymbol\Sigma)$. Show that
+minimising $\mathrm{KL}(p \,\|\, q)$ sets $\boldsymbol\mu$ to the mean of $p$ and
+$\boldsymbol\Sigma$ to its covariance.*
+
+**Step 1: write out the KL.** $\mathrm{KL}(p \,\|\, q) = \int p\ln p - \int p\ln q$. The first term
+does not depend on $q$. For a $D$-dimensional Gaussian,
+$-\ln q = \frac{D}{2}\ln 2\pi + \frac{1}{2}\ln|\boldsymbol\Sigma| + \frac{1}{2}(\mathbf{x} - \boldsymbol\mu)^{\mathrm{T}}\boldsymbol\Sigma^{-1}(\mathbf{x} - \boldsymbol\mu)$,
+so
+
+$$
+\mathrm{KL}(p \,\|\, q) = \frac{1}{2}\ln|\boldsymbol\Sigma| + \frac{1}{2}\mathbb{E}_p\big[(\mathbf{x} - \boldsymbol\mu)^{\mathrm{T}}\boldsymbol\Sigma^{-1}(\mathbf{x} - \boldsymbol\mu)\big] + \text{const}.
+$$
+
+**Step 2: the mean.** Only the expectation depends on $\boldsymbol\mu$. Its gradient is
+$-\boldsymbol\Sigma^{-1}\mathbb{E}_p[\mathbf{x} - \boldsymbol\mu]$ (the gradient of
+$\mathbf{a}^{\mathrm{T}}\mathbf{A}\mathbf{a}$ for symmetric $\mathbf{A}$ is $2\mathbf{A}\mathbf{a}$).
+$\boldsymbol\Sigma^{-1}$ is invertible, so the gradient is zero only when
+$\boldsymbol\mu = \mathbb{E}_p[\mathbf{x}]$.
+
+**Step 3: rewrite the quadratic as a trace.** A scalar equals its own trace, and the trace is
+unchanged by cycling a product:
+$\mathbf{a}^{\mathrm{T}}\boldsymbol\Sigma^{-1}\mathbf{a} = \operatorname{Tr}(\boldsymbol\Sigma^{-1}\mathbf{a}\mathbf{a}^{\mathrm{T}})$.
+Taking the expectation with $\boldsymbol\mu = \mathbb{E}_p[\mathbf{x}]$ turns
+$\mathbf{a}\mathbf{a}^{\mathrm{T}}$ into the covariance $\mathbf{S} = \operatorname{cov}_p[\mathbf{x}]$:
+
+$$
+\mathbb{E}_p\big[(\mathbf{x} - \boldsymbol\mu)^{\mathrm{T}}\boldsymbol\Sigma^{-1}(\mathbf{x} - \boldsymbol\mu)\big] = \operatorname{Tr}(\boldsymbol\Sigma^{-1}\mathbf{S}).
+$$
+
+**Step 4: the covariance.** Work with the precision $\boldsymbol\Lambda = \boldsymbol\Sigma^{-1}$,
+using $\ln|\boldsymbol\Sigma| = -\ln|\boldsymbol\Lambda|$. The part that depends on it is
+$-\frac{1}{2}\ln|\boldsymbol\Lambda| + \frac{1}{2}\operatorname{Tr}(\boldsymbol\Lambda\mathbf{S})$.
+With $\partial\ln|\mathbf{A}| / \partial\mathbf{A} = \mathbf{A}^{-\mathrm{T}}$ and
+$\partial\operatorname{Tr}(\mathbf{A}\mathbf{S}) / \partial\mathbf{A} = \mathbf{S}^{\mathrm{T}}$
+(see the [matrix calculus post](/blog/matrix-calculus/)), and all matrices symmetric, the gradient
+is
+
+$$
+-\frac{1}{2}\boldsymbol\Lambda^{-1} + \frac{1}{2}\mathbf{S} = -\frac{1}{2}\boldsymbol\Sigma + \frac{1}{2}\mathbf{S}.
+$$
+
+Zero gives $\boldsymbol\Sigma = \mathbf{S}$.
+
+**What it means.** Minimising $\mathrm{KL}(p \,\|\, q)$ over Gaussians **matches moments**: $q$
+takes the mean and covariance of $p$, whatever shape $p$ has.
+
+**Exercise 2.27.** *Evaluate $\mathrm{KL}(p \,\|\, q)$ between $p = \mathcal{N}(x \mid \mu, \sigma^2)$
+and $q = \mathcal{N}(x \mid m, s^2)$.*
+
+**Step 1: the log ratio.** The $\frac{1}{2}\ln 2\pi$ terms cancel, and
+$\frac{1}{2}\ln s^2 - \frac{1}{2}\ln\sigma^2 = \ln(s/\sigma)$:
+
+$$
+\ln p(x) - \ln q(x) = \ln\frac{s}{\sigma} - \frac{(x - \mu)^2}{2\sigma^2} + \frac{(x - m)^2}{2s^2}.
+$$
+
+**Step 2: average under $p$.** We need two expectations under $p$:
+
+- $\mathbb{E}_p[(x - \mu)^2] = \sigma^2$, the variance of $p$;
+- $\mathbb{E}_p[(x - m)^2] = \sigma^2 + (\mu - m)^2$: write $x - m = (x - \mu) + (\mu - m)$; the
+  cross term averages to zero because $\mathbb{E}_p[x - \mu] = 0$.
+
+**Step 3: combine.**
 
 $$
 \mathrm{KL}\big(\mathcal{N}(\mu, \sigma^2) \,\|\, \mathcal{N}(m, s^2)\big) = \ln\frac{s}{\sigma} + \frac{\sigma^2 + (\mu - m)^2}{2s^2} - \frac{1}{2}.
 $$
 
-It is zero when $m = \mu$ and $s = \sigma$, and the `GaussianKl` figure checks it against numerical
-integration. With $\mu = 0, \sigma = 1, m = 1, s = 2$: $0.6931 + 0.25 - 0.5 = 0.4431$ (SciPy's
-quadrature gives the same to 16 digits).
+**Check.** When $m = \mu$ and $s = \sigma$ it gives $0 + \frac{1}{2} - \frac{1}{2} = 0$, as a KL
+divergence of a distribution from itself must. With $\mu = 0, \sigma = 1, m = 1, s = 2$:
+$\ln 2 + \frac{1 + 1}{8} - \frac{1}{2} = 0.6931 + 0.25 - 0.5 = 0.4431$ (SciPy's quadrature gives the
+same to 16 digits). Swapping the arguments gives
+$\mathrm{KL}(q \,\|\, p) = \ln\frac{1}{2} + \frac{4 + 1}{2} - \frac{1}{2} = 1.3069$: KL is not
+symmetric. The `GaussianKl` figure checks the formula against numerical integration.
 
-**2.28** Let $\epsilon = (1 - \alpha)/2$, so $\alpha \to 1$ means $\epsilon \to 0$ and
-$(1 + \alpha)/2 = 1 - \epsilon$. Then
-$p^{(1+\alpha)/2} q^{(1-\alpha)/2} = p\,(q/p)^\epsilon = p\{1 + \epsilon\ln(q/p) + O(\epsilon^2)\}$,
-whose integral is $1 + \epsilon\int p\ln(q/p) + O(\epsilon^2)$. Also
-$1 - \alpha^2 = (1 - \alpha)(1 + \alpha) = 4\epsilon(1 - \epsilon)$. So
+**Exercise 2.28.** *The alpha divergence is
+$D_\alpha(p \,\|\, q) = \frac{4}{1 - \alpha^2}\big(1 - \int p^{(1+\alpha)/2} q^{(1-\alpha)/2}\, \mathrm{d}x\big)$
+(2.129). Show that it tends to $\mathrm{KL}(p \,\|\, q)$ as $\alpha \to 1$ and to
+$\mathrm{KL}(q \,\|\, p)$ as $\alpha \to -1$.*
 
-$$
-D_\alpha(p \,\|\, q) = \frac{1}{\epsilon(1 - \epsilon)}\Big\{-\epsilon\int p\ln\frac{q}{p} + O(\epsilon^2)\Big\} \;\to\; -\int p\ln\frac{q}{p} = \mathrm{KL}(p \,\|\, q).
-$$
+**Step 1: a small parameter.** Let $\epsilon = (1 - \alpha)/2$. Then $\alpha \to 1$ means
+$\epsilon \to 0$, and $(1 + \alpha)/2 = 1 - \epsilon$.
 
-For $\alpha \to -1$ swap the roles: with $\epsilon = (1 + \alpha)/2$ the integrand is
-$q\,(p/q)^\epsilon$, and the same steps give $\mathrm{KL}(q \,\|\, p)$.
-
-**2.29** $\mathrm{H}[x] + \mathrm{H}[y] - \mathrm{H}[x, y] = \iint p(x, y)\ln\frac{p(x, y)}{p(x)p(y)} = \mathrm{I}[x, y] = \mathrm{KL}(p(x, y) \,\|\, p(x)p(y)) \geqslant 0$,
-with equality if and only if $p(x, y) = p(x)p(y)$.
-
-**2.30** For $\mathbf{y} = \mathbf{A}\mathbf{x}$, (2.76) gives $p_{\mathbf{y}}(\mathbf{y}) = p_{\mathbf{x}}(\mathbf{A}^{-1}\mathbf{y})/|\det\mathbf{A}|$.
-Changing the integration variable back to $\mathbf{x}$ ($\mathrm{d}\mathbf{y} = |\det\mathbf{A}|\,\mathrm{d}\mathbf{x}$),
+**Step 2: rewrite the integrand.** $p^{1 - \epsilon} q^{\epsilon} = p\,(q/p)^\epsilon$. Use the
+hint $a^\epsilon = e^{\epsilon\ln a} = 1 + \epsilon\ln a + O(\epsilon^2)$ with $a = q/p$:
 
 $$
-\mathrm{H}[\mathbf{y}] = -\int p_{\mathbf{x}}(\mathbf{x})\big\{\ln p_{\mathbf{x}}(\mathbf{x}) - \ln|\det\mathbf{A}|\big\}\mathrm{d}\mathbf{x} = \mathrm{H}[\mathbf{x}] + \ln|\det\mathbf{A}|.
+p\,(q/p)^\epsilon = p + \epsilon\, p\ln\frac{q}{p} + O(\epsilon^2).
 $$
 
-The book writes $\ln\det\mathbf{A}$; the absolute value is needed when $\det\mathbf{A} < 0$.
-Stretching space by a factor $|\det\mathbf{A}|$ adds its logarithm to the differential entropy,
-which is the $-\ln\Delta$ ambiguity of (2.90) in another guise.
-
-**2.31** $\mathrm{H}[y \mid x] = \sum_x p(x)\,\mathrm{H}[y \mid x{=}x]$ with
-$\mathrm{H}[y \mid x{=}x] = -\sum_y p(y \mid x)\ln p(y \mid x) \geqslant 0$. A sum of non-negative terms
-is zero only if every term with $p(x) > 0$ is zero. Each $-p\ln p$ is strictly positive for
-$0 < p < 1$, so $p(y \mid x)$ must be 0 or 1 for every $y$: exactly one $y$ has $p(y \mid x) = 1$,
-and $y$ is a function of $x$.
-
-**2.32** If $f'' > 0$, Taylor's theorem around $x_\lambda = \lambda a + (1 - \lambda)b$ gives
-$f(a) = f(x_\lambda) + f'(x_\lambda)(a - x_\lambda) + \frac{1}{2}f''(\xi_a)(a - x_\lambda)^2$ and
-similarly for $b$. Weighting by $\lambda$ and $1 - \lambda$, the linear terms cancel because
-$\lambda(a - x_\lambda) + (1 - \lambda)(b - x_\lambda) = 0$, leaving
+**Step 3: integrate.** $\int p = 1$, so
 
 $$
-\lambda f(a) + (1 - \lambda)f(b) - f(x_\lambda) = \tfrac{1}{2}\big\{\lambda f''(\xi_a)(a - x_\lambda)^2 + (1 - \lambda)f''(\xi_b)(b - x_\lambda)^2\big\} > 0
+1 - \int p^{1-\epsilon}q^\epsilon\, \mathrm{d}x = -\epsilon\int p\ln\frac{q}{p}\, \mathrm{d}x + O(\epsilon^2) = \epsilon\,\mathrm{KL}(p \,\|\, q) + O(\epsilon^2).
 $$
 
-for $0 < \lambda < 1$: every chord lies strictly above. Conversely, if $f''(x_0) < 0$ somewhere, $f$
-is strictly concave near $x_0$ and short chords there lie below it. So chords above the function
-imply $f'' \geqslant 0$, and $f'' > 0$ implies strict convexity. The two are not quite
-equivalent: $f(x) = x^4$ is strictly convex but $f''(0) = 0$. The book's "equivalent" (and its
-remark after (2.101)) should read "non-negative" in one direction.
+**Step 4: the prefactor.** $1 - \alpha^2 = (1 - \alpha)(1 + \alpha) = 2\epsilon \cdot 2(1 - \epsilon) = 4\epsilon(1 - \epsilon)$,
+so $\frac{4}{1 - \alpha^2} = \frac{1}{\epsilon(1 - \epsilon)}$.
 
-**2.33** The case $M = 2$ is (2.101). Assume (2.102) for $M$ points and take $M + 1$ with
-$\lambda_{M+1} < 1$ (if it equals 1 there is nothing to prove). Write
+**Step 5: take the limit.**
 
 $$
-\sum_{i=1}^{M+1}\lambda_i x_i = \lambda_{M+1}x_{M+1} + (1 - \lambda_{M+1})\sum_{i=1}^{M}\frac{\lambda_i}{1 - \lambda_{M+1}}x_i.
+D_\alpha(p \,\|\, q) = \frac{\epsilon\,\mathrm{KL}(p \,\|\, q) + O(\epsilon^2)}{\epsilon(1 - \epsilon)} = \frac{\mathrm{KL}(p \,\|\, q) + O(\epsilon)}{1 - \epsilon} \;\to\; \mathrm{KL}(p \,\|\, q).
 $$
 
-By (2.101) $f$ of this is at most $\lambda_{M+1}f(x_{M+1}) + (1 - \lambda_{M+1})f\big(\sum_{i \le M}\mu_i x_i\big)$
-with $\mu_i = \lambda_i/(1 - \lambda_{M+1})$, which are non-negative and sum to one. The induction
-hypothesis bounds the last term by $\sum_{i \le M}\mu_i f(x_i)$, and multiplying back gives
-$\sum_{i \le M+1}\lambda_i f(x_i)$.
+**Step 6: the other limit.** For $\alpha \to -1$ let $\epsilon = (1 + \alpha)/2$. The integrand is
+now $q^{1-\epsilon}p^\epsilon = q\,(p/q)^\epsilon$: the same expression with $p$ and $q$ swapped,
+so the same steps give $\mathrm{KL}(q \,\|\, p)$.
 
-**2.34** With the empirical distribution (2.37) as $p$,
-$\mathrm{KL}(p \,\|\, q) = \int p\ln p - \int p\ln q(x \mid \boldsymbol\theta)$. The first term does not
-depend on $\boldsymbol\theta$ (strictly, it is infinite for delta functions, but it is the same
-infinity for every $\boldsymbol\theta$, which is what "up to an additive constant" means). By the
-sifting property the second term is $-\frac{1}{N}\sum_n \ln q(x_n \mid \boldsymbol\theta)$: the
-negative log likelihood divided by $N$.
+**Check with numbers.** For the Gaussians of Exercise 2.27, numerical integration gives
+$D_{0.9} = 0.4522$ and $D_{0.99} = 0.4440$, approaching $\mathrm{KL}(p \,\|\, q) = 0.4431$, and
+$D_{-0.99} = 1.2882$, approaching $\mathrm{KL}(q \,\|\, p) = 1.3069$.
 
-**2.35** $\mathrm{H}[x, y] = -\iint p(x, y)\ln p(x, y) = -\iint p(x, y)\{\ln p(y \mid x) + \ln p(x)\} = \mathrm{H}[y \mid x] - \int p(x)\ln p(x)\, \mathrm{d}x = \mathrm{H}[y \mid x] + \mathrm{H}[x]$,
-where the second integral used the sum rule $\int p(x, y)\, \mathrm{d}y = p(x)$.
+**Exercise 2.29.** *Show that $\mathrm{H}[x, y] \leqslant \mathrm{H}[x] + \mathrm{H}[y]$ (2.130),
+with equality if and only if $x$ and $y$ are independent.*
 
-**2.36** The joint is $p(0,0) = p(0,1) = p(1,1) = \frac{1}{3}$ and $p(1,0) = 0$. The marginals are
-$p(x) = (\frac{2}{3}, \frac{1}{3})$ and $p(y) = (\frac{1}{3}, \frac{2}{3})$, and
-$p(y \mid x{=}0) = (\frac{1}{2}, \frac{1}{2})$ while $p(y \mid x{=}1) = (0, 1)$. In nats:
+**Step 1: write all three as integrals over the joint.** By the sum rule,
+$\mathrm{H}[x] = -\int p(x)\ln p(x)\, \mathrm{d}x = -\iint p(x, y)\ln p(x)\, \mathrm{d}x\, \mathrm{d}y$,
+and the same for $y$. So
 
-| quantity | expression | value |
-| --- | --- | ---: |
-| (a) $\mathrm{H}[x]$ | $\ln 3 - \frac{2}{3}\ln 2$ | 0.6365 |
-| (b) $\mathrm{H}[y]$ | $\ln 3 - \frac{2}{3}\ln 2$ | 0.6365 |
-| (c) $\mathrm{H}[y \mid x]$ | $\frac{2}{3}\ln 2 + \frac{1}{3} \cdot 0$ | 0.4621 |
-| (d) $\mathrm{H}[x \mid y]$ | $\frac{1}{3} \cdot 0 + \frac{2}{3}\ln 2$ | 0.4621 |
-| (e) $\mathrm{H}[x, y]$ | $\ln 3$ | 1.0986 |
-| (f) $\mathrm{I}[x, y]$ | $\ln 3 - \frac{4}{3}\ln 2$ | 0.1744 |
+$$
+\mathrm{H}[x] + \mathrm{H}[y] - \mathrm{H}[x, y] = \iint p(x, y)\big\{\ln p(x, y) - \ln p(x) - \ln p(y)\big\} = \iint p(x, y)\ln\frac{p(x, y)}{p(x)\,p(y)}.
+$$
 
-Check: $\mathrm{H}[x] + \mathrm{H}[y \mid x] = 0.6365 + 0.4621 = 1.0986 = \mathrm{H}[x, y]$, and
-$\mathrm{H}[x] - \mathrm{H}[x \mid y] = 0.1744 = \mathrm{I}$. The Venn diagram is the `InfoBars` figure
-above: two "circles" $\mathrm{H}[x]$ and $\mathrm{H}[y]$ overlapping in $\mathrm{I}$, their union
-$\mathrm{H}[x, y]$, and the crescents $\mathrm{H}[x \mid y]$ and $\mathrm{H}[y \mid x]$.
+**Step 2: recognise a KL divergence.** The right-hand side is
+$\mathrm{KL}\big(p(x, y) \,\|\, p(x)\,p(y)\big)$, which is the mutual information $\mathrm{I}[x, y]$.
 
-**2.37** $\ln$ is concave, so Jensen's inequality (2.102) holds with $\geqslant$. With equal weights
-$1/M$ on positive numbers $x_1, \dots, x_M$:
-$\ln\big(\frac{1}{M}\sum_i x_i\big) \geqslant \frac{1}{M}\sum_i \ln x_i = \ln\big(\prod_i x_i\big)^{1/M}$.
-Since $\exp$ is increasing, the arithmetic mean is at least the geometric mean, with equality only
-when all $x_i$ are equal (strict concavity). The exercise says "real numbers"; they must be
-positive for the logarithm to exist.
+**Step 3: use Gibbs' inequality.** A KL divergence is never negative and is zero only when the two
+distributions are equal (main text, (2.105)). So
+$\mathrm{H}[x] + \mathrm{H}[y] - \mathrm{H}[x, y] \geqslant 0$, with equality exactly when
+$p(x, y) = p(x)\,p(y)$, which is independence.
 
-**2.38** Using $p(x, y) = p(x \mid y)\, p(y)$,
-$\mathrm{I}[x, y] = \iint p(x, y)\ln\frac{p(x \mid y)}{p(x)} = -\iint p(x, y)\ln p(x) + \iint p(x, y)\ln p(x \mid y) = \mathrm{H}[x] - \mathrm{H}[x \mid y]$,
-where the first integral used the sum rule over $y$. Writing $p(x, y) = p(y \mid x)p(x)$ instead
-gives $\mathrm{H}[y] - \mathrm{H}[y \mid x]$.
+**Exercise 2.30.** *For a non-singular linear map $\mathbf{y} = \mathbf{A}\mathbf{x}$, show that
+$\mathrm{H}[\mathbf{y}] = \mathrm{H}[\mathbf{x}] + \ln\det\mathbf{A}$.*
+
+**Step 1: the density of $\mathbf{y}$.** The inverse map is $\mathbf{x} = \mathbf{A}^{-1}\mathbf{y}$,
+whose Jacobian is $\mathbf{A}^{-1}$ with $|\det\mathbf{A}^{-1}| = 1 / |\det\mathbf{A}|$. By (2.76),
+
+$$
+p_{\mathbf{y}}(\mathbf{y}) = \frac{p_{\mathbf{x}}(\mathbf{A}^{-1}\mathbf{y})}{|\det\mathbf{A}|}.
+$$
+
+**Step 2: change the integration variable back to $\mathbf{x}$.** Substituting
+$\mathbf{y} = \mathbf{A}\mathbf{x}$ gives $\mathrm{d}\mathbf{y} = |\det\mathbf{A}|\, \mathrm{d}\mathbf{x}$,
+which cancels the $1 / |\det\mathbf{A}|$ in front:
+
+$$
+\mathrm{H}[\mathbf{y}] = -\int p_{\mathbf{y}}\ln p_{\mathbf{y}}\, \mathrm{d}\mathbf{y} = -\int p_{\mathbf{x}}(\mathbf{x})\big\{\ln p_{\mathbf{x}}(\mathbf{x}) - \ln|\det\mathbf{A}|\big\}\, \mathrm{d}\mathbf{x}.
+$$
+
+**Step 3: split.** The first part is $\mathrm{H}[\mathbf{x}]$; the second is
+$\ln|\det\mathbf{A}|$ times $\int p_{\mathbf{x}} = 1$:
+
+$$
+\mathrm{H}[\mathbf{y}] = \mathrm{H}[\mathbf{x}] + \ln|\det\mathbf{A}|.
+$$
+
+The book writes $\ln\det\mathbf{A}$; the absolute value is needed when $\det\mathbf{A} < 0$
+(a reflection).
+
+**Check with numbers.** Let $\mathbf{x}$ be two independent $\mathcal{N}(0, 1)$ variables, so
+$\mathrm{H}[\mathbf{x}] = 2 \times 1.419 = 2.838$ nats, and $\mathbf{A} = \operatorname{diag}(2, 3)$.
+Then $y_1 \sim \mathcal{N}(0, 4)$ and $y_2 \sim \mathcal{N}(0, 9)$, and Exercise 2.25 gives
+$\mathrm{H}[\mathbf{y}] = 4.630$, which is $2.838 + \ln 6 = 2.838 + 1.792$.
+
+**What it means.** Stretching space by a factor $|\det\mathbf{A}|$ adds its logarithm to the
+differential entropy. This is the $-\ln\Delta$ ambiguity of (2.90) in another guise: differential
+entropy depends on the units you measure in.
+
+**Exercise 2.31.** *Show that if $\mathrm{H}[y \mid x] = 0$ for discrete $x$ and $y$, then $y$ is a
+function of $x$: for each $x$ with $p(x) > 0$ only one $y$ has $p(y \mid x) \neq 0$.*
+
+**Step 1: split the conditional entropy by $x$.**
+
+$$
+\mathrm{H}[y \mid x] = \sum_x p(x)\, \mathrm{H}[y \mid x{=}x], \qquad \mathrm{H}[y \mid x{=}x] = -\sum_y p(y \mid x)\ln p(y \mid x).
+$$
+
+**Step 2: every piece is non-negative.** Each term $-p\ln p$ is $\geqslant 0$ for
+$0 \leqslant p \leqslant 1$, so each $\mathrm{H}[y \mid x{=}x] \geqslant 0$.
+
+**Step 3: a sum of non-negative terms is zero only if each term is.** So
+$\mathrm{H}[y \mid x{=}x] = 0$ for every $x$ with $p(x) > 0$, and within it every
+$-p(y \mid x)\ln p(y \mid x) = 0$.
+
+**Step 4: what that forces.** $-p\ln p$ is strictly positive for $0 < p < 1$ and zero only at
+$p = 0$ or $p = 1$. So every $p(y \mid x)$ is 0 or 1, and since they sum to one, exactly one $y$
+has $p(y \mid x) = 1$. That $y$ is determined by $x$.
+
+**Exercise 2.32.** *A strictly convex function is one for which every chord lies above the
+function. Show that this is equivalent to a positive second derivative.*
+
+**Step 1 ($f'' > 0$ ⇒ chords above): Taylor expansion.** Fix $a \neq b$, $0 < \lambda < 1$ and the
+point $x_\lambda = \lambda a + (1 - \lambda)b$ between them. Taylor's theorem with remainder gives
+points $\xi_a$, $\xi_b$ such that
+
+$$
+\begin{aligned}
+f(a) &= f(x_\lambda) + f'(x_\lambda)(a - x_\lambda) + \tfrac{1}{2}f''(\xi_a)(a - x_\lambda)^2, \\
+f(b) &= f(x_\lambda) + f'(x_\lambda)(b - x_\lambda) + \tfrac{1}{2}f''(\xi_b)(b - x_\lambda)^2.
+\end{aligned}
+$$
+
+**Step 2: weight and add.** Multiply the first line by $\lambda$, the second by $1 - \lambda$, and
+add. The linear terms cancel, because
+$\lambda(a - x_\lambda) + (1 - \lambda)(b - x_\lambda) = \lambda a + (1 - \lambda)b - x_\lambda = 0$:
+
+$$
+\lambda f(a) + (1 - \lambda)f(b) - f(x_\lambda) = \tfrac{1}{2}\big\{\lambda f''(\xi_a)(a - x_\lambda)^2 + (1 - \lambda)f''(\xi_b)(b - x_\lambda)^2\big\} > 0.
+$$
+
+The left side is the height of the chord above the function at $x_\lambda$, so every chord lies
+strictly above.
+
+**Step 3 (chords above ⇒ $f'' \geqslant 0$).** Suppose instead $f''(x_0) < 0$ at some point. If
+$f''$ is continuous it stays negative on a small interval around $x_0$, and Step 2 with the
+inequality reversed shows that chords inside that interval lie *below* $f$. So chords above force
+$f'' \geqslant 0$ everywhere.
+
+**Step 4: the two are not quite equivalent.** $f(x) = x^4$ is strictly convex (every chord lies
+above) but $f''(0) = 0$. So the correct statement is: $f'' > 0$ implies strict convexity, and
+strict convexity implies $f'' \geqslant 0$. The book's "equivalent" (and its remark after (2.101))
+should read "non-negative" in one direction.
+
+**Exercise 2.33.** *Using induction, show that the two-point inequality (2.101) for convex
+functions implies Jensen's inequality for $M$ points,
+$f\big(\sum_i \lambda_i x_i\big) \leqslant \sum_i \lambda_i f(x_i)$ with $\lambda_i \geqslant 0$
+and $\sum_i \lambda_i = 1$ (2.102).*
+
+**Step 1: base case.** For $M = 2$, (2.102) is exactly (2.101).
+
+**Step 2: inductive step, set-up.** Assume (2.102) holds for $M$ points and take $M + 1$. If
+$\lambda_{M+1} = 1$ all other weights are zero and both sides equal $f(x_{M+1})$. Otherwise pull
+out the last point and rescale the rest:
+
+$$
+\sum_{i=1}^{M+1}\lambda_i x_i = \lambda_{M+1}x_{M+1} + (1 - \lambda_{M+1})\sum_{i=1}^{M}\mu_i x_i, \qquad \mu_i = \frac{\lambda_i}{1 - \lambda_{M+1}}.
+$$
+
+The $\mu_i$ are non-negative and sum to $(1 - \lambda_{M+1}) / (1 - \lambda_{M+1}) = 1$, so
+$\bar x = \sum_{i \le M}\mu_i x_i$ is a weighted average of $M$ points.
+
+**Step 3: apply the two-point inequality** to the points $x_{M+1}$ and $\bar x$ with weights
+$\lambda_{M+1}$ and $1 - \lambda_{M+1}$:
+
+$$
+f\Big(\sum_{i=1}^{M+1}\lambda_i x_i\Big) \leqslant \lambda_{M+1}f(x_{M+1}) + (1 - \lambda_{M+1})f(\bar x).
+$$
+
+**Step 4: apply the induction hypothesis** to $f(\bar x) \leqslant \sum_{i \le M}\mu_i f(x_i)$, and
+multiply back: $(1 - \lambda_{M+1})\mu_i = \lambda_i$. So the right-hand side is at most
+$\sum_{i=1}^{M+1}\lambda_i f(x_i)$, which is (2.102) for $M + 1$ points.
+
+**Exercise 2.34.** *Show that, up to an additive constant, $\mathrm{KL}$ between the empirical
+distribution (2.37) and a model $q(x \mid \boldsymbol\theta)$ is the negative log likelihood.*
+
+**Step 1: split the KL.** With $p$ the empirical distribution,
+
+$$
+\mathrm{KL}(p \,\|\, q) = \int p(x)\ln p(x)\, \mathrm{d}x - \int p(x)\ln q(x \mid \boldsymbol\theta)\, \mathrm{d}x.
+$$
+
+**Step 2: the first term is a constant.** It does not involve $\boldsymbol\theta$.<Sidenote>Strictly,
+$\int p\ln p$ is $-\infty$ for a sum of delta functions, but it is the same for every
+$\boldsymbol\theta$, which is what "up to an additive constant" means. For discrete data it is an
+ordinary finite number.</Sidenote>
+
+**Step 3: the second term.** Substitute $p(x) = \frac{1}{N}\sum_n\delta(x - x_n)$ and use the
+sifting property, as in Exercise 2.7:
+
+$$
+-\int \frac{1}{N}\sum_{n}\delta(x - x_n)\ln q(x \mid \boldsymbol\theta)\, \mathrm{d}x = -\frac{1}{N}\sum_{n=1}^N \ln q(x_n \mid \boldsymbol\theta).
+$$
+
+**What it means.** That is the negative log likelihood divided by $N$. Minimising KL from the data
+to the model and maximising the likelihood are the same thing.
+
+**Exercise 2.35.** *Using the definition of conditional entropy (2.107) and the product rule,
+prove $\mathrm{H}[x, y] = \mathrm{H}[y \mid x] + \mathrm{H}[x]$ (2.108).*
+
+**Step 1: product rule inside the log.** $p(x, y) = p(y \mid x)\,p(x)$, and the log of a product
+is a sum:
+
+$$
+\mathrm{H}[x, y] = -\iint p(x, y)\ln p(x, y) = -\iint p(x, y)\ln p(y \mid x) - \iint p(x, y)\ln p(x).
+$$
+
+**Step 2: the first integral** is the definition (2.107) of $\mathrm{H}[y \mid x]$.
+
+**Step 3: the second integral.** $\ln p(x)$ does not depend on $y$, so do the $y$ integral first;
+the sum rule gives $\int p(x, y)\, \mathrm{d}y = p(x)$, leaving
+$-\int p(x)\ln p(x)\, \mathrm{d}x = \mathrm{H}[x]$.
+
+**What it means.** The information needed to specify both $x$ and $y$ is the information to specify
+$x$, plus what is still needed for $y$ once $x$ is known.
+
+**Exercise 2.36.** *Two binary variables have $p(x, y) = \frac{1}{3}$ for
+$(x, y) = (0, 0), (0, 1), (1, 1)$ and $p(1, 0) = 0$. Evaluate (a) $\mathrm{H}[x]$, (b)
+$\mathrm{H}[y]$, (c) $\mathrm{H}[y \mid x]$, (d) $\mathrm{H}[x \mid y]$, (e) $\mathrm{H}[x, y]$,
+(f) $\mathrm{I}[x, y]$, and draw a Venn diagram.*
+
+**Step 1: marginals.** Add the joint along rows and columns (sum rule):
+
+| | $y = 0$ | $y = 1$ | $p(x)$ |
+| --- | ---: | ---: | ---: |
+| $x = 0$ | 1/3 | 1/3 | 2/3 |
+| $x = 1$ | 0 | 1/3 | 1/3 |
+| $p(y)$ | 1/3 | 2/3 | 1 |
+
+**Step 2: conditionals.** Divide each row by $p(x)$ and each column by $p(y)$ (product rule):
+$p(y \mid x{=}0) = (\frac{1}{2}, \frac{1}{2})$, $p(y \mid x{=}1) = (0, 1)$,
+$p(x \mid y{=}0) = (1, 0)$, $p(x \mid y{=}1) = (\frac{1}{2}, \frac{1}{2})$.
+
+**Step 3: the entropies** (in nats; a fair coin has entropy $\ln 2$, a certain outcome 0):
+
+- (a) $\mathrm{H}[x] = -\frac{2}{3}\ln\frac{2}{3} - \frac{1}{3}\ln\frac{1}{3} = \ln 3 - \frac{2}{3}\ln 2 = 0.6365$.
+- (b) $\mathrm{H}[y]$: the same two probabilities in the other order, $0.6365$.
+- (c) $\mathrm{H}[y \mid x] = p(x{=}0)\,\mathrm{H}[y \mid x{=}0] + p(x{=}1)\,\mathrm{H}[y \mid x{=}1] = \frac{2}{3}\ln 2 + \frac{1}{3} \cdot 0 = 0.4621$.
+- (d) $\mathrm{H}[x \mid y] = \frac{1}{3} \cdot 0 + \frac{2}{3}\ln 2 = 0.4621$.
+- (e) $\mathrm{H}[x, y]$: three equally likely outcomes, so $\ln 3 = 1.0986$.
+- (f) $\mathrm{I}[x, y] = \mathrm{H}[x] - \mathrm{H}[x \mid y] = \ln 3 - \frac{4}{3}\ln 2 = 0.1744$.
+
+**Step 4: check.** The chain rule of Exercise 2.35 holds:
+$\mathrm{H}[x] + \mathrm{H}[y \mid x] = 0.6365 + 0.4621 = 1.0986 = \mathrm{H}[x, y]$. And the two
+ways to compute the mutual information agree:
+$\mathrm{H}[x] + \mathrm{H}[y] - \mathrm{H}[x, y] = 1.2730 - 1.0986 = 0.1744$.
+
+**Step 5: the Venn diagram.** It is the `InfoBars` figure above: two "circles" $\mathrm{H}[x]$ and
+$\mathrm{H}[y]$ overlapping in $\mathrm{I}[x, y]$, their union $\mathrm{H}[x, y]$, and the crescents
+$\mathrm{H}[x \mid y]$ and $\mathrm{H}[y \mid x]$ left over on each side.
+
+**Exercise 2.37.** *Apply Jensen's inequality with $f(x) = \ln x$ to show that the arithmetic mean
+of a set of numbers is never less than their geometric mean.*
+
+**Step 1: the direction.** $\ln$ is concave, so Jensen's inequality (2.102) holds with
+$\geqslant$: $\ln$ of an average is at least the average of $\ln$.
+
+**Step 2: equal weights.** Take $\lambda_i = 1/M$ on positive numbers $x_1, \dots, x_M$, and use
+$\sum_i \ln x_i = \ln\prod_i x_i$:
+
+$$
+\ln\Big(\frac{1}{M}\sum_{i=1}^M x_i\Big) \geqslant \frac{1}{M}\sum_{i=1}^M \ln x_i = \ln\Big(\prod_{i=1}^M x_i\Big)^{1/M}.
+$$
+
+**Step 3: remove the logs.** $\exp$ is increasing, so it keeps the inequality:
+$\frac{1}{M}\sum_i x_i \geqslant \big(\prod_i x_i\big)^{1/M}$. Equality holds only when all the
+$x_i$ are equal, because $\ln$ is strictly concave.
+
+**Check with numbers.** For $1, 4, 16$: the arithmetic mean is $21/3 = 7$, the geometric mean is
+$64^{1/3} = 4$. The exercise says "real numbers"; they must be positive for the logarithm to
+exist.
+
+**Exercise 2.38.** *Using the sum and product rules, show that
+$\mathrm{I}[x, y] = \mathrm{H}[x] - \mathrm{H}[x \mid y] = \mathrm{H}[y] - \mathrm{H}[y \mid x]$
+(2.110).*
+
+**Step 1: product rule in the definition.** Mutual information is
+$\iint p(x, y)\ln\frac{p(x, y)}{p(x)\,p(y)}$. Write $p(x, y) = p(x \mid y)\,p(y)$; the $p(y)$
+cancels:
+
+$$
+\mathrm{I}[x, y] = \iint p(x, y)\ln\frac{p(x \mid y)}{p(x)} = -\iint p(x, y)\ln p(x) + \iint p(x, y)\ln p(x \mid y).
+$$
+
+**Step 2: sum rule in the first integral.** Integrating out $y$ leaves
+$-\int p(x)\ln p(x) = \mathrm{H}[x]$.
+
+**Step 3: the second integral** is $-\mathrm{H}[x \mid y]$ by definition. So
+$\mathrm{I}[x, y] = \mathrm{H}[x] - \mathrm{H}[x \mid y]$.
+
+**Step 4: the other form.** Writing $p(x, y) = p(y \mid x)\,p(x)$ in Step 1 instead gives
+$\mathrm{H}[y] - \mathrm{H}[y \mid x]$.
+
+**What it means.** Mutual information is how much knowing $y$ reduces the uncertainty about $x$,
+and the reduction is the same in both directions.
 
 #### Bayesian probabilities (2.40–2.41)
 
-**2.40** The concave side lands up with probability 0.6. Let $\mathcal{H}$ be the hypothesis
-"concave side is heads", with prior $p(\mathcal{H}) = 1 - 0.1 = 0.9$. Under $\mathcal{H}$ a flip lands
-heads with probability 0.6; otherwise with 0.4. For 8 heads and 2 tails (in any fixed order; the
-binomial coefficient cancels),
+**Exercise 2.40.** *The bent coin lands concave side up with probability 0.6. The prior
+probability that the convex side is heads is 0.1. After 10 flips with 8 heads and 2 tails, find the
+posterior probability that the concave side is heads, and the probability that the next flip is
+heads.*
+
+**Step 1: hypotheses and prior.** Let $\mathcal{H}$ be "the concave side is heads". The prior is
+$p(\mathcal{H}) = 1 - 0.1 = 0.9$, so $p(\lnot\mathcal{H}) = 0.1$.
+
+**Step 2: probability of heads under each.** Under $\mathcal{H}$, heads means concave up, with
+probability 0.6. Under $\lnot\mathcal{H}$, heads is the convex side, up with probability 0.4.
+
+**Step 3: likelihoods.** The flips are independent given the hypothesis, so for one particular
+sequence with 8 heads and 2 tails
 
 $$
-\frac{p(\mathcal{H} \mid \mathcal{D})}{p(\lnot\mathcal{H} \mid \mathcal{D})} = \frac{0.9}{0.1} \cdot \frac{0.6^8\, 0.4^2}{0.4^8\, 0.6^2} = 9 \times 1.5^6 = 9 \times 11.39 = 102.5,
+p(\mathcal{D} \mid \mathcal{H}) = 0.6^8 \times 0.4^2 = 0.002687, \qquad p(\mathcal{D} \mid \lnot\mathcal{H}) = 0.4^8 \times 0.6^2 = 0.000236.
 $$
 
-so $p(\mathcal{H} \mid \mathcal{D}) = 102.5/103.5 = 0.9903$. The probability that the next flip lands
-heads averages over both hypotheses:
-$0.9903 \times 0.6 + 0.0097 \times 0.4 = 0.598$. The data pushed the belief that the concave side is
-heads from 0.90 to 0.99, and the prediction from $0.9 \times 0.6 + 0.1 \times 0.4 = 0.58$ to 0.598.
+(If we only know the counts, both likelihoods get the same binomial coefficient
+$\binom{10}{8}$, which cancels in Step 4.)
 
-**2.41** Substituting the prior (2.115) and the log likelihood (2.66) into (2.114),
+**Step 4: Bayes' theorem in odds form.** Dividing Bayes' theorem for $\mathcal{H}$ by Bayes'
+theorem for $\lnot\mathcal{H}$ cancels the evidence $p(\mathcal{D})$:
+
+$$
+\frac{p(\mathcal{H} \mid \mathcal{D})}{p(\lnot\mathcal{H} \mid \mathcal{D})} = \frac{p(\mathcal{H})}{p(\lnot\mathcal{H})} \cdot \frac{p(\mathcal{D} \mid \mathcal{H})}{p(\mathcal{D} \mid \lnot\mathcal{H})} = \frac{0.9}{0.1} \cdot \frac{0.6^8\, 0.4^2}{0.4^8\, 0.6^2} = 9 \times 1.5^6 = 9 \times 11.39 = 102.5.
+$$
+
+The likelihood ratio simplifies because six of the eight heads are "unmatched" by tails:
+$(0.6/0.4)^{8 - 2} = 1.5^6$.
+
+**Step 5: back to a probability.** Odds $o$ mean probability $o / (1 + o)$:
+$p(\mathcal{H} \mid \mathcal{D}) = 102.5 / 103.5 = 0.9903$.
+
+**Step 6: predict the next flip.** Average the heads probability over both hypotheses, weighted
+by the posterior (sum and product rules):
+
+$$
+p(\text{heads} \mid \mathcal{D}) = 0.9903 \times 0.6 + 0.0097 \times 0.4 = 0.598.
+$$
+
+**What it means.** The data pushed the belief that the concave side is heads from 0.90 to 0.99, and
+the prediction from $0.9 \times 0.6 + 0.1 \times 0.4 = 0.58$ to 0.598. It can never exceed 0.6,
+the heads probability if we were certain of $\mathcal{H}$.
+
+**Exercise 2.41.** *Substitute the Gaussian prior (2.115) into the negative log posterior (2.114)
+and use the log likelihood (2.66) to derive the regularised error (2.117).*
+
+**Step 1: the starting point.** Bayes' theorem in negative logs is (2.114):
+$-\ln p(\mathbf{w} \mid \mathcal{D}) = -\ln p(\mathcal{D} \mid \mathbf{w}) - \ln p(\mathbf{w}) + \ln p(\mathcal{D})$.
+
+**Step 2: the likelihood term.** Minus (2.66) is
+
+$$
+-\ln p(\mathcal{D} \mid \mathbf{w}) = \frac{1}{2\sigma^2}\sum_{n=1}^N\{y(x_n, \mathbf{w}) - t_n\}^2 + \frac{N}{2}\ln(2\pi\sigma^2).
+$$
+
+**Step 3: the prior term.** The prior (2.115) is a product of $M + 1$ Gaussians, so its log is a
+sum of $M + 1$ terms, and $\sum_i w_i^2 = \mathbf{w}^{\mathrm{T}}\mathbf{w}$:
+
+$$
+-\ln p(\mathbf{w}) = \sum_{i=0}^{M}\Big\{\frac{1}{2}\ln(2\pi s^2) + \frac{w_i^2}{2s^2}\Big\} = \frac{1}{2s^2}\mathbf{w}^{\mathrm{T}}\mathbf{w} + \frac{M + 1}{2}\ln(2\pi s^2).
+$$
+
+**Step 4: add.**
 
 $$
 \begin{aligned}
@@ -1607,7 +2503,16 @@ $$
 \end{aligned}
 $$
 
-The second, fourth and fifth terms do not depend on $\mathbf{w}$. Dropping them leaves (2.117).
+**Step 5: drop what does not depend on $\mathbf{w}$.** The second, fourth and fifth terms are
+constants when we minimise over $\mathbf{w}$. Dropping them leaves (2.117):
+
+$$
+\frac{1}{2\sigma^2}\sum_{n=1}^N\{y(x_n, \mathbf{w}) - t_n\}^2 + \frac{1}{2s^2}\mathbf{w}^{\mathrm{T}}\mathbf{w}.
+$$
+
+Multiplying by $\sigma^2$ gives the familiar sum-of-squares error plus a weight penalty
+$\frac{\lambda}{2}\mathbf{w}^{\mathrm{T}}\mathbf{w}$ with $\lambda = \sigma^2 / s^2$: a narrow
+prior (small $s$) means strong regularisation.
 
 ## Summary
 

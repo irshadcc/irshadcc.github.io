@@ -1,0 +1,291 @@
+/* Quantum figures (src/utils/quantum). Frames, controls and readouts come from
+   ../sampling/sampling.css (smp-*); these rules add the circuit, amplitude bars, Bloch sphere
+   and probability bars. SVG content is created by scripts, so the rules are global. */
+
+.qc-fig {
+	--qc-neg: #c2674c;
+	--qc-err: #c0392b;
+	--qc-bar: var(--accent);
+	--qc-now: rgba(31, 79, 120, 0.1);
+	--qc-hl: #d08a1e;
+}
+@media (prefers-color-scheme: dark) {
+	.qc-fig {
+		--qc-neg: #e8a07a;
+		--qc-err: #f08070;
+		--qc-now: rgba(141, 187, 227, 0.12);
+		--qc-hl: #f0b85a;
+	}
+}
+
+/* Circuit */
+.qc-fig .qc-circuit {
+	display: block;
+	width: 100%;
+	height: auto;
+	max-height: 22rem;
+	font: 11px var(--sans);
+	background: var(--bg);
+	border-radius: 5px;
+}
+.qc-fig .qc-wire {
+	stroke: var(--muted);
+	stroke-width: 1;
+}
+.qc-fig .qc-qlabel {
+	fill: var(--text);
+	font: 11.5px var(--mono);
+}
+.qc-fig .qc-box {
+	fill: var(--bg);
+	stroke: var(--text);
+	stroke-width: 1.2;
+}
+.qc-fig .qc-block {
+	fill: var(--accent-soft);
+	stroke: var(--accent);
+	stroke-width: 1.2;
+}
+.qc-fig .qc-gtext {
+	fill: var(--text);
+	font: 600 11.5px var(--sans);
+}
+.qc-fig .qc-ptext {
+	fill: var(--muted);
+	font: 9px var(--sans);
+}
+.qc-fig .qc-link {
+	stroke: var(--text);
+	stroke-width: 1.3;
+}
+.qc-fig .qc-dot {
+	fill: var(--text);
+}
+.qc-fig .qc-target {
+	fill: var(--bg);
+	stroke: var(--text);
+	stroke-width: 1.3;
+}
+.qc-fig .qc-caption {
+	fill: var(--muted);
+	font: italic 10px var(--sans);
+}
+.qc-fig .qc-caption.err {
+	fill: var(--qc-err);
+	font-weight: 600;
+}
+.qc-fig .qc-col {
+	cursor: pointer;
+	transition: opacity 0.15s;
+}
+.qc-fig .qc-col .qc-colbg {
+	fill: transparent;
+}
+.qc-fig .qc-col.now .qc-colbg {
+	fill: var(--qc-now);
+}
+.qc-fig .qc-col.now .qc-box,
+.qc-fig .qc-col.now .qc-block {
+	stroke: var(--accent);
+	stroke-width: 2;
+}
+.qc-fig .qc-col.future {
+	opacity: 0.28;
+}
+.qc-fig .qc-col.err-gate .qc-box {
+	stroke: var(--qc-err);
+}
+
+/* Amplitude bars */
+.qc-fig .qc-bar {
+	fill: var(--qc-bar);
+}
+.qc-fig .qc-bar.neg {
+	fill: var(--qc-neg);
+}
+.qc-fig .qc-bar.cplx {
+	fill: var(--qc-bar);
+	opacity: 0.6;
+}
+.qc-fig .qc-ket {
+	fill: var(--text);
+	font: 10.5px var(--mono);
+}
+.qc-fig .qc-val {
+	fill: var(--muted);
+	font-size: 9.5px;
+}
+.qc-fig .qc-base {
+	stroke: var(--muted);
+	stroke-width: 1;
+}
+.qc-fig .qc-mean {
+	stroke: var(--qc-hl);
+	stroke-width: 1.4;
+	stroke-dasharray: 5 3;
+}
+.qc-fig .qc-dial {
+	fill: none;
+	stroke: var(--faint);
+	stroke-width: 1;
+}
+.qc-fig .qc-hand {
+	stroke: var(--text);
+	stroke-width: 1.4;
+	stroke-linecap: round;
+}
+.qc-fig .qc-legend-mean {
+	border-top: 2px dashed var(--qc-hl);
+}
+.qc-fig .qc-legend-neg {
+	background: var(--qc-neg);
+}
+.qc-fig .qc-legend-pos {
+	background: var(--qc-bar);
+}
+
+/* Bloch sphere */
+.qc-fig .qc-sphere {
+	fill: var(--accent-soft);
+	fill-opacity: 0.35;
+	stroke: var(--muted);
+	stroke-width: 1;
+}
+.qc-fig .qc-ring {
+	fill: none;
+	stroke: var(--muted);
+	stroke-width: 0.8;
+}
+.qc-fig .qc-ring.back {
+	stroke-dasharray: 3 3;
+	opacity: 0.6;
+}
+.qc-fig .qc-axis {
+	stroke: var(--muted);
+	stroke-width: 0.8;
+}
+.qc-fig .qc-axlabel {
+	fill: var(--text);
+	font: 11.5px var(--sans);
+}
+.qc-fig .qc-vec {
+	stroke: var(--qc-hl);
+	stroke-width: 2.6;
+	stroke-linecap: round;
+}
+.qc-fig .qc-tip {
+	fill: var(--qc-hl);
+}
+.qc-fig .qc-trail {
+	fill: none;
+	stroke: var(--qc-hl);
+	stroke-width: 1.4;
+	stroke-dasharray: 2 3;
+}
+.qc-fig .qc-rotaxis {
+	stroke: var(--accent);
+	stroke-width: 1.4;
+	stroke-dasharray: 6 3;
+}
+.qc-fig .qc-proj {
+	stroke: var(--muted);
+	stroke-width: 0.8;
+	stroke-dasharray: 2 2;
+}
+.qc-gates {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.3rem;
+}
+.qc-gates button {
+	min-width: 2.2rem;
+	padding: 0.2rem 0.5rem;
+	border: 1px solid var(--faint);
+	border-radius: 4px;
+	background: var(--bg);
+	color: var(--text);
+	font: 600 0.8rem var(--sans);
+	cursor: pointer;
+}
+.qc-gates button:hover {
+	border-color: var(--accent);
+}
+.qc-gates button:disabled {
+	opacity: 0.5;
+	cursor: default;
+}
+.qc-history {
+	margin-top: 0.35rem;
+	color: var(--muted);
+	font: 0.78rem var(--mono);
+	overflow-wrap: anywhere;
+}
+
+/* Static probability bars */
+.qc-fig .qc-pbar {
+	fill: var(--qc-bar);
+	opacity: 0.55;
+}
+.qc-fig .qc-pbar.hl {
+	opacity: 1;
+}
+.qc-fig .qc-pbar.alt {
+	fill: var(--qc-neg);
+	opacity: 0.9;
+}
+.qc-fig .smp-legend span[hidden] {
+	display: none;
+}
+.qc-fig .qc-stepno {
+	color: var(--muted);
+	font-size: 0.8rem;
+	font-variant-numeric: tabular-nums;
+}
+.qc-fig .qc-ket.small,
+.qc-fig .qc-val.small {
+	font-size: 8.5px;
+}
+.qc-fig .qc-dot-tip {
+	fill: var(--text);
+}
+.qc-fig .qc-circuit {
+	margin: 0 auto;
+}
+
+/* Measurement along an axis */
+.qc-fig .qc-meas-axis {
+	stroke: var(--accent);
+	stroke-width: 2;
+}
+.qc-fig .qc-eig {
+	fill: var(--accent);
+}
+.qc-fig .qc-eig-label {
+	fill: var(--accent);
+	font: 600 11px var(--sans);
+}
+.qc-fig .qc-foot {
+	fill: var(--bg);
+	stroke: var(--qc-hl);
+	stroke-width: 2;
+}
+.qc-fig .qc-ghost {
+	stroke: var(--qc-neg);
+	stroke-width: 2.2;
+	stroke-dasharray: 5 3;
+	stroke-linecap: round;
+}
+.qc-fig .qc-ghost-tip {
+	fill: var(--qc-neg);
+}
+.qc-fig .qc-obs {
+	fill: var(--qc-neg);
+	opacity: 0.85;
+}
+.qc-fig .smp-legend i.qc-legend-state {
+	border-top: 3px solid var(--qc-hl);
+}
+.qc-fig .smp-legend i.qc-legend-foot {
+	background: var(--bg);
+	border: 2px solid var(--qc-hl);
+}
