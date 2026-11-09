@@ -1,0 +1,30 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import BinomialTreeSteps from "../../utils/quant/BinomialTreeSteps.astro";
+import DiceMarketSteps from "../../utils/quant/DiceMarketSteps.astro";
+import GamblersRuin from "../../utils/quant/GamblersRuin.astro";
+import KellyExplorer from "../../utils/quant/KellyExplorer.astro";
+import OptionGreeks from "../../utils/quant/OptionGreeks.astro";
+---
+
+<Layout title="Quantitative trading figures">
+	<main>
+		<h1>Quantitative trading figures</h1>
+		<h2>GamblersRuin</h2>
+		<GamblersRuin start={3} target={10} p={0.5} />
+		<GamblersRuin start={10} target={20} p={0.49} title="Slightly unfair coin, N = 20" />
+		<h2>KellyExplorer</h2>
+		<KellyExplorer p={0.6} b={1} bets={300} />
+		<KellyExplorer p={0.55} b={2} bets={500} f={0.5} title="2:1 payout, over-betting" />
+		<h2>DiceMarketSteps</h2>
+		<DiceMarketSteps dice="4,6,2" halfSpread={1} />
+		<DiceMarketSteps dice="1,1" halfSpread={2} start={1} title="Two dice, one revealed" />
+		<h2>BinomialTreeSteps</h2>
+		<BinomialTreeSteps n={3} kind="put" american />
+		<BinomialTreeSteps n={6} kind="call" start={7} title="Six-step European call, fully priced" />
+		<BinomialTreeSteps n={1} kind="call" r={0} sigma={0.18} start={2} title="One step" />
+		<h2>OptionGreeks</h2>
+		<OptionGreeks />
+		<OptionGreeks kind="put" greek="gamma" T={0.25} sigma={0.4} title="Three-month put, gamma" />
+	</main>
+</Layout>

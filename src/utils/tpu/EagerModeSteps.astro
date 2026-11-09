@@ -1,0 +1,457 @@
+---
+// Step-through of how one small PyTorch program is cut into TPU executables. Top: the program
+// with the line that issued the current event highlighted. Middle: one chip per dispatched op,
+// grouped by loop iteration; a chip is faint before it is issued, dashed while deferred and
+// filled with its executable's colour once it belongs to one. Bottom: the executables created so
+// far, each with what triggered it and whether it was compiled (cache miss), found in the cache,
+// or reused by a torch.compile callable, plus running counts. A mode picker switches between
+// TorchTPU strict eager, defer-and-fuse, torch.compile and PyTorch/XLA lazy tensors.
+// Logic (including a port of TorchTPU's repeated-op detector) is in deferredExecution.ts.
+// Usage in .mdx:
+//   import EagerModeSteps from "../../utils/tpu/EagerModeSteps.astro";
+//   <EagerModeSteps mode="fuse" title="Defer-and-fuse on the running example" />
+//   Optional: modes={["strict", "fuse"]} (modes offered in the picker), iters={4}, step={n}.
+import StepControls from "../compiler/StepControls.astro";
+import {
+	type Mode,
+	codeFor,
+	loopProgram,
+	simulate,
+	summary,
+} from "./deferredExecution";
+
+interface Props {
+	/** Mode shown on load. */
+	mode?: Mode;
+	/** Modes offered in the picker (default: all four). */
+	modes?: Mode[];
+	iters?: number;
+	step?: number;
+	title?: string;
+}
+
+const {
+	mode = "strict",
+	modes = ["strict", "fuse", "compile", "lazy"],
+	iters = 4,
+	step = 0,
+	title,
+} = Astro.props;
+
+const modeName: Record<Mode, string> = {
+	strict: "TorchTPU strict eager",
+	fuse: "TorchTPU defer-and-fuse",
+	compile: "TorchTPU torch.compile",
+	lazy: "PyTorch/XLA lazy tensors",
+};
+
+const runs = modes.map((m) => {
+	const prog = loopProgram(iters, m === "lazy");
+	const steps = simulate(m, prog);
+	const code = codeFor(m, prog);
+	const opIdx = prog
+		.map((e, i) => (e.kind === "op" ? i : -1))
+		.filter((i) => i >= 0);
+	const labels = prog.map((e) =>
+		e.kind === "op" ? e.name : e.kind === "markStep" ? "mark" : "item",
+	);
+	return { m, prog, steps, code, opIdx, labels, sum: summary(steps) };
+});
+const PALETTE = 6;
+const resultText = (e: { compiled: boolean; reused?: boolean; opt: string }) =>
+	e.compiled
+		? e.opt === "default"
+			? "compiled"
+			: `compiled -${e.opt}`
+		: e.reused
+			? "reused"
+			: "cache hit";
+---
+
+<figure class="ems" data-mode={mode} tabindex="-1">
+	{title && <figcaption class="ems-title">{title}</figcaption>}
+	{
+		modes.length > 1 && (
+			<div class="ems-modes" role="radiogroup" aria-label="Execution mode">
+				{runs.map((r) => (
+					<button type="button" class="ems-mode" data-m={r.m} role="radio" aria-checked={String(r.m === mode)}>
+						{modeName[r.m]}
+					</button>
+				))}
+			</div>
+		)
+	}
+	{
+		runs.map((r) => {
+			const at = Math.max(0, Math.min(r.steps.length - 1, step));
+			// Consecutive runs of ops with the same iteration, so "before loop" and "after loop" stay apart.
+			const groups: { label: string; ops: number[] }[] = [];
+			for (const j of r.opIdx) {
+				const it = r.prog[j].iter;
+				const last = groups[groups.length - 1];
+				const label = it > 0 ? `iteration ${it}` : groups.length === 0 ? "before loop" : "after loop";
+				if (last && last.label === label) last.ops.push(j);
+				else groups.push({ label, ops: [j] });
+			}
+			return (
+				<div class="ems-run" data-m={r.m} data-step={at} hidden={r.m !== mode}>
+					<StepControls labels={r.labels} step={at} />
+					<div class="ems-panes">
+						{r.steps.map((s, i) => (
+							<div class="ems-pane" data-i={i} aria-hidden={i !== at ? "true" : undefined}>
+								<div class="ems-top">
+									<pre class="ems-code">
+										{r.code.lines.map((l, k) => (
+											<span class:list={["ems-line", { on: k === r.code.lineOf[s.at] }]}>{l || " "}</span>
+										))}
+									</pre>
+									<div class="ems-count">
+										<div><b>{s.executables.length}</b> executables launched</div>
+										<div><b>{s.compiles}</b> compiled</div>
+										<div><b>{s.hits}</b> cache hits</div>
+										{r.m === "compile" && <div><b>{s.reuses}</b> reused by the callable</div>}
+									</div>
+								</div>
+								<div class="ems-ops" aria-label="Dispatched ops">
+									{groups.map((g) => (
+										<div class="ems-group">
+											<span class="ems-glabel">{g.label}</span>
+											<div class="ems-chips">
+												{g.ops.map((j) => {
+														const st = s.opState[j];
+														return (
+															<span
+																class:list={[
+																	"ems-chip",
+																	st === -2 && "future",
+																	st === -1 && "deferred",
+																	st >= 0 && `c${st % PALETTE}`,
+																	{ cur: j === s.at, fresh: st >= 0 && s.fresh.includes(st) },
+																]}
+																title={r.prog[j].sig}
+															>
+																{r.prog[j].name}
+																{st >= 0 && <sub>{st + 1}</sub>}
+															</span>
+														);
+													})}
+											</div>
+										</div>
+									))}
+								</div>
+								<div class="ems-tablewrap">
+<table class="ems-table">
+									<thead>
+										<tr>
+											<th>#</th>
+											<th>ops</th>
+											<th>trigger</th>
+											<th>result</th>
+										</tr>
+									</thead>
+									<tbody>
+										{s.executables.length === 0 && (
+											<tr>
+												<td colspan="4" class="ems-none">no executable yet</td>
+											</tr>
+										)}
+										{s.executables.map((e, k) => (
+											<tr class:list={{ fresh: s.fresh.includes(k) }}>
+												<td class="num">
+													<span class={`ems-sw c${k % PALETTE}`}>{k + 1}</span>
+												</td>
+												<td class="mono">{e.ops.map((j) => r.prog[j].name).join(" → ")}</td>
+												<td>{e.reason}</td>
+												<td class:list={["res", { miss: e.compiled }]}>{resultText(e)}</td>
+											</tr>
+										))}
+									</tbody>
+								</table>
+</div>
+								<p class="ems-text" set:html={s.text} />
+							</div>
+						))}
+					</div>
+					<p class="ems-sum">
+						Whole run: {r.sum.launches} executables, {r.sum.compiles} compiles, {r.sum.hits} cache hits
+						{r.m === "compile" ? `, ${r.sum.reuses} reused calls` : ""}.
+					</p>
+				</div>
+			);
+		})
+	}
+	<ul class="ems-legend">
+		<li><span class="ems-chip future">op</span>not issued yet</li>
+		<li><span class="ems-chip deferred">op</span>deferred</li>
+		<li><span class="ems-chip c0">op<sub>1</sub></span>in executable 1</li>
+		<li><span class="ems-chip c1 cur">op</span>current event</li>
+	</ul>
+</figure>
+
+<script>
+	import { bindStepper } from "../compiler/stepper";
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".ems")) {
+		const runs = [...fig.querySelectorAll<HTMLElement>(".ems-run")];
+		for (const run of runs) {
+			const panes = [...run.querySelectorAll<HTMLElement>(".ems-pane")];
+			bindStepper(run, panes.length, (i) => {
+				panes.forEach((p, k) => {
+					if (k === i) p.removeAttribute("aria-hidden");
+					else p.setAttribute("aria-hidden", "true");
+				});
+			});
+		}
+		const buttons = [...fig.querySelectorAll<HTMLButtonElement>(".ems-mode")];
+		for (const b of buttons) {
+			b.addEventListener("click", () => {
+				const m = b.dataset.m;
+				for (const x of buttons) x.setAttribute("aria-checked", String(x === b));
+				for (const run of runs) run.hidden = run.dataset.m !== m;
+				fig.dataset.mode = m ?? "";
+			});
+		}
+	}
+</script>
+
+<style>
+	.ems {
+		--c0: #dbe7f3;
+		--c0-line: #5d88b3;
+		--c1: #f6e3cf;
+		--c1-line: #c0843f;
+		--c2: #dcefe0;
+		--c2-line: #4f9a62;
+		--c3: #ece0f3;
+		--c3-line: #8f63ad;
+		--c4: #f5dcdc;
+		--c4-line: #b85757;
+		--c5: #e6ecd5;
+		--c5-line: #7e9440;
+		--cur: #c2410c;
+		--miss: #b4442b;
+		margin: 1.75rem 0;
+		font-family: var(--sans);
+		outline: none;
+		max-width: 100%;
+		min-width: 0;
+	}
+	@media (prefers-color-scheme: dark) {
+		.ems {
+			--c0: #1f2f40;
+			--c0-line: #7fa9d4;
+			--c1: #3a2c1c;
+			--c1-line: #d5a165;
+			--c2: #1d3324;
+			--c2-line: #6fbf86;
+			--c3: #2f2438;
+			--c3-line: #b691d1;
+			--c4: #3a2222;
+			--c4-line: #db7d7d;
+			--c5: #2b3220;
+			--c5-line: #a7bd68;
+			--cur: #f0884f;
+			--miss: #e9765b;
+		}
+	}
+	.ems-title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		text-align: center;
+		margin-bottom: 0.4rem;
+	}
+	.ems-modes {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.35rem;
+		justify-content: center;
+		margin-bottom: 0.6rem;
+	}
+	.ems-mode {
+		font: inherit;
+		font-size: 0.78rem;
+		padding: 0.2rem 0.6rem;
+		border: 1px solid var(--faint);
+		border-radius: 999px;
+		background: var(--bg);
+		color: var(--muted);
+		cursor: pointer;
+	}
+	.ems-mode[aria-checked="true"] {
+		background: var(--accent-soft);
+		border-color: var(--accent);
+		color: var(--text);
+	}
+	.ems-run[hidden] {
+		display: none;
+	}
+	.ems-panes {
+		margin-top: 0.5rem;
+	}
+	.ems-pane[aria-hidden="true"] {
+		display: none;
+	}
+	.ems-top {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.6rem 1rem;
+		align-items: flex-start;
+	}
+	.ems-code {
+		flex: 1 1 14rem;
+		min-width: 0;
+		margin: 0;
+		padding: 0.5rem 0;
+		font-family: var(--mono);
+		font-size: 0.76rem;
+		line-height: 1.5;
+		background: var(--surface);
+		border-radius: 6px;
+		overflow-x: auto;
+	}
+	.ems-line {
+		display: block;
+		padding: 0 0.7rem;
+		white-space: pre;
+		border-left: 3px solid transparent;
+	}
+	.ems-line.on {
+		background: var(--accent-soft);
+		border-left-color: var(--cur);
+	}
+	.ems-count {
+		flex: 0 0 auto;
+		font-size: 0.78rem;
+		color: var(--muted);
+		line-height: 1.6;
+	}
+	.ems-count b {
+		display: inline-block;
+		min-width: 1.6rem;
+		text-align: right;
+		color: var(--text);
+		font-variant-numeric: tabular-nums;
+	}
+	.ems-ops {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.5rem 0.9rem;
+		margin: 0.7rem 0 0.5rem;
+	}
+	.ems-glabel {
+		display: block;
+		font-size: 0.68rem;
+		color: var(--muted);
+		margin-bottom: 0.15rem;
+	}
+	.ems-chips {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.25rem;
+	}
+	.ems-chip {
+		display: inline-block;
+		font-family: var(--mono);
+		font-size: 0.72rem;
+		padding: 0.1rem 0.4rem;
+		border-radius: 4px;
+		border: 1px solid var(--faint);
+		background: var(--bg);
+	}
+	.ems-chip sub {
+		font-size: 0.6rem;
+		margin-left: 0.1rem;
+		color: var(--muted);
+	}
+	.ems-chip.future {
+		color: var(--faint);
+		border-color: var(--faint);
+	}
+	.ems-chip.deferred {
+		border-style: dashed;
+		border-color: var(--muted);
+	}
+	.ems-chip.cur {
+		outline: 2px solid var(--cur);
+		outline-offset: 1px;
+	}
+	.c0 { background: var(--c0); border-color: var(--c0-line); }
+	.c1 { background: var(--c1); border-color: var(--c1-line); }
+	.c2 { background: var(--c2); border-color: var(--c2-line); }
+	.c3 { background: var(--c3); border-color: var(--c3-line); }
+	.c4 { background: var(--c4); border-color: var(--c4-line); }
+	.c5 { background: var(--c5); border-color: var(--c5-line); }
+	.ems-tablewrap {
+		overflow-x: auto;
+		max-width: 100%;
+	}
+	.ems-table {
+		width: 100%;
+		border-collapse: collapse;
+		font-size: 0.76rem;
+		margin: 0.3rem 0;
+	}
+	.ems-table th {
+		text-align: left;
+		font-weight: 600;
+		color: var(--muted);
+		border-bottom: 1px solid var(--faint);
+		padding: 0.15rem 0.4rem;
+	}
+	.ems-table td {
+		padding: 0.15rem 0.4rem;
+		border-bottom: 1px solid var(--faint);
+	}
+	.ems-table td.num {
+		text-align: right;
+		width: 2rem;
+	}
+	.ems-table td.mono {
+		font-family: var(--mono);
+	}
+	.ems-table tr.fresh td {
+		background: var(--accent-soft);
+	}
+	.ems-table td.res.miss {
+		color: var(--miss);
+		font-weight: 600;
+	}
+	.ems-none {
+		color: var(--muted);
+		font-style: italic;
+	}
+	.ems-sw {
+		display: inline-block;
+		min-width: 1.2rem;
+		text-align: center;
+		border-radius: 3px;
+		border: 1px solid;
+		font-variant-numeric: tabular-nums;
+	}
+	.ems-text {
+		font-size: 0.85rem;
+		line-height: 1.5;
+		margin: 0.5rem 0 0;
+		min-height: 3.5em;
+	}
+	.ems-sum {
+		font-size: 0.78rem;
+		color: var(--muted);
+		margin: 0.4rem 0 0;
+	}
+	.ems-legend {
+		list-style: none;
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.3rem 1rem;
+		padding: 0;
+		margin: 0.5rem 0 0;
+		font-size: 0.74rem;
+		color: var(--muted);
+	}
+	.ems-legend li {
+		display: flex;
+		align-items: center;
+		gap: 0.35rem;
+	}
+</style>

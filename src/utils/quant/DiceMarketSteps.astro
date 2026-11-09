@@ -1,0 +1,145 @@
+---
+// The dice market-making game. The traded quantity is the sum of several dice, revealed one at a
+// time; the market maker quotes bid = fair − h and ask = fair + h around the conditional mean.
+// Each step reveals a die: the bars show P(total = s) given what is known, green inside
+// [bid, ask] and red outside it, where a trader who knew the total would buy at the ask or sell
+// at the bid. Readouts: fair value, standard deviation, the quote, the chance an informed trader
+// trades, their expected profit per trade (your loss), and your edge against an uninformed
+// trader (h). The half-spread slider shows the trade-off. Logic in quant.ts (diceMarket).
+// Usage in .mdx:
+//   <DiceMarketSteps dice="4,6,2" halfSpread={1} />
+import Player from "../sampling/Player.astro";
+import "../sampling/sampling.css";
+import "./quant.css";
+
+interface Props {
+	/** Comma-separated die faces, revealed in this order. */
+	dice?: string;
+	halfSpread?: number;
+	start?: number;
+	title?: string;
+	caption?: string;
+}
+
+const {
+	dice = "4,6,2",
+	halfSpread = 1,
+	start = 0,
+	title,
+	caption,
+} = Astro.props;
+const faces = dice.split(",").map((s) => Number(s.trim()));
+if (
+	!faces.length ||
+	faces.some((f) => !(f >= 1 && f <= 6 && Number.isInteger(f)))
+)
+	throw new Error("DiceMarketSteps: dice must be faces 1–6");
+---
+
+<figure class="smp-fig qt-fig qt-dice-mkt" data-dice={faces.join(",")} data-start={start}>
+	{title && <div class="smp-title">{title}</div>}
+	<div class="qt-dice">
+		<span>dice:</span>
+		{faces.map(() => <span class="qt-die">?</span>)}
+		<span class="d-total"></span>
+	</div>
+	<div class="smp-legend qt-legend">
+		<span><i class="box qt-kok"></i>total inside the quote</span>
+		<span><i class="box qt-kwarn"></i>outside: an informed trader hits you</span>
+		<span><i class="qt-kbid"></i>bid</span>
+		<span><i class="qt-kask"></i>ask</span>
+	</div>
+	<svg class="smp-svg" viewBox="0 0 640 220" role="img" aria-label="Distribution of the total given the dice revealed so far, with the bid and ask"></svg>
+	<div class="smp-controls">
+		<Player />
+		<label class="smp-slider">half-spread h = <strong class="v-h"></strong>
+			<input type="range" class="i-h" min="0" max="4" step="0.25" value={halfSpread} aria-label="Half-spread" />
+		</label>
+	</div>
+	<div class="smp-metrics">
+		<div><span>fair value E[total]</span><strong class="m-mean"></strong></div>
+		<div><span>std. deviation</span><strong class="m-sd"></strong></div>
+		<div><span>quote (bid – ask)</span><strong class="m-q"></strong></div>
+		<div><span>P(informed trader trades)</span><strong class="m-po"></strong></div>
+		<div><span>your loss per informed trade</span><strong class="m-loss"></strong></div>
+		<div><span>your edge per uninformed trade</span><strong class="m-edge"></strong></div>
+	</div>
+	<p class="smp-narration"></p>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import { axes, bindPlayer, el, fmt } from "../sampling/plot";
+	import { diceMarket } from "./quant";
+
+	function attach(fig: HTMLElement) {
+		const faces = (fig.dataset.dice ?? "").split(",").map(Number);
+		const m = faces.length;
+		const svg = fig.querySelector("svg")!;
+		const hIn = fig.querySelector<HTMLInputElement>(".i-h")!;
+		const dies = [...fig.querySelectorAll<HTMLElement>(".qt-die")];
+		let k = Math.min(Number(fig.dataset.start) || 0, m);
+
+		function draw() {
+			const h = Number(hIn.value);
+			const s = diceMarket(faces.slice(0, k), m, h);
+			const top = Math.max(...s.pmf) * 1.15;
+			svg.replaceChildren();
+			const A = axes(svg, { x: 46, y: 10, w: 578, h: 172 }, [m - 0.5, 6 * m + 0.5], [0, top], { xLabel: "total", yLabel: "probability", yTicks: 4, xTicks: Math.min(6 * m - m + 1, 16) });
+			s.pmf.forEach((p, v) => {
+				if (!p) return;
+				const out = v > s.ask + 1e-9 || v < s.bid - 1e-9;
+				const x0 = A.sx(v - 0.4);
+				el("rect", { x: x0, y: A.sy(p), width: A.sx(v + 0.4) - x0, height: A.sy(0) - A.sy(p), class: out ? "qt-bar-out" : "qt-bar-in" }, svg);
+			});
+			const vline = (x: number, cls: string, label: string, anchor: string, dx: number) => {
+				el("line", { x1: A.sx(x), x2: A.sx(x), y1: A.box.y, y2: A.box.y + A.box.h, class: cls }, svg);
+				el("text", { x: A.sx(x) + dx, y: A.box.y + 12, class: `${cls}-t`, "text-anchor": anchor }, svg, label);
+			};
+			vline(s.bid, "qt-bid", `bid ${fmt(s.bid, 2)}`, "end", -4);
+			vline(s.ask, "qt-ask", `ask ${fmt(s.ask, 2)}`, "start", 4);
+			el("line", { x1: A.sx(s.mean), x2: A.sx(s.mean), y1: A.box.y + 18, y2: A.box.y + A.box.h, class: "smp-muted-line" }, svg);
+
+			dies.forEach((d, i) => {
+				d.textContent = i < k ? String(faces[i]) : "?";
+				d.classList.toggle("shown", i < k);
+			});
+			const known = faces.slice(0, k).reduce((a, b) => a + b, 0);
+			fig.querySelector(".d-total")!.textContent = k ? `known so far: ${known}` : "";
+			fig.querySelector(".v-h")!.textContent = fmt(h, 2);
+			fig.querySelector(".m-mean")!.textContent = fmt(s.mean, 2);
+			fig.querySelector(".m-sd")!.textContent = fmt(s.sd, 3);
+			fig.querySelector(".m-q")!.textContent = `${fmt(s.bid, 2)} – ${fmt(s.ask, 2)}`;
+			fig.querySelector(".m-po")!.textContent = fmt(s.pOutside, 3);
+			fig.querySelector(".m-loss")!.textContent = fmt(s.informedLoss, 3);
+			fig.querySelector(".m-edge")!.textContent = fmt(h, 2);
+			const hidden = m - k;
+			fig.querySelector(".smp-narration")!.textContent =
+				k === 0
+					? `Nothing revealed: each die averages 3.5, so the fair value is ${m} × 3.5 = ${fmt(s.mean, 1)} with variance ${m} × 35/12, sd ${fmt(s.sd, 2)}. Step forward to reveal a die.`
+					: hidden
+						? `Revealed ${k > 1 ? `${faces.slice(0, k).join(" + ")} = ${known}` : `a ${known}`}; ${hidden} ${hidden > 1 ? "dice" : "die"} still hidden, worth 3.5 each. Fair value ${known} + ${fmt(3.5 * hidden, 1)} = ${fmt(s.mean, 1)}, sd ${fmt(s.sd, 2)}: the market narrows.`
+						: `All dice revealed: the total is ${known} for certain, so any spread is safe from an informed trader and the market is ${fmt(s.bid, 2)} – ${fmt(s.ask, 2)}.`;
+		}
+
+		bindPlayer(
+			fig,
+			(dir) => {
+				const n = k + dir;
+				if (n < 0 || n > m) return false;
+				k = n;
+				draw();
+				return k < m;
+			},
+			() => {
+				k = 0;
+				draw();
+			},
+			900,
+		);
+		hIn.addEventListener("input", draw);
+		draw();
+	}
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".qt-dice-mkt")) attach(fig);
+</script>

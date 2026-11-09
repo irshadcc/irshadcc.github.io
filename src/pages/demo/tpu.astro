@@ -1,0 +1,14 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import EagerModeSteps from "../../utils/tpu/EagerModeSteps.astro";
+---
+
+<Layout title="TPU execution figures">
+	<main>
+		<h1>TPU execution figures</h1>
+		<h2>EagerModeSteps</h2>
+		<EagerModeSteps title="All four modes, four iterations" />
+		<EagerModeSteps mode="fuse" modes={["fuse"]} step={6} title="Defer-and-fuse only, at the first repetition" />
+		<EagerModeSteps mode="lazy" modes={["strict", "lazy"]} iters={2} title="Two iterations, strict vs lazy" />
+	</main>
+</Layout>

@@ -1,0 +1,207 @@
+/* Extra styles for the quantitative-trading figures (src/utils/quant), on top of
+   ../sampling/sampling.css. Every class starts with qt-. SVG content is created by scripts,
+   so these rules are global. */
+
+.qt-fig {
+	--qt-bid: #2e7d5b;
+	--qt-ask: #c0392b;
+	--qt-warn: rgba(192, 57, 43, 0.28);
+	--qt-ok: rgba(46, 125, 91, 0.25);
+	--qt-node: var(--bg, #fff);
+	--qt-s1: #b8860b;
+	--qt-s2: #c2674c;
+	--qt-s3: #6a5acd;
+	--qt-s4: #2e7d5b;
+}
+@media (prefers-color-scheme: dark) {
+	.qt-fig {
+		--qt-bid: #6fcf9f;
+		--qt-ask: #f08070;
+		--qt-warn: rgba(240, 128, 112, 0.3);
+		--qt-ok: rgba(111, 207, 159, 0.25);
+		--qt-node: #1d1f22;
+		--qt-s1: #e0c060;
+		--qt-s2: #e8a07a;
+		--qt-s3: #a99cf0;
+		--qt-s4: #6fcf9f;
+	}
+}
+
+.qt-fig .qt-path {
+	fill: none;
+	stroke: var(--muted);
+	stroke-width: 1;
+	opacity: 0.35;
+}
+.qt-fig .qt-path.won {
+	stroke: var(--qt-bid);
+}
+.qt-fig .qt-path.lost {
+	stroke: var(--qt-ask);
+}
+.qt-fig .qt-path.hl {
+	stroke-width: 2.2;
+	opacity: 1;
+}
+.qt-fig .qt-barrier {
+	stroke: var(--text);
+	stroke-width: 1.4;
+}
+.qt-fig .qt-l1,
+.qt-fig .qt-l2,
+.qt-fig .qt-l3,
+.qt-fig .qt-l4 {
+	fill: none;
+	stroke-width: 1.8;
+}
+.qt-fig .qt-l1 {
+	stroke: var(--qt-s1);
+}
+.qt-fig .qt-l2 {
+	stroke: var(--qt-s2);
+}
+.qt-fig .qt-l3 {
+	stroke: var(--qt-s3);
+}
+.qt-fig .qt-l4 {
+	stroke: var(--qt-s4);
+	stroke-dasharray: 5 3;
+}
+.qt-legend i.qt-k1 {
+	border-top: 2px solid var(--qt-s1);
+}
+.qt-legend i.qt-k2 {
+	border-top: 2px solid var(--qt-s2);
+}
+.qt-legend i.qt-k3 {
+	border-top: 2px solid var(--qt-s3);
+}
+.qt-legend i.qt-k4 {
+	border-top: 2px dashed var(--qt-s4);
+}
+.qt-legend i.qt-kbid {
+	border-top: 2px solid var(--qt-bid);
+}
+.qt-legend i.qt-kask {
+	border-top: 2px solid var(--qt-ask);
+}
+.qt-legend i.qt-kwarn {
+	background: var(--qt-warn);
+	height: 0.7em;
+	border: 0;
+}
+.qt-legend i.qt-kok {
+	background: var(--qt-ok);
+	height: 0.7em;
+	border: 0;
+}
+.qt-legend i.qt-kearly {
+	border: 2px solid var(--qt-ask);
+	height: 0.7em;
+}
+
+/* dice market */
+.qt-dice {
+	display: flex;
+	gap: 0.6rem;
+	align-items: center;
+	margin: 0.3rem 0 0.4rem;
+	font-size: 0.85rem;
+	color: var(--muted);
+}
+.qt-die {
+	width: 2.1rem;
+	height: 2.1rem;
+	border-radius: 6px;
+	border: 1.5px dashed var(--muted);
+	display: grid;
+	place-items: center;
+	font-weight: 700;
+	font-size: 1.1rem;
+	color: var(--muted);
+}
+.qt-die.shown {
+	border: 1.5px solid var(--text);
+	color: var(--text);
+	background: var(--qt-node);
+}
+.qt-fig .qt-bar-in {
+	fill: var(--qt-ok);
+}
+.qt-fig .qt-bar-out {
+	fill: var(--qt-warn);
+}
+.qt-fig .qt-bid {
+	stroke: var(--qt-bid);
+	stroke-width: 2;
+}
+.qt-fig .qt-ask {
+	stroke: var(--qt-ask);
+	stroke-width: 2;
+}
+.qt-fig .qt-bid-t {
+	fill: var(--qt-bid);
+	font-size: 11px;
+	font-weight: 600;
+}
+.qt-fig .qt-ask-t {
+	fill: var(--qt-ask);
+	font-size: 11px;
+	font-weight: 600;
+}
+
+/* binomial tree */
+.qt-fig .qt-edge {
+	stroke: var(--faint);
+	stroke-width: 1.2;
+}
+.qt-fig .qt-edge.live {
+	stroke: var(--accent);
+	stroke-width: 2;
+}
+.qt-fig .qt-nbox {
+	fill: var(--qt-node);
+	stroke: var(--muted);
+	stroke-width: 1;
+	cursor: pointer;
+}
+.qt-fig .qt-nbox.done {
+	stroke: var(--accent);
+}
+.qt-fig .qt-nbox.now {
+	stroke: var(--accent);
+	stroke-width: 2.4;
+}
+.qt-fig .qt-nbox.sel {
+	stroke: var(--text);
+	stroke-width: 2.4;
+}
+.qt-fig .qt-nbox.early {
+	stroke: var(--qt-ask);
+	stroke-width: 2.4;
+}
+.qt-fig .qt-ns {
+	fill: var(--muted);
+	font-size: 10px;
+	pointer-events: none;
+}
+.qt-fig .qt-nv {
+	fill: var(--text);
+	font-size: 11.5px;
+	font-weight: 600;
+	pointer-events: none;
+}
+.qt-fig .qt-nv.pending {
+	fill: var(--faint);
+	font-weight: 400;
+}
+.qt-readout {
+	font-size: 0.82rem;
+	color: var(--muted);
+	margin: 0.3rem 0 0;
+	min-height: 2.6em;
+	font-variant-numeric: tabular-nums;
+}
+.qt-readout strong {
+	color: var(--text);
+}

@@ -1,0 +1,330 @@
+// Figure data for the PyTorch-on-TPU post: the software stack (BoxDiagram), the PJRT call sequence
+// (SequenceSteps) and the classes behind a TorchTPU tensor's data (UmlClassDiagram).
+// Names follow TorchTPU at commit 02cc8fe, PyTorch/XLA at 1e11002 and openxla/xla at 96afafc
+// (xla/pjrt/c/pjrt_c_api.h, PJRT C API version 0.117).
+
+import type { BoxEdge, BoxNode } from "../payments/boxDiagram";
+import type { Message, Participant } from "../payments/sequence";
+import type { UmlClass, UmlRelation } from "../uml/umlClass";
+
+// --- The stack ---------------------------------------------------------------------------------
+
+export const stackNodes: BoxNode[] = [
+	{
+		id: "py",
+		label: "PyTorch program",
+		sub: "model.to(device); loss.backward()",
+		col: 0,
+		row: 0,
+		w: 3,
+		group: 0,
+		note: "The same Python code for both stacks. Only the device string differs: <code>xla</code> for PyTorch/XLA, <code>tpu</code> for TorchTPU.",
+	},
+	{
+		id: "xkey",
+		label: "Dispatcher: XLA key",
+		sub: "XLANativeFunctions::mm",
+		col: 0,
+		row: 1,
+		group: 1,
+		note: "PyTorch/XLA registers its kernels under the in-tree <code>XLA</code> dispatch key. Each kernel unwraps the <code>XLATensor</code> and calls a <code>tensor_methods</code> function.",
+	},
+	{
+		id: "tkey",
+		label: "Dispatcher: PrivateUse1",
+		sub: 'renamed to "tpu"; AtenMmOut',
+		col: 2,
+		row: 1,
+		group: 2,
+		note: "TorchTPU is an out-of-tree backend: <code>TORCH_LIBRARY_IMPL(aten, PrivateUse1, m)</code> registers its kernels, and autoloading renames PrivateUse1 to <code>tpu</code>.",
+	},
+	{
+		id: "xir",
+		label: "Lazy IR graph",
+		sub: "XLATensor → torch::lazy::Node",
+		col: 0,
+		row: 2,
+		group: 1,
+		note: "A kernel does no work. It returns a tensor whose value is an IR node (for <code>mm</code>, a <code>GenericOp</code> with a lowering function). The graph grows until something asks for a value.",
+	},
+	{
+		id: "tdef",
+		label: "DeferredOp graph",
+		sub: "DeviceBufferList → DeferredOp",
+		col: 2,
+		row: 2,
+		group: 2,
+		note: "A kernel builds a <code>DeferredOp</code>: a StableHLO builder lambda, the input buffers, output shapes and cache-key parameters. Its storage points at this op instead of device memory.",
+	},
+	{
+		id: "xhlo",
+		label: "HLO (XlaBuilder)",
+		sub: "LoweringContext::BuildXla",
+		col: 0,
+		row: 3,
+		group: 1,
+		note: "At a sync, <code>XLAGraphExecutor</code> walks the graph in post order, hashes it and, on a cache miss, lowers every node into one <code>xla::XlaComputation</code> (HLO).",
+	},
+	{
+		id: "tshlo",
+		label: "StableHLO (MLIR)",
+		sub: "one op or a fused region",
+		col: 2,
+		row: 3,
+		group: 2,
+		note: "A background worker cuts the deferred ops into regions, fingerprints each and, on a miss, calls the builders to emit one StableHLO module per region.",
+	},
+	{
+		id: "xcc",
+		label: "PjRtComputationClient",
+		sub: "computation cache",
+		col: 0,
+		row: 4,
+		group: 1,
+		note: "<code>runtime::ComputationClient</code> hides PJRT behind <code>Compile</code>, <code>ExecuteComputation</code>, <code>TransferToDevice</code> and <code>TransferFromDevice</code>.",
+	},
+	{
+		id: "tcc",
+		label: "PjrtBackend",
+		sub: "3-tier compilation cache",
+		col: 2,
+		row: 4,
+		group: 2,
+		note: "A singleton that owns the <code>xla::PjRtClient</code> and the device. Executables are cached in process memory, in host shared memory and optionally in a remote file system.",
+	},
+	{
+		id: "capi",
+		label: "PJRT C API",
+		sub: "GetPjrtApi() → PJRT_Api function table",
+		col: 0,
+		row: 5,
+		w: 3,
+		group: 3,
+		note: "A stable C ABI between frameworks and hardware plugins. Both stacks use the C++ wrapper <code>xla::PjRtCApiClient</code>, which turns calls such as <code>CompileAndLoad</code> into <code>PJRT_Client_Compile</code>.",
+	},
+	{
+		id: "libtpu",
+		label: "libtpu.so",
+		sub: "XLA:TPU compiler + TPU runtime",
+		col: 0,
+		row: 6,
+		w: 3,
+		group: 4,
+		note: "Google's closed-source plugin. It compiles StableHLO or HLO to the TPU's private instruction set and runs programs, transfers and collectives.",
+	},
+	{
+		id: "tpu",
+		label: "TPU chips",
+		sub: "TensorCores (MXU, VPU), SparseCores, HBM, ICI",
+		col: 0,
+		row: 7,
+		w: 3,
+		group: 5,
+	},
+];
+
+export const stackEdges: BoxEdge[] = [
+	{ from: "py", to: "xkey", label: 'device="xla"' },
+	{ from: "py", to: "tkey", label: 'device="tpu"' },
+	{ from: "xkey", to: "xir" },
+	{ from: "tkey", to: "tdef" },
+	{ from: "xir", to: "xhlo", label: "mark_step" },
+	{ from: "tdef", to: "tshlo", label: "materialize" },
+	{ from: "xhlo", to: "xcc" },
+	{ from: "tshlo", to: "tcc" },
+	{ from: "xcc", to: "capi" },
+	{ from: "tcc", to: "capi" },
+	{ from: "capi", to: "libtpu" },
+	{ from: "libtpu", to: "tpu" },
+];
+
+// --- PJRT call sequence ------------------------------------------------------------------------
+
+export const pjrtParticipants: Participant[] = [
+	{ id: "fw", label: "Framework", sub: "torch_tpu / torch_xla" },
+	{ id: "api", label: "PJRT C API", sub: "PjRtCApiClient" },
+	{ id: "plug", label: "libtpu.so", sub: "plugin" },
+	{ id: "tpu", label: "TPU", sub: "device" },
+];
+
+export const pjrtMessages: Message[] = [
+	{
+		from: "fw",
+		to: "plug",
+		label: 'dlopen(libtpu.so); dlsym("GetPjrtApi")',
+		step: "Load",
+		phase: "Start-up (once per process)",
+		note: "<code>pjrt::LoadPjrtPlugin</code> opens the shared library and looks up one symbol, <code>GetPjrtApi</code>. This is the only symbol a plugin must export.",
+	},
+	{
+		from: "plug",
+		to: "fw",
+		label: "const PJRT_Api* (version, function pointers)",
+		step: "Api",
+		reply: true,
+		note: "The plugin returns a struct of function pointers (<code>PJRT_Client_Create</code>, <code>PJRT_Client_Compile</code>, ...) and its API version. A major-version change breaks the ABI. Minor versions only add fields, and every argument struct starts with <code>struct_size</code>, so a plugin can tell how many fields an older caller knows about.",
+	},
+	{
+		from: "fw",
+		to: "api",
+		label: 'GetCApiClient("tpu", options)',
+		step: "Client",
+		note: 'TorchTPU calls <code>xla::GetCApiClient("tpu", {{"premapped_buffer_size", ...}})</code>; PyTorch/XLA calls <code>xla::GetCApiClient("TPU")</code> after <code>InitializePjrtPlugin</code>.',
+	},
+	{
+		from: "api",
+		to: "plug",
+		label: "PJRT_Client_Create",
+		step: "Create",
+		note: "The plugin opens the local chips, sets up device memory and (in a multi-host job) joins the other hosts through a key-value store. The client lists its devices: their ids, process index, kind and torus coordinates.",
+	},
+	{
+		from: "fw",
+		to: "plug",
+		label: "PJRT_Client_BufferFromHostBuffer",
+		step: "H2D",
+		phase: "Data in",
+		note: '<code>tensor.to("tpu")</code> ends here. The call returns a <code>PJRT_Buffer</code> at once; the copy to HBM runs asynchronously and the buffer carries an event that fires when it is done.',
+	},
+	{
+		from: "plug",
+		to: "tpu",
+		label: "DMA host → HBM",
+		step: "DMA",
+		note: "The runtime copies the bytes into HBM in the device's tiled layout.",
+	},
+	{
+		from: "fw",
+		to: "plug",
+		label: "PJRT_Client_Compile(program, CompileOptionsProto)",
+		step: "Compile",
+		phase: "Compile (once per new graph)",
+		note: 'The program is a <code>PJRT_Program</code> with format <code>"mlir"</code> (StableHLO bytecode or text) or <code>"hlo"</code> (a serialized HloModuleProto). Options carry the device assignment, replica and partition counts and flags such as <code>xla_optimization_level</code>.',
+	},
+	{
+		from: "plug",
+		to: "plug",
+		label: "StableHLO → HLO → XLA:TPU passes → binary",
+		step: "XLA",
+		note: "Inside libtpu, XLA converts the module to HLO, runs fusion, layout assignment, SPMD partitioning and scheduling, and emits a TPU binary.",
+	},
+	{
+		from: "plug",
+		to: "fw",
+		label: "PJRT_LoadedExecutable*",
+		step: "Exe",
+		reply: true,
+		note: "A <em>loaded</em> executable is already placed on its devices and can be launched. The framework keeps it in its compilation cache under the graph's hash.",
+	},
+	{
+		from: "fw",
+		to: "plug",
+		label: "PJRT_LoadedExecutable_Execute(args[device][arg])",
+		step: "Execute",
+		phase: "Run (every step)",
+		note: "Arguments are a <code>[num_devices][num_args]</code> array of buffers. The call only <em>enqueues</em> the program and returns output buffers at once, plus one completion event per device.",
+	},
+	{
+		from: "plug",
+		to: "tpu",
+		label: "launch program",
+		step: "Launch",
+		note: "The runtime starts the program once its inputs' events have fired. The host is free to enqueue more work.",
+	},
+	{
+		from: "tpu",
+		to: "plug",
+		label: "done",
+		step: "Done",
+		reply: true,
+		tone: 1,
+		note: "When the TPU finishes, the output buffers become ready and their events fire. Errors also arrive here, so an error may surface long after the op that caused it.",
+	},
+	{
+		from: "fw",
+		to: "plug",
+		label: "PJRT_Buffer_ToHostBuffer → PJRT_Event",
+		step: "D2H",
+		phase: "Data out",
+		note: "<code>loss.item()</code> ends here. The copy waits for the buffer's producer, then DMAs the bytes back; <code>PJRT_Event_Await</code> blocks the Python thread until they arrive.",
+	},
+];
+
+// --- Classes behind a TorchTPU tensor ------------------------------------------------------------
+
+export const bufferClasses: UmlClass[] = [
+	{
+		id: "tensor",
+		name: "at::Tensor",
+		attrs: ["sizes, strides, storage_offset", "dtype, device = tpu:0"],
+		col: 0,
+		row: 0,
+		group: 0,
+		note: "An ordinary PyTorch tensor. Views share one <code>StorageImpl</code>; their sizes, strides and offset are kept and later decomposed into StableHLO slice, reshape, transpose and broadcast ops.",
+	},
+	{
+		id: "storage",
+		name: "c10::StorageImpl",
+		attrs: ["nbytes", "DataPtr data_ptr"],
+		col: 1,
+		row: 0,
+		group: 0,
+		note: "On CUDA, <code>data_ptr()</code> is a device address. On TorchTPU it points to a host-side object that describes the TPU data.",
+	},
+	{
+		id: "ref",
+		name: "DeviceBufferRef",
+		attrs: ["shared_ptr<DeviceBufferList> list", "int64 index"],
+		col: 2,
+		row: 0,
+		group: 1,
+		note: "The <code>c10::DataPtr</code>'s context. One output of one ATen op: a shared pointer to the op's buffer list and an index into it.",
+	},
+	{
+		id: "list",
+		name: "DeviceBufferList",
+		attrs: [
+			"vector<Shape> shapes",
+			"Data: deferred | materialized | placeholder",
+		],
+		methods: ["Materialize()"],
+		col: 2,
+		row: 1,
+		group: 1,
+		note: "All outputs of one ATen op (layer norm has three). It is in one of three states: deferred (holds a <code>DeferredOp</code>), materialized (holds <code>PjRtBuffer</code>s, maybe still being computed) or placeholder (used while tracing for <code>torch.compile</code>).",
+	},
+	{
+		id: "op",
+		name: "DeferredOp",
+		attrs: [
+			"OpName op_name",
+			"MlirOpBuilder op_builder",
+			"vector<DeviceBufferRef> inputs",
+			"vector<Shape> output_shapes",
+			"OpParamCacheKeys, donated_indices",
+		],
+		methods: ["Hash()"],
+		col: 1,
+		row: 1,
+		group: 2,
+		note: "An ATen op that has not run. <code>op_builder</code> emits its StableHLO when the region is compiled. <code>Hash()</code> combines the op name, input and output shapes, donated indices and parameters; the repeated-op detector compares these hashes.",
+	},
+	{
+		id: "buf",
+		name: "xla::PjRtBuffer",
+		attrs: ["on_device_shape (dims, tiled layout)", "ready future"],
+		col: 3,
+		row: 1,
+		group: 3,
+		note: "A typed, shaped array in HBM owned by PJRT. Unlike a CUDA allocation it knows its element type and its tiled on-device layout.",
+	},
+];
+
+export const bufferRelations: UmlRelation[] = [
+	{ from: "tensor", to: "storage", kind: "association", label: "storage" },
+	{ from: "storage", to: "ref", kind: "composition", label: "DataPtr ctx" },
+	{ from: "ref", to: "list", kind: "association", label: "list[index]" },
+	{ from: "list", to: "op", kind: "composition", label: "if deferred" },
+	{ from: "list", to: "buf", kind: "composition", label: "buffers" },
+	{ from: "op", to: "ref", kind: "aggregation", label: "inputs" },
+];

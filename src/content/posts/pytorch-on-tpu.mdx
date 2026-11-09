@@ -1,0 +1,770 @@
+---
+title: "PyTorch on TPUs: PyTorch/XLA, TorchTPU and PJRT"
+description: "How PyTorch programs reach Google TPUs: the PJRT runtime interface and how a program is compiled and executed through it, PyTorch/XLA's lazy tensors, and TorchTPU's PrivateUse1 backend with deferred ops, execution modes, a compilation cache, view decomposition and collectives compiled into the program, traced through the source."
+date: 2026-11-10
+tags: [DL Frameworks, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import LineChart from "../../utils/charts/LineChart.astro";
+import BoxDiagram from "../../utils/payments/BoxDiagram.astro";
+import SequenceSteps from "../../utils/payments/SequenceSteps.astro";
+import EagerModeSteps from "../../utils/tpu/EagerModeSteps.astro";
+import UmlClassDiagram from "../../utils/uml/UmlClassDiagram.astro";
+import {
+	bufferClasses,
+	bufferRelations,
+	pjrtMessages,
+	pjrtParticipants,
+	stackEdges,
+	stackNodes,
+} from "../../utils/tpu/tpuFigures";
+
+## Background
+
+On a GPU, PyTorch runs one op at a time. `torch.mm` on a CUDA tensor goes through the
+[dispatcher](/blog/pytorch-dispatcher/), picks a cuBLAS kernel and launches it. The kernel was
+compiled long before your program started. A Google **TPU** (Tensor Processing Unit) has no
+such library of ready-made kernels that you can call. Every TPU program is produced by the
+**XLA compiler** from a whole-array description of the computation. Its machine code is private.
+So "run this op" on a TPU always means "describe it, compile it, then launch the compiled
+program".
+
+That gap between PyTorch's op-by-op model and XLA's compile-a-whole-program model explains
+most of what follows. It is why the first PyTorch/XLA training step takes minutes. It is why a
+stray `.item()` can slow a TPU job down. It is also why a reshape can cost a copy. Two stacks
+have bridged the gap. **PyTorch/XLA** (2018–2026) records ops lazily and compiles a graph when
+you ask for a value. **TorchTPU**, open-sourced in October 2026, makes the TPU a normal eager
+PyTorch device. PyTorch/XLA is now deprecated in its favour.<Sidenote>The PyTorch/XLA README
+says the repository will be archived on 15 November 2026 and points new work to TorchTPU
+([README at `1e11002`](https://github.com/pytorch/xla/blob/1e110020e22b2c342a083c64fbc376f333fd1fbf/README.md)).
+TorchTPU is at [google-pytorch/torch_tpu](https://github.com/google-pytorch/torch_tpu); this
+post reads commit `02cc8fe` (9 November 2026).</Sidenote> Both stacks talk to the hardware
+through the same interface, **PJRT**.
+
+This post follows a PyTorch program down to the chip. It covers, in order:
+
+1. the TPU and the two software stacks, side by side;
+2. **PJRT**: what the interface is, and how a program is compiled, launched and read back
+   through it, with a small run you can reproduce;
+3. **PyTorch/XLA**: lazy tensors, `mark_step` and the graph cache;
+4. **TorchTPU**: the `PrivateUse1` backend, deferred ops, materialization, the three execution
+   modes and `torch.compile`;
+5. how TorchTPU maps PyTorch's views and in-place ops onto a functional compiler;
+6. collectives, and the performance traps that follow from all of this.
+
+It assumes you know what an ATen op and a dispatch key are. [The PyTorch
+Dispatcher](/blog/pytorch-dispatcher/) covers that. [Inside JAX](/blog/jax-internals/) covers
+the other big XLA front end, and [MLIR, One Lowering at a Time](/blog/mlir/) covers the IR that
+StableHLO is written in.
+
+## The hardware and the two stacks
+
+A TPU chip has one or more **TensorCores**. A TensorCore is a single-threaded processor with
+**matrix units** (MXUs, systolic arrays that multiply large tiles per cycle), a vector unit and
+a scalar unit. Newer chips add **SparseCores** for gathers and scatters, such as embedding
+lookups. Each chip has its own HBM, and chips connect through a torus of **inter-chip
+interconnect** (ICI) links into a **slice**.<Sidenote>Figures from TorchTPU's
+`docs/how_torchtpu_works.md`: TPU 8i has 288 GB of HBM at 8.6 TB/s and 19.2 TB/s of
+bidirectional ICI. Slices of TPU 7 and 8t are 3D tori.</Sidenote> There are no thousands of
+threads, and memory is not a flat byte array. A buffer is stored as 2-D tiles that line up with
+the vector registers. These two facts drive the design of both stacks.
+
+The figure shows both stacks. Each starts at the dispatcher, builds a graph of pending work,
+lowers it to an XLA program and hands it to PJRT. Below PJRT they are identical. Click a box to
+read what it does.
+
+<BoxDiagram
+	nodes={stackNodes}
+	edges={stackEdges}
+	selected="capi"
+	grid={{ cellW: 230, cellH: 62, gapX: 40, gapY: 34 }}
+	title="PyTorch/XLA (left) and TorchTPU (right) share PJRT and libtpu"
+/>
+
+Read the two columns as two answers to one question: *when* does a PyTorch op turn into an XLA
+program? PyTorch/XLA waits until you sync, so one program covers a whole training step.
+TorchTPU starts from one program per op and fuses more when it can. Everything from PJRT down
+is the same: the [StableHLO](https://openxla.org/stablehlo/spec) or HLO program goes to
+`libtpu.so`, which compiles and runs it.
+
+## PJRT
+
+### What PJRT is
+
+**PJRT** is the device interface of the OpenXLA
+project. It sits between a framework (JAX, PyTorch/XLA, TorchTPU, TensorFlow) and a hardware
+**plugin** (libtpu for TPUs, plugins for GPUs and other accelerators). It has two layers:
+
+- a **C++ API**, `xla::PjRtClient`, `xla::PjRtLoadedExecutable` and `xla::PjRtBuffer`, which
+  frameworks program against;
+- a **C API** in [`xla/pjrt/c/pjrt_c_api.h`](https://github.com/openxla/xla/blob/96afafc4351a78323c7511db91e2d62977f91a51/xla/pjrt/c/pjrt_c_api.h),
+  a struct of function pointers with a stable ABI. A framework built against one XLA version
+  can load a plugin built against another.
+
+A plugin is a shared library that exports a single symbol, `GetPjrtApi`. The framework opens
+the library and calls that symbol. It gets back a `PJRT_Api` struct: the API version followed by
+139 function pointers at version 0.117. XLA's loader does exactly this:
+
+```cpp
+// xla/pjrt/pjrt_api.cc (openxla/xla 96afafc), trimmed
+void* library = dlopen(library_path.data(), RTLD_LAZY);
+const PJRT_Api* (*init_fn)();
+*reinterpret_cast<void**>(&init_fn) = dlsym(library, "GetPjrtApi");
+// ... then SetPjrtApi(device_type, init_fn())
+```
+
+These objects cover almost everything a framework does:
+
+| Object | C type | What it is |
+| --- | --- | --- |
+| client | `PJRT_Client` | One per process. Owns the devices this process can address and the compiler. |
+| device / memory | `PJRT_Device`, `PJRT_Memory` | A chip (or core) and its memory spaces, e.g. HBM and pinned host memory. |
+| loaded executable | `PJRT_LoadedExecutable` | A compiled program, already placed on its devices and ready to launch. |
+| buffer | `PJRT_Buffer` | A typed, shaped array on one device, plus an event that says when it is ready. |
+| event | `PJRT_Event` | A future. Completion of a transfer or an execution. |
+
+The calls that matter are these. All of them are fields of `PJRT_Api` at API version 0.117:
+
+| Call | Does |
+| --- | --- |
+| `PJRT_Plugin_Initialize`, `PJRT_Client_Create` | Load the plugin, open the chips, discover the topology |
+| `PJRT_Client_BufferFromHostBuffer` | Start a host → device copy; return a buffer at once |
+| `PJRT_Client_Compile` | Compile a `PJRT_Program` (format `"mlir"` or `"hlo"`) with serialized `CompileOptionsProto` into a loaded executable |
+| `PJRT_LoadedExecutable_Execute` | Enqueue a program on `num_devices` devices with a `[num_devices][num_args]` array of argument buffers; return output buffers and per-device completion events |
+| `PJRT_Buffer_ToHostBuffer` | Start a device → host copy; return an event |
+| `PJRT_Event_Await`, `PJRT_Event_OnReady` | Block on, or attach a callback to, an event |
+
+Every argument struct starts with `struct_size`. A minor version bump may only *add* fields at
+the end, so a plugin can tell from `struct_size` how many fields an older caller knows
+about.<Sidenote>From the version comment in `pjrt_c_api.h`. A major version bump (deleting or
+reordering fields) breaks the ABI; the major version has been 0 throughout.</Sidenote>
+
+Both PyTorch stacks create their client the same way, through the C API wrapper
+`xla::GetCApiClient`:
+
+```cpp
+// TorchTPU csrc/pjrt/pjrt_client.cc (02cc8fe)
+if (device_type == "tpu") {
+  return AdaptXlaError(
+      xla::GetCApiClient(
+          "tpu", {{"premapped_buffer_size", tpu_premapped_buffer_size}}),
+      /*context=*/"failed to retrieve the PjRt client");
+}
+
+// PyTorch/XLA torch_xla/csrc/runtime/pjrt_registry.cpp (1e11002), trimmed
+auto tpu_library_path = sys_util::GetEnvString(
+    env::kEnvTpuLibraryPath,
+    sys_util::GetEnvString(env::kEnvInferredTpuLibraryPath, "libtpu.so"));
+XLA_ASSIGN_OR_RETURN(const PJRT_Api* c_api,
+                     pjrt::LoadPjrtPlugin("tpu", tpu_library_path));
+XLA_RETURN_IF_ERROR(pjrt::InitializePjrtPlugin("tpu"));
+XLA_ASSIGN_OR_RETURN(client, xla::GetCApiClient("TPU"));
+```
+
+### A program's life through PJRT
+
+Step through the figure to follow one program, from loading the plugin to reading a result
+back. Watch which calls return at once: the Python thread blocks only at the last step.
+
+<SequenceSteps
+	participants={pjrtParticipants}
+	messages={pjrtMessages}
+	title="One program through PJRT: load, compile, run, read back"
+/>
+
+Two points matter for everything later.
+
+**Execution is asynchronous.** `Execute` returns output buffers before the TPU has started.
+Their contents are futures. A later `Execute` can take those buffers as inputs, and the runtime
+orders the two programs by their events. So the host can run ahead of the device and keep a
+queue of programs in flight. It only waits when it copies data back to the host.
+
+**A buffer is typed and shaped.** A `PJRT_Buffer` knows its element type, its dimensions and
+its on-device tiled layout. A CUDA allocation is just bytes. This difference is why PyTorch's
+storage model, a flat byte array plus strides, needs a translation layer on TPU. The
+[TorchTPU section](#tensors-that-point-at-deferred-ops) shows that layer.
+
+### Running PJRT by hand
+
+You can drive a PJRT client directly from Python, because `jaxlib` exposes its client. The
+script below compiles a StableHLO program, puts three arrays on the device, launches the program
+and reads the result back. It uses the CPU client, since this post was written without a
+TPU.<Sidenote>jax and jaxlib 0.12.0.1 on macOS. In this build the CPU client is linked in
+directly (`client.is_c_api` is `False`), so the calls go through the C++ API rather than the C
+API. On a TPU VM, `get_backend("tpu")` returns the libtpu client loaded through the C API, and
+the same calls work.</Sidenote>
+
+```python
+import numpy as np, jax
+from jax._src import xla_bridge
+from jax._src.lib import xla_client as xc
+
+def f(x, w, b):
+    return jax.nn.relu(x @ w + b)
+
+x = np.array([[-1, 0], [1, 2]], np.float32)
+w = np.array([[1, 2], [3, 4]], np.float32)
+b = np.array([0.5, -6], np.float32)
+mlir = jax.jit(f).lower(x, w, b).as_text()            # StableHLO text
+
+client = xla_bridge.get_backend("cpu")                 # an xla::PjRtClient
+dev = client.devices()[0]
+exe = client.compile_and_load(mlir, xc.DeviceList((dev,)), xc.CompileOptions())
+args = [jax.device_put(a, dev) for a in (x, w, b)]     # BufferFromHostBuffer
+out = exe.execute(args)                                # Execute: returns at once
+print(np.asarray(out[0]))                              # ToHostBuffer + await
+```
+
+The program that went into `compile_and_load` is this StableHLO module:
+
+```
+func.func public @main(%arg0: tensor<2x2xf32>, %arg1: tensor<2x2xf32>, %arg2: tensor<2xf32>) -> tensor<2x2xf32> {
+  %0 = stablehlo.dot_general %arg0, %arg1, contracting_dims = [1] x [0] : (tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x2xf32>
+  %1 = stablehlo.broadcast_in_dim %arg2, dims = [1] : (tensor<2xf32>) -> tensor<1x2xf32>
+  %2 = stablehlo.broadcast_in_dim %1, dims = [0, 1] : (tensor<1x2xf32>) -> tensor<2x2xf32>
+  %3 = stablehlo.add %0, %2 : tensor<2x2xf32>
+  %4 = call @relu(%3) : (tensor<2x2xf32>) -> tensor<2x2xf32>      // maximum(%3, 0)
+  return %4 : tensor<2x2xf32>
+}
+```
+
+Every shape is static and part of the type. Every value is assigned once: there is no
+"write into this buffer". The bias add has no implicit broadcasting either; it is spelled out as
+two `broadcast_in_dim` ops. PyTorch's dynamic shapes, in-place ops and broadcasting all have to
+be expressed in these terms.
+
+The run printed `[[0, 0], [7.5, 4]]`. Check it by hand. First,
+$xw = \left(\begin{smallmatrix}-1 & -2\\ 7 & 10\end{smallmatrix}\right)$. Adding $b = (0.5, -6)$ to each
+row gives $\left(\begin{smallmatrix}-0.5 & -8\\ 7.5 & 4\end{smallmatrix}\right)$. ReLU then clears the
+first row, which matches the output and NumPy's
+`np.maximum(x @ w + b, 0)`.
+
+## PyTorch/XLA: lazy tensors
+
+PyTorch/XLA was the first stack, and its design answers the problem in the simplest way: never
+run an op. Record every op and compile the record when a value is needed.
+
+### From `aten::mm` to an IR node
+
+PyTorch/XLA registers kernels under PyTorch's in-tree `XLA` dispatch key. The kernels are
+generated from `codegen/xla_native_functions.yaml`, which starts with `backend: XLA`. A tensor
+on device `xla:0` wraps an **`XLATensor`**. Its data is one of four things: a device buffer
+(`handle`), an IR value (`ir_value`), a CPU tensor waiting for upload (`tensor_data`), or a view
+of another tensor. The `mm` kernel shows the pattern:
+
+```cpp
+// torch_xla/csrc/aten_xla_type.cpp (1e11002)
+at::Tensor XLANativeFunctions::mm(const at::Tensor& self, const at::Tensor& mat2) {
+  XLA_ASSIGN_OR_THROW(XLATensorPtr xla_self, bridge::GetXlaTensor(self));
+  XLA_ASSIGN_OR_THROW(XLATensorPtr xla_mat2, bridge::GetXlaTensor(mat2));
+  XLA_ASSIGN_OR_THROW(XLATensorPtr output, tensor_methods::mm(xla_self, xla_mat2));
+  return bridge::AtenFromXlaTensor(std::move(output));
+}
+
+// torch_xla/csrc/ops/ops.cpp: the IR node and how to lower it
+torch::lazy::NodePtr Dot(const torch::lazy::Value& input, const torch::lazy::Value& weight) {
+  auto lower_fn = [](const XlaNode& node, LoweringContext* loctx) -> XlaOpVector {
+    xla::XlaOp xla_input = loctx->GetOutputOp(node.operand(0));
+    xla::XlaOp xla_weight = loctx->GetOutputOp(node.operand(1));
+    return node.ReturnOp(BuildDot(xla_input, xla_weight), loctx);
+  };
+  ...
+  return GenericOp(torch::lazy::OpKind(at::aten::mm), {input, weight},
+                   /*shape_fn=*/..., std::move(lower_fn));
+}
+```
+
+The kernel runs nothing on the device. It creates a node that remembers its operands and a
+**lowering function**, which emits HLO later. Shape inference does run at once, because PyTorch
+needs `output.shape` straight away. The result is an `XLATensor` whose value is that node.
+
+### `mark_step`: hash, lower, compile, run
+
+The graph grows until something forces it. That can be `xm.mark_step()` (renamed
+`torch_xla.sync()`), a host transfer such as `.item()` or `print(t)`, or the step barrier in
+the data loader. Then `XLAGraphExecutor::SyncTensorsGraphInternal` runs. Trimmed:
+
+```cpp
+// torch_xla/csrc/xla_graph_executor.cpp (1e11002), trimmed
+SyncTensorCollection coll = CollectSyncTensors(*tensors, config);   // live tensors with pending IR
+ExtractIRAndPrepareXlaData_(tensors, coll.config, coll.indices, ir_values, tensor_data_vec);
+PostOrderData po_data = RunPostOrder(ir_values, &coll);            // topological order + hash
+MergeHash(torch::lazy::Hash(po_data.parameter_sequence), &coll.hash);
+...
+auto cache_res = TryRunCachedSync(tensors, &coll, &po_data, tensor_data_vec, ...);
+if (cache_res.first) return cache_res.second;                      // cache hit: just execute
+CompilationResult compile_result =
+    Compile(*tensors, devices, coll, &po_data, ir_values, buffer_donor_indices);
+GetComputationCache()->Add(coll.hash, cached_computation);
+return ScheduleSyncTensorsGraph(tensors, &coll, ...);              // ExecuteComputation, async
+```
+
+The **graph hash** covers each node's op, its shape and its parameters, plus the order of the
+device-data inputs. It does not cover the data itself. So a training step that builds the same
+graph every iteration compiles once and then hits the cache. Anything that changes the graph
+causes a recompile: a new batch shape, a Python `if` on a tensor value, a learning rate passed
+as a Python float that changes each step. On TPU a recompile takes seconds to minutes, which is
+why recompilation is PyTorch/XLA's best-known problem.<Sidenote>`PT_XLA_DEBUG_LEVEL=2` and the
+`metrics_report()` counters `CompileTime` and `UncachedCompile` exist to find these
+recompilations.</Sidenote>
+
+`Compile` lowers each node with its lowering function into one `xla::XlaComputation` (HLO),
+marks buffers that may be donated, and calls `PjRtComputationClient::Compile`. That function
+fills in `xla::CompileOptions` and calls `client_->CompileAndLoad`. The options differ between
+the two ways PyTorch/XLA uses several chips:
+
+| Mode | `num_replicas` | `num_partitions` | `use_spmd_partitioning` | Device assignment |
+| --- | --: | --: | --- | --- |
+| One process per chip (replicated) | device count | 1 | no | `(device_count × 1)` |
+| SPMD (`torch_xla.distributed.spmd`) | 1 | device count | yes | `(1 × device_count)` |
+
+In SPMD mode one process drives every chip on the host. Sharding annotations on tensors become
+HLO sharding attributes, and XLA's partitioner splits the program and inserts the collectives.
+Execution goes through `ExecuteComputation` (one device) or `ExecuteReplicated` (all devices).
+Both wrap `PjRtLoadedExecutable::ExecuteSharded` and `Execute`, which are the C++ faces of
+`PJRT_LoadedExecutable_Execute`.
+
+PyTorch/XLA later added an eager mode (`torch_xla.experimental.eager_mode(True)`) and the
+`openxla` backend for `torch.compile`. The lazy core stayed the default, with its hard parts:
+the first step is slow, recompiles are silent, and debugging is far from the line that failed.
+TorchTPU was designed to remove these.
+
+## TorchTPU: a native eager backend
+
+TorchTPU's aim is that `model.to("cuda")` becomes `model.to("tpu")` and nothing else changes.
+That includes eager execution, `torch.compile`, `torch.distributed`, streams and events. The
+same ingredients are used: XLA, StableHLO and PJRT. The difference is in where the graph is cut
+and who decides.
+
+### A `PrivateUse1` backend
+
+TorchTPU is an out-of-tree backend. It registers its kernels under the dispatch key PyTorch
+reserves for such backends, `PrivateUse1`. When `torch_tpu` is installed, `import torch`
+autoloads it, and it renames `PrivateUse1` to `tpu`. So `torch.device("tpu")`,
+`tensor.is_tpu` and `torch.accelerator.current_accelerator()` all work. The registration is
+ordinary PyTorch C++:
+
+```cpp
+// csrc/eager/tpu_aten_kernels.cc (02cc8fe), trimmed
+TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
+  ImplStable<OpName::kAbsOut>(m, AtenAbsOut);
+  ImplStable<OpName::kAcosOut>(m, AtenAcosOut);
+  ...                                    // one line per supported ATen op
+}
+TORCH_LIBRARY_IMPL(_, PrivateUse1, m) {  // anything not registered above
+  m.fallback(torch::CppFunction::makeFromBoxedFunction<&TpuMissingOpFallback>());
+}
+TORCH_LIBRARY_IMPL(_, AutogradPrivateUse1, m) {
+  m.fallback(torch::CppFunction::makeFallthrough());   // use PyTorch's own autograd formulas
+}
+```
+
+Autograd needs no special handling. PyTorch's autograd runs above the backend key, so the
+backward pass reaches TorchTPU as ordinary ATen ops. TorchTPU registers its own autograd only
+for a few ops, such as pooling.
+
+### Tensors that point at deferred ops
+
+A CUDA tensor's storage holds a device address. A TorchTPU tensor's storage holds a pointer to
+a host-side object that describes the data, which may not exist yet.<Sidenote>TorchTPU's memory
+model doc calls this "the key to TorchTPU's operation". The class comment in
+`csrc/eager/device_buffer.h` describes the three-level structure.</Sidenote> Click the classes
+in the figure. Follow the chain from `at::Tensor` to either a `DeferredOp` (not computed yet)
+or a `PjRtBuffer` (computed, or being computed).
+
+<UmlClassDiagram
+	classes={bufferClasses}
+	relations={bufferRelations}
+	selected="list"
+	title="What a TorchTPU tensor's data pointer leads to"
+/>
+
+There are three levels because one ATen op can have several outputs. `native_layer_norm`
+returns the output, the mean and the reciprocal standard deviation. A **`DeviceBufferList`**
+holds all outputs of one op. A **`DeviceBufferRef`** is one of them: a shared pointer to the
+list plus an index. A **`DeferredOp`** is an op that has not run. It holds its inputs as more
+`DeviceBufferRef`s. So pending work forms a graph, the same kind PyTorch/XLA builds. The
+difference is in what happens next. When the last tensor that refers to a deferred op dies, the
+op can be dropped without ever running.
+
+### Writing a kernel: `aten::mm`
+
+A TorchTPU kernel checks its arguments as PyTorch's CUDA kernel would. It works out the output
+shape and dtype, then calls `DispatchOp` (or `DispatchOpOut`) with a **builder**: a lambda that
+emits the op's StableHLO when asked. The `mm` kernel, trimmed:
+
+```cpp
+// csrc/ops/mm/mm_aten_kernels.cc (02cc8fe), trimmed
+absl::Status Mm(const at::Tensor& lhs, const at::Tensor& rhs, at::Tensor& out,
+                OpParamCacheKeys param_keys, std::optional<at::ScalarType> out_dtype) {
+  TT_RETURN_IF_ERROR(ValidateMmOutInputs(lhs, rhs, out, out_dtype));   // same errors as CUDA
+  int64_t output_dims[2] = {lhs.size(0), rhs.size(1)};
+  ...
+  const auto current_precision = GetAndAddPrecisionTo(param_keys);     // part of the cache key
+  auto op_builder = [current_precision, target_elem_dtype, needs_conversion](
+                        FixedSizeSpan<mlir::MlirOp, 2> inputs) -> absl::StatusOr<mlir::MlirOp> {
+    mlir::MlirOp lhs_op = inputs[0], rhs_op = inputs[1];
+    if (needs_conversion) { /* stablehlo.convert both inputs */ }
+    return BuildMmShlo(lhs_op, rhs_op, current_precision);             // stablehlo.dot_general
+  };
+  return DispatchOpOut<2>(std::move(op_builder), {lhs, rhs}, out,
+                          {.out_dtype = target_elem_dtype, .out_dims = output_dims,
+                           .op_param_cache_keys = std::move(param_keys)});
+}
+```
+
+`DispatchOpOut` does not call the builder. It creates a `DeferredOp` that holds the builder, the
+input refs, the output shape and the cache-key parameters. It points `out`'s storage at that op
+and pushes it onto the current stream. Then the kernel returns. Any parameter that changes the
+emitted StableHLO must go into `op_param_cache_keys`: `gelu`'s `approximate` string, or `mm`'s
+matmul precision here. Otherwise two different programs would share one cache entry.
+
+### Materialization: from deferred op to PJRT
+
+**Materialization** turns deferred ops into real buffers. A background worker thread per stream
+does it in five steps, following `docs/torchtpu_execution_model.md`:
+
+1. **Analyse** the deferred ops on the stream. Decide how many executables to cut them into,
+   what each one's inputs and outputs are, which optimisation level to use, and whether a region
+   should run on a TensorCore or a SparseCore.
+2. **Fingerprint** each region: its graph structure, the input and output shapes, and the
+   compiler options, including the TPU generation and the libtpu and PJRT versions.
+3. **Look up** the fingerprint in the compilation cache. On a miss, call every op's builder to
+   emit one StableHLO module. Then hand the module to a compile thread pool, which calls
+   `PjRtClient::CompileAndLoad`.
+4. **Enqueue** the executable with `torch_tpu::Execute`, which calls
+   `PjRtLoadedExecutable::Execute`. The outputs are `PjRtBuffer` futures, and they replace the
+   `DeferredOp` in each `DeviceBufferList`.
+5. Return. Python only waits if the trigger was a host copy or a `synchronize()`.
+
+The `Execute` wrapper is short. It shows how TorchTPU uses PJRT:
+
+```cpp
+// csrc/pjrt/pjrt_execute.cc (02cc8fe), trimmed
+absl::StatusOr<PjRtBufferPointers> Execute(const SharedLoadedExecutableWithMetadata& executable,
+                                           std::vector<xla::PjRtBuffer*> argument_buffers, ...) {
+  xla::ExecuteOptions execute_options{.strict_shape_checking = true};
+  if (layout_validation == ArgumentLayoutValidation::kValidate)
+    TT_RETURN_IF_ERROR(ValidateArgumentLayouts(*executable, argument_buffers));
+  TT_ASSIGN_OR_RETURN(auto results_per_device,
+      AdaptXlaError(executable->GetLoadedExecutable()->Execute(
+                        absl::MakeConstSpan(&argument_buffers, 1),   // one device
+                        execute_options, returned_futures),
+                    "failed to run executable"));
+  return std::move(results_per_device[0]);
+}
+```
+
+There is one device per process, so the argument list is `[1][num_args]`, as on a GPU with one
+process per device. The layout check exists because PJRT only compares an argument's *size*
+with what the program expects. A same-sized buffer in another tiled layout would be read wrongly
+without any error.<Sidenote>Another detail in `csrc/common/compilation.cc`: XLA:TPU limits a
+program to about 16K parameters on v7. A program with more than 2,000 arguments, such as a
+fused optimizer step over thousands of weights, gets its arguments passed as one tuple, as JAX
+does. PyTorch/XLA does the same above 3,200 parameters
+(`XLA_PARAMETER_WRAPPING_THREADSHOLD`).</Sidenote>
+
+### Execution modes
+
+When does materialization start? That choice is the **execution mode**, and it trades compile
+time against run time:
+
+| Mode | How to enable | When materialization starts | Graph size | XLA level |
+| --- | --- | --- | --- | --- |
+| Strict eager (default) | nothing | Right after each op | 1 op | `-O1` |
+| Debug eager | `TORCH_TPU_LAUNCH_BLOCKING=1` | Same, and the host waits for each op | 1 op | `-O1` |
+| Defer-and-fuse | `TORCH_TPU_DEFER_AND_FUSE=1` | On a host transfer or sync, or when a loop is detected | many ops | `-O2` |
+| `torch.compile` | `torch.compile(m, backend="tpu")` | Compiled ahead; each call just launches | FX graph | `-O2` |
+
+The `-O1` for single ops comes from `MakeCompilerOptionOverrides` in
+`csrc/common/compilation.cc`: the eager `kFastCompile` mode sets `xla_optimization_level` to
+`O1`, and `torch.compile` keeps XLA's default, `O2`.
+
+The figure runs one program through each mode and through PyTorch/XLA. The program is a small
+loop: `x = x * 0.5`, then four iterations of `x = torch.relu(x @ w + b)` on 8×8 tensors, then
+`x.sum().item()`. Pick a mode and step through. Each chip is an ATen op. It is dashed while
+deferred and takes its executable's colour once it is part of one. The table lists each
+executable and whether it was compiled or found in the cache.
+
+<EagerModeSteps mode="fuse" title="One loop, four ways to cut it into TPU programs" />
+
+The four runs end like this:
+
+| Mode | Executables launched | Compiles | Cache hits | Launches reused by a compiled callable |
+| --- | --: | --: | --: | --: |
+| Strict eager | 14 | 5 | 9 | 0 |
+| Defer-and-fuse | 4 | 3 | 1 | 0 |
+| `torch.compile` | 6 | 3 | 0 | 3 |
+| PyTorch/XLA, `mark_step` per iteration | 5 | 3 | 2 | 0 |
+
+**Strict eager** compiles each distinct op once, five here (`mul`, `mm`, `add`, `relu`, `sum`).
+After that it hits the cache, because the cache key is the op plus its shapes, not its data.
+The compiles are small, done in parallel and at `-O1`, so the first result arrives fast. The
+cost is one launch per op: 14 here.
+
+**Defer-and-fuse** waits. The ops pile up until a loop is detected (step 7 in the figure). At
+that point everything deferred, `mul` plus two loop iterations, becomes one program. The third
+iteration is flushed as soon as it completes and compiled as the loop body. The fourth has the
+same key, so it hits the cache. `.item()` flushes the last `sum`. That makes 4 launches, but
+each compile is larger and at `-O2`.
+
+**`torch.compile`** compiles `step` once, on its first call. Later calls skip the eager machinery
+entirely: no `DeferredOp`s, no analysis, no cache lookup. The callable pushes its executable
+straight to PJRT. Ops outside `step` still run in strict eager.
+
+**PyTorch/XLA** compiles twice for the loop. The first graph includes `mul`, so it differs from
+the other three. This is the familiar "the first two steps are slow" pattern.
+
+These counts come from a model of the modes, written in `deferredExecution.ts`. The detector in
+it is a line-by-line port of TorchTPU's. The model assumes only `x` stays alive between ops,
+so each flush is one single-output region.<Sidenote>With more live tensors, the default
+`GraphSplitMode::kSplitGraph` can cut a flush into several single-output graphs, to avoid
+computing anything twice. The model also uses the sequence of op signatures as the cache key,
+where TorchTPU fingerprints the graph and the compiler options.</Sidenote>
+
+### How defer-and-fuse finds a loop
+
+Defer-and-fuse cannot wait for an explicit sync. A training loop may never call `.item()` and
+would grow an unbounded graph. So it watches for repetition. Each new deferred op is hashed by
+`DeferredOp::Hash()` from its op name, its input and output shapes, its donated indices and its
+parameters. The detector then looks for a block of 2 to 128 hashes that appears at least twice
+in a row at the end of the queue (`events_queue.cc`: `kMinRepeatedSubsequenceLength = 2`,
+`kMaxRepeatedSubsequenceLength = 128`, `kMinRepetitionCount = 2`):
+
+```cpp
+// csrc/eager/events_queue.cc (02cc8fe), StreamState::FindRepeatedSequence, trimmed
+// Walk back from the end; each position whose hash equals the newest op's hash ends a
+// candidate block of length repetition_length.
+while (prior_repetition_end_it != deferred_ops_.rend() &&
+       repetition_length <= kMaxRepeatedSubsequenceLength) {
+  if (prior_repetition_end_it->deferred_op_hash != new_hash) { ++repetition_length; ++prior_repetition_end_it; continue; }
+  // Compare the last repetition_length ops with the repetition_length ops before them.
+  ... if (matches == required_matches) return repetition_length;
+}
+return 0;
+```
+
+Trace it on the example. Write `P` for `mul` and `A`, `B`, `C` for `mm`, `add` and `relu`. The
+queue grows `P A B C A B C`. When the second `C` arrives, the scan starts two positions back, at
+the `A` in position 5 (counting from 1). That `A` is not a `C`, so the block length becomes 3
+and the scan moves to position 4. That op is a `C`. Now compare positions 4, 3, 2 with 7, 6, 5:
+`C=C`, `B=B`, `A=A`. That is 3 matches out of 3 needed, so a loop of length 3 is found. The
+detector stores the pattern `A B C` and asks for a graph break. From then on a fast path
+(`CheckLastRepeatedSequence`) just checks each new op against the next expected hash. It
+flushes after each complete `A B C`, and resets if an unexpected op (`sum`) arrives.
+
+### The compilation cache
+
+Each compile goes through a cache with three tiers:
+
+| Tier | Where | Shared between | Default |
+| --- | --- | --- | --- |
+| 1 | Process memory | Threads of one process | Always on |
+| 2 | Host shared memory | Processes on one host, e.g. 4 or 8 ranks | On for distributed jobs |
+| 3 | Remote file system, e.g. GCS | Hosts, jobs, restarts | Off until a location is set |
+
+Tier 2 matters because TorchTPU runs one process per chip. On an 8-chip host, all 8 ranks
+compile the same programs, and tier 2 lets seven of them reuse the first one's work.
+
+### `torch.compile`
+
+`torch.compile(model, backend="tpu")` registers a Dynamo backend. It does not use
+[TorchInductor](/blog/torch-inductor/). Dynamo captures an [FX graph](/blog/torch-fx-graph/),
+and [AOTAutograd](/blog/aot-autograd/) splits it into forward and backward graphs. TorchTPU's
+`StaticCompiler` then does the following for each graph (from
+`src/torch_tpu/_internal/compile/compiler.py`):
+
+1. runs FX passes: decompose auto-functionalized ops so buffer donation still works, fold
+   grouped-query attention, detect causal masks, and mark constants and activation checkpoints;
+2. replaces the example inputs with **placeholder tensors**. These are real TorchTPU tensors in
+   the `DeviceBufferList` placeholder state, carrying shape, dtype and device layout but no
+   data;
+3. runs the graph *eagerly* on the placeholders with every op deferred (`fx_to_mlir`). This
+   reuses every eager kernel's builder, so eager and compiled modes share one set of op
+   lowerings;
+4. compiles the resulting StableHLO module once, at `-O2`, optionally on a background thread;
+5. returns a `TorchTpuCompiledExecutable` that launches the executable directly through PJRT.
+
+Step 3 is the reason the design has one kernel library and not two. PyTorch/XLA needed both a
+lowering function per IR node and a separate path for `torch.compile`.
+
+## Mapping PyTorch's semantics onto a functional compiler
+
+StableHLO has no pointers, no strides and no mutation. PyTorch has all three. TorchTPU keeps
+PyTorch's *logical* behaviour by rewriting the physical operations into functional ones.
+
+### Views become StableHLO ops
+
+On CUDA a view is free: a kernel reads the same bytes with other strides. On TPU, memory is
+tiled, so a stride pattern cannot be applied directly. TorchTPU performs **view decomposition**:
+it turns a (sizes, strides, offset) triple into a chain of slice, reshape, transpose and
+broadcast ops that produce the same elements. The example from TorchTPU's memory-model doc,
+checked with PyTorch 2.9.1:
+
+```python
+base = torch.arange(10, dtype=torch.float)                 # [0, 1, ..., 9]
+physical = base.as_strided(size=(2, 2, 2), stride=(2, 3, 0), storage_offset=1)
+logical = base[1:].view(3, 3)[:2, ::2].t().unsqueeze(-1).expand(2, 2, 2)
+torch.equal(physical, logical)                             # True
+```
+
+Each step of the chain, with the strides PyTorch reports:
+
+| Step | Shape | Strides | Offset | Values |
+| --- | --- | --- | --: | --- |
+| `base[1:]` | (9,) | (1,) | 1 | 1 … 9 |
+| `.view(3, 3)` | (3, 3) | (3, 1) | 1 | [[1, 2, 3], [4, 5, 6], [7, 8, 9]] |
+| `[:2, ::2]` | (2, 2) | (3, 2) | 1 | [[1, 3], [4, 6]] |
+| `.t()` | (2, 2) | (2, 3) | 1 | [[1, 4], [3, 6]] |
+| `.unsqueeze(-1)` | (2, 2, 1) | (2, 3, 1) | 1 | [[[1], [4]], [[3], [6]]] |
+| `.expand(2, 2, 2)` | (2, 2, 2) | (2, 3, 0) | 1 | [[[1, 1], [4, 4]], [[3, 3], [6, 6]]] |
+
+The last row has exactly the strides and offset of `physical`. Check one entry: element
+`[1, 0, 1]` sits at offset $1 + 2\cdot 1 + 3\cdot 0 + 0\cdot 1 = 3$, and `base[3] = 3`, which
+matches. In StableHLO the chain is `slice`, `reshape`, `slice`, `transpose`, `reshape`,
+`broadcast_in_dim`. The catch: a transpose or reshape of a tiled buffer may need a real copy on
+TPU. **Views are not free on TPU.**
+
+### In-place ops, buffer donation and copy-on-write
+
+`x.add_(1)` writes into `x`'s storage, and every view of that storage sees the change. StableHLO
+can only make new values. TorchTPU handles this by functionalizing automatically:
+
+1. Compute the new value out of place. For a write through a view, run the view decomposition
+   *in reverse* (**view inversion**) and merge the result into the base with
+   `stablehlo.dynamic_update_slice`.
+2. Swap the new buffer into the storage's metadata object. Every tensor that shares the
+   storage now sees it.
+
+Done naively, this doubles peak memory, since the old and new buffers exist together. So when
+the old buffer has no other users, TorchTPU marks it **donated**: XLA may write the output into
+the input's memory. `DispatchOpOut` does this for in-place and `out=` ops
+(`AutoDonateInPlaceBuffers`). When donation cannot be proved safe, the update stays out of
+place. Then a small write into a slice of a large tensor copies the *whole* storage.
+
+Immutability gives one thing back. `clone()` is **copy-on-write**: the clone refers to the same
+buffer until one side is written. Writing to an overlapping view, such as the output of
+`expand`, is undefined behaviour on CUDA. TorchTPU always raises an error for it, because view
+inversion would be ambiguous.
+
+## Collectives compiled into the program
+
+On GPUs, `dist.all_reduce` calls NCCL, a separate communication library (see [How GPUs
+Talk](/blog/collective-communication/)). TorchTPU's `tpu_dist` process-group backend has no
+such library. It lowers each collective to a StableHLO op such as `stablehlo.all_reduce`,
+`all_gather`, `reduce_scatter` or `all_to_all`. XLA then compiles the op into the TPU program,
+which drives the ICI links directly. This brings two differences from GPUs.
+
+**Every rank must describe every group.** `dist.all_reduce(t, group=g)` only names the
+caller's group. `stablehlo.all_reduce` needs `replica_groups` covering *all* ranks, including
+groups the caller is not in. For example, with 8 ranks split into two groups of 4:
+
+```
+%0 = "stablehlo.all_reduce"(%arg0) <{ replica_groups = dense<[[4, 0, 1, 3], [5, 2, 6, 7]]> : tensor<2x4xi64> }> ...
+```
+
+`tpu_dist` swaps group membership between all ranks when a group is set up, so each rank can
+emit the full list.
+
+**Ranks must run identical programs.** XLA's collectives assume SPMD: every rank runs the same
+module with collectives in the same order. PyTorch code is often MPMD in practice. A branch
+such as `if rank == 0` or an uneven shard can give two ranks different modules, which can
+deadlock. So by default TorchTPU compiles each collective as its own small ("skinny")
+program, with graph breaks around it. That is safe, but XLA cannot overlap the communication
+with compute. There are two ways to opt in to fusing collectives:
+
+- `@torch.tpu.distributed.spmd_safe` on a function you know is SPMD. Collectives inside it are
+  fused into the surrounding graph.
+- `TORCH_TPU_SPMD_HANDSHAKE_STAGE=COMPILE_STAGE`, which compares the compiled FX graphs across
+  ranks and fuses only if they match. `DISPATCH_STAGE` does the check at launch instead, for
+  jobs where only some ranks recompile.
+
+Before PJRT starts, the job must also describe the slice. `TORCH_TPU_TOPOLOGY` gives the
+physical mesh, `TORCH_TPU_SLICEBUILDER_ADDRESSES` gives the hosts that build the ICI mesh, and
+`WORLD_SIZE` gives the rank count. A TPU process cannot look at all chips and pick one, the way
+a CUDA process picks `cuda:{local_rank}`.
+
+## Where performance goes
+
+The design explains the usual performance traps.
+
+**Tiny programs starve the TPU.** Enqueuing an executable through PJRT costs about 50 µs of host
+time.<Sidenote>"Usually, 50 microseconds or less", from `docs/torchtpu_execution_model.md`. The
+chart assumes exactly 50 µs and a host that does nothing else.</Sidenote> If the program runs
+for less time than that, the TPU waits for the host. The chart shows the share of time the TPU
+is busy: $t / \max(t, 50\,\mu\text{s})$ for a program that takes $t$ on the device. It also
+shows the same ops fused four to a program, which gives $4t / \max(4t, 50\,\mu\text{s})$.
+
+<LineChart
+	x={() => Array.from({ length: 101 }, (_, i) => 2 * i)}
+	series={[
+		{ name: "one op per program (strict eager)", fn: (t) => (t === 0 ? 0 : (100 * t) / Math.max(t, 50)) },
+		{ name: "four ops per program (fused)", fn: (t) => (t === 0 ? 0 : (100 * 4 * t) / Math.max(4 * t, 50)) },
+	]}
+	xLabel="device time per op (µs)"
+	yLabel="TPU busy (%)"
+	title="Launch-bound below 50 µs of work per program"
+	height={280}
+/>
+
+An op that takes 10 µs on the device keeps the TPU 20% busy in strict eager. Fused four to a
+program, it keeps it 80% busy. For the 8×8 example, where each op takes far under 50 µs, the
+launches alone take up to $14 \times 50 = 700\ \mu\text{s}$ in strict eager and
+$4 \times 50 = 200\ \mu\text{s}$ in defer-and-fuse. Large matmuls hide the overhead. Small ops,
+such as optimizer updates over many small weights, do not, which is why `_foreach` and fused
+optimizer kernels matter here.
+
+**Host transfers break graphs.** `if loss.item() > 0`, `torch.nonzero` and `masked_select` all
+need a value on the host. In strict eager the stream drains first. In defer-and-fuse and
+`torch.compile` the sync also cuts the graph, so the fused program is split at that point. The
+fix is the same as on PyTorch/XLA: keep control flow on the device (`torch.where`) and log
+asynchronously.
+
+**Non-contiguous inputs cost copies.** PJRT needs a compiled program's inputs to be contiguous
+and zero-offset. A view passed to a compiled function is first copied in eager mode. Keep the
+tensors passed between compiled regions contiguous.
+
+**Partial writes may copy the whole buffer.** When donation is impossible, writing into a slice
+of a large tensor rebuilds all of it. Prefer several small tensors to slices of one large one.
+
+## Summary
+
+- **PJRT** is the interface between frameworks and accelerators: a stable C API with a small
+  set of objects (client, buffer, loaded executable, event) that a plugin such as `libtpu.so`
+  exposes through `GetPjrtApi`. Transfers and launches return futures, so the host can run
+  ahead of the device.
+- A TPU only runs **XLA-compiled whole-array programs**. Every PyTorch-on-TPU design is a choice
+  of where to cut PyTorch's op stream into such programs, traded against compile time.
+- **PyTorch/XLA** records everything lazily and compiles at `mark_step` or host transfers. The
+  graph hash caches whole steps, but any change in the graph recompiles.
+- **TorchTPU** is a `PrivateUse1` eager backend. A tensor's storage points to a `DeferredOp`
+  holding a StableHLO builder or to a `PjRtBuffer`. A background worker compiles and launches
+  one op at a time (strict, `-O1`), fused regions found by loop detection (defer-and-fuse,
+  `-O2`), or whole FX graphs (`torch.compile`).
+- PyTorch's **views, in-place ops and collectives** become functional StableHLO: view
+  decomposition and inversion, buffer donation and copy-on-write, and collectives compiled into
+  the program with global `replica_groups`.
+
+## References
+
+- TorchTPU source and docs, commit
+  [`02cc8fe`](https://github.com/google-pytorch/torch_tpu/tree/02cc8fee1e33df7a173ddfc0d8526778d861dbe9):
+  `docs/how_torchtpu_works.md`, `docs/torchtpu_execution_model.md`,
+  `docs/torchtpu_memory_model.md`, `docs/distributed_support.md`; `csrc/pjrt/`,
+  `csrc/eager/device_buffer.h`, `csrc/eager/events_queue.cc`, `csrc/eager/tpu_aten_kernels.cc`,
+  `csrc/ops/mm/mm_aten_kernels.cc`, `csrc/common/compilation.cc`,
+  `src/torch_tpu/_internal/compile/compiler.py`.
+- C. Basile et al., [TorchTPU: A Hybrid Eager/Compiled Architecture for Native PyTorch
+  Execution on TPU](https://arxiv.org/abs/2610.24161), arXiv:2610.24161, 2026.
+- Google Cloud, [TorchTPU is now open source](https://cloud.google.com/blog/topics/ai-infrastructure/torchtpu-is-now-open-source-run-native-pytorch-on-tpus),
+  October 2026.
+- PyTorch/XLA source, commit
+  [`1e11002`](https://github.com/pytorch/xla/tree/1e110020e22b2c342a083c64fbc376f333fd1fbf):
+  `torch_xla/csrc/xla_graph_executor.cpp`, `torch_xla/csrc/aten_xla_type.cpp`,
+  `torch_xla/csrc/ops/ops.cpp`, `torch_xla/csrc/runtime/pjrt_computation_client.cpp`,
+  `torch_xla/csrc/runtime/pjrt_registry.cpp`.
+- OpenXLA, [`xla/pjrt/c/pjrt_c_api.h`](https://github.com/openxla/xla/blob/96afafc4351a78323c7511db91e2d62977f91a51/xla/pjrt/c/pjrt_c_api.h)
+  and [`xla/pjrt/pjrt_api.cc`](https://github.com/openxla/xla/blob/96afafc4351a78323c7511db91e2d62977f91a51/xla/pjrt/pjrt_api.cc)
+  at commit `96afafc`; [PJRT C++ API overview](https://openxla.org/xla/pjrt/cpp_api_overview);
+  [StableHLO specification](https://openxla.org/stablehlo/spec).

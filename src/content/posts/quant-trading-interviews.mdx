@@ -1,0 +1,1957 @@
+---
+title: "The Maths of Quantitative Trading Interviews"
+description: "What quant trading interviews test and how to answer it: mental maths, probability, random walks and martingales, Kelly betting, market making and adverse selection, options from binomial trees to Black–Scholes and the Greeks, regression and portfolio risk, each with worked examples and exercises with solutions."
+date: 2026-11-09
+updated: 2026-11-10
+tags: [Quantitative finance, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import ConfidenceChart from "../../utils/charts/ConfidenceChart.astro";
+import LineChart from "../../utils/charts/LineChart.astro";
+import MatchingSteps from "../../utils/orderbook/MatchingSteps.astro";
+import BinomialTreeSteps from "../../utils/quant/BinomialTreeSteps.astro";
+import DiceMarketSteps from "../../utils/quant/DiceMarketSteps.astro";
+import GamblersRuin from "../../utils/quant/GamblersRuin.astro";
+import KellyExplorer from "../../utils/quant/KellyExplorer.astro";
+import OptionGreeks from "../../utils/quant/OptionGreeks.astro";
+import ProbabilityBars from "../../utils/quantum/ProbabilityBars.astro";
+import {
+	birthday,
+	regressionData,
+	regressionFit,
+	threeDiceSums,
+	twoAssetVol,
+	waitHH,
+	waitHT,
+} from "../../utils/quant/quantFigures";
+
+## Background
+
+A **quantitative trader** decides what to buy and sell, at what price and in what size, using
+numbers rather than hunches. Firms such as Jane Street, Optiver, Susquehanna (SIG), IMC, Citadel
+Securities and Hudson River Trading make their money by **market making**: they stand ready to
+buy slightly below what something is worth and sell slightly above it, thousands of times a
+day. Each trade earns a sliver. The job is to know what "worth" means when the future is
+random, and to stay alive when you are wrong.
+
+That job explains the interview. Firms do not test finance trivia; they test whether you can
+reason about uncertainty quickly and out loud. Can you find an expected value in your head? Do
+you notice when a counterparty knows more than you? Will you bet the right amount when you have
+an edge, and not more? Questions about dice, coins and cards are the cheapest way to probe
+these skills, so they dominate. Options and statistics follow, because they are the language
+of the products and the research.
+
+This post teaches the whole syllabus from first principles. It starts with **what the interview
+tests**, then works through the topics in the order they build on each other: **mental maths**,
+**probability**, **random walks and martingales**, **betting with an edge (Kelly)**, **market
+making**, **options**, **statistics and regression**, **portfolios and risk**, and finally how
+to handle **brainteasers, coding and the live interview**. Every section has a worked example
+with real numbers and ends with exercises; click "Solution" to check your answer. For the
+probability basics in more depth, see [Probability foundations](/blog/probability-foundations/);
+for how an exchange matches orders, see [Building an order book in C++](/blog/order-book-cpp/).
+
+## What the interview tests
+
+Firms rarely publish their formats, so the picture below comes from candidate reports and prep
+guides; treat the details as typical rather than official.<Sidenote>Sources: the Jane Street,
+Optiver and SIG guides on techinterview.org, tradermath.org and quantt.co.uk listed in the
+References, which summarise candidate reports. Specific counts (for example "80 questions in 8
+minutes") are reported by candidates and change between years and offices.</Sidenote> A
+typical **quant trader** process has four kinds of round:
+
+- **Timed arithmetic tests.** Optiver's reported "80 in 8" is 80 arithmetic questions in eight
+  minutes with no calculator, often followed by a number-sequence test. Jane Street reportedly
+  uses a shorter mental-maths screen.
+- **Probability and expected-value interviews.** Dice, coins, cards, conditional probability,
+  "what is the fair price of this game?" You think aloud; the interviewer adds twists.
+- **Trading and market-making games.** "Make me a market on the sum of three dice." You quote a
+  bid and an ask, the interviewer trades against you, and you update. SIG is known for games built
+  on poker-style expected-value reasoning.
+- **Options, statistics and coding,** weighted by role. Options market makers (Optiver, SIG,
+  IMC) ask about payoffs, Greeks and volatility; research roles ask about regression and
+  overfitting; developer and researcher roles add a coding round.
+
+The table maps each topic to the section that teaches it.
+
+| Topic | Typical question | Where it matters most | Section |
+| --- | --- | --- | --- |
+| Mental maths | $47 \times 53$, $3/8$ as a percent, $\sqrt{252}$ | Online tests, every live round | [Mental maths](#mental-maths-and-estimation) |
+| Probability | P(sum of 3 dice = 10), Monty Hall | All firms | [Probability](#probability) |
+| Expected value | Fair price of a die game with a re-roll | All firms | [Expected value](#expected-value-and-linearity) |
+| Random walks | Gambler's ruin, expected time to HH | Prop firms, quant research | [Random walks](#random-walks-and-martingales) |
+| Bet sizing | How much to bet with a 60% edge | SIG, prop firms | [Kelly](#betting-and-the-kelly-criterion) |
+| Market making | Quote a market, adverse selection | Optiver, SIG, Jane Street, IMC | [Market making](#market-making) |
+| Options | Put–call parity, delta, ATM price | Options market makers | [Options](#options) |
+| Statistics | Regression slope, overfitting | Quant research | [Statistics](#statistics-and-regression) |
+| Portfolios | Diversification, Sharpe ratio | Quant research, risk | [Portfolios](#portfolios-and-risk) |
+
+The common thread is **expected value under uncertainty, computed fast and explained clearly.**
+The rest of the post builds that skill one layer at a time.
+
+#### What interviewers are grading
+
+It helps to know what the person across the table writes down, because it is rarely "got the
+right number". Reports from candidates and interviewers converge on five things:
+
+1. **Structure.** Do you turn a vague question into a precise one ("by 'fair price' I mean the
+   expected payout")? Do you name the states, the events or the unknowns before computing?
+2. **Speed with accuracy.** Traders act in seconds. An answer that is roughly right now beats
+   an exact answer in five minutes, *as long as you say it is approximate* and can refine it.
+3. **Sanity checks.** Does the answer pass obvious tests? A probability must lie in $[0, 1]$; an
+   expected wait for a 3-flip pattern cannot be below 3; a call cannot be worth more than the
+   stock.
+4. **Updating.** When the interviewer adds information ("the second die is a 6", "I just bought
+   ten from you"), do you change your answer, and in the right direction?
+5. **Risk sense.** Do you size a bet to your edge and your uncertainty, rather than maximising
+   the expected value of one bet?
+
+Every section below trains at least one of these. The exercises are written in interview
+style: try to answer aloud in under two minutes before opening the solution.
+
+## Mental maths and estimation
+
+Speed matters because a trader's edge disappears while they reach for a calculator. Interview
+arithmetic is not about memorising tables; it is about a handful of tricks that turn hard
+products into easy ones.
+
+**Split one factor into a round number plus a correction.** To multiply $37 \times 24$, note
+that $24 = 25 - 1$ and $25 = 100 / 4$:
+
+$$
+37 \times 24 = 37 \times 25 - 37 = 3700 / 4 - 37 = 925 - 37 = 888.
+$$
+
+**Use the difference of squares when two numbers sit either side of a round one.**
+$(a - b)(a + b) = a^2 - b^2$, so $47 \times 53 = 50^2 - 3^2 = 2500 - 9 = 2491$.
+
+**Square numbers near 50 or 100 by expanding.** $(50 + a)^2 = 2500 + 100a + a^2$, so
+$53^2 = 2500 + 300 + 9 = 2809$. Likewise $(100 - a)^2 = 10000 - 200a + a^2$, so
+$98^2 = 10000 - 400 + 4 = 9604$.
+
+**Know the common fractions as percentages.** Prices, probabilities and returns arrive as
+fractions; converting on sight saves seconds every time.
+
+| Fraction | Percent | Fraction | Percent | Fraction | Percent |
+| --- | ---: | --- | ---: | --- | ---: |
+| 1/3 | 33.33 | 1/7 | 14.29 | 1/11 | 9.09 |
+| 1/6 | 16.67 | 1/8 | 12.50 | 1/12 | 8.33 |
+| 3/8 | 37.50 | 1/9 | 11.11 | 1/16 | 6.25 |
+| 5/8 | 62.50 | 2/7 | 28.57 | 1/36 | 2.78 |
+
+**Know the market constants.** A year has about 252 trading days and $\sqrt{252} \approx 15.9$,
+so an annual volatility of 16% is about 1% a day ($0.16 / 15.87 = 0.0101$). Money doubles in
+about $72 / r$ years at $r$% a year (the **rule of 72**: at 8%, about 9 years).
+
+**Percentages are commutative.** $x\%$ of $y$ equals $y\%$ of $x$, so "17% of 60" is
+"60% of 17" $= 10.2$. Pick whichever order is easier.
+
+**Percentage changes do not cancel.** A fall of 50% followed by a rise of 50% leaves
+$0.5 \times 1.5 = 0.75$ of the start: a loss of 25%. In general a fall of $x$ needs a rise of
+$x/(1 - x)$ to recover: a 20% drawdown needs a 25% gain. This asymmetry is the volatility drag
+that reappears in the Kelly section.
+
+**Use first-order expansions for small numbers.** For $|x|$ much less than 1:
+
+- $(1 + x)^n \approx 1 + nx + \tfrac{n(n-1)}{2}x^2$. Example: $1.02^{10} \approx 1 + 0.2 + 45 \times 0.0004 = 1.218$ (exact 1.219).
+- $1/(1 - x) \approx 1 + x$. Example: $1/0.96 \approx 1.04$ (exact 1.0417).
+- $\sqrt{a^2 + b} \approx a + b/(2a)$. Example: $\sqrt{50} = \sqrt{49 + 1} \approx 7 + 1/14 = 7.0714$ (exact 7.0711).
+- $e^x \approx 1 + x$ and $\ln(1 + x) \approx x$, which is why small percentage returns and log
+  returns are nearly equal.
+
+Three logarithms are worth knowing by heart: $\ln 2 = 0.693$, $\ln 10 = 2.303$ and
+$\log_{10} 2 = 0.301$. With them, "how many doublings to grow a thousandfold?" is
+$\log_2 1000 = 3 / 0.301 \approx 10$ in your head.
+
+#### Number sequences
+
+Optiver's reported assessment adds a **sequences** test: given the start of a sequence, find the
+next term. The patterns come from a small family, so check them in order:
+
+1. **Differences.** Write the gaps between terms; if they are constant or form a simple
+   pattern, extend them. $4, 7, 12, 19, 28$ has gaps $3, 5, 7, 9$, so the next gap is 11 and the
+   answer is 39.
+2. **Ratios.** $1, 2, 6, 24, 120$ multiplies by $2, 3, 4, 5$: next is $720$ (factorials).
+3. **A formula in $n$.** $2, 6, 12, 20, 30$ is $n(n + 1)$: next is $42$.
+4. **A recursion.** $3, 5, 9, 17, 33$ is "double and subtract 1": next is $65$. Fibonacci-like
+   sequences add the previous two terms.
+5. **Two interleaved sequences.** $1, 10, 2, 20, 3, 30$ alternates $1, 2, 3$ and $10, 20, 30$:
+   next is 4.
+6. **Special sets.** Primes ($2, 3, 5, 7, 11, 13 \to 17$), squares, cubes, digits of a number.
+
+If two passes do not reveal a pattern, look at differences of differences, then at
+interleaving. Under time pressure, skip and come back.
+
+**Estimate before you compute.** A **Fermi estimate** breaks an unknown quantity into factors
+you can guess within a factor of two, then multiplies. Errors in independent guesses partly
+cancel, so the product is usually right to an order of magnitude. Interviewers care about the
+decomposition and the stated assumptions, not the final digit. For example, "How many piano
+tuners work in Chicago?": assume about 3 million people, 1 piano per 20 households of 2.5 people
+(60,000 pianos), each tuned once a year, and a tuner who does 4 tunings a day on 250 days
+(1,000 a year). That gives $60\,000 / 1\,000 = 60$ tuners: an answer of "about 50 to 100".
+
+**Practice daily.** Timed drills (for example the free Zetamac arithmetic game) build speed in
+a few weeks; aim to say every intermediate step aloud, because the live rounds grade the
+reasoning too.
+
+#### Exercises
+
+**1.1** Compute $64 \times 56$ and $1.05^2$ without writing anything down.
+
+<details>
+<summary>Solution</summary>
+
+$64 \times 56 = 60^2 - 4^2 = 3600 - 16 = 3584$ (both are 4 away from 60).
+$1.05^2 = 1 + 2(0.05) + 0.05^2 = 1.1025$, the same expansion as for 53².
+</details>
+
+**1.2** A stock has annual volatility 32%. What is a one-standard-deviation daily move on a
+\$50 stock?
+
+<details>
+<summary>Solution</summary>
+
+Daily volatility is $32\% / \sqrt{252} \approx 32\% / 16 = 2\%$. On \$50 that is about \$1.00.
+(With $\sqrt{252} = 15.87$ the exact figure is \$1.01.)
+</details>
+
+**1.3** What is $7/16$ as a percentage, and roughly what is $1/17$?
+
+<details>
+<summary>Solution</summary>
+
+$7/16 = 7 \times 6.25\% = 43.75\%$. For $1/17$: $1/17$ is a little below $1/16 = 6.25\%$; scaling by
+$16/17 \approx 0.94$ gives about $5.9\%$ (exactly $5.88\%$).
+</details>
+
+**1.4** A fund loses 20% in year one and gains 20% in year two. What is its total return, and
+what gain in year two would have broken even?
+
+<details>
+<summary>Solution</summary>
+
+$0.8 \times 1.2 = 0.96$: a 4% loss overall. Breaking even needs $1/0.8 = 1.25$, a 25% gain. The
+general rule: a fall of $x$ needs a rise of $x/(1 - x)$.
+</details>
+
+**1.5** Find the next term: (a) $1, 3, 7, 15, 31$; (b) $2, 5, 10, 17, 26$; (c) $1, 4, 2, 8, 3, 12$.
+
+<details>
+<summary>Solution</summary>
+
+(a) Double and add 1 (or $2^n - 1$): 63. (b) $n^2 + 1$ for $n = 1, 2, \ldots$ (gaps $3, 5, 7, 9$):
+37. (c) Two interleaved sequences, $1, 2, 3$ and $4, 8, 12$: next is 4.
+</details>
+
+**1.6** Estimate $\sqrt{0.0003}$ and $e^{0.05}$.
+
+<details>
+<summary>Solution</summary>
+
+$\sqrt{0.0003} = \sqrt{3} \times 10^{-2} \approx 0.0173$. $e^{0.05} \approx 1 + 0.05 + 0.05^2/2 =
+1.05125$ (exact 1.05127).
+</details>
+
+## Probability
+
+Probability is the core of every trading interview. Three tools solve almost every question:
+**counting**, **conditioning**, and **expected value**, with **first-step analysis** for anything
+that unfolds over time.
+
+### Counting
+
+When all outcomes are equally likely, a probability is a ratio of counts: favourable outcomes
+over all outcomes. Two counts do most of the work. The number of ordered sequences of $k$ items
+from $n$ with repeats is $n^k$. The number of unordered subsets of size $k$ is the **binomial
+coefficient** $\binom{n}{k} = \frac{n!}{k!\,(n-k)!}$.
+
+**Worked example: three dice sum to 10.** There are $6^3 = 216$ equally likely ordered rolls.
+Count the rolls that sum to 10 by the first die $a$: the other two must sum to $10 - a$.
+Two dice sum to $s$ in $6 - |s - 7|$ ways (for $2 \le s \le 12$), so
+
+| First die $a$ | Remaining sum | Ways |
+| --- | ---: | ---: |
+| 1 | 9 | 4 |
+| 2 | 8 | 5 |
+| 3 | 7 | 6 |
+| 4 | 6 | 5 |
+| 5 | 5 | 4 |
+| 6 | 4 | 3 |
+
+The total is $27$, so $P(\text{sum} = 10) = 27/216 = 1/8$. The figure shows the whole
+distribution: it is symmetric about the mean $10.5$, so 10 and 11 tie as the most likely sums.
+
+<ProbabilityBars
+	values={threeDiceSums}
+	labels={threeDiceSums.map((_, i) => String(i + 3))}
+	highlight={[7]}
+	xLabel="sum of three dice"
+	yLabel="probability"
+	caption="Distribution of the sum of three fair dice (exact, by convolution). The highlighted bar is P(10) = 27/216 = 0.125."
+/>
+
+**Worked example: the birthday problem.** In a room of $n$ people, what is the chance two
+share a birthday? Counting the complement is easier: the chance all birthdays differ is
+$\frac{365}{365} \cdot \frac{364}{365} \cdots \frac{365 - n + 1}{365}$. For $n = 23$ this is
+$0.493$, so the chance of a match is $0.507$, just over half. The surprise disappears once you
+count pairs: 23 people form $\binom{23}{2} = 253$ pairs, each matching with probability $1/365$.
+
+<LineChart
+	x={() => Array.from({ length: 61 }, (_, i) => i)}
+	series={[{ name: "P(shared birthday)", fn: (n) => birthday(n) }]}
+	xLabel="people in the room n"
+	yLabel="probability"
+	height={240}
+/>
+
+The curve crosses one half between 22 (0.476) and 23 (0.507) people and passes 0.99 at 57.
+
+### Conditional probability and Bayes
+
+The probability of $A$ **given** $B$ restricts the world to outcomes where $B$ happened:
+$P(A \mid B) = P(A \cap B) / P(B)$. Rearranging both ways gives **Bayes' theorem**,
+
+$$
+P(A \mid B) = \frac{P(B \mid A)\, P(A)}{P(B)}.
+$$
+
+It turns "how likely is the evidence if the hypothesis is true" into "how likely is the
+hypothesis now that I have seen the evidence". Traders use it constantly: every trade against
+you is evidence about what the other side knows.
+
+**Worked example: a two-headed coin.** A bag holds one fair coin and one two-headed coin. You
+draw one at random and flip it three times: three heads. What is the chance it is the
+two-headed coin? Before the flips each coin has probability $1/2$. The two-headed coin produces
+three heads with probability 1, the fair coin with probability $1/8$. Bayes gives
+
+$$
+P(\text{two-headed} \mid HHH) = \frac{1 \cdot \tfrac12}{1 \cdot \tfrac12 + \tfrac18 \cdot \tfrac12} = \frac{8}{9}.
+$$
+
+**Worked example: Monty Hall.** A prize is behind one of three doors. You pick door 1. The
+host, who knows where the prize is and always opens a losing door you did not pick, opens door
+3. Should you switch to door 2? Condition on where the prize is. If it is behind door 1
+(probability $1/3$), switching loses. If it is behind door 2 or 3 (probability $2/3$), the host
+is forced to reveal the other losing door, and switching wins. So switching wins with
+probability $2/3$. The host's choice carries information because it is not random.
+
+A useful habit: when a conditional question feels slippery, **list the equally likely
+outcomes and cross out the ones the condition rules out.** "Two dice, at least one is a 6:
+what is the chance the sum is 7?" The condition leaves 11 of 36 outcomes; two of them, (1, 6)
+and (6, 1), sum to 7. The answer is $2/11$, not $1/6$.
+
+### Expected value and linearity
+
+The **expected value** of a random variable is its probability-weighted average,
+$\mathbb{E}[X] = \sum_x x\, P(X = x)$. It is the fair price of a bet that pays $X$: pay less and
+you profit on average, pay more and you lose.
+
+Its most useful property is **linearity**: $\mathbb{E}[X + Y] = \mathbb{E}[X] + \mathbb{E}[Y]$
+**even when $X$ and $Y$ are dependent.** This lets you split a hard count into easy
+**indicator variables**, each 1 when an event happens and 0 otherwise, whose expectation is just
+the event's probability.
+
+**Worked example: matching hats.** $n$ people throw their hats in a pile and each takes one at
+random. How many get their own hat back, on average? Let $I_k$ be 1 if person $k$ gets their
+hat. Each person is equally likely to get any of the $n$ hats, so $\mathbb{E}[I_k] = 1/n$, and
+
+$$
+\mathbb{E}\Big[\sum_{k=1}^{n} I_k\Big] = \sum_{k=1}^{n} \frac{1}{n} = 1,
+$$
+
+for every $n$. The indicators are dependent (if the first $n - 1$ people match, so does the
+last), but linearity does not care.
+
+**Worked example: coupon collector.** How many rolls of a die until every face has appeared?
+Split the wait into stages. After seeing $k$ distinct faces, each roll shows a new face with
+probability $(6 - k)/6$, so the stage lasts $6 / (6 - k)$ rolls on average (a geometric wait).
+Summing the stages,
+
+$$
+\mathbb{E}[\text{rolls}] = \frac{6}{6} + \frac{6}{5} + \frac{6}{4} + \frac{6}{3} + \frac{6}{2} + \frac{6}{1} = 6\left(1 + \tfrac12 + \cdots + \tfrac16\right) = 14.7.
+$$
+
+**Worked example: the re-roll game.** You roll a die and win its face value in dollars. After
+seeing the first roll you may re-roll once and take the second result instead. What is the
+game worth? Work backwards. A re-roll is worth $3.5$ on average, so keep any first roll above
+$3.5$ (4, 5 or 6) and re-roll 1, 2 or 3. Half the time you keep a roll averaging 5; half the
+time you re-roll and get 3.5:
+
+$$
+\mathbb{E} = \tfrac12 \cdot 5 + \tfrac12 \cdot 3.5 = 4.25.
+$$
+
+With two re-rolls the threshold rises to the new continuation value 4.25: keep 5 or 6, so the
+value is $\tfrac13 \cdot 5.5 + \tfrac23 \cdot 4.25 = 14/3 \approx 4.67$. This
+"compare now to the value of waiting" pattern is **dynamic programming**, and it reappears in
+American option pricing below.
+
+#### Variance and conditional expectation
+
+The expected value says where a quantity is centred; the **variance** says how far it typically
+strays: $\operatorname{Var}(X) = \mathbb{E}[(X - \mathbb{E}X)^2] = \mathbb{E}[X^2] - (\mathbb{E}X)^2$.
+Its square root is the **standard deviation**. For a die, $\mathbb{E}[X^2] = 91/6$, so the
+variance is $91/6 - 3.5^2 = 35/12$ and the standard deviation is 1.71. Variance is not linear:
+
+$$
+\operatorname{Var}(aX + bY) = a^2 \operatorname{Var}X + b^2 \operatorname{Var}Y + 2ab\, \operatorname{Cov}(X, Y),
+$$
+
+where the **covariance** $\operatorname{Cov}(X, Y) = \mathbb{E}[XY] - \mathbb{E}X\, \mathbb{E}Y$ is zero
+for independent variables. So variances of independent quantities add, and standard deviations
+add "in quadrature": three dice have variance $3 \times 35/12$ and standard deviation
+$\sqrt{3} \times 1.71 = 2.96$, not $3 \times 1.71$. This is the most important fact in risk
+management, and it is why the portfolio section works.
+
+When a quantity depends on another random quantity, condition on the first one. The **law of
+total expectation** (also called the **tower property**) says
+$\mathbb{E}[Y] = \mathbb{E}\big[\mathbb{E}[Y \mid N]\big]$, and the **law of total variance** says
+
+$$
+\operatorname{Var}(Y) = \mathbb{E}\big[\operatorname{Var}(Y \mid N)\big] + \operatorname{Var}\big(\mathbb{E}[Y \mid N]\big).
+$$
+
+**Worked example.** Roll a die, then flip that many coins. How many heads, on average, and with
+what variance? Given that the die shows $N$, the heads count is binomial with mean $N/2$ and variance
+$N/4$. So $\mathbb{E}[Y] = \mathbb{E}[N]/2 = 1.75$, and
+
+$$
+\operatorname{Var}(Y) = \mathbb{E}[N/4] + \operatorname{Var}(N/2) = \frac{3.5}{4} + \frac{35/12}{4} = 0.875 + 0.729 = 1.604.
+$$
+
+The first term is the noise of the coins; the second is the extra noise from not knowing how
+many coins there will be. Traders meet the same split when an option's payoff depends on a
+volatility that is itself uncertain.
+
+#### The distributions to know
+
+Most interview questions reduce to one of a handful of distributions. Knowing their means and
+variances saves deriving them under pressure.
+
+| Distribution | Describes | Mean | Variance |
+| --- | --- | --- | --- |
+| Bernoulli($p$) | One trial: 1 with probability $p$ | $p$ | $p(1 - p)$ |
+| Binomial($n, p$) | Successes in $n$ independent trials | $np$ | $np(1 - p)$ |
+| Geometric($p$) | Trials up to and including the first success | $1/p$ | $(1 - p)/p^2$ |
+| Poisson($\lambda$) | Count of rare events in an interval | $\lambda$ | $\lambda$ |
+| Uniform($a, b$) | Any point in $[a, b]$ equally likely | $(a + b)/2$ | $(b - a)^2/12$ |
+| Exponential($\lambda$) | Waiting time between Poisson events | $1/\lambda$ | $1/\lambda^2$ |
+| Normal($\mu, \sigma^2$) | Sums of many small effects (CLT) | $\mu$ | $\sigma^2$ |
+
+Two facts about them come up constantly. The **geometric** wait is memoryless: having waited 10
+rolls for a 6 does not shorten the remaining wait, which is still 6 on average (with variance
+30). And the **normal** distribution puts 68%, 95% and 99.7% of its mass within 1, 2 and 3
+standard deviations of the mean.
+
+#### Continuous problems and symmetry
+
+With continuous variables, probabilities become areas or volumes. Two techniques solve nearly
+every interview question.
+
+**Draw the sample space.** Two people agree to meet between 12:00 and 13:00, each arriving at a
+uniformly random time and waiting 15 minutes. What is the chance they meet? Plot the two arrival
+times as a point in the unit square; they meet when $|x - y| \le 1/4$, a band around the
+diagonal. The two corner triangles where they miss each have legs $3/4$, so the answer is
+$1 - (3/4)^2 = 7/16 = 0.4375$.
+
+**Use the CDF of a maximum or minimum.** The largest of $n$ independent Uniform(0, 1) values is
+below $x$ only if all of them are, so $P(\max \le x) = x^n$. Differentiating gives the density
+$n x^{n-1}$ and the mean $n/(n + 1)$: $2/3$ for two values, $3/4$ for three. By symmetry
+($x \mapsto 1 - x$) the minimum has mean $1/(n + 1)$. The $n$ points split $[0, 1]$ into $n + 1$
+gaps, and by symmetry each gap has the same expected length $1/(n + 1)$, the same argument as
+the first-ace exercise below.
+
+### First-step analysis
+
+Many questions ask how long something takes: "How many coin flips, on average, until two heads
+in a row?" **First-step analysis** defines one unknown per state, writes how one flip moves
+between states, and solves the linear equations.
+
+**Worked example: waiting for HH.** Let $E_0$ be the expected number of further flips when the
+last flip was not H (or at the start), and $E_1$ when the last flip was H. One flip costs 1 and
+moves you on:
+
+$$
+E_0 = 1 + \tfrac12 E_1 + \tfrac12 E_0, \qquad E_1 = 1 + \tfrac12 \cdot 0 + \tfrac12 E_0.
+$$
+
+The first gives $E_0 = 2 + E_1$; substituting the second, $E_0 = 3 + \tfrac12 E_0$, so
+$E_0 = 6$.
+
+**The same method for HT gives 4, not 6.** From state "last flip H", a T finishes and another
+H keeps you in the same state ($E_1 = 1 + \tfrac12 E_1$, so $E_1 = 2$, and $E_0 = 2 + E_1 = 4$).
+For HH a T sends you all the way back to the start. The two patterns are equally likely in any
+given pair of flips, yet HH takes longer to appear because its occurrences clump: HHH contains
+two HH's that overlap. The figure shows the full waiting-time distributions.
+
+<ProbabilityBars
+	values={waitHH.slice(0, 16).flatMap((p, i) => [p, waitHT[i]])}
+	labels={waitHH.slice(0, 16).flatMap((_, i) => [String(i + 1), ""])}
+	labelEvery={2}
+	highlight={waitHH.slice(0, 16).map((_, i) => 2 * i)}
+	alt={waitHT.slice(0, 16).map((_, i) => 2 * i + 1)}
+	showValues={false}
+	legend={["HH", "HT"]}
+	xLabel="flip on which the pattern first completes"
+	yLabel="probability"
+	caption="P(first HH ends on flip n) = F(n−1)/2ⁿ (Fibonacci numbers) beside P(first HT ends on flip n) = (n−1)/2ⁿ. HT has the heavier middle and HH the longer tail: means 4 and 6."
+/>
+
+#### Which pattern comes first? Penney's game
+
+A sharper twist: flip until either HHT or HTH appears. Which is more likely to come first? The
+expected waits are 8 and 10, which suggests HHT, but expected waits do not answer "which
+first". First-step analysis does, with probabilities instead of waiting times.
+
+Let $x_s$ be the probability that HHT wins from state $s$, where the state is the useful suffix
+of the flips so far: nothing, H, HH or HT.
+
+- From **HH**, HHT has already won the race: another H leaves you at HH, and the first T
+  completes HHT. So $x_{HH} = 1$.
+- From **HT**, an H completes HTH (HHT loses); a T sends you back to the start:
+  $x_{HT} = \tfrac12 \cdot 0 + \tfrac12 x_\varnothing$.
+- From **H**: $x_H = \tfrac12 x_{HH} + \tfrac12 x_{HT}$.
+- From the start, a T changes nothing, so $x_\varnothing = x_H$.
+
+Substituting, $x_H = \tfrac12 + \tfrac14 x_H$, so $x_H = 2/3$. **HHT comes first two times in
+three** (a simulation of 100,000 races gave 0.669). The reason is visible in the states: once
+HH appears, HHT cannot lose, but HTH can be destroyed by a single wrong flip. In **Penney's
+game** the second player can always pick a pattern that beats the first player's, a favourite
+interview twist about non-transitive bets.
+
+#### Exercises
+
+**2.1** Two dice are rolled. What is the expected value of the larger one?
+
+<details>
+<summary>Solution</summary>
+
+$P(\max \le k) = (k/6)^2$, so $P(\max = k) = (k^2 - (k-1)^2)/36 = (2k - 1)/36$. Then
+$\mathbb{E}[\max] = \sum_{k=1}^{6} k(2k-1)/36 = (1 + 6 + 15 + 28 + 45 + 66)/36 = 161/36 \approx 4.47$.
+</details>
+
+**2.2** Cards are dealt from a shuffled 52-card deck until the first ace. How many cards do
+you expect to deal, including the ace?
+
+<details>
+<summary>Solution</summary>
+
+The 4 aces split the 48 other cards into 5 gaps; by symmetry each gap holds $48/5 = 9.6$ cards
+on average. You deal the first gap and then the ace: $9.6 + 1 = 10.6 = 53/5$. (Indicator check:
+each non-ace precedes all four aces with probability $1/5$.)
+</details>
+
+**2.3** What is the expected number of flips until HTH? Until HHH?
+
+<details>
+<summary>Solution</summary>
+
+States = length of the matched prefix. For HTH: $E_0 = 1 + \tfrac12 E_1 + \tfrac12 E_0$,
+$E_1 = 1 + \tfrac12 E_1 + \tfrac12 E_2$ (H keeps "H"), $E_2 = 1 + \tfrac12 \cdot 0 + \tfrac12 E_0$
+(T after HT resets). Solving: $E_0 = 10$. For HHH the same method gives $E_0 = 14$. A general
+shortcut: the answer is $\sum 2^k$ over every $k$ where the pattern's first $k$ flips equal its
+last $k$: HTH overlaps itself at $k = 1, 3$ ($2 + 8 = 10$); HHH at $k = 1, 2, 3$ ($2 + 4 + 8 = 14$).
+</details>
+
+**2.4** You break a stick at two uniformly random points. What is the chance the three pieces
+form a triangle?
+
+<details>
+<summary>Solution</summary>
+
+The pieces form a triangle exactly when no piece is longer than half the stick. Picture the two
+break points as a point in the unit square; the condition "all three pieces below 1/2" cuts out
+two small triangles of total area $1/4$. Answer $1/4$ (a simulation with a million breaks gave
+0.2497).
+</details>
+
+**2.5** A test for a rare condition (1 in 1,000) is 99% sensitive and has a 1% false-positive
+rate. You test positive. Roughly how worried should you be?
+
+<details>
+<summary>Solution</summary>
+
+Out of 100,000 people, 100 have it and 99 test positive; 99,900 do not and 999 test positive.
+$P(\text{has it} \mid +) = 99 / (99 + 999) = 0.090$, about 9%. The base rate dominates.
+</details>
+
+**2.6** You roll a die six times. What is the expected number of distinct faces you see?
+
+<details>
+<summary>Solution</summary>
+
+Indicators again: face $k$ is missing from all six rolls with probability $(5/6)^6 = 0.335$, so it
+appears with probability $0.665$. Six faces give $6(1 - (5/6)^6) = 3.99$. Note how far below 6 this
+is: coupon collecting is slow.
+</details>
+
+**2.7** A coin is flipped 10 times. A **run** is a maximal block of equal flips (HHTHH has three
+runs). What is the expected number of runs?
+
+<details>
+<summary>Solution</summary>
+
+A new run starts at flip 1 and at every flip that differs from the one before it. Each of the 9
+later flips differs from its predecessor with probability $1/2$, so the expected number of runs is
+$1 + 9/2 = 5.5$.
+</details>
+
+**2.8** Three numbers are drawn independently from Uniform(0, 1). What is the expected value of
+the middle one, and the chance that the largest exceeds 0.9?
+
+<details>
+<summary>Solution</summary>
+
+The three points cut $[0, 1]$ into four gaps of expected length $1/4$ each, so the middle point
+sits at $2/4 = 1/2$ on average. $P(\max > 0.9) = 1 - 0.9^3 = 0.271$.
+</details>
+
+**2.9** Game A pays the face of one die in dollars. Game B rolls two dice and pays the larger
+face. What is each game worth, and which is riskier?
+
+<details>
+<summary>Solution</summary>
+
+A is worth 3.5 with variance $35/12 = 2.92$ (standard deviation 1.71). B is worth
+$161/36 = 4.47$ (Exercise 2.1); with $\mathbb{E}[\max^2] = \sum k^2 (2k - 1)/36 = 791/36$ its variance
+is $791/36 - (161/36)^2 = 1.97$ (standard deviation 1.40). B pays more *and* varies less: taking
+the maximum squeezes the outcomes towards the top.
+</details>
+
+## Random walks and martingales
+
+Prices move step by step, and a trader's P&L is a running sum of wins and losses. The simplest
+model of both is a **random walk**: start at $S_0 = k$ and add $+1$ with probability $p$ or
+$-1$ with probability $q = 1 - p$ at each step. Questions about how far it wanders and when it
+hits a level are interview staples, and they lead to the **martingale**, the tool that prices
+options.
+
+### Gambler's ruin
+
+**The classic question.** You have \$$k$ and bet \$1 at a time on a coin that wins with
+probability $p$. You stop when you reach \$$N$ or go broke. What is the chance you reach $N$?
+
+First-step analysis gives it. Let $P_k$ be the chance of reaching $N$ from $k$. One bet later
+you are at $k + 1$ or $k - 1$, so
+
+$$
+P_k = p\, P_{k+1} + q\, P_{k-1}, \qquad P_0 = 0,\ P_N = 1.
+$$
+
+For a fair coin the solution is a straight line, $P_k = k/N$. For $p \ne \tfrac12$, write
+$r = q/p$; the solution is
+
+$$
+P_k = \frac{1 - r^k}{1 - r^N}.
+$$
+
+The expected length of the game is $k(N - k)$ for a fair coin, and
+$\frac{k}{q - p} - \frac{N}{q - p} P_k$ otherwise.
+
+**Worked example.** Start with $k = 3$, target $N = 10$. With a fair coin, $P_3 = 3/10 = 0.3$
+and the game lasts $3 \times 7 = 21$ bets on average. Tilt the coin by one percentage point
+against you, $p = 0.49$: $r = 0.51/0.49 = 1.0408$ and $P_3 = (1 - 1.0408^3)/(1 - 1.0408^{10})
+= 0.259$. A tiny edge changes a lot: at $k = 50$, $N = 100$ the same 1% tilt cuts your chance
+from 0.5 to 0.119. **The house edge compounds over many bets**, which is why a trader with a
+small edge wants many small independent trades, and a player with a small disadvantage should
+make few large bets.
+
+In the figure below, 30 of 2,000 seeded walks are drawn. Compare the share of the batch that
+reached $N$ with the theory, then move $p$ to 0.49 and watch the green share fall from about 30%
+to about 26%.
+
+<GamblersRuin start={3} target={10} p={0.5} />
+
+### Martingales and optional stopping
+
+A **martingale** is a process whose expected next value, given everything seen so far, equals
+its current value: $\mathbb{E}[M_{n+1} \mid M_0, \ldots, M_n] = M_n$. It is the mathematical
+form of a **fair game**: no information about the past lets you predict the next move's
+direction. A fair-coin random walk is a martingale.
+
+The **optional stopping theorem** says that if you stop a martingale at a stopping time $\tau$
+(a rule that depends only on the past, such as "stop at 0 or $N$") and the process stays
+bounded until then, then $\mathbb{E}[M_\tau] = M_0$. **No stopping rule turns a fair game into a
+winning one.**
+
+That gives gambler's ruin in one line. The walk ends at $N$ with probability $P_k$ and at 0
+otherwise, so $\mathbb{E}[S_\tau] = N P_k = k$, and $P_k = k/N$.
+
+Martingales also find durations. For a fair walk, $M_n = S_n^2 - n$ is a martingale too
+(each step adds 1 to $\mathbb{E}[S^2]$, and the $-n$ cancels it). Optional stopping gives
+$\mathbb{E}[S_\tau^2] - \mathbb{E}[\tau] = k^2$. Since $S_\tau^2$ is $N^2$ with probability
+$k/N$ and $0$ otherwise, $\mathbb{E}[\tau] = Nk - k^2 = k(N - k)$. For the unfair walk the trick
+is to find a function of $S_n$ that is a martingale: $r^{S_n}$ with $r = q/p$ works, because
+$p\, r^{s+1} + q\, r^{s-1} = r^s (q + p) = r^s$. Optional stopping then gives the formula for
+$P_k$ above.<Sidenote>Optional stopping needs a condition: here the walk is bounded between 0 and
+$N$ before $\tau$, and $\tau$ is finite with probability 1. Without one, the theorem fails: "double
+your bet after every loss" stops with a win almost surely, but needs unbounded credit.</Sidenote>
+
+#### Wald's identity
+
+A close cousin of optional stopping handles sums with a random number of terms. If
+$S_\tau = X_1 + \cdots + X_\tau$ adds independent steps with mean $m$, and $\tau$ is a stopping
+time with finite mean, then **Wald's identity** says $\mathbb{E}[S_\tau] = m\, \mathbb{E}[\tau]$: the
+average total is the average step times the average number of steps. (The process
+$S_n - nm$ is a martingale, and optional stopping does the rest.)
+
+For the unfair walk, each step has mean $p - q$, so
+$\mathbb{E}[S_\tau] - k = (p - q)\, \mathbb{E}[\tau]$. Since $\mathbb{E}[S_\tau] = N P_k$,
+
+$$
+\mathbb{E}[\tau] = \frac{N P_k - k}{p - q}.
+$$
+
+Check with $k = 5$, $N = 10$, $p = 0.45$: $P_5 = 0.268$, so
+$\mathbb{E}[\tau] = (2.683 - 5)/(-0.1) = 23.2$, matching the formula above. The same identity
+prices "how long until the casino takes my money": a gambler with \$100 betting \$1 at a time on
+a game with a 1% house edge ($p - q = -0.01$) and no upper target loses it all in
+$100 / 0.01 = 10{,}000$ bets on average.
+
+#### The reflection principle
+
+How likely is a walk to *touch* a level at some point, rather than to end above it? For a
+symmetric walk there is a beautiful trick. Take any path that reaches level $a > 0$ and ends
+below it. Reflect the part of the path after the first visit to $a$ in the line $y = a$. The
+reflected path ends above $a$, and the reflection is a one-to-one pairing between the two sets of
+paths. So paths that touch $a$ and end below it are exactly as common as paths that end above
+it, and
+
+$$
+P\Big(\max_{t \le n} S_t \ge a\Big) = P(S_n \ge a) + P(S_n \gt a).
+$$
+
+**Worked example.** Ten fair steps, level $a = 2$. $S_{10} \ge 2$ needs at least 6 heads:
+$386/1024$. $S_{10} \gt 2$ needs at least 7: $176/1024$. So the walk touches 2 with probability
+$562/1024 = 0.549$, well above the chance of ending there or above (0.377). Enumerating all
+1,024 paths gives the same number. As the steps get finer the second term approaches the first,
+and the ratio tends to exactly 2.
+
+For Brownian motion the correction term vanishes, and $P(\max_{s \le t} W_s \ge a) = 2P(W_t \ge a)$.
+A stock with 20% volatility and no drift touches a level 10% above today (in log terms) within
+a year with probability $2(1 - N(0.1 / 0.2)) = 2(1 - N(0.5)) = 0.617$, even though it ends the
+year above that level only 31% of the time. **Barrier options** (which switch on or off when a
+level is touched) are priced with exactly this argument.
+
+The same reflection solves the **ballot problem**: if candidate A receives $a$ votes and B
+receives $b \lt a$, counted in random order, the chance A leads throughout the count is
+$(a - b)/(a + b)$. With 6 votes to 4 that is $0.2$, which a brute-force count of all 210 orders
+confirms.
+
+### Brownian motion and Itô's lemma
+
+Shrink the steps of a random walk and speed them up, keeping variance per unit time fixed, and
+the limit is **Brownian motion** $W_t$: a continuous path with $W_0 = 0$, independent
+increments, and $W_t - W_s \sim \mathcal{N}(0, t - s)$. Its paths are so rough that over a short
+time $dt$ the move $dW$ has size $\sqrt{dt}$, much larger than $dt$. So $(dW)^2$ does not
+vanish: it equals $dt$ on average and, in the limit, exactly.
+
+That one fact is **Itô's lemma**. For a smooth function $f(X_t)$ of a process with
+$dX = \mu\, dt + \sigma\, dW$, a Taylor expansion to second order keeps the $(dX)^2 = \sigma^2 dt$
+term:
+
+$$
+df = f'(X)\, dX + \tfrac12 f''(X)\, \sigma^2\, dt.
+$$
+
+**Worked example: $W_t^2$.** With $f(x) = x^2$, $f' = 2x$, $f'' = 2$, $\mu = 0$ and
+$\sigma = 1$: $d(W_t^2) = 2W_t\, dW_t + dt$. The $dW$ term has mean zero, so
+$\mathbb{E}[W_t^2] = t$, matching the variance. It also shows $W_t^2 - t$ is a martingale, the
+continuous version of $S_n^2 - n$.
+
+**Worked example: stock prices.** The standard model, **geometric Brownian motion**, has
+returns rather than prices following Brownian motion: $dS = \mu S\, dt + \sigma S\, dW$. Apply
+Itô to $\ln S$ ($f' = 1/S$, $f'' = -1/S^2$):
+
+$$
+d \ln S = \left(\mu - \tfrac12 \sigma^2\right) dt + \sigma\, dW, \qquad S_t = S_0\, e^{(\mu - \sigma^2/2)t + \sigma W_t}.
+$$
+
+The mean price grows at $\mu$ ($\mathbb{E}[S_t] = S_0 e^{\mu t}$), but the **median** grows at
+$\mu - \tfrac12\sigma^2$. With $\mu = 10\%$ and $\sigma = 20\%$ a year, the typical path grows
+at only 8% a year. This gap, the **volatility drag**, is the same effect that makes over-betting
+ruinous in the next section.
+
+**Hitting levels with drift.** Gambler's ruin has a continuous version too. For a Brownian
+motion with drift, $X_t = \mu t + \sigma W_t$ with $\mu \gt 0$, the process $e^{-2\mu X_t/\sigma^2}$ is
+a martingale (check with Itô: the $dt$ terms cancel). Optional stopping then gives the
+probability of *ever* falling to $-a$:
+
+$$
+P(\text{ever reach } -a) = e^{-2\mu a / \sigma^2}.
+$$
+
+A strategy whose log wealth drifts up 10% a year with 20% volatility ever loses half its log
+value ($a = 0.5$) with probability $e^{-2 \times 0.1 \times 0.5 / 0.04} = e^{-2.5} = 0.082$. A
+positive drift does not rule out deep drawdowns; it only makes them exponentially unlikely in
+$\mu a / \sigma^2$. The Kelly section turns this into a formula for drawdowns.
+
+#### Exercises
+
+**3.1** A fair random walk starts at 0. What is the expected number of steps until it first
+reaches $+3$ or $-3$?
+
+<details>
+<summary>Solution</summary>
+
+Shift by 3: start at $k = 3$ between barriers 0 and $N = 6$. The duration is $k(N - k) = 3 \times 3
+= 9$. In general, reaching $\pm a$ takes $a^2$ steps: distance grows like the square root of
+time.
+</details>
+
+**3.2** You start with \$5 and bet \$1 a time on a game you win with probability 0.45. You stop
+at \$10 or \$0. What is the chance you reach \$10, and how long does the game last on average?
+
+<details>
+<summary>Solution</summary>
+
+$r = 0.55/0.45 = 1.2222$. $P_5 = (1 - r^5)/(1 - r^{10}) = 0.268$. Duration:
+$\frac{5}{0.1} - \frac{10}{0.1}(0.268) = 50 - 26.8 = 23.2$ bets. (Both checked by solving the
+linear equations numerically.)
+</details>
+
+**3.3** Use Itô's lemma to find $\mathbb{E}[W_t^4]$.
+
+<details>
+<summary>Solution</summary>
+
+With $f(x) = x^4$: $d(W^4) = 4W^3\, dW + 6W^2\, dt$. Taking expectations kills the $dW$ term:
+$\frac{d}{dt}\mathbb{E}[W_t^4] = 6\, \mathbb{E}[W_t^2] = 6t$, so $\mathbb{E}[W_t^4] = 3t^2$, the
+fourth moment of a normal with variance $t$.
+</details>
+
+**3.4** You can play a fair coin game as long as you like and stop whenever you choose. Can
+you guarantee a positive expected profit if your losses are capped at \$100?
+
+<details>
+<summary>Solution</summary>
+
+No. Your wealth is a martingale and it is bounded below by $-100$ and stopped by your rule. With
+a bounded loss and any stopping rule that ends in finite expected time, optional stopping gives
+expected profit 0. The famous "double after a loss" system only wins on average if you are
+allowed unbounded losses.
+</details>
+
+**3.5** A symmetric random walk takes 10 steps. What is the probability it never goes below its
+starting point (it may touch 0)?
+
+<details>
+<summary>Solution</summary>
+
+Going below 0 means touching $-1$. By reflection in $y = -1$, that has probability
+$P(S_{10} \le -1) + P(S_{10} \lt -1)$. After an even number of steps $S_{10}$ is even, so both events
+are "$S_{10} \le -2$" (at most 4 heads), with probability $386/1024$ each. The walk therefore
+stays at or above 0 with probability $1 - 772/1024 = 252/1024 = 0.246$. That equals
+$P(S_{10} = 0) = \binom{10}{5}/2^{10}$, a known identity, and a count of all 1,024 paths agrees.
+</details>
+
+**3.6** A stock has zero drift and 30% annual volatility. Roughly how likely is it to trade at
+least 15% higher (in log terms) at some point in the next three months?
+
+<details>
+<summary>Solution</summary>
+
+Over a quarter, the standard deviation of the log price is $0.3 \times \sqrt{0.25} = 0.15$. The
+level is one standard deviation up, so by reflection the chance of touching it is
+$2(1 - N(1)) = 2 \times 0.159 = 0.317$, against $0.159$ for ending above it.
+</details>
+
+## Betting and the Kelly criterion
+
+Suppose you have found an edge: a bet that wins with probability $p = 0.6$ at even money
+($b = 1$, so a win pays your stake). The expected profit per dollar is $pb - q = 0.2$. How much
+of your wealth should you bet each time?
+
+**Maximising expected wealth is the wrong goal.** Expected wealth after $n$ bets of fraction
+$f$ is $(1 + 0.2f)^n$, largest at $f = 1$: bet everything every time. But then one loss ruins
+you, and over 100 bets you are almost surely broke ($1 - 0.6^{100}$). The mean is propped up by
+a single astronomically lucky path.
+
+**Maximise the growth rate instead.** After $n$ bets with $W$ wins, wealth is
+$(1 + fb)^W (1 - f)^{n - W}$. Its logarithm divided by $n$ converges to the **growth rate**
+
+$$
+g(f) = p \ln(1 + fb) + q \ln(1 - f).
+$$
+
+Almost every path grows like $e^{n g(f)}$, so $g$ describes the typical (median) outcome. Setting
+$g'(f) = \frac{pb}{1 + fb} - \frac{q}{1 - f} = 0$ gives the **Kelly criterion**
+
+$$
+f^* = p - \frac{q}{b} = \frac{\text{edge}}{\text{odds}}.
+$$
+
+**Worked example.** For $p = 0.6$, $b = 1$: $f^* = 0.6 - 0.4 = 0.2$. Then
+$g(0.2) = 0.6 \ln 1.2 + 0.4 \ln 0.8 = 0.1094 - 0.0893 = 0.0201$ per bet. Some neighbours:
+
+| Fraction $f$ | Growth $g(f)$ per bet | Median wealth after 300 bets |
+| ---: | ---: | ---: |
+| 0.10 (half Kelly) | 0.0150 | 91 |
+| 0.20 (Kelly) | 0.0201 | 420 |
+| 0.30 | 0.0147 | 83 |
+| 0.40 (double Kelly) | −0.0024 | 0.48 |
+| 0.50 | −0.0340 | 0.00004 |
+
+Two facts are worth memorising. **Half Kelly keeps three quarters of the growth** with far
+smaller swings (near the peak $g$ is a parabola, so $g(f^*/2) \approx \tfrac34 g(f^*)$; here 0.0150
+vs 0.0201). And **double Kelly grows at roughly zero**: here slightly negative, because the
+growth curve crosses zero at $f = 0.389$. Over-betting an edge loses money even though every bet
+is favourable. In practice traders bet a fraction of Kelly because $p$ itself is only an
+estimate, and over-estimating it pushes you into the steep right side of the curve.
+
+In the figure, every line uses the same seeded sequence of wins and losses. Drag "your f" past
+0.39 and watch the median collapse while the mean keeps rising.
+
+<KellyExplorer p={0.6} b={1} bets={300} />
+
+The continuous version links back to the previous section. Investing a fraction $f$ in a stock
+with excess return $\mu - r$ and volatility $\sigma$ gives growth
+$r + f(\mu - r) - \tfrac12 f^2 \sigma^2$, maximised at $f^* = (\mu - r)/\sigma^2$. The
+$-\tfrac12 f^2\sigma^2$ term is the volatility drag again.<Sidenote>Kelly's 1956 paper derived the
+rule for a gambler receiving a noisy private signal. Thorp applied it to blackjack and later to
+his hedge fund; see the References.</Sidenote>
+
+#### Why the logarithm?
+
+The step from "wealth" to "log wealth" deserves a closer look, because interviewers probe it.
+Wealth after $n$ bets is a *product* of $n$ random factors, $(1 + fb)$ or $(1 - f)$. Products
+are awkward, but their logarithms are sums:
+
+$$
+\ln W_n = \sum_{i=1}^{n} \ln(\text{factor}_i).
+$$
+
+By the law of large numbers, a sum of $n$ independent terms is close to $n$ times their mean
+when $n$ is large. So $\ln W_n \approx n\, g(f)$ with high probability, and the *typical* wealth is
+$e^{n g(f)}$. The *mean* wealth, $(1 + f(pb - q))^n$, is a different and misleading number: it is
+dominated by rare paths with many more wins than average. At $f = 0.5$ in the example, mean
+wealth after 300 bets is astronomically large while the median is $0.00004$: almost everyone is
+ruined, and a vanishing few are rich enough to pull the average up.
+
+So Kelly is not a matter of taste. **Any other fixed fraction ends up with less wealth than Kelly
+with probability approaching 1** as the number of bets grows. Equivalently, Kelly maximises
+expected *log* utility, which is why economists describe it as the choice of a log-utility
+investor.
+
+#### Drawdowns and fractional Kelly
+
+Growth is not the only thing a trader cares about; a firm will shut down a strategy that loses
+half its capital, however good its long-run growth. The continuous model gives a clean answer.
+Bet a fraction $c$ of the Kelly amount (so $c = 1$ is full Kelly, $c = 0.5$ is half Kelly) on an
+investment with Sharpe ratio $\lambda$. Log wealth then drifts at $\lambda^2 c(1 - c/2)$ with
+volatility $c\lambda$, and the drift-hitting formula from the previous section gives the
+probability of *ever* falling to a fraction $x$ of today's wealth:
+
+$$
+P(\text{wealth ever falls to } x \text{ of today}) = x^{2/c - 1}.
+$$
+
+| Fraction of Kelly $c$ | Share of the maximum growth $c(2 - c)$ | P(ever lose half) |
+| ---: | ---: | ---: |
+| 2 (double Kelly) | 0 | 1 |
+| 1 (full Kelly) | 1 | 0.5 |
+| 0.5 (half Kelly) | 0.75 | 0.125 |
+| 0.25 (quarter Kelly) | 0.4375 | 0.0078 |
+
+**Full Kelly halves your money at some point with probability one half.** Half Kelly gives up a
+quarter of the growth and cuts that risk to one in eight; quarter Kelly makes it negligible. This
+table is the main reason professional traders run at a fraction of Kelly.<Sidenote>Formula from
+the continuous-time Kelly literature (see Thorp 2006 in the References). Check: a simulation of
+4,000 discretised paths over 200 years gave 0.478 for full Kelly and 0.117 for half Kelly; the
+small shortfall comes from the finite horizon and weekly steps.</Sidenote> Notice it does not
+depend on the Sharpe ratio: a better strategy grows faster, but its drawdowns at full Kelly are
+just as deep.
+
+#### Estimation error
+
+The other reason to bet less than Kelly is that $p$ is never known exactly. Suppose you believe
+$p = 0.6$ and bet $f = 0.2$, but the true $p$ is 0.55. For the true bet, Kelly is $0.1$, so you are
+at double Kelly, and your growth is $0.55 \ln 1.2 + 0.45 \ln 0.8 = -0.00014$ per bet: a winning
+bet, sized from a five-point overestimate, loses money in the long run. Betting half of your
+estimated Kelly ($f = 0.1$) would have landed exactly on the true optimum. The growth curve is
+flat on the left of the peak and steep on the right, so **errors in the direction of betting too
+little are cheap and errors in the direction of betting too much are expensive.**
+
+#### Exercises
+
+**4.1** A bet wins with probability 0.55 at even money. What is the Kelly fraction and the
+growth rate per bet?
+
+<details>
+<summary>Solution</summary>
+
+$f^* = 0.55 - 0.45 = 0.10$. $g(0.1) = 0.55 \ln 1.1 + 0.45 \ln 0.9 = 0.05242 - 0.04741 = 0.0050$ per
+bet: a 0.5% median growth per bet.
+</details>
+
+**4.2** A bet pays 2 to 1 ($b = 2$) and wins with probability 0.4. Should you bet, and how much?
+
+<details>
+<summary>Solution</summary>
+
+Edge per dollar: $0.4 \times 2 - 0.6 = 0.2 > 0$, so yes. $f^* = 0.4 - 0.6/2 = 0.1$: bet 10% of
+wealth. Note the higher payout means a lower fraction than the even-money bet with the same
+edge, because losses are more frequent.
+</details>
+
+**4.3** A strategy has expected excess return 6% a year with 20% volatility. What leverage does
+Kelly suggest, and what is the median growth at full and half Kelly (ignoring the risk-free
+rate)?
+
+<details>
+<summary>Solution</summary>
+
+$f^* = 0.06 / 0.04 = 1.5$ (150% exposure). Growth $f\mu - \tfrac12 f^2\sigma^2$: at $f = 1.5$,
+$0.09 - 0.045 = 4.5\%$; at $f = 0.75$, $0.045 - 0.01125 = 3.4\%$, again three quarters.
+</details>
+
+**4.4** You run a strategy at full Kelly. What is the probability that at some point your capital
+falls to a quarter of today's? At half Kelly?
+
+<details>
+<summary>Solution</summary>
+
+$x^{2/c - 1}$ with $x = 1/4$: full Kelly gives $(1/4)^1 = 0.25$; half Kelly gives $(1/4)^3 = 1/64 = 0.016$.
+</details>
+
+**4.5** An interviewer offers you a bet: a coin you believe lands heads 60% of the time pays even
+money on heads. You have \$1,000 and can bet as many times as you like. How do you play, and
+what would change your plan?
+
+<details>
+<summary>Solution</summary>
+
+Kelly says 20% of wealth per bet, \$200 on the first flip, then 20% of whatever you have. A good
+answer adds: (1) the 60% is an estimate, so bet less, perhaps 10% (half Kelly), since over-betting
+is the costly error; (2) if the number of bets is small, the long-run argument is weaker and
+lower variance matters more; (3) if the payout odds change, recompute $f^* = p - q/b$.
+</details>
+
+## Market making
+
+A **market maker** quotes two prices: a **bid**, at which they will buy, and an **ask** (or offer),
+at which they will sell. The gap is the **spread**; the midpoint is their estimate of **fair
+value**. A quote is written "bid at ask", for example "9.5 at 11.5", often with sizes. In an
+exchange, these quotes rest in a **limit order book**: buy orders sorted by price on one side,
+sell orders on the other. An incoming order that crosses the spread trades against the best
+resting price, with ties broken by time. The figure steps through matching on a small book; see
+[the order book post](/blog/order-book-cpp/) for the engine behind it.
+
+<MatchingSteps />
+
+The market maker's profit comes from the spread: buying at the bid and selling at the ask earns
+the spread on a round trip. Two forces push back. **Adverse selection**: some counterparties
+know more than you, and they only trade when your price is wrong. **Inventory risk**: after you
+buy, you own something whose price can fall before you sell it.
+
+### Making a market on a dice game
+
+The most common trading-interview game: "Make me a market on the sum of three dice." It tests
+whether you can find a fair value, size a spread to the uncertainty, and update as information
+arrives.
+
+**Step 1: fair value.** Each die averages 3.5, so the sum averages $10.5$. Its variance is
+$3 \times 35/12 = 8.75$ (a die has variance $\mathbb{E}[X^2] - 3.5^2 = 91/6 - 12.25 = 35/12$), so
+the standard deviation is $2.96$.
+
+**Step 2: a spread.** Quote around fair value, wide enough to cover what you cannot know.
+"9.5 at 11.5" (half-spread $h = 1$) is a reasonable opening. Against an **uninformed** trader,
+who buys or sells at random, you earn $h = 1$ per trade on average. Against an **informed**
+trader, who knows the dice, you lose: they buy at 11.5 whenever the total is 12 or more and sell
+at 9.5 whenever it is 9 or less, which happens 75% of the time, and their expected profit per
+trade is $\mathbb{E}[(S - 11.5)^+] + \mathbb{E}[(9.5 - S)^+] = 1.54$.
+
+**Step 3: update.** When a die is revealed, fair value becomes the known part plus 3.5 per
+hidden die, and the uncertainty shrinks. Reveal a 4: fair value $4 + 7 = 11$, standard deviation
+$2.42$. Reveal a 6 next: fair value $10 + 3.5 = 13.5$, standard deviation $1.71$. Your quote moves
+with fair value, and you can afford to narrow it.
+
+The figure steps through exactly this. Green bars are totals inside your quote; red bars are
+totals at which an informed trader would hit you. Widen the half-spread to 2 and the informed
+trader's chance of trading drops from 0.75 to 0.52 and their profit from 1.54 to 0.91; but in a
+real market, wide quotes also attract fewer uninformed trades.
+
+<DiceMarketSteps dice="4,6,2" halfSpread={1} />
+
+**How interviewers play it.** The interviewer may trade against you, hint that they know
+something, or ask you to make a market on a strange quantity ("the number of windows in this
+building"). Good habits: state your fair value and your uncertainty, quote symmetric around
+fair value at first, **move your price after each trade** (a buyer suggests the value is higher),
+and keep track of your position. If you are long 5 contracts and do not want more, shade both
+prices down so buyers are more likely to take your offer.
+
+#### A full game, trade by trade
+
+Here is the dice game played to settlement, with the dice from the figure (4, 6, 2, so the total
+is 12). Each contract settles at the total: if you are **short** (sold more than you bought), you
+pay the total for each contract at the end. Track **position** (contracts held, negative when
+short) and **cash** separately; P&L is cash plus position times the settlement value.
+
+| Event | Your quote | Trade | Position | Cash |
+| --- | --- | --- | ---: | ---: |
+| Start | 9.5 – 11.5 | | 0 | 0 |
+| Interviewer buys 2 at your ask | 9.5 – 11.5 | you sell 2 at 11.5 | −2 | +23.0 |
+| You raise the quote: buying is evidence | 10.5 – 12.5 | | −2 | +23.0 |
+| Interviewer sells 1 at your bid | 10.5 – 12.5 | you buy 1 at 10.5 | −1 | +12.5 |
+| First die revealed: 4, fair value 11 | 10 – 12 | | −1 | +12.5 |
+| Interviewer buys 1 at your ask | 10 – 12 | you sell 1 at 12 | −2 | +24.5 |
+| Settlement: total is 12 | | you pay 2 × 12 | 0 | +0.5 |
+
+You finish up 0.5. Before the last two dice were revealed, your expected P&L was
+$24.5 - 2 \times 11 = 2.5$ (marking your position at fair value 11). The dice then came in high
+(12 against an expected 11), which cost you 2 on a short position of 2. That is **inventory
+risk** in miniature: trading at good prices had put you 2.5 up on paper, and the position you
+were left holding gave back 2. Interviewers like to ask exactly this decomposition: "how much
+did you make from the spread and how much from your position?" (Exercise 5.4 works one through.)
+
+Notice also what the interviewer did: bought twice and sold once. If they had known the dice,
+buying at 11.5 and 12 would have been right and selling at 10.5 wrong; a mixture like this is
+consistent with noise. Saying this aloud ("their flow looks two-sided, so I won't move my fair
+value much") is exactly the reasoning the round tests.
+
+### Adverse selection and inventory
+
+**Glosten–Milgrom: why spreads exist even with no costs.** An asset is worth either 90 or 110,
+each with probability $\tfrac12$, so fair value is 100. A fraction $\mu = 0.3$ of traders know the
+true value; the rest buy or sell at random with equal probability. A market maker who breaks
+even sets the ask to the expected value **given that someone buys**. A buy is more likely when
+the value is high:
+
+$$
+P(\text{buy} \mid 110) = \mu + \tfrac12(1 - \mu) = 0.65, \qquad P(\text{buy} \mid 90) = \tfrac12(1 - \mu) = 0.35.
+$$
+
+By Bayes, $\mathbb{E}[V \mid \text{buy}] = (0.65 \times 110 + 0.35 \times 90)/(0.65 + 0.35) = 103$.
+By symmetry the bid is 97. The spread of 6, which equals $2\mu \times 10$, is pure protection
+against informed traders: the market maker loses to them and wins it back from the uninformed.
+**More informed flow means wider spreads.** And every trade moves the quote, because it is
+evidence: after a buy, the market maker revises fair value to 103.
+
+The updating continues trade by trade. After each trade the market maker's belief
+$P(V = 110)$ changes by Bayes' rule, and the new ask is $90 + 20 \times P(V = 110 \mid \text{history}, \text{one more buy})$,
+the new bid the same with one more sell:
+
+| Trades so far | P(V = 110) | Bid | Ask |
+| --- | ---: | ---: | ---: |
+| none | 0.500 | 97.0 | 103.0 |
+| buy | 0.650 | 100.0 | 105.5 |
+| buy, buy | 0.775 | 103.0 | 107.3 |
+| buy, sell | 0.500 | 97.0 | 103.0 |
+
+Two lessons follow. **Prices discover the truth**: a run of buys drags the quotes towards 110,
+because only an informed trader (or bad luck) produces such a run. And **opposite trades cancel**:
+a buy followed by a sell returns the market maker to where they started, because the two pieces
+of evidence have equal and opposite weight. The bid after one buy (100) is just the fair value
+after that buy: a sell would undo it.
+
+**Inventory: skew, do not just widen.** A market maker who has bought too much wants to sell.
+In the Avellaneda–Stoikov model the market maker quotes around a **reservation price**
+$r = s - q\, \gamma \sigma^2 (T - t)$ rather than the mid $s$, where $q$ is inventory, $\gamma$
+risk aversion, $\sigma$ volatility and $T - t$ the time left. Long inventory ($q > 0$) lowers
+both quotes, making the sale more likely and the next purchase less likely. The effect is
+larger when the asset is volatile or a long time remains, because the risk of holding is
+larger.<Sidenote>Avellaneda and Stoikov (2008), "High-frequency trading in a limit order book";
+the optimal spread in the same model adds a term that depends on how quickly order arrival
+falls off with distance from the mid.</Sidenote>
+
+**Worked example.** The mid is $s = 100$, you are long $q = 3$ units, risk aversion $\gamma = 0.1$,
+volatility $\sigma = 2$ per unit time and half a unit of time remains. The reservation price is
+$100 - 3 \times 0.1 \times 4 \times 0.5 = 99.4$: you value your inventory 0.6 below the mid, because
+holding it is risky. The model's total spread is
+$\gamma\sigma^2(T - t) + \tfrac{2}{\gamma}\ln(1 + \gamma/k)$; with an order-arrival decay $k = 1.5$
+that is $0.2 + 1.29 = 1.49$, so you would quote about $98.65$ at $100.15$: a bid well below the
+mid and an ask only a little above it. Buying from you has become attractive for counterparties
+and selling to you unattractive, which is how the market maker sheds a long position without
+crossing the spread itself.
+
+#### Exercises
+
+**5.1** Make a market on the product of two dice.
+
+<details>
+<summary>Solution</summary>
+
+Independence gives $\mathbb{E}[XY] = 3.5^2 = 12.25$. The standard deviation is 8.94 (from
+$\mathbb{E}[X^2 Y^2] = (91/6)^2$), so the uncertainty is large and the distribution skewed (it runs
+from 1 to 36). A sensible opening is "11 at 13.5" or wider, and you should say why it is wide.
+</details>
+
+**5.2** You quote 9.5 at 11.5 on three dice. Someone immediately lifts your offer for size.
+Then they offer to buy more at 12. What do you do?
+
+<details>
+<summary>Solution</summary>
+
+Their buying is evidence that the total is high (they may have seen a die). Raise your fair value
+and your quotes, for example to "11.5 at 13.5", and be reluctant to sell more: you are already
+short. Selling more at 12 to someone who keeps buying is the adverse-selection trap.
+</details>
+
+**5.3** In the Glosten–Milgrom example, what are the bid and ask if half the traders are
+informed?
+
+<details>
+<summary>Solution</summary>
+
+$P(\text{buy} \mid 110) = 0.5 + 0.25 = 0.75$, $P(\text{buy} \mid 90) = 0.25$. Ask
+$= 0.75 \times 110 + 0.25 \times 90 = 105$, bid $= 95$, spread $2 \times 0.5 \times 10 = 10$.
+</details>
+
+**5.4** On the three-dice contract you sell 3 at 11.5 and buy 1 at 9.5 before any die is revealed.
+The total turns out to be 8. What is your P&L, and how much came from the spread versus your
+position?
+
+<details>
+<summary>Solution</summary>
+
+Cash $= 3 \times 11.5 - 9.5 = 25$; position $-2$; settlement pays out $2 \times 8 = 16$, so P&L $= +9$.
+Spread: each trade was 1 better than fair value 10.5, so 4 trades earned $4 \times 1 = 4$.
+Position: short 2 from a fair value of 10.5 to a settlement of 8 earned $2 \times 2.5 = 5$.
+Total $4 + 5 = 9$.
+</details>
+
+**5.5** Why might a market maker *narrow* the spread after a trade rather than widen it?
+
+<details>
+<summary>Solution</summary>
+
+If the trade reduced their inventory (a buyer took the market maker's long position off their
+hands), they are now carrying less risk and can afford to quote tighter. Spreads widen with
+inventory and with the share of informed flow; they narrow when uncertainty falls (a die is
+revealed) or inventory shrinks.
+</details>
+
+## Options
+
+An **option** is the right, but not the obligation, to trade an asset at a fixed **strike**
+price $K$ on (or before) an **expiry** date $T$. A **call** is the right to buy, a **put** the
+right to sell. A **European** option can be exercised only at expiry, an **American** one at any
+time. Options are the main product of firms like Optiver, SIG and IMC, so their interviews test
+payoffs, pricing and the **Greeks** (sensitivities).
+
+### Payoffs and put–call parity
+
+At expiry, a call is worth $\max(S_T - K, 0)$ and a put $\max(K - S_T, 0)$, where $S_T$ is the
+stock price then. Their difference is linear in $S_T$:
+
+$$
+\max(S_T - K, 0) - \max(K - S_T, 0) = S_T - K.
+$$
+
+So a portfolio of one call minus one put pays the same as one share minus $K$ in cash, in every
+state of the world. Two portfolios with identical payoffs must have identical prices today, or
+someone could buy the cheap one, sell the dear one and lock in a riskless profit (an
+**arbitrage**). Discounting the cash at rate $r$ gives **put–call parity** for European options:
+
+$$
+C - P = S - K e^{-rT}.
+$$
+
+**Worked example.** With $S = 100$, $K = 100$, $r = 5\%$, $T = 1$ year: $C - P = 100 - 95.12 =
+4.88$. The Black–Scholes prices below, $C = 10.45$ and $P = 5.57$, differ by exactly 4.88. Parity
+needs no model of how prices move, which is why interviewers love it: it is pure no-arbitrage
+reasoning.
+
+#### No-arbitrage bounds
+
+The same "compare two portfolios" argument bounds option prices without any model:
+
+- **A call is worth at most the stock**: $C \le S$. The call pays $\max(S_T - K, 0) \le S_T$.
+- **A call is worth at least its discounted intrinsic value**: $C \ge \max(S - Ke^{-rT}, 0)$. Parity
+  gives $C = S - Ke^{-rT} + P$ and $P \ge 0$. With $S = K = 100$, $r = 5\%$, $T = 1$ the bound is
+  4.88; the Black–Scholes price 10.45 respects it.
+- **A put is worth at most the discounted strike**: $P \le Ke^{-rT}$.
+- **Call prices fall with the strike, but not too fast**: for $K_1 \lt K_2$,
+  $0 \le C(K_1) - C(K_2) \le (K_2 - K_1)e^{-rT}$. The **call spread** (long $K_1$, short $K_2$) pays
+  between 0 and $K_2 - K_1$.
+- **Call prices are convex in the strike**: a **butterfly** (long $K - h$, short two $K$, long
+  $K + h$) pays something non-negative, so it must cost something non-negative:
+  $C(K - h) - 2C(K) + C(K + h) \ge 0$. With $S = 100$, $\sigma = 20\%$, $r = 5\%$, $T = 1$:
+  $16.70 - 2 \times 10.45 + 6.04 = 1.84 \ge 0$.
+
+Interviewers test these by quoting prices that violate one and asking for the trade.
+
+**Strategies are sums of payoffs.** Because payoffs add, any piecewise-linear payoff can be built
+from calls, puts and the stock. A **straddle** (call plus put at the same strike) bets on a big
+move in either direction. A **bull call spread** caps both the cost and the gain of a bullish view.
+A **butterfly** bets that the stock ends near the middle strike.
+
+<LineChart
+	x={() => Array.from({ length: 161 }, (_, i) => 60 + i * 0.5)}
+	series={[
+		{ name: "straddle, K = 100", fn: (s) => Math.abs(s - 100) },
+		{ name: "bull call spread 95 / 105", fn: (s) => Math.min(Math.max(s - 95, 0), 10) },
+		{ name: "butterfly 90 / 100 / 110", fn: (s) => Math.max(s - 90, 0) - 2 * Math.max(s - 100, 0) + Math.max(s - 110, 0) },
+	]}
+	xLabel="stock price at expiry"
+	yLabel="payoff"
+	height={260}
+/>
+
+The butterfly's tent shape is why convexity in the strike matters: shrink $h$ and the butterfly,
+scaled by $1/h^2$, approaches a spike at $K$. Its price then measures the risk-neutral probability
+density of ending at $K$, so **option prices across strikes encode the market's whole distribution
+for the stock** (the Breeden–Litzenberger result). A cruder version of the same idea: a
+**digital call**, paying 1 if $S_T \gt K$, is the limit of a call spread scaled by $1/h$, so its
+price is $-\partial C / \partial K = e^{-rT} N(d_2)$. At the money with the inputs above that is
+$0.9512 \times N(0.15) = 0.532$, a little above one half because the drift is positive under the
+risk-neutral measure.
+
+### The binomial model
+
+How can anyone price an option without knowing whether the stock will rise? The answer is
+**replication**: build the option's payoff from stock and cash.
+
+**One step.** A stock at 100 will be 120 or 80 in one period; interest is zero. A call with
+strike 100 pays 20 or 0. Buy $\Delta$ shares and borrow $B$ so that
+
+$$
+120\Delta - B = 20, \qquad 80\Delta - B = 0 \quad\Rightarrow\quad \Delta = \frac{20 - 0}{120 - 80} = 0.5,\ B = 40.
+$$
+
+The portfolio costs $100 \times 0.5 - 40 = 10$ today and pays exactly the option's payoff in
+both states, so the call is worth 10. The real-world probability of an up move never entered.
+
+**Risk-neutral pricing.** The same answer comes from pretending the stock earns the risk-free
+rate on average. The **risk-neutral probability** $q$ solves $120q + 80(1 - q) = 100$, so
+$q = 0.5$, and the price is $\mathbb{E}_q[\text{payoff}] = 0.5 \times 20 = 10$. With interest,
+$q = (e^{r\Delta t} - d)/(u - d)$ and the expectation is discounted. Under $q$ the discounted
+stock price is a martingale, which ties pricing back to the previous sections.
+
+**Many steps.** The **Cox–Ross–Rubinstein (CRR)** tree chops time into $n$ steps of length
+$\Delta t$, with moves $u = e^{\sigma\sqrt{\Delta t}}$ and $d = 1/u$. Prices are found backwards
+from expiry: each node is the discounted risk-neutral average of its two children. An American
+option also checks whether exercising now beats holding, the same "now versus the value of
+waiting" comparison as the re-roll game.
+
+**Worked example.** $S = 100$, $K = 100$, $r = 5\%$, $\sigma = 20\%$, $T = 1$, three steps:
+$u = 1.1224$, $d = 0.8909$, $q = 0.5438$. The European put is worth 6.17 on this tree. The
+American put is worth more, 6.50, because at the node after two down moves ($S = 79.38$),
+exercising pays $20.62$ while holding is worth only $18.97$. Exercising early lets you collect
+the strike sooner and earn interest on it. Step through the figure and hover that node; then
+switch to a call and note that the American call never exercises early on a stock without
+dividends.
+
+<BinomialTreeSteps S={100} K={100} T={1} r={0.05} sigma={0.2} n={3} kind="put" american />
+
+As the steps increase, the European price converges to Black–Scholes: 6.17, 5.09, 5.53 and
+5.57 for 3, 4, 50 and 500 steps against 5.5735 (the odd–even zigzag is typical of CRR trees).
+
+### Black–Scholes and the Greeks
+
+Letting the number of steps go to infinity, or equivalently hedging continuously under
+geometric Brownian motion, gives the **Black–Scholes** price of a European call:
+
+$$
+C = S\, N(d_1) - K e^{-rT} N(d_2), \qquad d_{1,2} = \frac{\ln(S/K) + (r \pm \tfrac12\sigma^2)T}{\sigma\sqrt{T}},
+$$
+
+where $N$ is the standard normal CDF. $N(d_2)$ is the risk-neutral probability the call ends in
+the money, and $N(d_1)$ is the number of shares in the replicating portfolio. With $S = K = 100$,
+$r = 5\%$, $\sigma = 20\%$, $T = 1$: $d_1 = 0.35$, $d_2 = 0.15$, $C = 10.45$.
+
+**The at-the-money rule of thumb.** With $r = 0$ and $S = K$, expanding $N$ around 0 gives
+$C \approx S\sigma\sqrt{T}/\sqrt{2\pi} \approx 0.4\, \sigma \sqrt{T}\, S$. For $S = 100$,
+$\sigma = 20\%$, $T = 1$: $0.4 \times 0.2 \times 100 = 8$ (exact: 7.97). Interviewers expect this
+in seconds. An at-the-money **straddle** (call plus put) is about $0.8\,\sigma\sqrt{T}\,S$.
+
+The **Greeks** measure how the price changes when one input moves. They are how a market maker
+thinks about risk.
+
+| Greek | Definition | Call at $S = K = 100$ (inputs above) | Meaning |
+| --- | --- | ---: | --- |
+| Delta $\Delta$ | $\partial C / \partial S$ | 0.637 | Shares to hedge one option |
+| Gamma $\Gamma$ | $\partial^2 C / \partial S^2$ | 0.0188 | How fast delta changes |
+| Vega | $\partial C / \partial \sigma$ | 0.375 per vol point | Exposure to volatility |
+| Theta $\Theta$ | $\partial C / \partial t$ | −0.0176 per day | Value lost to time |
+
+**Gamma and theta are two sides of one trade.** A delta-hedged option holder makes money when
+the stock moves a lot (gamma) and loses money as time passes (theta). With $r = 0$ the
+Black–Scholes equation gives $\Theta = -\tfrac12 \sigma^2 S^2 \Gamma$ exactly, so over a short time
+$dt$ the hedged P&L is
+
+$$
+\tfrac12 \Gamma S^2 \left(\sigma_{\text{realised}}^2 - \sigma_{\text{implied}}^2\right) dt.
+$$
+
+Buying an option is therefore a bet that the stock will move more than the **implied
+volatility** priced into it. This is what options traders actually trade: volatility, not
+direction.
+
+In the figure, drag the spot to see delta run from 0 to 1, switch to gamma to see it peak at
+the strike, and shorten $T$ to see gamma sharpen and theta grow as expiry nears.
+
+<OptionGreeks K={100} S={100} sigma={0.2} T={1} r={0.05} kind="call" greek="delta" />
+
+Parity ties the Greeks of calls and puts together. Differentiating $C - P = S - Ke^{-rT}$ with
+respect to $S$ gives $\Delta_C - \Delta_P = 1$ (here $0.637 - (-0.363) = 1$), and a second time gives
+equal gammas. Calls and puts at the same strike also share vega, because the right-hand side does
+not depend on $\sigma$. So for volatility trading it does not matter whether you buy calls or puts;
+the difference is a position in the stock.
+
+#### Delta hedging, step by step
+
+A market maker who sells an option does not want to bet on the stock's direction. They **delta
+hedge**: hold $\Delta$ shares against each option sold, and rebalance as $\Delta$ changes. Here is a
+short call hedged daily over five trading days, with $S = K = 100$, $\sigma = 20\%$ and $r = 0$.
+The premium received is $1.124$ (Black–Scholes for five days). The stock path is invented for the
+example.
+
+| Day | Stock | Delta | Shares bought (+) or sold (−) | Cash after trade |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 100.0 | 0.506 | +0.506 | −49.44 |
+| 1 | 101.5 | 0.727 | +0.221 | −71.90 |
+| 2 | 99.8 | 0.468 | −0.259 | −46.04 |
+| 3 | 100.9 | 0.696 | +0.228 | −69.02 |
+| 4 | 102.2 | 0.959 | +0.263 | −95.89 |
+| 5 | 101.0 | expiry | | |
+
+At expiry the 0.959 shares are worth 96.81 and the call costs 1.00 to settle, so the P&L is
+$-95.89 + 96.81 - 1.00 = -0.085$. Check one row: on day 2 the stock fell to 99.8, delta dropped from
+0.727 to 0.468, so you **sold** 0.259 shares *after a fall*; on days 1, 3 and 4 you **bought** after
+rises. A short-option hedger always buys high and sells low, and those small losses are the cost of
+being short gamma. The premium pays for them if the stock moves as much as the 20% volatility
+priced in. Here the path's realised volatility was 21.7%, a little more, so the hedger lost a
+little. The gamma–theta formula predicts this: summing
+$\tfrac12 \Gamma S^2 (\sigma^2 \Delta t - (\Delta S/S)^2)$ over the five days gives $-0.094$, close to the
+actual $-0.085$.
+
+#### Implied volatility and the smile
+
+Of the five Black–Scholes inputs, four are observable: spot, strike, time and rate. Volatility is
+not. Traders therefore turn the formula around: given an option's market price, the **implied
+volatility** is the $\sigma$ that makes Black–Scholes match it. A one-year at-the-money call
+trading at 12.00 (with $S = K = 100$, $r = 5\%$) implies $\sigma = 24.1\%$; at 10.45 it would imply
+20%. Because price rises with volatility (vega is positive), the inversion has one answer, found
+by a few steps of Newton's method.
+
+Options desks quote and think in implied volatility, not price, because it makes options with
+different strikes and maturities comparable. If Black–Scholes were exactly right, every strike
+would show the same implied volatility. In practice the plot of implied volatility against strike
+is a **smile** or **skew**: in equity markets, low-strike puts trade at higher implied volatility
+than at-the-money options, because crashes are more likely than a lognormal model allows and
+investors pay for protection. Saying "the skew prices in fat left tails" is the expected interview
+answer.
+
+#### Exercises
+
+**6.1** A call trades at 10 and a put at 5, both with strike 100 and one year to expiry, on a
+stock at 100. Interest rates are zero. Is there an arbitrage?
+
+<details>
+<summary>Solution</summary>
+
+Parity requires $C - P = S - K = 0$, but $C - P = 5$. The call is rich relative to the put: sell the
+call, buy the put, buy the stock. Cost: $-10 + 5 + 100 = 95$; borrow it. At expiry the
+position (long stock, long put, short call) is worth exactly 100 whatever happens, so you repay
+95 and keep 5.
+</details>
+
+**6.2** Estimate the price of a three-month at-the-money straddle on a \$50 stock with 40%
+implied volatility.
+
+<details>
+<summary>Solution</summary>
+
+$0.8 \times 0.4 \times \sqrt{0.25} \times 50 = 0.8 \times 0.4 \times 0.5 \times 50 = 8$. Black–Scholes with
+$r = 0$ gives 7.97.
+</details>
+
+**6.3** A stock at 50 will be 60 or 40 in one period, with zero interest. Price a put with strike
+50 and give its hedge.
+
+<details>
+<summary>Solution</summary>
+
+$q = (50 - 40)/(60 - 40) = 0.5$. The put pays 0 or 10, so it is worth $0.5 \times 10 = 5$. Hedge:
+$\Delta = (0 - 10)/(60 - 40) = -0.5$, so the replicating portfolio is short half a share plus 30 in
+cash ($-25 + 30 = 5$).
+</details>
+
+**6.4** Why is it never optimal to exercise an American call early on a stock that pays no
+dividend?
+
+<details>
+<summary>Solution</summary>
+
+Exercising now pays $S - K$. Holding is worth at least $S - Ke^{-r(T - t)}$ (the European lower
+bound from parity, since $P \ge 0$), which is larger when $r > 0$: you pay the strike later. You
+also keep the option's protection against a fall. So the call is worth more alive than dead;
+selling it beats exercising it.
+</details>
+
+**6.5** What is the delta of an at-the-money call with a very short time to expiry, and why do
+traders say it is "about 0.5"?
+
+<details>
+<summary>Solution</summary>
+
+$d_1 = (r + \tfrac12\sigma^2)\sqrt{T}/\sigma \to 0$ as $T \to 0$, so $\Delta = N(d_1) \to 0.5$: the
+stock is equally likely to finish above or below the strike. For longer maturities $d_1 > 0$ and
+delta is above 0.5 (0.637 in the table).
+</details>
+
+**6.6** Calls on the same stock and expiry trade at 15 (strike 90), 9 (strike 100) and 2 (strike
+110). Is there an arbitrage?
+
+<details>
+<summary>Solution</summary>
+
+The butterfly costs $15 - 2 \times 9 + 2 = -1$: you would be *paid* 1 to enter a position whose payoff
+is never negative. Buy the 90 and 110 calls, sell two 100 calls, collect 1 now, and receive a
+non-negative payoff (up to 10 at $S_T = 100$) at expiry.
+</details>
+
+**6.7** You are long an at-the-money straddle and delta-hedged. The stock does not move for a
+week. Did you make or lose money? What if it swings up and down 3% every day?
+
+<details>
+<summary>Solution</summary>
+
+A straddle is long gamma and short theta. With no movement you collect no gamma profits and pay a
+week of theta: you lose. With large daily swings, each rebalance sells after rises and buys after
+falls, locking in gains of about $\tfrac12 \Gamma S^2 (\Delta S/S)^2$ per day. If the realised
+volatility of those swings (3% a day is about 48% a year) exceeds the implied volatility you paid,
+you make money.
+</details>
+
+**6.8** Estimate the vega of a one-year at-the-money call on a \$100 stock, per volatility point.
+
+<details>
+<summary>Solution</summary>
+
+From $C \approx 0.4\,\sigma\sqrt{T}\,S$, $\partial C/\partial\sigma \approx 0.4\sqrt{T}\,S = 40$ per unit of
+volatility, or 0.40 per point. Black–Scholes gives 0.397 with $r = 0$ (0.375 with $r = 5\%$). Vega is
+largest at the money and grows with $\sqrt{T}$.
+</details>
+
+## Statistics and regression
+
+Research roles ask how you would know an edge is real. That needs three ideas: standard errors,
+regression, and the danger of searching too hard.
+
+**Standard errors.** The average of $n$ independent observations with standard deviation
+$\sigma$ has standard deviation $\sigma/\sqrt{n}$: halving the error takes four times the data.
+By the **central limit theorem** the average is roughly normal, so about 95% of averages land
+within two standard errors of the truth. Example: 100 fair-coin flips have mean 50 and standard
+deviation 5; 60 or more heads is two standard deviations out, and the exact probability is
+0.028.
+
+**How long to prove a Sharpe ratio.** The **Sharpe ratio** of a strategy is its mean excess
+return over its volatility, per year. After $Y$ years of returns, the t-statistic of the mean is
+roughly $\text{SR}\sqrt{Y}$. To reach $t = 2$ a Sharpe of 1 needs 4 years of data, a Sharpe of
+0.5 needs 16, and a Sharpe of 2 one year. This is why high-frequency strategies, which can have
+very high Sharpe ratios and many independent bets, can be validated quickly and slow strategies
+cannot.
+
+#### Testing whether an edge is real
+
+A **hypothesis test** asks: if there were no edge (the **null hypothesis**), how surprising would
+this data be? The **t-statistic** measures the observed mean in units of its standard error,
+$t = \bar x / (s / \sqrt{n})$, and roughly $|t| \gt 2$ is "significant at 5%": data this extreme
+would arise less than 5% of the time with no edge. The **p-value** is that probability.
+
+**Worked example.** A strategy earns a mean daily return of 0.05% with a daily standard deviation
+of 1% over 250 days. Then $t = 0.05 / 1 \times \sqrt{250} = 0.79$. That is well inside the noise:
+a strategy with no edge at all would produce a $t$ this large about 43% of the time. The
+annualised Sharpe ratio is $0.05 / 1 \times \sqrt{252} = 0.79$, the same number, which is the
+"$t \approx \text{SR}\sqrt{Y}$" rule with $Y = 1$.
+
+A **confidence interval** reports the same uncertainty as a range. A coin shows 60 heads in 100
+flips; the estimate is $\hat p = 0.6$ with standard error $\sqrt{0.6 \times 0.4 / 100} = 0.049$, so
+the 95% interval is $0.6 \pm 1.96 \times 0.049 = [0.504, 0.696]$. It just excludes 0.5. (Because a
+fair coin has standard deviation 5 heads, 60 heads is two of them away from 50, matching the
+earlier tail probability of 0.028 for "60 or more".)
+
+Two warnings recur in interviews. **The sample variance divides by $n - 1$**, not $n$, because the
+deviations are measured from the sample mean, which is itself fitted to the data and so sits
+slightly closer to the points than the true mean does. And **"not significant" is not "no
+effect"**: a test with little data cannot distinguish a small edge from none, as the example
+above shows.
+
+**Linear regression.** Ordinary least squares fits $y = \alpha + \beta x + \varepsilon$ by
+minimising the sum of squared residuals. The solution is
+
+$$
+\hat\beta = \frac{\sum (x_i - \bar x)(y_i - \bar y)}{\sum (x_i - \bar x)^2} = \rho\, \frac{\sigma_y}{\sigma_x}, \qquad \hat\alpha = \bar y - \hat\beta \bar x,
+$$
+
+and $R^2 = \rho^2$ is the share of the variance of $y$ explained. In finance, regressing a stock's
+returns on the market's gives its **beta** (market exposure) and **alpha** (return not explained
+by the market).
+
+**Worked example.** Ten days of market and stock returns, in percent:
+
+| Market $x$ | −4 | −2 | −1 | 0 | 1 | 1 | 2 | 3 | −3 | 3 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Stock $y$ | −5 | −3 | 0 | 1 | 1 | 2 | 2 | 5 | −4 | 3 |
+
+The means are $\bar x = 0$ and $\bar y = 0.2$. The sums are $\sum (x - \bar x)^2 = 54$,
+$\sum (x - \bar x)(y - \bar y) = 69$ and $\sum (y - \bar y)^2 = 93.6$. So $\hat\beta = 69/54 = 1.28$,
+$\hat\alpha = 0.2$, $\rho = 69/\sqrt{54 \times 93.6} = 0.971$ and $R^2 = 0.94$. Check one residual: on
+the first day the fit predicts $0.2 + 1.28 \times (-4) = -4.91$ against $-5$, a miss of $-0.09$. The
+residual standard deviation is 0.82 and the slope's standard error is $0.82/\sqrt{54} = 0.11$, so
+$t = 11.4$: the beta is clearly not zero (with only ten points, the alpha of 0.2 is not
+distinguishable from zero).
+
+<ConfidenceChart
+	x={() => Array.from({ length: 81 }, (_, i) => -5 + i / 8)}
+	mean={(x) => regressionFit.alpha + regressionFit.beta * x}
+	lower={(x) => regressionFit.alpha + regressionFit.beta * x - 2.306 * regressionFit.s * Math.sqrt(1 + 1 / regressionFit.n + (x - regressionFit.mx) ** 2 / regressionFit.sxx)}
+	upper={(x) => regressionFit.alpha + regressionFit.beta * x + 2.306 * regressionFit.s * Math.sqrt(1 + 1 / regressionFit.n + (x - regressionFit.mx) ** 2 / regressionFit.sxx)}
+	points={regressionData}
+	meanLabel="fit y = 0.2 + 1.28x"
+	bandLabel="95% prediction interval"
+	pointsLabel="daily returns"
+	xLabel="market return (%)"
+	yLabel="stock return (%)"
+	height={300}
+/>
+
+The band is the 95% prediction interval for a new day ($t_{8} = 2.306$); it widens away from
+$\bar x$ because the slope is uncertain.
+
+**A classic trap: regression is not symmetric.** Regressing $x$ on $y$ gives slope
+$69/93.6 = 0.74$, not $1/1.28 = 0.78$. The two slopes multiply to $\rho^2 = 0.94$. Both lines shrink
+towards the mean of the variable being predicted, which is **regression to the mean**.
+
+**Overfitting and multiple testing.** Test 20 strategies with no edge at the 5% significance
+level and the chance at least one looks significant is $1 - 0.95^{20} = 0.64$. A backtest that
+tried many parameters must be judged on data it never saw (an out-of-sample period), with the
+significance bar raised for the number of things tried. Interviewers often ask "your backtest
+has a Sharpe of 3; what could be wrong?": look-ahead bias (using data not yet available),
+survivorship bias (testing only stocks that still exist), ignored transaction costs and
+overfitting.
+
+How much higher should the bar be? The simplest correction, **Bonferroni**, divides the
+significance level by the number of tests. For 20 strategies at an overall 5% level, each test
+must pass at $0.25\%$, which for a two-sided normal test means $|t| \gt 3.02$ instead of 1.96.
+Harvey, Liu and Zhu argued on these grounds that new return factors in finance research should
+clear $t \gt 3$. Bonferroni is conservative when the tests are correlated (similar strategies
+tend to succeed or fail together), but it is the right first answer in an interview.
+
+#### More regression traps
+
+**Omitted variables.** Suppose returns really follow $y = \beta_1 x_1 + \beta_2 x_2 + \varepsilon$, but
+you regress $y$ on $x_1$ alone. The fitted slope converges to
+
+$$
+\beta_1 + \beta_2 \frac{\operatorname{Cov}(x_1, x_2)}{\operatorname{Var}(x_1)},
+$$
+
+not $\beta_1$. If a stock's true model is $y = 1 \cdot x_1 + 2 \cdot x_2$ and the omitted factor has
+regression slope 0.5 on $x_1$, the one-factor regression reports a slope of $1 + 2 \times 0.5 = 2$:
+the omitted factor's effect is credited to the one you kept. This is why a "new signal" is
+always checked against known factors (market, size, value, momentum) before anyone believes it.
+
+**Correlated regressors.** When two regressors are highly correlated (**multicollinearity**), the
+regression cannot tell their effects apart: the individual slopes get large standard errors and
+can flip sign between samples, even though their combined prediction is stable.
+
+**Overlapping data.** Five-day returns computed every day overlap by four days, so consecutive
+observations share 80% of their content. Treating them as independent overstates the number of
+observations about fivefold and shrinks standard errors by about $\sqrt{5}$, the same fake precision
+as duplicating rows (Exercise 7.2).
+
+#### Exercises
+
+**7.1** The regression of $y$ on $x$ has slope 0.8 and the regression of $x$ on $y$ has slope 0.45.
+What is the correlation?
+
+<details>
+<summary>Solution</summary>
+
+The slopes are $\rho\sigma_y/\sigma_x$ and $\rho\sigma_x/\sigma_y$; their product is $\rho^2 = 0.36$,
+so $\rho = 0.6$ (positive, like the slopes).
+</details>
+
+**7.2** You duplicate every row of your dataset and rerun the regression. What happens to
+$\hat\beta$ and its standard error?
+
+<details>
+<summary>Solution</summary>
+
+$\hat\beta$ is unchanged: every sum doubles and the ratio stays the same. The reported standard
+error shrinks, roughly by $\sqrt{2}$ for large $n$ (for the ten-point example, from 0.112 to
+0.075, a factor of 1.5 because the degrees of freedom go from 8 to 18). The shrinkage is fake:
+no new information was added. The same error appears when overlapping returns are treated as
+independent.
+</details>
+
+**7.3** Stocks A and B have correlation 0.9, and B and C have correlation 0.9. What is the
+lowest possible correlation between A and C?
+
+<details>
+<summary>Solution</summary>
+
+The correlation matrix must be positive semidefinite, which gives
+$\rho_{AC} \ge \rho_{AB}\rho_{BC} - \sqrt{(1 - \rho_{AB}^2)(1 - \rho_{BC}^2)} = 0.81 - 0.19 = 0.62$.
+Geometrically: correlations are cosines of angles between vectors; A and C are each within
+25.8° of B, so at most 51.7° apart, and $\cos 51.7° = 0.62$.
+</details>
+
+**7.4** A strategy shows an annualised Sharpe ratio of 1.5 over two years of daily data. Is it
+significant? What if it was the best of 50 variants you tried?
+
+<details>
+<summary>Solution</summary>
+
+$t \approx 1.5 \sqrt{2} = 2.12$, just above 1.96 on its own. As the best of 50 tries, the Bonferroni
+threshold is $0.05/50 = 0.1\%$, about $|t| \gt 3.3$; at $t = 2.12$ it is no longer convincing. It needs
+out-of-sample data, or about $(3.3/1.5)^2 \approx 4.8$ years at the same Sharpe.
+</details>
+
+**7.5** You estimate a daily volatility from 100 daily returns. Roughly how precise is the
+estimate?
+
+<details>
+<summary>Solution</summary>
+
+For roughly normal returns, the standard error of a sample standard deviation is about
+$\sigma/\sqrt{2n} = \sigma/\sqrt{200} \approx 0.07\sigma$: a 7% relative error. Volatility is much easier
+to estimate than the mean (whose relative error here would be enormous), which is one reason
+options traders can trade volatility with confidence while directional traders struggle to measure
+their edge.
+</details>
+
+## Portfolios and risk
+
+Combining positions is where most of a trading firm's risk management lives. The key fact is
+that **variances add, with a correlation term**:
+
+$$
+\sigma_p^2 = w^2 \sigma_1^2 + (1 - w)^2 \sigma_2^2 + 2 w (1 - w) \rho\, \sigma_1 \sigma_2.
+$$
+
+When $\rho \lt 1$, the portfolio is less volatile than the weighted average of its parts. That is
+**diversification**.
+
+**Worked example.** Two assets have volatilities 20% and 30% and correlation 0.2. Setting the
+derivative to zero gives the **minimum-variance** weight in the first asset,
+
+$$
+w^* = \frac{\sigma_2^2 - \rho\sigma_1\sigma_2}{\sigma_1^2 + \sigma_2^2 - 2\rho\sigma_1\sigma_2} = \frac{0.09 - 0.012}{0.13 - 0.024} = 0.736,
+$$
+
+with portfolio volatility 18.1%: lower than either asset alone. With $\rho = -1$ the risk
+can be removed completely (at $w = 0.6$); with $\rho = 1$ there is no benefit at all.
+
+<LineChart
+	x={() => Array.from({ length: 101 }, (_, i) => i / 100)}
+	series={[
+		{ name: "ρ = 1", fn: (w) => 100 * twoAssetVol(w, 1) },
+		{ name: "ρ = 0.2", fn: (w) => 100 * twoAssetVol(w, 0.2) },
+		{ name: "ρ = −0.5", fn: (w) => 100 * twoAssetVol(w, -0.5) },
+		{ name: "ρ = −1", fn: (w) => 100 * twoAssetVol(w, -1) },
+	]}
+	xLabel="weight w in asset 1 (σ = 20%); rest in asset 2 (σ = 30%)"
+	yLabel="portfolio volatility (%)"
+	height={280}
+/>
+
+**Diversification has a floor.** An equal-weighted portfolio of $N$ assets, each with volatility
+$\sigma$ and pairwise correlation $\rho$, has variance $\sigma^2\left(\rho + (1 - \rho)/N\right)$.
+With $\sigma = 20\%$ and $\rho = 0.3$: 20% for one asset, 12.2% for ten, 11.1% for a hundred, and
+never below $\sqrt{0.3} \times 20\% = 11.0\%$. The correlated part, **systematic risk**, cannot be
+diversified away; this is the idea behind the **CAPM**, in which only an asset's beta to the
+market earns a risk premium.
+
+#### Many assets: the tangency portfolio
+
+With $n$ assets, write the weights as a vector $w$ and the covariances as a matrix $\Sigma$ (variances
+on the diagonal, covariances off it). The portfolio variance is $w^\top \Sigma w$, the matrix form
+of the two-asset formula. Two portfolios matter:
+
+- The **minimum-variance portfolio** has $w \propto \Sigma^{-1}\mathbf{1}$, scaled so the weights sum to 1.
+- The **tangency portfolio** maximises the Sharpe ratio $(w^\top\mu - r)/\sqrt{w^\top\Sigma w}$ and has
+  $w \propto \Sigma^{-1}(\mu - r)$. Its squared Sharpe ratio is $(\mu - r)^\top \Sigma^{-1} (\mu - r)$.
+
+**Worked example.** Add expected returns to the two assets above: 8% and 12%, with a risk-free
+rate of 2%. On their own their Sharpe ratios are $6/20 = 0.30$ and $10/30 = 0.33$. Solving
+$\Sigma w = \mu - r$ and normalising gives weights 56.1% and 43.9%, an expected return of 9.75%,
+volatility 18.9% and a Sharpe ratio of $7.75/18.9 = 0.41$: better than either asset alone. Every
+investor who can borrow and lend at the risk-free rate should hold this mix, scaled up or down to
+their taste for risk. This is **two-fund separation**, and with the Kelly result above it says how
+much: $f^* = (\mu - r)/\sigma^2$ applied to the tangency portfolio.
+
+**CAPM.** If every investor holds the tangency portfolio, it must be the market portfolio, and
+each asset's expected return depends only on its **beta** to the market:
+$\mathbb{E}[R_i] = r + \beta_i(\mathbb{E}[R_m] - r)$. The stock from the regression example, with
+$\beta = 1.28$, a 2% risk-free rate and a 5% market premium, should earn $2\% + 1.28 \times 5\% = 8.4\%$.
+Anything earned above this line is **alpha**, which is what a quant fund is paid to find.
+
+In practice the inputs are the weak point. Expected returns are estimated with huge errors (the
+statistics section showed why), and the optimiser leans hardest on exactly the assets whose
+expected returns were overestimated. Practitioners shrink the estimates, add constraints, or
+build portfolios from risk alone (equal risk contribution) for this reason.
+
+**Combining strategies.** Two uncorrelated strategies with the same Sharpe ratio $S$, combined
+optimally, have Sharpe $S\sqrt{2}$: returns add linearly but uncorrelated risks add in
+quadrature. This is why trading firms run many small, independent strategies rather than one
+big one, and why the **fundamental law of active management** says that skill per bet times the
+square root of the number of independent bets sets the overall Sharpe.
+
+**Measuring risk.** **Value at Risk (VaR)** at 99% is the loss exceeded on only 1% of days; for
+normal returns it is $2.33\sigma$. It says nothing about how bad the worst 1% is, so firms also use
+**expected shortfall** (the average loss beyond VaR), stress tests and position limits. For a
+normal distribution the 99% expected shortfall is $\varphi(2.326)/0.01 = 2.67\sigma$, only 15% beyond
+VaR; for fat-tailed returns the gap is much larger, which is exactly when it matters. Expected
+shortfall also has a property VaR lacks: the shortfall of a combined book is never more than the
+sum of its parts, so it rewards diversification as it should.
+
+#### Exercises
+
+**8.1** Two uncorrelated strategies each have a Sharpe ratio of 1. What is the best Sharpe you
+can get by combining them?
+
+<details>
+<summary>Solution</summary>
+
+Allocate equal risk to each. Mean returns add ($\mu_1 + \mu_2 = 2\mu$ for unit risk each) and
+variances add ($\sigma^2 + \sigma^2$), so Sharpe $= 2\mu/(\sqrt2\sigma) = \sqrt2 \times 1 = 1.41$.
+</details>
+
+**8.2** A portfolio has daily volatility of \$1 million. What is its approximate one-day 99% VaR
+and ten-day 99% VaR, assuming normal, independent daily returns?
+
+<details>
+<summary>Solution</summary>
+
+One day: 2.33 × \$1 million = \$2.33 million. Ten days: volatility scales with $\sqrt{10} = 3.16$,
+so the VaR is 2.33 × 3.16 × \$1 million = \$7.4 million. Real returns have fat tails and serial correlation, so this is a
+lower bound on prudence, not a guarantee.
+</details>
+
+**8.3** A stock has beta 1.5 to the market and 40% volatility; the market has 16% volatility.
+What share of the stock's variance is market risk, and what is its idiosyncratic volatility?
+
+<details>
+<summary>Solution</summary>
+
+Market variance contributed: $(1.5 \times 0.16)^2 = 0.0576$; total variance $0.4^2 = 0.16$. So market
+risk is $0.0576/0.16 = 36\%$ of the variance (this is the regression $R^2$), and the idiosyncratic
+volatility is $\sqrt{0.16 - 0.0576} = \sqrt{0.1024} = 32\%$.
+</details>
+
+## Brainteasers, coding and the live interview
+
+**Brainteasers** test structured thinking under pressure more than knowledge. A dependable
+approach: restate the problem, try the smallest cases, look for symmetry or an invariant, and
+work backwards from the end. Two examples:
+
+- **25 horses, 5 lanes, no timer: how many races to find the fastest three?** Race five groups
+  (5 races), then race the five winners (race 6). Only the top three groups can contain a top-3
+  horse, and only the candidates that could still be second or third remain: the second and third
+  of the winners' race, the second and third from the fastest group, and the second from the
+  second-fastest group. Race those five (race 7). Answer: 7.
+- **Two ropes each take an hour to burn, unevenly. Measure 45 minutes.** Light rope A at both
+  ends and rope B at one end. A burns out in 30 minutes; at that moment light B's other end, and
+  it burns out 15 minutes later.
+- **Two eggs, 100 floors: find the highest safe floor with the fewest drops in the worst case.**
+  With one egg you must go floor by floor. With two, drop the first egg at floor $k$, then
+  $k + (k - 1)$, then $k + (k - 1) + (k - 2)$, and so on: each time the first egg survives, the
+  remaining linear search with the second egg gets one floor shorter, which keeps the worst case
+  constant at $k$ drops. You need $k + (k - 1) + \cdots + 1 = k(k + 1)/2 \ge 100$, so $k = 14$
+  ($14 \times 15 / 2 = 105$, while 13 gives only 91).
+- **100 lockers, all closed. Person $k$ toggles every $k$-th locker, for $k = 1, \ldots, 100$.
+  Which stay open?** Locker $n$ is toggled once per divisor of $n$. Divisors come in pairs
+  $(d, n/d)$, except when $d = n/d$, so only perfect squares have an odd number of divisors. The
+  10 lockers 1, 4, 9, ..., 100 stay open.
+- **Ants on a 1-metre stick walk at 1 m/min in random directions and reverse when they collide.
+  How long until all have fallen off?** At most one minute: two ants bouncing off each other look
+  exactly like two ants passing through each other with labels swapped, so the collisions change
+  nothing about *when* ants leave the stick. The invariant does all the work.
+
+**Coding rounds** for traders usually ask for a short simulation or a clean implementation of a
+probability calculation; developer and researcher roles ask standard algorithm questions. A good
+habit is to check an analytic answer with a quick Monte Carlo:
+
+```python
+import random
+
+def flips_until(pattern: str) -> int:
+    seq = ""
+    while not seq.endswith(pattern):
+        seq += random.choice("HT")
+    return len(seq)
+
+trials = 200_000
+print(sum(flips_until("HH") for _ in range(trials)) / trials)  # about 6.0
+print(sum(flips_until("HT") for _ in range(trials)) / trials)  # about 4.0
+```
+
+Dynamic programming is the other recurring pattern: the value of a game with choices, computed
+backwards. The re-roll game takes three lines, and the loop is the same "keep if better than the
+value of continuing" rule an American option uses:
+
+```python
+def reroll_value(rerolls: int) -> float:
+    value = 3.5                      # with no re-rolls left, take the roll
+    for _ in range(rerolls):
+        value = sum(max(face, value) for face in range(1, 7)) / 6
+    return value
+
+print([round(reroll_value(n), 4) for n in range(5)])  # [3.5, 4.25, 4.6667, 4.9444, 5.1296]
+```
+
+**In the room.** Think out loud, so the interviewer can follow and help. State assumptions
+("I'll assume the dice are fair and independent"). Give a quick estimate before an exact
+answer, and sanity-check the result (a probability above 1, or an expected wait shorter than the
+pattern, means an error). In trading games, a decision you can justify beats a fast guess, and
+changing your mind when new information arrives is the point, not a weakness.
+
+## A study plan
+
+A reasonable eight-week plan for someone with a maths or computer science degree:
+
+| Weeks | Focus | Material |
+| --- | --- | --- |
+| Daily, throughout | 10–15 minutes of timed arithmetic | Zetamac or similar drills |
+| 1–3 | Probability, expected value, first-step analysis | Zhou ch. 4, *Fifty Challenging Problems in Probability*, this post's exercises |
+| 3–4 | Random walks, martingales, Brownian motion | Zhou ch. 5 |
+| 4–5 | Market-making games, Kelly, poker-style EV | Practise quoting out loud with a friend; Thorp's Kelly paper |
+| 5–7 | Options: parity, binomial trees, Greeks, volatility | Hull (binomial trees, Black–Scholes, Greeks), Natenberg, Zhou ch. 6 |
+| 6–8 | Statistics, regression, coding | Your own small simulations; mock interviews |
+
+## Summary
+
+- Trading interviews test **expected value under uncertainty, computed quickly and explained
+  aloud**; dice, coins and cards are just the cheapest way to probe it.
+- **Counting, conditioning, linearity of expectation and first-step analysis** solve most
+  probability questions; **martingales with optional stopping** solve most random-walk ones.
+- An edge is not enough: **bet sizing** matters, and Kelly's $f^* = p - q/b$ maximises long-run
+  growth; betting twice that much grows at about zero.
+- A **market maker** quotes around fair value with a spread that pays for **adverse
+  selection**, updates on every trade, and skews quotes to manage **inventory**.
+- Options are priced by **replication and no-arbitrage** (put–call parity, binomial trees,
+  Black–Scholes); traders think in Greeks, and owning gamma is a bet that realised volatility
+  will beat implied.
+
+## References
+
+- Xinfeng Zhou, *A Practical Guide to Quantitative Finance Interviews* (2008), the "green book".
+- Timothy Falcon Crack, *Heard on the Street: Quantitative Questions from Wall Street Job
+  Interviews*.
+- Frederick Mosteller, *Fifty Challenging Problems in Probability with Solutions* (Dover, 1965).
+- Mark Joshi, Nick Denson and Andrew Downes, *Quant Job Interview Questions and Answers*.
+- John C. Hull, *Options, Futures, and Other Derivatives*; Sheldon Natenberg, *Option Volatility
+  and Pricing*.
+- J. L. Kelly Jr., "A New Interpretation of Information Rate", *Bell System Technical Journal*
+  35 (1956); E. O. Thorp, "The Kelly Criterion in Blackjack, Sports Betting, and the Stock
+  Market" (2006).
+- F. Black and M. Scholes, "The Pricing of Options and Corporate Liabilities", *Journal of
+  Political Economy* 81 (1973); J. C. Cox, S. A. Ross and M. Rubinstein, "Option Pricing: A
+  Simplified Approach", *Journal of Financial Economics* 7 (1979).
+- L. R. Glosten and P. R. Milgrom, "Bid, Ask and Transaction Prices in a Specialist Market with
+  Heterogeneously Informed Traders", *Journal of Financial Economics* 14 (1985).
+- D. T. Breeden and R. H. Litzenberger, "Prices of State-Contingent Claims Implicit in Option
+  Prices", *Journal of Business* 51 (1978).
+- C. R. Harvey, Y. Liu and H. Zhu, "... and the Cross-Section of Expected Returns", *Review of
+  Financial Studies* 29 (2016).
+- M. Avellaneda and S. Stoikov, "High-frequency trading in a limit order book", *Quantitative
+  Finance* 8 (2008).
+- Interview-format reports: [Jane Street interview guide](https://www.techinterview.org/companies/jane-street/)
+  and [SIG interview guide](https://www.techinterview.org/companies/sig-susquehanna-interview-guide/)
+  (techinterview.org), [Optiver 80 in 8 guide](https://www.quantt.co.uk/resources/optiver-80-in-8-guide)
+  (quantt.co.uk), [SIG interview guide](https://www.tradermath.org/articles/sig-interview-guide)
+  (tradermath.org). These are third-party summaries of candidate reports, not firm publications.

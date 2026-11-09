@@ -1,0 +1,124 @@
+---
+// Gambler's ruin: a walk starts at k, steps +1 with probability p and −1 otherwise, and stops
+// at 0 (ruin) or N (target). The plot draws the first 30 of a batch of seeded walks, green if
+// they reached N and red if ruined, with one walk highlighted; the readouts compare the share
+// of the batch that reached N and its mean length with the closed forms
+// P(win) = (1 − r^k) / (1 − r^N), r = (1 − p)/p (k/N when p = ½) and the expected duration.
+// Sliders change p and k; "New walks" draws a fresh batch. Logic in quant.ts.
+// Usage in .mdx:
+//   <GamblersRuin start={3} target={10} p={0.5} />
+import "../sampling/sampling.css";
+import "./quant.css";
+
+interface Props {
+	start?: number;
+	target?: number;
+	p?: number;
+	/** Walks per batch (only 30 are drawn). */
+	walks?: number;
+	seed?: number;
+	title?: string;
+	caption?: string;
+}
+
+const {
+	start = 3,
+	target = 10,
+	p = 0.5,
+	walks = 2000,
+	seed = 1,
+	title,
+	caption,
+} = Astro.props;
+---
+
+<figure class="smp-fig qt-fig qt-ruin" data-start={start} data-target={target} data-walks={walks} data-seed={seed}>
+	{title && <div class="smp-title">{title}</div>}
+	<div class="smp-legend qt-legend">
+		<span><i class="qt-kbid"></i>reached N (win)</span>
+		<span><i class="qt-kask"></i>hit 0 (ruin)</span>
+		<span>thick line: one walk followed step by step</span>
+	</div>
+	<svg class="smp-svg" viewBox="0 0 640 250" role="img" aria-label="Random walks between 0 and N"></svg>
+	<div class="smp-controls">
+		<label class="smp-slider">p = <strong class="v-p"></strong>
+			<input type="range" class="i-p" min="0.40" max="0.60" step="0.01" value={p} aria-label="Probability of an up step" />
+		</label>
+		<label class="smp-slider">start k = <strong class="v-k"></strong>
+			<input type="range" class="i-k" min="1" max={target - 1} step="1" value={start} aria-label="Starting capital" />
+		</label>
+		<button type="button" class="smp-btn i-new">New walks</button>
+	</div>
+	<div class="smp-metrics">
+		<div><span>P(reach N), theory</span><strong class="m-pt"></strong></div>
+		<div><span>share of walks that won</span><strong class="m-ps"></strong></div>
+		<div><span>E[steps], theory</span><strong class="m-dt"></strong></div>
+		<div><span>mean steps in batch</span><strong class="m-ds"></strong></div>
+	</div>
+	<p class="smp-narration"></p>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import { el, fmt, axes } from "../sampling/plot";
+	import { mulberry32, ruinDuration, ruinWinProb, simulateWalk, type WalkPath } from "./quant";
+
+	function attach(fig: HTMLElement) {
+		const N = Number(fig.dataset.target);
+		const count = Number(fig.dataset.walks);
+		let seed = Number(fig.dataset.seed);
+		const svg = fig.querySelector("svg")!;
+		const pIn = fig.querySelector<HTMLInputElement>(".i-p")!;
+		const kIn = fig.querySelector<HTMLInputElement>(".i-k")!;
+
+		function draw() {
+			const p = Number(pIn.value);
+			const k = Number(kIn.value);
+			const rng = mulberry32(seed);
+			const batch: WalkPath[] = [];
+			for (let i = 0; i < count; i++) batch.push(simulateWalk(rng, k, N, p, 20000));
+			const shown = batch.slice(0, 30);
+			const theoryDur = ruinDuration(k, N, p);
+			const xmax = Math.max(10, Math.min(Math.max(...shown.map((w) => w.pos.length - 1)), Math.ceil(theoryDur * 4)));
+
+			svg.replaceChildren();
+			const A = axes(svg, { x: 40, y: 10, w: 584, h: 200 }, [0, xmax], [0, N], { xLabel: "step", yLabel: "capital", yTicks: N > 10 ? 4 : 5 });
+			el("line", { x1: A.box.x, x2: A.box.x + A.box.w, y1: A.sy(N), y2: A.sy(N), class: "qt-barrier" }, svg);
+			el("line", { x1: A.box.x, x2: A.box.x + A.box.w, y1: A.sy(0), y2: A.sy(0), class: "qt-barrier" }, svg);
+			const path = (w: WalkPath) =>
+				w.pos
+					.slice(0, xmax + 1)
+					.map((y, x) => `${x ? "L" : "M"}${A.sx(x).toFixed(1)},${A.sy(y).toFixed(1)}`)
+					.join("");
+			shown.forEach((w, i) => {
+				el("path", { d: path(w), class: `qt-path ${w.won === 1 ? "won" : w.won === 0 ? "lost" : ""}${i === 0 ? " hl" : ""}` }, svg);
+			});
+			el("text", { x: A.box.x + A.box.w - 4, y: A.sy(N) + 12, class: "smp-note", "text-anchor": "end" }, svg, `N = ${N}`);
+
+			const won = batch.filter((w) => w.won === 1).length / count;
+			const meanLen = batch.reduce((s, w) => s + w.pos.length - 1, 0) / count;
+			const pt = ruinWinProb(k, N, p);
+			fig.querySelector(".v-p")!.textContent = fmt(p, 2);
+			fig.querySelector(".v-k")!.textContent = String(k);
+			fig.querySelector(".m-pt")!.textContent = fmt(pt, 3);
+			fig.querySelector(".m-ps")!.textContent = `${fmt(won, 3)} (of ${count})`;
+			fig.querySelector(".m-dt")!.textContent = fmt(theoryDur, 1);
+			fig.querySelector(".m-ds")!.textContent = fmt(meanLen, 1);
+			const first = shown[0];
+			const fair = Math.abs(p - 0.5) < 1e-9;
+			fig.querySelector(".smp-narration")!.textContent =
+				`Start with ${k} and stop at 0 or ${N}. ${fair ? `With a fair coin P(win) = k/N = ${k}/${N}` : `With p = ${fmt(p, 2)}, r = q/p = ${fmt((1 - p) / p, 3)} and P(win) = (1 − r^${k}) / (1 − r^${N})`} = ${fmt(pt, 3)}. ` +
+				`The thick walk ${first.won === 1 ? "reached" : "was ruined at"} ${first.won === 1 ? N : 0} after ${first.pos.length - 1} steps.`;
+		}
+
+		pIn.addEventListener("input", draw);
+		kIn.addEventListener("input", draw);
+		fig.querySelector(".i-new")!.addEventListener("click", () => {
+			seed += 1;
+			draw();
+		});
+		draw();
+	}
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".qt-ruin")) attach(fig);
+</script>

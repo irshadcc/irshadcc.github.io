@@ -1,0 +1,179 @@
+---
+// Black–Scholes prices and Greeks against the stock price. Top: the option's value today
+// (solid), its value with a quarter of the time left (thin) and its payoff at expiry (dashed),
+// with the chosen spot marked. Bottom: one Greek (delta, gamma, vega per vol point or theta per
+// day) across the same range of spots. Sliders: spot, volatility, time to expiry and rate; hover
+// either plot to read values at that spot. Readouts include the at-the-money rule of thumb
+// C ≈ 0.4 σ √T S. Logic in quant.ts (blackScholes).
+// Usage in .mdx:
+//   <OptionGreeks K={100} sigma={0.2} T={1} r={0.05} kind="call" greek="delta" />
+import "../sampling/sampling.css";
+import "./quant.css";
+
+interface Props {
+	K?: number;
+	S?: number;
+	sigma?: number;
+	T?: number;
+	r?: number;
+	kind?: "call" | "put";
+	greek?: "delta" | "gamma" | "vega" | "theta";
+	title?: string;
+	caption?: string;
+}
+
+const {
+	K = 100,
+	S = 100,
+	sigma = 0.2,
+	T = 1,
+	r = 0.05,
+	kind = "call",
+	greek = "delta",
+	title,
+	caption,
+} = Astro.props;
+---
+
+<figure class="smp-fig qt-fig qt-greeks" data-k={K}>
+	{title && <div class="smp-title">{title}</div>}
+	<div class="smp-legend qt-legend">
+		<span><i class="k-p"></i>value today</span>
+		<span><i class="qt-k3"></i>value with ¼ of the time left</span>
+		<span><i class="k-qd"></i>payoff at expiry</span>
+	</div>
+	<svg class="smp-svg s-p" viewBox="0 0 640 200" role="img" aria-label="Option value against stock price"></svg>
+	<svg class="smp-svg s-g" viewBox="0 0 640 170" role="img" aria-label="Option Greek against stock price"></svg>
+	<p class="qt-readout"></p>
+	<div class="smp-controls">
+		<label>
+			<select class="i-kind" aria-label="Option type">
+				<option value="call" selected={kind === "call"}>call</option>
+				<option value="put" selected={kind === "put"}>put</option>
+			</select>
+		</label>
+		<label>Greek
+			<select class="i-greek" aria-label="Greek to plot">
+				<option value="delta" selected={greek === "delta"}>delta</option>
+				<option value="gamma" selected={greek === "gamma"}>gamma</option>
+				<option value="vega" selected={greek === "vega"}>vega (per vol point)</option>
+				<option value="theta" selected={greek === "theta"}>theta (per day)</option>
+			</select>
+		</label>
+		<label class="smp-slider">spot S = <strong class="v-s"></strong>
+			<input type="range" class="i-s" min={K * 0.5} max={K * 1.5} step={K / 200} value={S} aria-label="Stock price" />
+		</label>
+		<label class="smp-slider">σ = <strong class="v-sig"></strong>
+			<input type="range" class="i-sig" min="0.05" max="0.8" step="0.01" value={sigma} aria-label="Volatility" />
+		</label>
+		<label class="smp-slider">T = <strong class="v-t"></strong>
+			<input type="range" class="i-t" min="0.02" max="2" step="0.02" value={T} aria-label="Years to expiry" />
+		</label>
+		<label class="smp-slider">r = <strong class="v-r"></strong>
+			<input type="range" class="i-r" min="0" max="0.1" step="0.005" value={r} aria-label="Interest rate" />
+		</label>
+	</div>
+	<div class="smp-metrics">
+		<div><span>price</span><strong class="m-p"></strong></div>
+		<div><span>delta</span><strong class="m-d"></strong></div>
+		<div><span>gamma</span><strong class="m-g"></strong></div>
+		<div><span>vega (per vol pt)</span><strong class="m-v"></strong></div>
+		<div><span>theta (per day)</span><strong class="m-t"></strong></div>
+		<div><span>0.4 σ √T S (ATM rule)</span><strong class="m-atm"></strong></div>
+	</div>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import { axes, curve, el, fmt } from "../sampling/plot";
+	import { blackScholes, type Greeks, type OptionKind } from "./quant";
+
+	type GreekName = "delta" | "gamma" | "vega" | "theta";
+	const value = (g: Greeks, name: GreekName) => (name === "vega" ? g.vega / 100 : name === "theta" ? g.theta / 365 : g[name]);
+	const label: Record<GreekName, string> = { delta: "delta", gamma: "gamma", vega: "vega / vol pt", theta: "theta / day" };
+
+	function attach(fig: HTMLElement) {
+		const K = Number(fig.dataset.k);
+		const sp = fig.querySelector<SVGSVGElement>(".s-p")!;
+		const sg = fig.querySelector<SVGSVGElement>(".s-g")!;
+		const q = <T extends Element>(s: string) => fig.querySelector<T>(s)!;
+		const kindIn = q<HTMLSelectElement>(".i-kind");
+		const greekIn = q<HTMLSelectElement>(".i-greek");
+		const sIn = q<HTMLInputElement>(".i-s");
+		const sigIn = q<HTMLInputElement>(".i-sig");
+		const tIn = q<HTMLInputElement>(".i-t");
+		const rIn = q<HTMLInputElement>(".i-r");
+		const readout = q<HTMLElement>(".qt-readout");
+		const lo = K * 0.5;
+		const hi = K * 1.5;
+
+		function draw() {
+			const kind = kindIn.value as OptionKind;
+			const greek = greekIn.value as GreekName;
+			const S = Number(sIn.value);
+			const sigma = Number(sigIn.value);
+			const T = Number(tIn.value);
+			const r = Number(rIn.value);
+			const bs = (s: number, t = T) => blackScholes(s, K, t, r, sigma, kind);
+			const payoff = (s: number) => (kind === "call" ? Math.max(s - K, 0) : Math.max(K - s, 0));
+			const pmax = Math.max(bs(hi).price, bs(lo).price, payoff(hi), payoff(lo)) * 1.05;
+
+			sp.replaceChildren();
+			const P = axes(sp, { x: 50, y: 8, w: 574, h: 160 }, [lo, hi], [0, pmax], { xLabel: "stock price S", yLabel: "value", yTicks: 4 });
+			el("path", { d: curve(P, payoff), class: "smp-q-dash" }, sp);
+			el("path", { d: curve(P, (s) => bs(s, T / 4).price), class: "qt-l3" }, sp);
+			el("path", { d: curve(P, (s) => bs(s).price), class: "smp-p" }, sp);
+			el("line", { x1: P.sx(K), x2: P.sx(K), y1: P.box.y, y2: P.box.y + P.box.h, class: "smp-muted-line" }, sp);
+			el("text", { x: P.sx(K) + 4, y: P.box.y + 12, class: "smp-note" }, sp, "K");
+			el("circle", { cx: P.sx(S), cy: P.sy(bs(S).price), r: 4, class: "smp-current" }, sp);
+
+			const gv = Array.from({ length: 201 }, (_, i) => value(bs(lo + ((hi - lo) * i) / 200), greek));
+			let gmin = Math.min(0, ...gv);
+			let gmax = Math.max(0, ...gv);
+			const pad = (gmax - gmin) * 0.08 || 0.01;
+			gmin -= gmin < 0 ? pad : 0;
+			gmax += pad;
+			sg.replaceChildren();
+			const G = axes(sg, { x: 50, y: 8, w: 574, h: 128 }, [lo, hi], [gmin, gmax], { xLabel: "stock price S", yLabel: label[greek], yTicks: 4 });
+			if (gmin < 0) el("line", { x1: G.box.x, x2: G.box.x + G.box.w, y1: G.sy(0), y2: G.sy(0), class: "smp-muted-line" }, sg);
+			el("path", { d: curve(G, (s) => value(bs(s), greek)), class: "smp-p" }, sg);
+			el("path", { d: curve(G, (s) => value(bs(s, T / 4), greek)), class: "qt-l3" }, sg);
+			el("line", { x1: G.sx(K), x2: G.sx(K), y1: G.box.y, y2: G.box.y + G.box.h, class: "smp-muted-line" }, sg);
+			el("circle", { cx: G.sx(S), cy: G.sy(value(bs(S), greek)), r: 4, class: "smp-current" }, sg);
+
+			const g = bs(S);
+			q(".v-s").textContent = fmt(S, 1);
+			q(".v-sig").textContent = `${Math.round(sigma * 100)}%`;
+			q(".v-t").textContent = `${fmt(T, 2)} y`;
+			q(".v-r").textContent = `${fmt(r * 100, 1)}%`;
+			q(".m-p").textContent = fmt(g.price, 3);
+			q(".m-d").textContent = fmt(g.delta, 3);
+			q(".m-g").textContent = fmt(g.gamma, 4);
+			q(".m-v").textContent = fmt(g.vega / 100, 3);
+			q(".m-t").textContent = fmt(g.theta / 365, 4);
+			q(".m-atm").textContent = fmt(0.4 * sigma * Math.sqrt(T) * S, 3);
+			show(S);
+		}
+
+		function show(s: number) {
+			const kind = kindIn.value as OptionKind;
+			const g = blackScholes(s, K, Number(tIn.value), Number(rIn.value), Number(sigIn.value), kind);
+			readout.innerHTML = `At S = <strong>${fmt(s, 1)}</strong>: ${kind} = <strong>${fmt(g.price, 3)}</strong>, delta ${fmt(g.delta, 3)}, gamma ${fmt(g.gamma, 4)}, vega ${fmt(g.vega / 100, 3)} per vol point, theta ${fmt(g.theta / 365, 4)} per day (d₁ = ${fmt(g.d1, 3)}, d₂ = ${fmt(g.d2, 3)}).`;
+		}
+
+		for (const svg of [sp, sg]) {
+			svg.addEventListener("mousemove", (e) => {
+				const rect = svg.getBoundingClientRect();
+				const x = ((e.clientX - rect.left) / rect.width) * 640;
+				const s = lo + ((x - 50) / 574) * (hi - lo);
+				if (s >= lo && s <= hi) show(s);
+			});
+			svg.addEventListener("mouseleave", () => show(Number(sIn.value)));
+		}
+		for (const i of [kindIn, greekIn]) i.addEventListener("change", draw);
+		for (const i of [sIn, sigIn, tIn, rIn]) i.addEventListener("input", draw);
+		draw();
+	}
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".qt-greeks")) attach(fig);
+</script>

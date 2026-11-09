@@ -1,0 +1,215 @@
+---
+// Step-through option pricing on a Cox–Ross–Rubinstein binomial tree. Step 0 grows the stock
+// tree forward (u = e^{σ√Δt}, d = 1/u); step 1 writes the payoff at expiry; every further step
+// moves one level back, valuing each node as the discounted risk-neutral average
+// e^{−rΔt}(q V_up + (1 − q) V_down), and for an American option the larger of that and the
+// exercise value (red outline when exercising wins). Click or hover a node for its arithmetic.
+// Controls: number of steps, call / put, American, σ. Readouts compare the tree price with the
+// Black–Scholes price of the European option. Logic in quant.ts (binomialTree, blackScholes).
+// Usage in .mdx:
+//   <BinomialTreeSteps S={100} K={100} T={1} r={0.05} sigma={0.2} n={3} kind="put" american />
+import Player from "../sampling/Player.astro";
+import "../sampling/sampling.css";
+import "./quant.css";
+
+interface Props {
+	S?: number;
+	K?: number;
+	T?: number;
+	r?: number;
+	sigma?: number;
+	n?: number;
+	kind?: "call" | "put";
+	american?: boolean;
+	/** Stage shown first: 0 = stock tree only; n + 1 = fully priced. */
+	start?: number;
+	title?: string;
+	caption?: string;
+}
+
+const {
+	S = 100,
+	K = 100,
+	T = 1,
+	r = 0.05,
+	sigma = 0.2,
+	n = 3,
+	kind = "put",
+	american = false,
+	start = 0,
+	title,
+	caption,
+} = Astro.props;
+---
+
+<figure class="smp-fig qt-fig qt-tree" data-s={S} data-k={K} data-t={T} data-r={r} data-start={start}>
+	{title && <div class="smp-title">{title}</div>}
+	<div class="smp-legend qt-legend">
+		<span>each node: stock price (small) and option value (bold)</span>
+		<span><i class="k-p"></i>level just computed</span>
+		<span><i class="box qt-kearly"></i>American: exercise early</span>
+	</div>
+	<svg class="smp-svg" viewBox="0 0 640 300" role="img" aria-label="Binomial tree with stock prices and option values"></svg>
+	<p class="qt-readout"></p>
+	<div class="smp-controls">
+		<Player />
+		<label>steps
+			<select class="i-n" aria-label="Number of time steps">
+				{[1, 2, 3, 4, 5, 6].map((v) => <option value={v} selected={v === n}>{v}</option>)}
+			</select>
+		</label>
+		<label>
+			<select class="i-kind" aria-label="Option type">
+				<option value="call" selected={kind === "call"}>call</option>
+				<option value="put" selected={kind === "put"}>put</option>
+			</select>
+		</label>
+		<label><input type="checkbox" class="i-am" checked={american} /> American</label>
+		<label class="smp-slider">σ = <strong class="v-sig"></strong>
+			<input type="range" class="i-sig" min="0.05" max="0.6" step="0.01" value={sigma} aria-label="Volatility" />
+		</label>
+	</div>
+	<div class="smp-metrics">
+		<div><span>u, d</span><strong class="m-ud"></strong></div>
+		<div><span>risk-neutral q</span><strong class="m-q"></strong></div>
+		<div><span>tree price</span><strong class="m-tree"></strong></div>
+		<div><span>Black–Scholes (European)</span><strong class="m-bs"></strong></div>
+	</div>
+	<p class="smp-narration"></p>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+	import { bindPlayer, el, fmt } from "../sampling/plot";
+	import { binomialTree, blackScholes, type OptionKind, type TreeNode } from "./quant";
+
+	function attach(fig: HTMLElement) {
+		const S0 = Number(fig.dataset.s);
+		const K = Number(fig.dataset.k);
+		const T = Number(fig.dataset.t);
+		const r = Number(fig.dataset.r);
+		const svg = fig.querySelector("svg")!;
+		const nIn = fig.querySelector<HTMLSelectElement>(".i-n")!;
+		const kindIn = fig.querySelector<HTMLSelectElement>(".i-kind")!;
+		const amIn = fig.querySelector<HTMLInputElement>(".i-am")!;
+		const sigIn = fig.querySelector<HTMLInputElement>(".i-sig")!;
+		const readout = fig.querySelector<HTMLElement>(".qt-readout")!;
+		let stage = Number(fig.dataset.start) || 0;
+		let sel: [number, number] = [0, 0];
+
+		const params = () => ({
+			n: Number(nIn.value),
+			kind: kindIn.value as OptionKind,
+			american: amIn.checked,
+			sigma: Number(sigIn.value),
+		});
+
+		/** Node (i, j) has a value once the backward pass has reached its level. */
+		const known = (n: number, i: number) => stage >= 1 && i >= n - (stage - 1);
+
+		function explain(t: ReturnType<typeof binomialTree>, nd: TreeNode, n: number, kind: OptionKind, am: boolean) {
+			const pay = kind === "call" ? `max(S − K, 0) = max(${fmt(nd.S, 2)} − ${K}, 0)` : `max(K − S, 0) = max(${K} − ${fmt(nd.S, 2)}, 0)`;
+			if (!known(n, nd.i)) {
+				readout.innerHTML = `Node (step ${nd.i}, ${nd.j} up): S = S₀ u<sup>${nd.j}</sup> d<sup>${nd.i - nd.j}</sup> = <strong>${fmt(nd.S, 2)}</strong>. Its value is not computed yet.`;
+				return;
+			}
+			if (nd.i === n) {
+				readout.innerHTML = `Expiry node: payoff ${pay} = <strong>${fmt(nd.V, 3)}</strong>.`;
+				return;
+			}
+			const up = t.levels[nd.i + 1][nd.j + 1].V;
+			const dn = t.levels[nd.i + 1][nd.j].V;
+			let s = `Hold: e<sup>−rΔt</sup>(q·V<sub>up</sub> + (1 − q)·V<sub>down</sub>) = ${fmt(t.disc, 4)} × (${fmt(t.q, 4)} × ${fmt(up, 3)} + ${fmt(1 - t.q, 4)} × ${fmt(dn, 3)}) = <strong>${fmt(nd.hold, 3)}</strong>.`;
+			if (am) s += ` Exercise now: ${pay} = ${fmt(nd.exercise, 3)}. Value = max = <strong>${fmt(nd.V, 3)}</strong>${nd.early ? " (exercise early)" : ""}.`;
+			readout.innerHTML = s;
+		}
+
+		function draw() {
+			const { n, kind, american, sigma } = params();
+			stage = Math.min(stage, n + 1);
+			const t = binomialTree(S0, K, T, r, sigma, n, kind, american);
+			const W = 640;
+			const H = 300;
+			const bw = 76;
+			const bh = 34;
+			const mx = 12 + bw / 2;
+			const dx = n ? (W - 2 * mx) / n : 0;
+			const dy = (H - bh - 12) / (2 * Math.max(n, 1));
+			const pos = (i: number, j: number) => [mx + i * dx, H / 2 - (2 * j - i) * dy];
+			svg.replaceChildren();
+			const current = stage >= 1 ? n - (stage - 1) : -1;
+			for (let i = 0; i < n; i++) {
+				for (let j = 0; j <= i; j++) {
+					const [x, y] = pos(i, j);
+					for (const jj of [j, j + 1]) {
+						const [x2, y2] = pos(i + 1, jj);
+						el("line", { x1: x, y1: y, x2, y2, class: `qt-edge${i === current ? " live" : ""}` }, svg);
+					}
+				}
+			}
+			for (const level of t.levels) {
+				for (const nd of level) {
+					const [x, y] = pos(nd.i, nd.j);
+					const k = known(n, nd.i);
+					const cls = ["qt-nbox"];
+					if (k) cls.push("done");
+					if (nd.i === current) cls.push("now");
+					if (k && nd.early) cls.push("early");
+					if (sel[0] === nd.i && sel[1] === nd.j) cls.push("sel");
+					const box = el("rect", { x: x - bw / 2, y: y - bh / 2, width: bw, height: bh, rx: 4, class: cls.join(" "), tabindex: 0 }, svg);
+					el("text", { x, y: y - 4, class: "qt-ns", "text-anchor": "middle" }, svg, `S ${fmt(nd.S, 2)}`);
+					el("text", { x, y: y + 11, class: `qt-nv${k ? "" : " pending"}`, "text-anchor": "middle" }, svg, k ? fmt(nd.V, 3) : "?");
+					const pick = () => {
+						sel = [nd.i, nd.j];
+						for (const b of svg.querySelectorAll(".qt-nbox.sel")) b.classList.remove("sel");
+						box.classList.add("sel");
+						explain(t, nd, n, kind, american);
+					};
+					box.addEventListener("mouseenter", pick);
+					box.addEventListener("click", pick);
+					box.addEventListener("focus", pick);
+				}
+			}
+			const selNode = t.levels[Math.min(sel[0], n)]?.[Math.min(sel[1], sel[0])] ?? t.levels[0][0];
+			explain(t, selNode, n, kind, american);
+
+			const bs = blackScholes(S0, K, T, r, sigma, kind);
+			fig.querySelector(".v-sig")!.textContent = fmt(sigma, 2);
+			fig.querySelector(".m-ud")!.textContent = `${fmt(t.u, 4)}, ${fmt(t.d, 4)}`;
+			fig.querySelector(".m-q")!.textContent = fmt(t.q, 4);
+			fig.querySelector(".m-tree")!.textContent = stage === n + 1 ? fmt(t.levels[0][0].V, 4) : "…";
+			fig.querySelector(".m-bs")!.textContent = fmt(bs.price, 4);
+			const style = american ? "American" : "European";
+			fig.querySelector(".smp-narration")!.textContent =
+				stage === 0
+					? `Forward pass: from S₀ = ${S0} each step multiplies the price by u = ${fmt(t.u, 4)} or d = ${fmt(t.d, 4)} (Δt = ${fmt(t.dt, 3)} years). Step forward to price ${american ? "an" : "a"} ${style} ${kind} with strike ${K}.`
+					: stage === 1
+						? `At expiry the option is worth its payoff, ${kind === "call" ? "max(S − K, 0)" : "max(K − S, 0)"}.`
+						: stage < n + 1
+							? `Step ${current}: each node is the discounted average of its two children under q = ${fmt(t.q, 4)}${american ? ", or the exercise value if that is larger" : ""}.`
+							: `Done: the ${style} ${kind} is worth ${fmt(t.levels[0][0].V, 4)} on this ${n}-step tree; Black–Scholes gives ${fmt(bs.price, 4)} for the European option. More steps close the gap.`;
+		}
+
+		bindPlayer(
+			fig,
+			(dir) => {
+				const n = Number(nIn.value);
+				const s = stage + dir;
+				if (s < 0 || s > n + 1) return false;
+				stage = s;
+				draw();
+				return stage < n + 1;
+			},
+			() => {
+				stage = 0;
+				draw();
+			},
+			900,
+		);
+		for (const i of [nIn, kindIn, amIn]) i.addEventListener("change", draw);
+		sigIn.addEventListener("input", draw);
+		draw();
+	}
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".qt-tree")) attach(fig);
+</script>

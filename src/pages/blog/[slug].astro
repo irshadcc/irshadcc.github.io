@@ -15,6 +15,8 @@ const { post } = Astro.props;
 const { Content, headings } = await render(post);
 // Timeline navigation for posts with enough sections to need it; h4 and deeper are left out.
 const toc = headings.filter((h) => h.depth <= 3);
+// Posts tagged "Draft" were written with an LLM and carry a notice above the text.
+const isDraft = post.data.tags?.includes("Draft") ?? false;
 ---
 
 <Layout title={post.data.title} description={post.data.description} article={post.data}>
@@ -30,5 +32,15 @@ const toc = headings.filter((h) => h.depth <= 3);
 		)}
 	</p>
 	<PostTags tags={post.data.tags} />
+	{
+		isDraft && (
+			<blockquote class="llm-notice">
+				<p>
+					<strong>Disclaimer:</strong> this post was generated with an LLM. It may contain
+					errors, so check important details against the linked sources.
+				</p>
+			</blockquote>
+		)
+	}
 	<Content />
 </Layout>
