@@ -1,0 +1,3048 @@
+---
+title: "Hopper and Blackwell Kernels in 100 Questions"
+description: "One hundred questions with short answers and the reasoning behind them, from the CUDA execution model through PTX, clusters, mbarriers, TMA, WGMMA, CuTe layouts and CUTLASS to Blackwell's tcgen05 and Tensor Memory, followed by ten full kernel exercises with reference solutions."
+date: 2026-11-15
+tags: [CUDA, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import LayoutGrid from "../../component/LayoutGrid.astro";
+import PtxAnatomy from "../../utils/gpu/PtxAnatomy.astro";
+import MmaPartitionSteps from "../../utils/gpu/MmaPartitionSteps.astro";
+import TmemMap from "../../utils/gpu/TmemMap.astro";
+import UmmaPipeline from "../../utils/gpu/UmmaPipeline.astro";
+
+## Background
+
+On Ampere, a fast matrix-multiply kernel was mostly about threads: every thread computed
+addresses, issued its own copies and held its own piece of the result in registers. Hopper
+(sm_90) and datacenter Blackwell (sm_100) move that work into hardware. A **Tensor Memory
+Accelerator (TMA)** copies whole tiles from one instruction, an **mbarrier** in shared memory
+tracks when the bytes have landed, and the tensor core runs **asynchronously**: Hopper's `wgmma`
+is issued by a 128-thread warpgroup, Blackwell's `tcgen05.mma` by a single thread, with the
+accumulator moved out of registers into a new **Tensor Memory (TMEM)**.
+
+This matters because the new instructions are collective, asynchronous and unforgiving. A wrong
+byte count in an mbarrier hangs the kernel; a swizzle that the copy and the multiply disagree on
+gives a wrong product without any fault; a register the compiler has to move makes `ptxas`
+quietly serialise every MMA. Reading library code such as CUTLASS is the way to learn the
+patterns, and it is hard going without knowing what each piece is for.
+
+This post is a study guide in question-and-answer form. It has one hundred questions in eleven
+sections, ordered so that each builds on the last: the **execution model and toolchain**,
+**PTX**, **thread block clusters**, **mbarriers**, **TMA**, **Hopper WGMMA**, **CuTe layouts**,
+**CuTe tensors and atoms**, **CUTLASS on Hopper**, **Blackwell tcgen05 and TMEM**, and **porting
+and debugging**. Each question is tagged *Core*, *Intermediate* or *Advanced*; click "Answer" for
+a short answer, the reasoning behind it and, where it helps, a code fragment. Ten full kernel
+exercises with reference solutions follow. For longer treatments of single topics, see
+[PTX, NVIDIA's Virtual Instruction Set](/blog/ptx/),
+[Mathematical Foundations for CuTe Layouts](/blog/mathematical-foundations-cute-layout/),
+[Warp MMA and Warpgroup MMA in the CuTe DSL](/blog/cute-dsl-warp-and-warpgroup-mma/) and
+[Blackwell's tcgen05 MMA in the CuTe DSL](/blog/cute-dsl-tcgen05-mma/).
+
+## The two architectures at a glance
+
+Most questions below are a detail of one row in this table. Keep it in view while you study.
+
+| Concern | Hopper (sm_90a) | Datacenter Blackwell (sm_100a) |
+| --- | --- | --- |
+| Tensor Core instruction | `wgmma.mma_async`, issued by a 128-thread warpgroup | `tcgen05.mma`, issued by a single thread |
+| Accumulator lives in | Registers of the warpgroup | Tensor Memory (TMEM), 128 lanes by 512 columns per CTA |
+| Largest single MMA | M = 64, N up to 256 | M = 128 on one CTA, M = 256 across a CTA pair |
+| MMA completion | `wgmma.commit_group` and `wgmma.wait_group` | `tcgen05.commit` arrives on an mbarrier |
+| Global to shared copy | TMA: `cp.async.bulk.tensor` with mbarrier completion, optional cluster multicast | Same as Hopper |
+| Epilogue read-out | Accumulator already in registers | `tcgen05.ld` from TMEM to registers, in separate epilogue warps |
+| Persistent scheduling | Static tile scheduler, optional stream-K | Cluster Launch Control (dynamic, hardware assisted) |
+| New data types | FP8 (e4m3, e5m2) | FP4 and FP6, block-scaled MX and NV formats |
+
+Exact operand lists, descriptor bit fields and supported shapes change between PTX ISA versions.
+Treat the [PTX ISA manual](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html) as
+the authority and check any encoding against it before you rely on it.
+
+## 1. CUDA execution model and toolchain
+
+What a kernel author must know about threads, memory and build flags before touching any new instruction. Questions 1 to 10.
+
+#### Q1. What are a warp and a warpgroup, and why do Hopper and Blackwell kernels reason in those units instead of single threads?
+
+*Core*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** A warp is 32 threads that execute together in SIMT fashion. A warpgroup is 4 consecutive warps, 128 threads, and it is the unit that issues one `wgmma` on Hopper and that maps onto the 128 lanes of Tensor Memory on Blackwell.
+
+The new instructions are collective. `wgmma.mma_async` needs all 128 threads of a warpgroup to execute it together, and on Blackwell warp w of a warpgroup can only read TMEM lanes 32w to 32w+31. So thread block sizes are multiples of 128 and roles (load, math, epilogue) are assigned per warp or per warpgroup, using `threadIdx.x / 32` or `/ 128`.
+</details>
+
+#### Q2. What is the difference between compiling for `sm_90` and `sm_90a`?
+
+*Core*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** `sm_90a` enables architecture-specific instructions that are not promised to work on later GPUs. `wgmma` needs `sm_90a`. TMA, mbarrier and clusters are baseline `sm_90` features.
+
+Plain `sm_XX` targets are forward compatible. The `a` suffix means 'this exact architecture', so a binary built with it will not load on a different one. That is why CUTLASS builds with `-DCUTLASS_NVCC_ARCHS=90a` and why a Hopper WGMMA kernel does not run on Blackwell.
+
+```bash
+nvcc -arch=sm_90a -std=c++17 gemm.cu -o gemm
+nvcc -arch=sm_100a -std=c++17 gemm.cu -o gemm_bw
+```
+
+**Line by line.**
+
+- `nvcc -arch=sm_90a -std=c++17 gemm.cu -o gemm`: compiles `gemm.cu` for Hopper with the architecture-specific features switched on, so `wgmma` is legal. `-std=c++17` is the language level CUTLASS and CuTe require. The result is the executable `gemm`.
+- `nvcc -arch=sm_100a -std=c++17 gemm.cu -o gemm_bw`: the same source built for datacenter Blackwell, which makes `tcgen05` legal. It needs its own binary, because code built for an `a` target only loads on that exact architecture.
+</details>
+
+#### Q3. Blackwell targets come as `sm_100`, `sm_100a` and `sm_100f`. What does the `f` suffix add?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** `f` means family-specific: the feature works across a family of related architectures (for example sm_100 and sm_103), where `a` pins one architecture only.
+
+The tcgen05 instructions are listed for targets such as `sm_100a`, `sm_100f`, `sm_103a` and `sm_103f`. Building for `sm_100f` gives you tcgen05 while staying portable across the datacenter Blackwell family. Choose `a` only when you need a feature that exists on a single architecture.
+</details>
+
+#### Q4. Does every GPU branded Blackwell have tcgen05 and Tensor Memory?
+
+*Core*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** No. Datacenter Blackwell (sm_100 family) has them. Consumer Blackwell (sm_120) does not, and CUTLASS ships a separate set of SM120 kernels for it.
+
+The PTX manual also gives different shared memory limits: 228 KB for sm_100a-class targets and 100 KB for sm_120a. When you read 'Blackwell' in a tutorial, check which compute capability it means before copying a tile shape or a schedule.
+</details>
+
+#### Q5. How much shared memory can one thread block use on Hopper, and what must you do to get more than the default?
+
+*Core*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** About 227 KB per block (228 KB per SM). Anything above 48 KB must be requested with `cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes)`.
+
+High-performance GEMM kernels spend almost all of this on pipeline stages for A and B tiles, so a block typically owns a whole SM. That is a deliberate choice: the kernel overlaps work in time through asynchrony, not by packing several blocks on one SM.
+</details>
+
+#### Q6. A tuned Hopper GEMM runs one thread block per SM. Is low occupancy a problem?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** No. The goal is Tensor Core utilisation, not occupancy. One block keeps the Tensor Cores busy by overlapping copies, math and epilogue with asynchronous instructions.
+
+Classic CUDA hides latency by running many blocks per SM. Hopper-era kernels instead keep one block alive (a persistent kernel) and pipeline inside it: TMA fills buffers while WGMMA consumes earlier ones. The metric to watch is achieved TFLOPS against the Tensor Core peak for that data type.
+</details>
+
+#### Q7. What is a shared memory bank conflict, and how do modern kernels avoid it without padding?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** Shared memory has 32 banks of 4 bytes. Threads of one warp that hit the same bank at different addresses are serialised. Modern kernels avoid this with a swizzled layout, an XOR permutation of addresses that TMA writes and the Tensor Core reads.
+
+Padding wastes scarce shared memory and breaks the regular layout the MMA descriptors expect. Swizzling keeps the tile dense and only permutes where each 16-byte chunk sits within a row group. Because the copy side (TMA descriptor) and the math side (matrix descriptor) both name the same swizzle mode, neither needs explicit address math.
+</details>
+
+#### Q8. How do warp-specialized kernels move register budget from producer warps to consumer warps?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** With the PTX instruction `setmaxnreg`, which a whole warp executes to lower or raise its per-thread register limit. CUTLASS wraps it as `cutlass::arch::warpgroup_reg_dealloc<N>()` and `warpgroup_reg_alloc<N>()`.
+
+An SM has a fixed register file. A TMA producer needs very few registers, while a WGMMA consumer holds a large accumulator. In the CUTLASS ping-pong kernel producers drop to 40 registers and consumers rise to 232. The count must be a multiple of 8 within the range the PTX manual allows, and a raise can block until another warp has released registers.
+
+```cpp
+if (warp_group_role == WarpGroupRole::Producer) {
+  cutlass::arch::warpgroup_reg_dealloc<40>();
+} else {
+  cutlass::arch::warpgroup_reg_alloc<232>();
+}
+```
+
+**Line by line.**
+
+- `if (warp_group_role == WarpGroupRole::Producer) {`: the role is computed from `threadIdx.x / 128`, so all 128 threads of a warpgroup take the same branch. That matters because `setmaxnreg` is `.sync.aligned` and must not sit under divergent control flow.
+- `cutlass::arch::warpgroup_reg_dealloc<40>();`: emits `setmaxnreg.dec.sync.aligned.u32 40`. Each producer thread's register limit drops to 40 and the freed registers go back to the SM's pool.
+- `cutlass::arch::warpgroup_reg_alloc<232>();`: emits `setmaxnreg.inc.sync.aligned.u32 232` in the two consumer warpgroups, raising their limit to 232 for the large accumulator. It can block until the producer has released its registers.
+- The budget adds up: 128 threads × 40 + 256 threads × 232 = 5,120 + 59,392 = 64,512 registers, inside the 65,536 of one SM.
+</details>
+
+#### Q9. How do you write a PTX instruction directly inside CUDA C++?
+
+*Core*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** With GCC-style inline assembly: `asm volatile("ptx text" : outputs : inputs : clobbers);`. Operands are referenced as `%0`, `%1` and so on, with constraint letters such as `r` (32-bit register), `l` (64-bit register), `f` (float) and `n` (immediate).
+
+This is how CuTe implements every new instruction, so reading `include/cute/arch/*.hpp` is the fastest way to learn real PTX usage. The CCCL library also offers typed wrappers in `cuda::ptx` (for example `cuda::ptx::tcgen05_alloc`), which catch operand mistakes at compile time.
+
+```cpp
+template <int N>
+__device__ void warpgroup_wait() {
+  asm volatile("wgmma.wait_group.sync.aligned %0;\n" :: "n"(N) : "memory");
+}
+```
+
+**Line by line.**
+
+- `template <int N>`: the wait depth is a template parameter, because PTX needs it as an immediate constant, not a value in a register.
+- `__device__ void warpgroup_wait() {`: a function that runs on the GPU and is called from device code.
+- `asm volatile("wgmma.wait_group.sync.aligned %0;\n" :: "n"(N) : "memory");`: the string is the PTX instruction, and `%0` is replaced by the first operand. The empty slot before the first `::` means no outputs. `"n"(N)` passes `N` as an immediate. The `"memory"` clobber tells the compiler that memory may have changed, so it cannot keep cached values across the wait. `volatile` stops the compiler from deleting or moving the statement.
+</details>
+
+#### Q10. How do you confirm that your build really emitted the instructions you intended?
+
+*Core*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** Dump the PTX with `nvcc --ptx` (or `-keep`) and search for the mnemonic, then read the machine code with `cuobjdump -sass` if needed. Also read every `ptxas` warning.
+
+A kernel can compile and still be slow because the compiler fell back to a safe sequence. The best-known case is the ptxas warning that `wgmma.mma_async` instructions were serialized, which means your asynchronous pipeline has collapsed to one MMA at a time.
+
+```bash
+nvcc --ptx -arch=sm_90a gemm.cu -o gemm.ptx
+grep -c "wgmma.mma_async" gemm.ptx
+```
+
+**Line by line.**
+
+- `nvcc --ptx -arch=sm_90a gemm.cu -o gemm.ptx`: stops after the front end and writes the PTX as text to `gemm.ptx`, without running `ptxas`.
+- `grep -c "wgmma.mma_async" gemm.ptx`: counts the lines that contain the mnemonic. A count of 0 means the build never emitted WGMMA. Serialisation happens later, in `ptxas`, so also read the warnings from a full compile.
+</details>
+
+## 2. PTX fundamentals
+
+Reading and writing the instruction set that every abstraction below compiles to. Questions 11 to 18.
+
+#### Q11. Where does PTX sit in the compilation pipeline?
+
+*Core*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** CUDA C++ is compiled to NVVM IR, then to PTX, a virtual instruction set. `ptxas` (offline) or the driver (JIT) translates PTX to the GPU's native SASS.
+
+PTX is the lowest level you can author portably. Each module starts with `.version` and `.target` directives, and the target decides which instructions are legal. Features arrive in PTX ISA versions: WGMMA, TMA and mbarrier in the 8.0 line with Hopper, and tcgen05 in the 8.6 line with Blackwell.
+</details>
+
+#### Q12. Decode this instruction: `cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [dst], [tmap, {x, y}], [mbar];`
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** An asynchronous bulk copy of a 2-D tensor tile, from global memory to shared memory in the cluster address space, that reports completion by performing a complete-tx of the copied byte count on the mbarrier at `mbar`.
+
+PTX names read left to right as opcode then dot-separated qualifiers. Here `dst` is the shared memory destination, `tmap` is the address of the tensor map descriptor, `{x, y}` are tile coordinates in elements, and `mbar` is a shared memory address of an mbarrier. Learning to split the qualifiers this way makes the whole manual readable.
+</details>
+
+Hover or tap each part of the instruction to see what it says:
+
+<PtxAnatomy
+	title="A TMA tile load, read left to right"
+	parts={[
+		{ text: "cp.async.bulk.tensor", kind: "op", label: "opcode", note: "An asynchronous bulk copy of a tensor tile: the TMA instruction." },
+		{ text: ".2d", kind: "mod", label: "rank", note: "The tile is two-dimensional, so the coordinate list has two entries." },
+		{ text: ".shared::cluster", kind: "type", label: "destination space", note: "Shared memory, addressed in the cluster window. The block's own shared memory is valid in it too." },
+		{ text: ".global", kind: "type", label: "source space", note: "The tile is read from global memory." },
+		{ text: ".mbarrier::complete_tx::bytes", kind: "mod", label: "completion", note: "When the bytes land, perform a complete-tx of that byte count on the mbarrier operand." },
+		{ text: " [dst],", kind: "operand", label: "destination", note: "Shared memory address of the tile buffer (128-byte aligned)." },
+		{ text: " [tmap, {x, y}],", kind: "operand", label: "source", note: "Address of the tensor map descriptor plus the tile coordinates in elements, innermost first." },
+		{ text: " [mbar];", kind: "operand", label: "barrier", note: "Shared memory address of the mbarrier that receives the complete-tx." },
+	]}
+/>
+
+#### Q13. What are PTX state spaces, and what is the difference between `.shared::cta` and `.shared::cluster`?
+
+*Core*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** State spaces are storage classes such as `.reg`, `.global`, `.shared`, `.local`, `.param` and `.const`. `.shared::cta` addresses the executing block's own shared memory. `.shared::cluster` is a window that also covers the shared memory of the other blocks in the same cluster.
+
+An address in the block's own shared memory is valid in both spaces. To reach another block's memory you first translate the address with `mapa` and then use a `.shared::cluster` access. TMA multicast and remote mbarrier arrives both rely on this window.
+</details>
+
+#### Q14. Many new instructions carry `.sync.aligned`. What does each word require of you?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** `.sync` means the instruction is collective: it waits for all threads of the warp. `.aligned` means every thread in the warp (and for WGMMA the warpgroup) must execute the same instruction together, so it must not sit under divergent control flow.
+
+Putting an aligned instruction inside an `if (threadIdx.x == 0)` branch is undefined behaviour. Branch on warp or warpgroup index instead, so that whole warps take the same path. This is the most common mistake when hand-writing `wgmma`, `setmaxnreg` or `tcgen05.ld`.
+</details>
+
+#### Q15. Which special registers describe a thread's position in a cluster?
+
+*Core*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** `%cluster_ctaid` (block coordinate inside the cluster), `%cluster_nctaid` (cluster dimensions), `%cluster_ctarank` (linear rank of the block), `%cluster_nctarank` (number of blocks), plus `%clusterid`, `%nclusterid` and `%is_explicit_cluster`.
+
+These complement the familiar `%tid`, `%ntid`, `%ctaid` and `%nctaid`. CuTe exposes them as `cute::block_id_in_cluster()`, `cute::block_rank_in_cluster()` and `cute::cluster_shape()`. A kernel launched without a cluster behaves as an implicit 1x1x1 cluster.
+</details>
+
+#### Q16. What do `ldmatrix` and `stmatrix` do, and where does `stmatrix` appear in a Hopper GEMM?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** They are warp-level instructions that move 8x8 matrix fragments between shared memory and registers in the layout Tensor Cores use. `stmatrix` (new in sm_90) is used in the epilogue to store accumulator fragments to shared memory before a TMA store.
+
+On Ampere, `ldmatrix` loaded A and B fragments for `mma.sync`. On Hopper the operands come straight from shared memory through descriptors, so `ldmatrix` drops out of the main loop. The accumulator is still in registers, so the epilogue needs the reverse path, which `stmatrix` provides efficiently.
+</details>
+
+#### Q17. What is the async proxy, and when must you issue `fence.proxy.async`?
+
+*Advanced*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** Memory is accessed through proxies. Ordinary loads and stores use the generic proxy, while TMA uses the async proxy. When threads write shared memory normally and a TMA store will then read it, a `fence.proxy.async` is required in between.
+
+Without the fence the async engine may not observe the latest generic-proxy writes, and the output tile contains stale data. CuTe names this `tma_store_fence()`. The typical epilogue order is: write accumulators to shared memory, fence, synchronise the participating threads, then issue the TMA store from one thread.
+</details>
+
+#### Q18. Compare `cp.async` (Ampere), `cp.async.bulk` and `cp.async.bulk.tensor` (Hopper).
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** `cp.async` copies 4, 8 or 16 bytes per thread and is tracked with commit/wait groups. `cp.async.bulk` copies a contiguous byte range from one thread and signals an mbarrier. `cp.async.bulk.tensor` copies a multi-dimensional tile described by a tensor map and is what people mean by TMA.
+
+With `cp.async` every thread computes addresses and issues copies, which costs registers and instructions. The bulk forms hand the whole transfer to hardware. The 1-D bulk form needs 16-byte aligned addresses and a size that is a multiple of 16 bytes. The tensor form adds strides, bounds handling and swizzling.
+</details>
+
+## 3. Thread block clusters and distributed shared memory
+
+The level of hierarchy between a block and the grid, introduced with Hopper. Questions 19 to 25.
+
+#### Q19. What is a thread block cluster?
+
+*Core*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** A group of thread blocks that the GPU guarantees to schedule at the same time on neighbouring SMs, so they can synchronise and read or write each other's shared memory.
+
+A cluster holds at most 8 blocks on current hardware. It adds a level between block and grid, and it is the prerequisite for distributed shared memory, TMA multicast and Blackwell's two-CTA MMA.
+</details>
+
+#### Q20. How do you launch a kernel with a cluster shape?
+
+*Core*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** Either annotate the kernel with `__cluster_dims__(x, y, z)` at compile time, or launch with `cudaLaunchKernelEx` and a `cudaLaunchAttributeClusterDimension` attribute. The grid dimensions must be divisible by the cluster dimensions.
+
+The runtime form is what libraries use, because the best cluster shape depends on the problem. CUTLASS hides this behind `cutlass::launch_kernel_on_cluster` and the `ClusterShape` template argument.
+
+```cpp
+cudaLaunchConfig_t cfg = {};
+cfg.gridDim = grid; cfg.blockDim = block; cfg.dynamicSmemBytes = smem;
+cudaLaunchAttribute attr[1];
+attr[0].id = cudaLaunchAttributeClusterDimension;
+attr[0].val.clusterDim = {2, 1, 1};
+cfg.attrs = attr; cfg.numAttrs = 1;
+cudaLaunchKernelEx(&cfg, kernel, args...);
+```
+
+**Line by line.**
+
+- `cudaLaunchConfig_t cfg = {};`: a launch configuration with every field zeroed.
+- `cfg.gridDim = grid; cfg.blockDim = block; cfg.dynamicSmemBytes = smem;`: the same three values as `kernel<<<grid, block, smem>>>`.
+- `cudaLaunchAttribute attr[1];`: an array of extra launch attributes. Here there is one.
+- `attr[0].id = cudaLaunchAttributeClusterDimension;`: says that this attribute sets the cluster shape.
+- `attr[0].val.clusterDim = {2, 1, 1};`: two blocks along x per cluster, so `grid.x` must be even.
+- `cfg.attrs = attr; cfg.numAttrs = 1;`: attaches the attribute array to the configuration.
+- `cudaLaunchKernelEx(&cfg, kernel, args...);`: launches `kernel` with that configuration. The kernel arguments follow as ordinary arguments.
+</details>
+
+#### Q21. How does a block address another block's shared memory?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** It maps its own shared memory address to the peer's with `mapa.shared::cluster` (in C++, `cooperative_groups::cluster_group::map_shared_rank(ptr, rank)`), then accesses it with a `.shared::cluster` instruction.
+
+All blocks in a cluster have the same shared memory layout, so 'the same variable in block r' is a well-defined address. This is why an mbarrier in one block can be arrived on by a thread in another: the remote thread translates the barrier address with the target rank.
+</details>
+
+#### Q22. Why must blocks in a cluster synchronise before any of them exits?
+
+*Advanced*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** A block's shared memory is released when it exits. If a peer still has a pending remote write, TMA multicast or remote barrier arrive aimed at it, that access hits freed memory.
+
+Cluster kernels end with a cluster-wide barrier (`barrier.cluster.arrive` then `barrier.cluster.wait`, wrapped by `cute::cluster_arrive()` and `cute::cluster_wait()`), and often begin with one too so that every block has initialised its mbarriers before anyone uses them.
+</details>
+
+#### Q23. How do clusters reduce memory traffic in GEMM?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** Blocks in the same row of output tiles need the same A tile, and blocks in the same column need the same B tile. With a cluster, one TMA multicast load fetches a tile once and delivers it to every block that needs it.
+
+In a 2x2 cluster, four output tiles need only two distinct A tiles and two distinct B tiles per k-step, not four of each. The saving is in global memory and L2 traffic. The cost is extra synchronisation: each block's buffers are now filled by requests issued in other blocks.
+</details>
+
+#### Q24. What is a CTA pair on Blackwell, and what constraint does it put on the cluster shape?
+
+*Advanced*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** Two neighbouring blocks in a cluster that jointly execute one `tcgen05.mma` with `.cta_group::2`. In CUTLASS the first cluster dimension must be a multiple of 2 for 2-SM instructions.
+
+The MMA reads operands from the shared memory of both blocks and writes results into the Tensor Memory of both, giving an effective M of up to 256. One thread in one block of the pair issues the instruction. All `cta_group`-qualified tcgen05 instructions in a kernel must use the same group value, including alloc and dealloc.
+</details>
+
+#### Q25. Why not always use the largest cluster?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** A cluster can start only when enough SMs are free at once, so large clusters are harder to schedule and can leave SMs idle when the grid does not divide evenly.
+
+Bigger clusters save more loads through multicast but add scheduling friction and synchronisation fan-out. Shapes like 2x1 are common defaults. Recent CUTLASS SM100 kernels also support choosing the cluster shape at run time.
+</details>
+
+## 4. mbarrier and asynchronous synchronisation
+
+The one primitive that ties threads, TMA and Tensor Cores together. Questions 26 to 34.
+
+#### Q26. What is an mbarrier?
+
+*Core*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** A 64-bit object in shared memory that tracks a pending arrival count, a pending transaction (byte) count and a phase. A phase completes when both counts reach zero.
+
+Unlike `__syncthreads()`, it does not require every thread to take part, and hardware can arrive on it. That makes it the natural way to say 'this buffer is full' or 'this buffer is free' in a producer and consumer pipeline.
+</details>
+
+#### Q27. Walk through one phase of an mbarrier's life.
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** `mbarrier.init` sets the expected arrival count. Threads call `mbarrier.arrive` and hardware performs `complete_tx`. When pending arrivals and pending bytes are both zero the phase completes, the barrier re-arms itself with the same count, and the phase bit flips.
+
+Because it re-arms automatically, one barrier can guard the same buffer for the whole kernel. Waiters distinguish 'this round' from 'the previous round' only by the phase parity they pass in, which is why tracking parity correctly matters so much.
+
+```ptx
+mbarrier.init.shared::cta.b64 [bar], 1;
+mbarrier.arrive.expect_tx.shared::cta.b64 state, [bar], nbytes;
+cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [dst], [tmap, {x, y}], [bar];
+mbarrier.try_wait.parity.shared::cta.b64 done, [bar], parity;
+```
+
+**Line by line.**
+
+- `mbarrier.init.shared::cta.b64 [bar], 1;`: initialises the 64-bit barrier at shared address `bar` with an expected arrival count of 1, in phase 0.
+- `mbarrier.arrive.expect_tx.shared::cta.b64 state, [bar], nbytes;`: first adds `nbytes` to the pending transaction count, then arrives once, so the pending arrivals drop to 0. The phase cannot complete yet, because the bytes are still pending. `state` receives an opaque token for the phase.
+- `cp.async.bulk.tensor.2d...[dst], [tmap, {x, y}], [bar];`: TMA copies the tile at coordinates (x, y) into `dst`. As the bytes land it performs `complete_tx` on `bar`. When the pending byte count reaches 0, the phase completes.
+- `mbarrier.try_wait.parity.shared::cta.b64 done, [bar], parity;`: sets the predicate `done` if the phase with this parity (0 the first time) has completed. Waiters loop until `done` is true, then flip `parity` for the buffer's next use.
+</details>
+
+#### Q28. What are `expect_tx` and `complete_tx`, and why must the expectation be set before the copy is issued?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** `expect_tx` adds a number of bytes to the barrier's pending transaction count. Each asynchronous copy later subtracts the bytes it delivered with `complete_tx`. If the copy finishes before the expectation is registered, the phase can complete early or the counts go wrong.
+
+The usual form is the fused `mbarrier.arrive.expect_tx`, executed by the producer thread right before it issues the TMA copies for that stage. The byte count must equal exactly what the TMA will deliver to this block for that barrier, including tiles delivered by multicast from other blocks.
+</details>
+
+#### Q29. What is the difference between `mbarrier.test_wait` and `mbarrier.try_wait`?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** Both return a predicate saying whether the phase with the given parity has completed. `test_wait` returns immediately. `try_wait` may block for an implementation-defined time first, so it is the one to use in a wait loop.
+
+A wait is written as `do { try_wait } while (!done)`. CUTLASS pipelines expose a two-step form: `consumer_try_wait` returns a token after one attempt, and `consumer_wait(state, token)` loops only if the token says the barrier was not ready.
+</details>
+
+#### Q30. What goes wrong if a waiter passes the wrong phase parity?
+
+*Advanced*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** It either returns immediately, because that parity refers to a phase that already completed, and reads a buffer that is still being filled, or it waits for a phase that will not come and the kernel hangs.
+
+A buffer's barrier flips phase each time the buffer is reused. With S stages, the phase for a stage flips once every S iterations. CUTLASS `PipelineState` stores the stage index, the phase bit and a count, and flips the phase when the index wraps to zero. Hand-written loops must do the same.
+</details>
+
+#### Q31. How does `cutlass::PipelineTmaAsync` use barriers to manage a ring of buffers?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** Each stage has two mbarriers: a full barrier that TMA completes when data has landed, and an empty barrier that consumers arrive on when they are finished with the stage.
+
+The producer calls `producer_acquire` (wait on empty, then arrive with expect_tx on full), issues TMA copies against `producer_get_barrier`, and advances. The consumer calls `consumer_wait` on full, does the math, then `consumer_release` to arrive on empty. `producer_commit` does nothing here because the TMA hardware performs the completion itself.
+
+```cpp
+// producer warp
+pipeline.producer_acquire(prod_state);
+auto* bar = pipeline.producer_get_barrier(prod_state);
+copy(tma_a.with(*bar, mcast_mask_a), tAgA(_,k), tAsA(_,prod_state.index()));
+copy(tma_b.with(*bar, mcast_mask_b), tBgB(_,k), tBsB(_,prod_state.index()));
+++prod_state;
+
+// consumer warpgroup
+auto token = pipeline.consumer_try_wait(cons_state);
+pipeline.consumer_wait(cons_state, token);
+// ... wgmma on stage cons_state.index() ...
+pipeline.consumer_release(cons_state);
+++cons_state;
+```
+
+**Line by line.**
+
+- `pipeline.producer_acquire(prod_state);`: waits on the empty barrier of stage `prod_state.index()` until consumers have released it, then arms that stage's full barrier with `arrive.expect_tx` for the stage's byte count.
+- `auto* bar = pipeline.producer_get_barrier(prod_state);`: a pointer to the full barrier of that stage.
+- `copy(tma_a.with(*bar, mcast_mask_a), tAgA(_,k), tAsA(_,prod_state.index()));`: a TMA load of the k-th A tile into the stage's slot. `.with` attaches the barrier that gets the `complete_tx` and the multicast mask of receiving blocks.
+- `copy(tma_b.with(*bar, mcast_mask_b), tBgB(_,k), tBsB(_,prod_state.index()));`: the same for B, on the same barrier. The expected byte count covers both tiles.
+- `++prod_state;`: advances to the next stage. When the index wraps to 0 the phase bit flips.
+- `auto token = pipeline.consumer_try_wait(cons_state);`: a single `try_wait` on the stage's full barrier. The token records whether the data was already there.
+- `pipeline.consumer_wait(cons_state, token);`: returns at once if the token says ready, and loops otherwise.
+- `// ... wgmma on stage cons_state.index() ...`: the math reads A and B from that stage's buffers.
+- `pipeline.consumer_release(cons_state);`: arrives on the stage's empty barrier (in every block that multicasts into it), so the producer may refill it. On Hopper, do this only once the WGMMAs that read the stage have been waited on.
+- `++cons_state;`: advances the consumer's stage index and phase.
+</details>
+
+#### Q32. With TMA multicast in a cluster, why does releasing a buffer involve arriving on barriers in other blocks?
+
+*Advanced*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** The buffer in block Y is refilled by producers in other blocks of the same cluster row and column. Those producers wait on their own empty barriers, so Y's consumers must arrive on the empty barriers of every block that will write into Y.
+
+This is a remote `mbarrier.arrive.shared::cluster` on a translated address. The empty barrier's expected arrival count therefore includes consumers from several blocks. Getting this count wrong is a classic source of deadlock when changing the cluster shape of a hand-written kernel.
+</details>
+
+#### Q33. What must happen between initialising mbarriers and the first use by other threads or by TMA?
+
+*Advanced*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** The initialisation must be made visible: a fence for barrier initialisation followed by a block-wide or cluster-wide sync.
+
+CUTLASS has one thread initialise all barriers, calls `cutlass::arch::fence_barrier_init()` (PTX `fence.mbarrier_init.release.cluster`), and then syncs. Skipping the sync lets another warp or a peer block arrive on a barrier that has not been initialised yet, which corrupts its state.
+</details>
+
+#### Q34. What limits the counts an mbarrier can hold?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** The arrival count is limited to $2^\{20\} - 1$. The transaction count is a byte count with its own range defined in the PTX manual.
+
+In practice arrival counts are tiny (one producer thread, or the number of consumer warps or threads). The limit matters only if you arrive per thread across a large cluster. Prefer one arrival per warp or per warpgroup so counts stay small and easy to reason about.
+</details>
+
+## 5. Tensor Memory Accelerator
+
+Hardware-driven tile copies between global and shared memory. Questions 35 to 44.
+
+#### Q35. What does TMA do, and what does it save compared with per-thread copies?
+
+*Core*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** One thread issues one instruction naming a tile by coordinates. A hardware engine computes all addresses and moves the data asynchronously between global and shared memory.
+
+It removes address arithmetic, per-thread copy instructions and the registers they need. That lets a single producer warp feed two consumer warpgroups, and it is what makes warp specialisation pay off on Hopper.
+</details>
+
+#### Q36. What is a tensor map descriptor and where is it created?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** A 128-byte `CUtensorMap` created on the host with `cuTensorMapEncodeTiled` (or the im2col variant). It records the base pointer, element type, rank, global dimensions and strides, the box (tile) dimensions, element strides, swizzle mode, L2 promotion and out-of-bounds fill.
+
+The kernel receives the descriptor and only supplies tile coordinates at run time. Tensors of rank 1 to 5 are supported. Since everything about the layout is fixed in the descriptor, a wrong stride or box size shows up as silently wrong data, so validate descriptors on a tiny problem first.
+</details>
+
+#### Q37. A tile hangs past the edge of the matrix. What does TMA do?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** On load, elements outside the global tensor are filled with zero (or NaN, if the descriptor asks for it). On store, out-of-bounds elements are not written.
+
+This removes remainder handling from the kernel: edge tiles run the same code as interior tiles. Zero fill is exactly what GEMM needs, since zeros contribute nothing to the accumulation.
+</details>
+
+#### Q38. What swizzle modes can a tensor map use, and what must they agree with?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** None, 32-byte, 64-byte and 128-byte. The mode must match the shared memory layout that the MMA's matrix descriptor declares.
+
+TMA writes the tile already swizzled, and WGMMA or tcgen05 reads it assuming the same pattern. A mismatch does not fault. It produces a wrong product. In swizzled modes the innermost box dimension in bytes also may not exceed the swizzle width, which is why K-major half-precision tiles use 64 elements per swizzle row at 128 bytes.
+</details>
+
+#### Q39. How do you set up and use a TMA load in CuTe?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** On the host, call `make_tma_atom(SM90_TMA_LOAD{}, gmem_tensor, smem_layout, tile_shape)`. In the kernel, get a coordinate tensor with `tma.get_tma_tensor(shape)`, tile it like any tensor, split it with `tma_partition`, and call `copy(tma.with(mbarrier), src, dst)` from one thread.
+
+The object carries the descriptor. The 'global tensor' in the kernel holds coordinates, not data, so `local_tile` and slicing select which tile to fetch. `tma_partition` returns the global and shared views, and its multicast arguments decide which slice this CTA loads. This two-step host and device pattern differs from `TiledCopy`, where everything is built in the kernel.
+
+```cpp
+// host
+Copy_Atom tma_a = make_tma_atom(SM90_TMA_LOAD{}, mA, sA(_,_,0), make_shape(bM,bK));
+// device
+Tensor mA = tma_a.get_tma_tensor(make_shape(M,K));
+Tensor gA = local_tile(mA, cta_tiler, cta_coord, Step<_1, X,_1>{});   // (BLK_M,BLK_K,k)
+auto [tAgA, tAsA] = tma_partition(tma_a, Int<0>{}, Layout<_1>{},      // no multicast
+                                  group_modes<0,2>(sA), group_modes<0,2>(gA));
+if (elect_one) copy(tma_a.with(mbar), tAgA(_,k), tAsA(_,stage));
+```
+
+**Line by line.**
+
+- `Copy_Atom tma_a = make_tma_atom(SM90_TMA_LOAD{}, mA, sA(_,_,0), make_shape(bM,bK));`: runs on the host. It builds a TMA copy atom whose tensor map comes from the global tensor `mA` (pointer, shape, strides). One stage of the shared memory layout, `sA(_,_,0)`, supplies the swizzle, and the box is `bM` × `bK`.
+- `Tensor mA = tma_a.get_tma_tensor(make_shape(M,K));`: runs on the device. It gives an M × K tensor whose elements are coordinates (m, k), not data. TMA only needs coordinates.
+- `Tensor gA = local_tile(mA, cta_tiler, cta_coord, Step<_1, X,_1>{});`: cuts out this CTA's row of tiles. `Step<_1, X, _1>` drops the N mode of the (M, N, K) tiler. The result has shape (BLK_M, BLK_K, k), with k running over the K tiles.
+- `auto [tAgA, tAsA] = tma_partition(tma_a, Int<0>{}, Layout<_1>{}, group_modes<0,2>(sA), group_modes<0,2>(gA));`: `Int<0>{}` is this CTA's position in the multicast group, and `Layout<_1>{}` is a group of one, so no multicast. `group_modes<0,2>` merges the two tile modes so a whole tile is one TMA unit. It returns the global view (TMA, k) and the shared view (TMA, stage).
+- `if (elect_one) copy(tma_a.with(mbar), tAgA(_,k), tAsA(_,stage));`: one thread issues the copy of tile k into buffer `stage`, completing on `mbar`.
+</details>
+
+#### Q40. How does a multicast load choose its destinations and report completion?
+
+*Advanced*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** The `.multicast::cluster` form takes a 16-bit mask with one bit per block rank. The tile is written at the same shared memory offset in every selected block, and each selected block's mbarrier at the same offset receives the `complete_tx`.
+
+Every receiving block must already have registered the right `expect_tx` on its own barrier. CUTLASS splits each tile so that every block in a row or column loads a slice and multicasts it to the others, which spreads the issue cost and keeps all blocks symmetric.
+</details>
+
+#### Q41. How is a TMA store tracked, given that there is no mbarrier operand?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** Stores use the `.bulk_group` completion mechanism: `cp.async.bulk.commit_group` then `cp.async.bulk.wait_group N`. In CuTe these are `tma_store_arrive()` and `tma_store_wait<N>()`.
+
+The source shared memory must stay untouched until the store completes, so a kernel either waits before reusing that buffer or rotates between several epilogue buffers. Remember the `fence.proxy.async` before issuing the store.
+</details>
+
+#### Q42. What does `cp.reduce.async.bulk.tensor` add over a plain store?
+
+*Advanced*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** It combines the shared memory tile into global memory with a reduction such as add, min, max, and, or, xor, instead of overwriting.
+
+This is useful when several blocks contribute partial results to the same output tile, as in split-K style decompositions, because the accumulation happens atomically in the copy engine with no separate reduction kernel.
+</details>
+
+#### Q43. What alignment does TMA require of shared memory buffers?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** Tensor (tile) copies need the shared memory address aligned to 128 bytes. The 1-D bulk form needs 16-byte alignment and a size that is a multiple of 16 bytes.
+
+Violations are not always diagnosed and can corrupt data. Declare pipeline buffers with `alignas(128)` in the shared storage struct, as CUTLASS collectives do, and keep each stage's size a multiple of the alignment.
+</details>
+
+#### Q44. Besides tiled loads, what other TMA modes exist?
+
+*Advanced*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** An im2col mode that gathers convolution windows directly from an NHWC-style tensor, and prefetch forms (`cp.async.bulk.prefetch.tensor`) that warm the cache without writing shared memory. Newer PTX versions add further variants.
+
+Im2col lets convolution reuse the GEMM main loop without materialising the unfolded matrix. Check the PTX manual for which modes your target supports, since the list has grown with each ISA release.
+</details>
+
+## 6. Hopper WGMMA
+
+The warpgroup-level asynchronous Tensor Core instruction. Questions 45 to 54.
+
+#### Q45. What does one `wgmma.mma_async` compute, and what shapes does it support?
+
+*Core*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** D = A x B + D for a tile with M = 64, N from 8 to 256 in steps of 8, and a K that depends on type: 8 for TF32, 16 for FP16 and BF16, 32 for FP8 and INT8.
+
+The shape is part of the mnemonic, for example `m64n128k16`. A full CTA tile such as 128x128x64 is built from several instructions: two warpgroups each cover M = 64, and four k-blocks of 16 cover K = 64.
+</details>
+
+The step-through below partitions a $128 \times 256$ C tile for two warpgroups running
+`m64n256k16`, the "two warpgroups each cover M = 64" case from the answer. Follow thread 0 down to
+the accumulator values it holds; note that each warp of a warpgroup owns 16 of the 64 rows.
+
+<MmaPartitionSteps preset="wgmma-C" thread={0} caption="From mC to thread 0's accumulator for wgmma m64n256k16 with two warpgroups stacked along M." />
+
+#### Q46. Where do the three operands of WGMMA live?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** B is always read from shared memory through a descriptor. A comes either from shared memory through a descriptor or from registers. The accumulator D is always in registers.
+
+Reading A and B straight from shared memory removes the `ldmatrix` step and its registers. The register form of A exists for cases such as attention, where the result of one product feeds the next. With A in registers only B can be transposed.
+</details>
+
+#### Q47. What is a WGMMA matrix descriptor?
+
+*Advanced*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** A 64-bit value that tells the Tensor Core where a shared memory operand starts and how it is laid out: the start address, a leading-dimension byte offset, a stride-dimension byte offset, a base offset and the swizzle mode.
+
+Addresses and offsets are stored in units of 16 bytes. You rarely build one by hand: in CuTe, `thr_mma.make_fragment_A(tCsA)` on a WGMMA atom returns a tensor of descriptors, computed from the swizzled shared memory layout. Consult the PTX manual for the exact bit positions.
+</details>
+
+#### Q48. What is the correct instruction sequence around WGMMA?
+
+*Core*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** `wgmma.fence`, then one or more `wgmma.mma_async`, then `wgmma.commit_group`, and later `wgmma.wait_group N`, which blocks until at most N committed groups are still running.
+
+Commit does not wait. It only closes the batch. That is what lets the warpgroup prepare the next step while the Tensor Cores work. `wait_group 0` drains everything and is required before the epilogue reads the accumulator.
+
+```cpp
+warpgroup_fence_operand(tCrC);
+warpgroup_arrive();                      // wgmma.fence
+for (int k = 0; k < size<2>(tCrA); ++k)
+  cute::gemm(tiled_mma, tCrA(_,_,k,stage), tCrB(_,_,k,stage), tCrC);
+warpgroup_commit_batch();                // wgmma.commit_group
+warpgroup_wait<0>();                     // wgmma.wait_group 0
+warpgroup_fence_operand(tCrC);
+```
+
+**Line by line.**
+
+- `warpgroup_fence_operand(tCrC);`: a compiler fence, not an instruction. Each accumulator register goes through an empty `asm` with a read-write constraint, so the compiler cannot move accesses to it across this point.
+- `warpgroup_arrive();`: emits `wgmma.fence.sync.aligned`, which orders earlier register writes (such as zeroing the accumulator) before the MMAs that follow.
+- `for (int k = 0; k < size<2>(tCrA); ++k)`: loops over the k-blocks inside one stage. Mode 2 of `tCrA` counts them, for example 4 for a K tile of 64 with `k16` instructions.
+- `cute::gemm(tiled_mma, tCrA(_,_,k,stage), tCrB(_,_,k,stage), tCrC);`: issues the `wgmma.mma_async` instructions for k-block `k`. A and B are descriptor tensors pointing into shared memory buffer `stage`.
+- `warpgroup_commit_batch();`: emits `wgmma.commit_group`, which closes the batch without waiting.
+- `warpgroup_wait<0>();`: emits `wgmma.wait_group 0`, which blocks until no committed group is still running.
+- `warpgroup_fence_operand(tCrC);`: the compiler fence again, so no read of the accumulator is hoisted above the wait.
+</details>
+
+#### Q49. What exactly does `wgmma.fence` order?
+
+*Advanced*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** It orders earlier accesses to warpgroup registers before later accesses to the same registers by `wgmma.mma_async`.
+
+It is needed whenever normal code has written registers that an MMA will read or accumulate into, such as zeroing the accumulator or producing A in registers. Consecutive MMAs of the same shape that accumulate into the same registers are ordered automatically and need no fence between them.
+</details>
+
+#### Q50. What may you not do with the accumulator while a WGMMA group is in flight, and what does the compiler do if you make that hard?
+
+*Advanced*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** You may not read or write the accumulator registers (or register A fragments) until a `wait_group` covering that MMA returns. If ptxas cannot keep those registers in place, it serializes the MMAs and warns about a potential performance loss.
+
+Serialisation inserts a fence, commit and wait around every single MMA. Typical causes are accumulator registers being moved or spilled, non-inlined calls in the main loop, or accumulators that differ between MMAs in a group. Treat that warning as a bug to fix, not noise.
+</details>
+
+#### Q51. What do K-major and MN-major mean for a shared memory operand?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** They say which dimension is contiguous in memory. K-major means the K dimension is the fast one. MN-major means M (for A) or N (for B) is.
+
+FP16 and BF16 support both, which is how all four TN, NT, NN, TT combinations work without copying. FP8 and INT8 are K-major only on Hopper. In CUTLASS terms, 'TN' (row-major A, column-major B) gives K-major for both operands.
+</details>
+
+#### Q52. How does a kernel avoid zero-filling the accumulator before the first k-iteration?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** The instruction has a scale-D flag. With it cleared the MMA computes D = A x B and ignores the old D. CuTe exposes this as `tiled_mma.accumulate_ = GMMA::ScaleOut::Zero`, switched to `One` after the first MMA.
+
+Zeroing a large accumulator costs instructions and forces an extra fence. Using the flag makes the first MMA overwrite and all later ones accumulate. Blackwell's `tcgen05.mma` has the equivalent `enable_input_d` operand.
+</details>
+
+#### Q53. Decode the CuTe atom name `SM90_64x128x16_F32F16F16_SS<GMMA::Major::K, GMMA::Major::K>`.
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** A Hopper WGMMA with M=64, N=128, K=16, FP32 accumulator, FP16 A and B, both operands sourced from shared memory (SS), both K-major.
+
+The suffix `RS` means A comes from registers. The name maps directly onto the PTX mnemonic `wgmma.mma_async.sync.aligned.m64n128k16.f32.f16.f16`, which is the point of the convention: you can read the instruction off the type.
+</details>
+
+#### Q54. How do you build a shared memory layout that WGMMA accepts?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** Tile a predefined swizzled atom up to the buffer shape, for example `tile_to_shape(GMMA::Layout_K_SW128_Atom<T>{}, make_shape(bM, bK, stages))`.
+
+The atoms encode the canonical layouts from the PTX manual. Pick the widest swizzle whose row size divides the major dimension: 128-byte, then 64, then 32. For half precision and K-major, the 128-byte atom spans 64 elements along K.
+</details>
+
+## 7. CuTe layouts and the layout algebra
+
+The core abstraction: a function from coordinates to offsets, and the operations that combine such functions. Questions 55 to 66.
+
+#### Q55. What is a CuTe `Layout`?
+
+*Core*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** A pair Shape:Stride that defines a function from a multi-dimensional coordinate to an integer offset: the inner product of the coordinate with the strides.
+
+Layouts describe both data (where element (i, j) lives) and threads (which thread owns which element). Because they are just functions on integers, the same algebra tiles matrices, partitions work across threads and describes instruction operand formats.
+
+```cpp
+auto L = make_layout(make_shape(4, 8), make_stride(1, 4));
+print(L);          // (4,8):(1,4)   column-major 4x8
+print(L(2, 3));    // 2*1 + 3*4 = 14
+```
+
+**Line by line.**
+
+- `auto L = make_layout(make_shape(4, 8), make_stride(1, 4));`: a 4 × 8 layout. Moving one row adds 1 to the offset and moving one column adds 4.
+- `print(L);`: prints `(4,8):(1,4)`, the shape followed by the stride. This is column-major.
+- `print(L(2, 3));`: evaluates the layout at row 2, column 3: 2 × 1 + 3 × 4 = 14.
+</details>
+
+#### Q56. Write the layouts for a 4x8 matrix stored column-major and row-major.
+
+*Core*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** Column-major is `(4,8):(1,4)`. Row-major is `(4,8):(8,1)`.
+
+In column-major, stepping the row index moves 1 and stepping the column moves a whole column of 4. In row-major, stepping the row moves a whole row of 8. `make_layout(shape)` with no strides gives column-major, CuTe's default.
+</details>
+
+Each cell below shows the offset that the layout gives to coordinate (row, column). In the
+column-major grid the numbers run down the columns; in the row-major grid they run along the rows.
+
+<LayoutGrid name="column-major" shape={[4, 8]} stride={[1, 4]} />
+
+<LayoutGrid name="row-major" shape={[4, 8]} stride={[8, 1]} />
+
+#### Q57. What does the layout `(2,3):(3,1)` return for the single integer index 3?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** 4. The integer 3 is first converted to the coordinate (1,1), then mapped to 1x3 + 1x1 = 4.
+
+Any layout also accepts a 1-D index. CuTe converts it to a natural coordinate colexicographically, leftmost mode fastest: index i becomes (i mod 2, i div 2). This convention is why every layout can be treated as a function on a single integer, which the algebra relies on.
+</details>
+
+#### Q58. What are hierarchical (nested) shapes for?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** A mode can itself be a tuple, as in `((2,2),8):((1,4),16)`. Nesting groups related modes, so a layout can keep 'tile' and 'rest' or 'thread' and 'value' as separate addressable units.
+
+Nested layouts accept coordinates at several granularities: a full nested coordinate, one integer per top-level mode, or a single integer. Divide operations produce nested results precisely so you can slice the tile mode and the remainder mode independently.
+</details>
+
+#### Q59. Why does CuTe distinguish `_8{}` (or `Int<8>`) from a plain `int` 8?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** The first is a static integer whose value is in the type. Layouts built from static integers are computed entirely at compile time and can be checked with `static_assert`.
+
+Tile shapes, atom layouts and swizzles are static, so the compiler folds all the layout arithmetic into constants. Problem sizes are dynamic. Mixing is allowed, for example `Shape<_128, _128, int>`. Accidentally making a tile dimension dynamic costs performance and can break instruction selection.
+</details>
+
+#### Q60. What does `coalesce` do? Give an example.
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** It simplifies a layout without changing it as a function of the 1-D index. `coalesce((2,(1,6)):(1,(6,2)))` is `12:1`.
+
+It removes size-1 modes and merges neighbouring modes when the next stride equals the previous size times stride. Here 2:1 and 6:2 merge because 2x1 = 2. Coalescing is used inside composition and when choosing vectorised copies, since a contiguous run is easier to recognise once merged.
+</details>
+
+#### Q61. What is `composition(A, B)`? Work the example A = `(6,2):(8,2)`, B = `(4,3):(3,1)`.
+
+*Advanced*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** It is the layout R with R(c) = A(B(c)). The result is `((2,2),3):((24,2),8)`.
+
+B's outputs are fed to A as 1-D indices. Along B's second mode, A(0), A(1), A(2) = 0, 8, 16, giving 3:8. Along the first mode, B yields 0, 3, 6, 9 and A maps them to 0, 24, 2, 26, which is (2,2):(24,2). Composition is how you select or reorder elements of a layout, and it underlies every divide.
+</details>
+
+#### Q62. What is `complement(A, M)`? Give two examples.
+
+*Advanced*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** A layout that reaches the offsets A does not, so that A together with its complement covers 0 to M-1 in order. `complement(4:2, 24)` is `(2,3):(1,8)` and `complement(6:4, 24)` is `4:1`.
+
+For 4:2, A touches 0, 2, 4, 6. The mode 2:1 fills the gaps left by stride 2, and 3:8 repeats the whole 8-wide block three times to reach 24. The complement is 'the layout of the repetition', which is exactly what tiling needs.
+</details>
+
+#### Q63. How is `logical_divide(A, B)` defined, and what is `logical_divide(16:3, 4:1)`?
+
+*Advanced*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** It is `composition(A, make_layout(B, complement(B, size(A))))`. The example gives `(4,4):(3,12)`.
+
+The complement of 4:1 in 16 is 4:4, so the concatenated layout is (4,4):(1,4). Composing with 16:3 scales the strides to 3 and 12. The first mode is 'position inside a tile' and the second is 'which tile'. That is tiling expressed as one composition.
+</details>
+
+#### Q64. How do `logical_divide`, `zipped_divide`, `tiled_divide` and `flat_divide` differ?
+
+*Advanced*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** They compute the same division per mode but group the result differently. Logical keeps (tile, rest) inside each mode. Zipped gathers all tile modes first and all rest modes second. Tiled and flat then flatten the rest modes, or both groups.
+
+Zipped is the most useful: `((TileM,TileN),(RestM,RestN))` lets you slice out a whole tile with `tensor(_, tile_index)`. A helpful identity is that mode 0 of `zipped_divide(a, b)` equals `composition(a, b)`. `local_tile` is a zipped divide followed by a slice.
+</details>
+
+#### Q65. What do `logical_product`, `blocked_product` and `raked_product` build?
+
+*Advanced*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** Layouts made by repeating one layout according to another. Blocked product places copies of A as contiguous blocks arranged by B. Raked product interleaves the copies.
+
+Products are the reverse direction of divides and are how thread-value layouts for copies and MMAs are constructed: start from what one thread or one atom covers, then replicate it across threads or across the tile. `tile_to_shape` is a product that grows an atom to a requested shape.
+</details>
+
+#### Q66. How does CuTe represent a swizzled shared memory layout?
+
+*Advanced*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** As a `ComposedLayout` of a `Swizzle<B, M, S>` function applied on top of an ordinary layout. The 128-byte mode is `Swizzle<3,4,3>`.
+
+A swizzle XORs B bits taken from a higher position into B bits starting at bit M, with S the distance between the two fields. It is a permutation but not a Shape:Stride function, so it needs its own type. With M = 4 the unit moved is 16 bytes. The 64-byte and 32-byte modes use B = 2 and B = 1.
+</details>
+
+## 8. CuTe tensors, atoms and partitioning
+
+Turning layouts into views of memory and into instruction calls. Questions 67 to 74.
+
+#### Q67. What is a CuTe `Tensor`?
+
+*Core*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** An engine (a pointer or an owned array) paired with a layout. Indexing applies the layout to a coordinate and dereferences the engine at that offset.
+
+Pointers are tagged with their memory space using `make_gmem_ptr` and `make_smem_ptr`, which lets `copy` choose instructions by source and destination. Owning register tensors come from `make_tensor<T>(layout)` or `make_fragment_like`.
+
+```cpp
+Tensor mA = make_tensor(make_gmem_ptr(A), make_shape(M, K), make_stride(K, 1));
+Tensor sA = make_tensor(make_smem_ptr(smem.A), sA_layout);
+Tensor col = mA(_, 3);     // slice: all rows of column 3
+```
+
+**Line by line.**
+
+- `Tensor mA = make_tensor(make_gmem_ptr(A), make_shape(M, K), make_stride(K, 1));`: an M × K view of global memory at `A`, row-major: rows are K elements apart and neighbours in a row are 1 apart, so K is the contiguous (K-major) dimension.
+- `Tensor sA = make_tensor(make_smem_ptr(smem.A), sA_layout);`: a view of the shared memory buffer `smem.A` with the layout `sA_layout`, possibly swizzled. The pointer tag tells `copy` that the data is in shared memory.
+- `Tensor col = mA(_, 3);`: `_` keeps the row mode and 3 fixes the column. The result is a rank-1 tensor of M elements with stride K, with no copy made.
+</details>
+
+#### Q68. What do `local_tile` and `local_partition` return?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** `local_tile(tensor, tiler, coord)` returns the tile at a given tile coordinate, typically this block's piece. `local_partition(tensor, layout, index)` returns the elements assigned to one index of a layout, typically one thread's piece.
+
+Both are a divide followed by a slice. A `Step<_1, X, _1>` projection lets one (M, N, K) tiler apply to A (M and K), B (N and K) and C (M and N) by dropping the unused mode. The result often keeps a trailing mode that iterates over k-tiles.
+</details>
+
+#### Q69. CuTe code is full of names like `tAgA`, `tCsA` and `tCrC`. What is the convention?
+
+*Core*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** `t<P><m><X>`: a tensor partitioned by P's pattern, living in memory m (g global, s shared, r register), holding data of X. `tCsA` is A in shared memory, partitioned the way the MMA (which computes C) wants it.
+
+Tensors partitioned by the same pattern have matching shapes, so `copy(tAgA, tAsA)` or `gemm(tCrA, tCrB, tCrC)` line up element for element. Following the convention makes shape mismatches visible from the names alone.
+</details>
+
+#### Q70. What are an `MMA_Atom` and a `TiledMMA`?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** An atom wraps one MMA instruction together with traits describing which threads take part and how each thread's values map to A, B and C. A `TiledMMA` repeats the atom across M, N and K to cover a larger tile with more threads.
+
+`make_tiled_mma(atom, atom_layout)` builds it. For WGMMA each unit of the atom layout is a warpgroup, so `(2,1,1)` means two warpgroups stacked along M. From a thread slice, `partition_A`, `partition_B`, `partition_C` and `partition_fragment_C` give views shaped as (atom values, repeats in M or N, repeats in K, remaining modes).
+</details>
+
+#### Q71. What is a thread-value (TV) layout?
+
+*Advanced*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** A layout whose coordinate is (thread index, value index) and whose output is a position in the tile. It states which element each thread holds in each of its value slots.
+
+Every atom publishes TV layouts for its operands, taken from the fragment tables in the PTX manual. Partitioning a tensor is composing its layout with the TV layout and slicing at one thread. That is why generic `copy` and `gemm` need no instruction-specific indexing code.
+</details>
+
+#### Q72. How do `Copy_Atom` and `TiledCopy` relate, and why is there a `make_tiled_copy_C`?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** A copy atom wraps one copy instruction, such as a vectorised load, `cp.async` or `stmatrix`. A `TiledCopy` assigns elements of a tile to threads and values. `make_tiled_copy_C(atom, tiled_mma)` builds a copy whose thread assignment matches the MMA's accumulator layout.
+
+The epilogue must move each thread's accumulator values out without shuffling between threads, so its copy pattern has to mirror the MMA's C layout. Use `partition_S` for the source view and `partition_D` for the destination. `retile_S` or `retile_D` re-view an existing fragment in the copy's shape.
+</details>
+
+#### Q73. Why can the same `cute::gemm(tiled_mma, A, B, C)` call serve Ampere, Hopper and Blackwell?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** `gemm` and `copy` are generic algorithms that loop over the tensor modes and call the atom for each instruction-sized piece. Only the atom differs between architectures.
+
+On Ampere the A and B arguments are register fragments. On Hopper with an SS atom they are descriptor tensors. On Blackwell A and B are descriptors and C is a TMEM tensor. The call site looks the same, which is what lets a main loop be ported by changing types and synchronisation, not index math.
+</details>
+
+#### Q74. What is the CuTe DSL?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** A Python-embedded form of CuTe, shipped with CUTLASS 4.x, in which kernels are written as decorated Python functions and JIT-compiled to PTX. It exposes the same layouts, tensors, atoms and pipelines as the C++ library.
+
+It removes C++ template compile times and error messages while aiming for the same generated code. The concepts in this guide carry over directly: `cute.make_layout`, `cute.logical_divide`, `cute.make_tiled_mma`, `cute.nvgpu.warpgroup.fence()` and so on. Production kernels such as recent FlashAttention work have been written in it.
+</details>
+
+## 9. CUTLASS kernel design on Hopper
+
+How the library assembles atoms into complete GEMM kernels. Questions 75 to 84.
+
+#### Q75. What are the layers of a CUTLASS 3.x and later GEMM?
+
+*Core*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** Atom (one instruction), Tiled (atoms across threads), Collective (a main loop or an epilogue for one block), Kernel (the device function over the grid), and Device (the host-side handle that launches it).
+
+The two collectives are `CollectiveMma` and `CollectiveEpilogue`. `cutlass::gemm::kernel::GemmUniversal` composes them, and `cutlass::gemm::device::GemmUniversalAdapter` provides `can_implement`, `initialize` and `run`. Each layer is specialised by a dispatch policy type.
+</details>
+
+#### Q76. What does the mainloop `CollectiveBuilder` need from you?
+
+*Core*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** The architecture and operation class, the element type, layout and alignment of A and B, the accumulator type, the tile shape, the cluster shape, a stage count policy and a kernel schedule.
+
+From these it deduces the MMA atom, the TMA copies, the swizzled shared memory layouts and the dispatch policy. The `Auto` options let the library choose a stage count and schedule. Writing the collective type by hand is possible and is the route when you need something the builder does not cover.
+
+```cpp
+using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+    cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
+    ElementA, LayoutA, AlignmentA,
+    ElementB, LayoutB, AlignmentB,
+    ElementAccumulator,
+    TileShape, ClusterShape,
+    cutlass::gemm::collective::StageCountAutoCarveout<
+      static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+    cutlass::gemm::KernelTmaWarpSpecializedCooperative
+  >::CollectiveOp;
+
+using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int,int,int>, CollectiveMainloop, CollectiveEpilogue>;
+using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+```
+
+**Line by line.**
+
+- `using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<`: the builder is a compile-time function. Its `CollectiveOp` member is the main loop type it chooses.
+- `cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,`: target Hopper and use the Tensor Cores.
+- `ElementA, LayoutA, AlignmentA,`: A's element type (for example `half_t`), its layout (`RowMajor` or `ColumnMajor`), and its alignment in elements, usually 16 bytes divided by the element size.
+- `ElementB, LayoutB, AlignmentB,`: the same for B.
+- `ElementAccumulator,`: the accumulator type, for example `float`.
+- `TileShape, ClusterShape,`: the CTA tile, for example `Shape<_128,_128,_64>`, and the cluster, for example `Shape<_2,_1,_1>`.
+- `cutlass::gemm::collective::StageCountAutoCarveout<`: as many pipeline stages as fit in shared memory after reserving the bytes given next.
+- `static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,`: the reserved bytes, the epilogue's shared storage.
+- `cutlass::gemm::KernelTmaWarpSpecializedCooperative`: the kernel schedule, cooperative warp specialisation.
+- `>::CollectiveOp;`: the mainloop type the builder picked.
+- `using GemmKernel = cutlass::gemm::kernel::GemmUniversal<`: the kernel that combines the collectives.
+- `Shape<int,int,int>, CollectiveMainloop, CollectiveEpilogue>;`: the problem shape (M, N, K) is dynamic (`int`), followed by the two collectives.
+- `using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;`: the host-side handle with `can_implement`, `initialize` and `run`.
+</details>
+
+#### Q77. What is a dispatch policy such as `MainloopSm90TmaGmmaWarpSpecialized<Stages, ClusterShape, KernelSchedule>`?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** A tag type that selects one specialisation of `CollectiveMma` and carries its compile-time parameters.
+
+The name reads as: Hopper, TMA for loads, GMMA (WGMMA) for math, warp-specialized structure. Kernel and epilogue specialisations are selected the same way. To find the code that runs, look up the policy in `dispatch_policy.hpp` and open the collective file with the matching name.
+</details>
+
+#### Q78. What is warp specialisation, and why is it especially effective on Hopper?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** Different warps of a block take fixed roles: producers issue loads, consumers do Tensor Core math and the epilogue. They communicate through shared memory buffers guarded by mbarriers.
+
+TMA makes the producer nearly free in threads and registers, `setmaxnreg` moves the saved registers to the consumers, and WGMMA is asynchronous. The alternative, a multistage kernel where every warp both loads and computes, was the Ampere design and wastes registers on Hopper.
+</details>
+
+#### Q79. Compare the cooperative and ping-pong schedules.
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** Both use one producer warpgroup and two consumer warpgroups in a persistent kernel. In cooperative, the two consumers split the same output tile. In ping-pong, each consumer owns a different tile, and they alternate so one runs its epilogue while the other runs MMAs.
+
+Ping-pong keeps the Tensor Cores busy during epilogues, which helps when the epilogue is a noticeable share of the time, as with small K. Cooperative gives each consumer half a tile, so larger tiles fit in registers. In ping-pong each consumer holds a whole tile's accumulator, and tiles such as 128x256 can spill.
+</details>
+
+#### Q80. How do the two ping-pong consumers avoid issuing MMAs at the same time?
+
+*Advanced*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** They take turns through an ordered barrier, `cutlass::OrderedSequenceBarrier`, which admits the warpgroups to the math section in a fixed alternating order.
+
+A consumer waits for its turn, runs its main loop, passes the turn to the other consumer, then performs its epilogue. The epilogue of tile i therefore overlaps the main loop of tile i+1 in the other warpgroup.
+</details>
+
+#### Q81. What is a persistent kernel and what does the tile scheduler do in one?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** The grid is sized to the hardware, not the problem, and each block loops over many output tiles. The tile scheduler hands each block its next tile.
+
+This amortises launch cost, barrier setup and register reallocation over many tiles and enables epilogue overlap across tiles. `PersistentTileSchedulerSm90` assigns tiles statically: a block starts from its own index and strides by the grid size. It also decides the traversal order of tiles, which affects L2 reuse.
+</details>
+
+#### Q82. What problem does stream-K solve, and how?
+
+*Advanced*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** When the number of output tiles is not a multiple of the number of blocks, the final wave leaves SMs idle. Stream-K splits the total k-iterations of all tiles evenly across blocks, so some tiles are computed by several blocks and combined in a fix-up step.
+
+CUTLASS implements it in `PersistentTileSchedulerSm90StreamK`, selected with the `cutlass::gemm::StreamKScheduler` tag. It supports decomposition modes for data-parallel, split-K, stream-K and a heuristic choice. Partial accumulators go through a workspace buffer and a reduction, so the benefit is largest for problems with few tiles.
+</details>
+
+#### Q83. How is the number of pipeline stages decided, and what is `StageCountAutoCarveout`?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** `StageCountAuto` fits as many stages as the shared memory capacity allows for the given tile. `StageCountAutoCarveout<bytes>` first subtracts a reserved amount, normally the epilogue's shared storage.
+
+Each stage holds one A tile and one B tile. More stages hide more load latency but returns flatten quickly, and shared memory is also needed for the epilogue buffer. Forgetting the carveout when the epilogue uses shared memory leads to a kernel that asks for more than the block limit.
+</details>
+
+#### Q84. How do you fuse extra work, such as a bias and an activation, into the epilogue?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** Through epilogue fusion operations in `cutlass::epilogue::fusion`. The simple case is `LinearCombination` (D = alpha x acc + beta x C). Arbitrary element-wise graphs are expressed as an epilogue visitor tree (EVT).
+
+Fusing avoids a second pass over the output through global memory. The epilogue schedule decides the data path: the TMA warp-specialized epilogue goes registers to shared memory to a TMA store, while the no-smem variants write from registers directly to global memory.
+</details>
+
+## 10. Blackwell tcgen05 and Tensor Memory
+
+The fifth-generation Tensor Core interface and its dedicated memory. Questions 85 to 95.
+
+#### Q85. What are the main changes from Hopper's WGMMA to Blackwell's `tcgen05.mma`?
+
+*Core*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** The MMA is issued by one thread, not a warpgroup. The accumulator lives in Tensor Memory, not registers. Tiles are larger, up to M = 128 on one CTA and M = 256 on a CTA pair. Completion is reported through an mbarrier.
+
+`wgmma` is not available on sm_100, so Hopper kernels must be ported. CUTLASS calls the new instruction UMMA. Per the CUTLASS documentation, these instructions deliver 2x to 4x the throughput of the corresponding Hopper Tensor Core operations.
+</details>
+
+#### Q86. What is the geometry of Tensor Memory?
+
+*Core*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** Each CTA sees 128 lanes (rows) by up to 512 columns of 32-bit cells, which is 256 KiB.
+
+Lanes are address coordinates, not thread lane ids. An M = 128 accumulator uses all 128 lanes, and N FP32 values per row use N columns. So a 128x256 FP32 accumulator takes 256 columns, and two such accumulators fill TMEM.
+</details>
+
+The map below draws TMEM as 128 lanes by 512 columns and places two $128 \times 256$ FP32
+accumulators in it, the "two such accumulators fill TMEM" case. Each accumulator row is one lane;
+each FP32 value is one column.
+
+<TmemMap presets={["acc-2stage", "m64", "pair-m128", "pair-m256"]} caption="TMEM allocations for common tile shapes. Use the tabs to switch between them." />
+
+#### Q87. What are the rules of `tcgen05.alloc`?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** It allocates whole columns, all 128 lanes each. The column count must be a power of two from 32 to 512. It is a warp-collective instruction, it writes the base address to a 32-bit shared memory slot, and it can block until columns are free.
+
+Plan the maximum TMEM need up front: within a CTA a later allocation may not ask for more columns than an earlier one. Use one warp to allocate, then publish the address to the other warps through shared memory and a sync.
+
+```ptx
+// schematic; see the PTX manual for the full operand rules
+tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [tmem_addr_slot], 256;
+// ... kernel body ...
+tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;
+tcgen05.dealloc.cta_group::1.sync.aligned.b32 taddr, 256;
+```
+
+**Line by line.**
+
+- `// schematic; see the PTX manual for the full operand rules`: the lines show the instruction forms, not compilable code.
+- `tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [tmem_addr_slot], 256;`: one whole warp allocates 256 TMEM columns (all 128 lanes) for this CTA. The base address is written to the 32-bit shared memory slot `tmem_addr_slot`, where the other warps can read it.
+- `// ... kernel body ...`: MMAs accumulate into TMEM, and the epilogue reads it with `tcgen05.ld`.
+- `tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;`: promises that this CTA will not allocate again, so other CTAs on the SM are not held up waiting for it.
+- `tcgen05.dealloc.cta_group::1.sync.aligned.b32 taddr, 256;`: frees the 256 columns that start at `taddr`, the address read back from the slot. Do this only after every operation that touches them has finished.
+</details>
+
+#### Q88. What must a kernel do with TMEM before it exits?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** Wait for all asynchronous operations that touch TMEM, then deallocate everything it allocated. `tcgen05.relinquish_alloc_permit` declares that the CTA will not allocate again.
+
+TMEM belongs to the SM, so a leaked allocation or one freed while an MMA is in flight affects whoever runs next. With `cta_group::2`, a warp in each CTA of the pair must execute the alloc and the dealloc, and the peer CTA must be running to take part.
+</details>
+
+#### Q89. What are the operands of `tcgen05.mma`?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** The destination D as a TMEM address, A as a shared memory descriptor or a TMEM address, B as a shared memory descriptor, a 32-bit instruction descriptor that encodes types, shape and layout, and a flag that enables D as an input. Block-scaled and sparse forms add scale factor or metadata operands in TMEM.
+
+The kind is in the mnemonic, for example `tcgen05.mma.cta_group::1.kind::f16`. Because the shape lives in the instruction descriptor and not the mnemonic, one instruction form covers many tile sizes. In CuTe the atoms are named like `SM100_MMA_F16BF16_SS`, with a 2-SM variant for CTA pairs.
+</details>
+
+#### Q90. How does a thread learn that a `tcgen05.mma` has finished?
+
+*Advanced*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** The issuing thread executes `tcgen05.commit` with an mbarrier address. The barrier receives an arrival once all prior asynchronous tcgen05 operations from that thread have completed. Other warps wait on that barrier in the usual way.
+
+This unifies synchronisation: TMA completion, MMA completion and thread hand-offs are all mbarrier phases. With `.cta_group::2` and the multicast qualifier, the commit can arrive on barriers in both CTAs of a pair. It replaces Hopper's `wgmma.commit_group` and `wait_group`.
+</details>
+
+#### Q91. How does the epilogue read the accumulator out of TMEM?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** With `tcgen05.ld`, a warp-collective load from TMEM to registers, followed by `tcgen05.wait::ld` before the registers are used. Warp w of a warpgroup can access lanes 32w to 32w+31 only.
+
+Reading a 128-lane accumulator therefore takes four warps. The instruction has data-movement shapes such as `.16x128b` with a repeat factor `.xN` that set how many columns each thread receives. `tcgen05.st` with `tcgen05.wait::st` is the reverse direction, and `.pack::16b` and `.unpack::16b` handle 16-bit values.
+</details>
+
+The figure shows the four epilogue warps reading one accumulator with `tcgen05.ld`: warp $w$
+touches only lanes $32w$ to $32w + 31$, so the 128 lanes split into four horizontal bands.
+
+<TmemMap presets={["epilogue"]} />
+
+#### Q92. When do you need `tcgen05.fence::before_thread_sync` and `tcgen05.fence::after_thread_sync`?
+
+*Advanced*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** When one thread's tcgen05 operation must be ordered against another thread's, and the two threads coordinate through something other than tcgen05 itself, such as an mbarrier or a block sync.
+
+The first is placed before the synchronising event in the thread that did the earlier operation, the second after the event in the thread doing the later one. Example: epilogue warps finish `tcgen05.ld` on an accumulator region, signal a barrier, and the MMA warp then overwrites that region.
+</details>
+
+#### Q93. What is `tcgen05.cp` used for?
+
+*Advanced*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** Copying data from shared memory into Tensor Memory. Its main use is loading scale factors for block-scaled MMAs.
+
+Scale factors arrive from global memory by TMA into shared memory, then move to TMEM with `tcgen05.cp`, where the MMA reads them. Its completion is covered by the same `tcgen05.commit` mechanism as the MMA. A related instruction, `tcgen05.shift`, shifts rows within TMEM.
+</details>
+
+#### Q94. Why does holding accumulators in TMEM make a better pipeline than Hopper's ping-pong?
+
+*Advanced*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** The MMA thread needs almost no registers, and the accumulator for the next tile can go into a different TMEM region while epilogue warps drain the previous one. Math and epilogue overlap without two full consumer warpgroups.
+
+On Hopper the accumulator ties up the registers of the warpgroup that computed it, so overlapping requires duplicating consumers. On Blackwell an 'accumulator pipeline' of TMEM stages connects one MMA warp to four epilogue warps, each side synchronised by mbarriers.
+</details>
+
+The toy timeline below shows the three roles of a Blackwell kernel: the TMA warp, the single MMA
+warp and the epilogue warps. Compare the two timelines: with one TMEM accumulator stage the MMA warp
+idles while the epilogue drains each tile; with two, the epilogue of one tile runs under the
+MMAs of the next.
+
+<UmmaPipeline caption="Toy model in illustrative units, not a measurement. Lengthen the epilogue to see the one-stage pipeline fall further behind." />
+
+#### Q95. What are the block-scaled MMA kinds?
+
+*Advanced*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** `mxf8f6f4`, `mxf4` and `mxf4nvf4`. They compute D = C + (A x SFA) x (B x SFB), where each scale factor applies to a block of 16 or 32 elements along K.
+
+MX formats follow the OCP specification with an unsigned 8-bit exponent-only scale (`float_ue8m0_t`) per 32 elements. NVIDIA's NVFP4 uses `float_ue4m3_t` per 16 elements. In CUTLASS you use types such as `mx_float4_t` or `nv_float4_t` with `OpClassBlockScaledTensorOp`, and `Sm1xxBlockScaledConfig` builds the scale factor layouts.
+</details>
+
+## 11. Blackwell kernels in CUTLASS, porting and debugging
+
+Putting the pieces together and finding out why a kernel is wrong or slow. Questions 96 to 100.
+
+#### Q96. How are warps assigned in the CUTLASS Blackwell warp-specialized persistent kernel?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** Warp 0 issues MMAs, warp 1 is the scheduler, warp 2 does mainloop TMA loads, warp 3 does epilogue loads, and warps 4 to 7 run the epilogue.
+
+Three pipelines connect them: shared memory stages from the load warp to the MMA warp, TMEM accumulator stages from the MMA warp to the epilogue warps, and a Cluster Launch Control pipeline from the scheduler to everyone. Compare Hopper, where a 384-thread block is one producer and two consumer warpgroups.
+</details>
+
+#### Q97. What is Cluster Launch Control (CLC)?
+
+*Advanced*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** A Blackwell feature for dynamic persistent scheduling. The kernel is launched with one cluster per output tile, and a running cluster can claim a not-yet-started cluster's work with `clusterlaunchcontrol.try_cancel`, then process that tile itself.
+
+Each worker starts with its own block index as its first tile. A successful query returns the coordinates of the claimed tile, and a decline normally means the grid is exhausted, so the worker exits. Unlike a static persistent schedule, this adapts when some SMs are busy with other work. In CUTLASS the scheduler warp issues the queries through a pipeline of depth 3.
+</details>
+
+#### Q98. Which schedules do you pass to the builders for a dense SM100 GEMM?
+
+*Intermediate*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** `KernelTmaWarpSpecialized1SmSm100` or `KernelTmaWarpSpecialized2SmSm100` for the main loop, with `cutlass::epilogue::TmaWarpSpecialized1Sm` or `TmaWarpSpecialized2Sm` (or the `NoSmemWarpSpecialized` variants) for the epilogue.
+
+The tile argument is the MMA tile shape. In 2-SM mode a 256x256 MMA tile becomes 128x256 per CTA. Dense legacy types allow M of 64 or 128 on one SM and 128 or 256 on two, with N from 64 to 256. Narrow-precision and block-scaled kernels have their own schedule names and stricter alignment tables.
+</details>
+
+#### Q99. You are porting a Hopper GEMM main loop to Blackwell by hand. What changes?
+
+*Advanced*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** Replace the WGMMA atom with a tcgen05 atom, allocate TMEM and make the accumulator a TMEM tensor, issue MMAs from one thread, replace commit and wait groups with `tcgen05.commit` on an mbarrier, add `tcgen05.ld` in the epilogue warps, and deallocate TMEM at the end.
+
+The TMA loads, swizzled shared memory layouts and load pipeline carry over largely unchanged. Rework the warp roles, since consumers no longer need large register budgets. Then consider 2-SM MMA with a cluster and CLC scheduling as second steps once the single-CTA kernel is correct.
+</details>
+
+#### Q100. A new asynchronous kernel hangs or gives wrong results. What do you check, and how do you judge its speed once it works?
+
+*Advanced*
+
+<details>
+<summary>Answer</summary>
+
+**Answer.** For hangs: barrier arrival counts, `expect_tx` byte totals, phase parity, barrier initialisation followed by a sync, and remote arrives matching the cluster shape. For wrong data: swizzle agreement between TMA and MMA descriptors, 128-byte buffer alignment, a missing `fence.proxy.async`, or reading an accumulator before its wait. For speed: compare achieved TFLOPS with the Tensor Core peak.
+
+Debug on one tile, one stage and a 1x1x1 cluster first, then scale each dimension separately, since each adds one synchronisation relationship. For performance, confirm there are no WGMMA serialisation warnings, then sweep tile shape, stage count, cluster shape and schedule. Small-K problems are dominated by the epilogue, and problems with few tiles by scheduling.
+
+```cpp
+// TFLOPS for an M x N x K GEMM: 2*M*N*K floating point operations
+double tflops = 2.0 * M * N * K / seconds / 1e12;
+```
+
+**Line by line.**
+
+- `// TFLOPS for an M x N x K GEMM: 2*M*N*K floating point operations`: every output element takes K multiply-adds, and each multiply-add counts as 2 floating-point operations.
+- `double tflops = 2.0 * M * N * K / seconds / 1e12;`: starting with `2.0` makes the whole product a `double`, so it cannot overflow the way an `int` product would. Example: M = N = K = 8192 is 2 × 8192³ ≈ 1.10 × 10¹² operations, and in 2 ms that is about 550 TFLOPS.
+</details>
+
+## 12. Full kernel exercises
+
+Ten complete kernels to write, in order of difficulty. Each has a specification, checks that tell you when you are done, the mistakes people usually make, and a reference solution. Attempt each one before you open the solution. None of the solutions was compiled or run while preparing this post, so treat them as reading material that needs testing on real hardware.<Sidenote>Solutions E2, E3 and E5 to E10 contain code condensed from the NVIDIA CUTLASS examples, Copyright (c) 2017 - 2026 NVIDIA CORPORATION & AFFILIATES, used under the [BSD-3-Clause license](https://github.com/NVIDIA/cutlass/blob/main/LICENSE.txt). E1 and E4 were written for this guide.</Sidenote>
+
+### E1. TMA tile load with a hand-written mbarrier
+
+*Intermediate · Hopper or Blackwell, raw PTX*
+
+Write a kernel with no CuTe at all that fetches one 64x64 float tile per block through TMA, waits for it on an mbarrier, and writes it back to a second array. You own every instruction, so this is where the protocol becomes concrete.
+
+**Specification**
+
+- Build the tensor map on the host with `cuTensorMapEncodeTiled`: rank 2, float32, no swizzle, zero fill for out-of-bounds.
+- Use a matrix whose size is not a multiple of 64 (for example 300 rows by 1000 columns) so that edge tiles exercise the out-of-bounds path.
+- In the kernel: one thread initialises the barrier with an arrival count of 1, then the block syncs.
+- The same thread does `mbarrier.arrive.expect_tx` with the tile's byte count and issues `cp.async.bulk.tensor.2d`.
+- Every thread waits on phase 0 with a `try_wait.parity` loop, then copies its share of the tile to the output, skipping coordinates outside the matrix.
+
+**Hints**
+
+- Dimensions are passed innermost first: `{width, height}`. The stride array has rank minus 1 entries, in bytes.
+- Pass the map as `const __grid_constant__ CUtensorMap` and take its address in the kernel.
+- Shared memory pointers must be converted to 32-bit shared addresses before going into PTX.
+
+**You are done when**
+
+- The output equals the input exactly, including the last partial row and column of tiles.
+- Change the expected byte count to half the tile. The kernel should now read a partly filled tile or misbehave. Explain which, then restore it.
+- Change the wait parity to 1. The kernel should hang. Explain why.
+
+**Common mistakes**
+
+- Forgetting the sync after `mbarrier.init`: other warps wait on an uninitialised barrier.
+- A tile buffer that is not 128-byte aligned.
+- A row pitch in bytes that is not a multiple of 16.
+
+<details>
+<summary>Reference solution</summary>
+
+Only thread 0 arrives, so the barrier count is 1 and the phase completes when that arrival and all 16384 bytes have landed. The out-of-bounds part of an edge tile is filled with zeros by the hardware, and the kernel simply does not write those positions back.
+
+*Written for this guide. Not compiled or run here.*
+
+```cpp
+// nvcc -arch=sm_90a -std=c++17 e1_tma.cu -lcuda -o e1_tma
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <cstdio>
+#include <vector>
+
+constexpr int TILE_W = 64, TILE_H = 64;
+constexpr int TILE_BYTES = TILE_W * TILE_H * sizeof(float);
+
+__device__ inline uint32_t smem_addr(const void* p) {
+  return static_cast<uint32_t>(__cvta_generic_to_shared(p));
+}
+
+__global__ void tile_roundtrip(const __grid_constant__ CUtensorMap tmap,
+                               float* out, int W, int H)
+{
+  __shared__ alignas(128) float tile[TILE_H * TILE_W];
+  __shared__ alignas(8) uint64_t bar;
+  const uint32_t bar_a = smem_addr(&bar), tile_a = smem_addr(tile);
+
+  if (threadIdx.x == 0) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" :: "r"(bar_a), "r"(1));
+    asm volatile("fence.mbarrier_init.release.cluster;");
+  }
+  __syncthreads();                              // everyone sees the initialised barrier
+
+  const int x0 = blockIdx.x * TILE_W, y0 = blockIdx.y * TILE_H;
+  if (threadIdx.x == 0) {
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;"
+                 :: "r"(bar_a), "r"(TILE_BYTES));
+    asm volatile(
+      "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes"
+      " [%0], [%1, {%2, %3}], [%4];"
+      :: "r"(tile_a), "l"(reinterpret_cast<uint64_t>(&tmap)),
+         "r"(x0), "r"(y0), "r"(bar_a)
+      : "memory");
+  }
+
+  // All threads: wait for phase 0 (parity 0) to complete.
+  asm volatile(
+    "{\n"
+    ".reg .pred p;\n"
+    "WAIT:\n"
+    "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n"
+    "@p bra DONE;\n"
+    "bra WAIT;\n"
+    "DONE:\n"
+    "}\n" :: "r"(bar_a), "r"(0));
+
+  for (int i = threadIdx.x; i < TILE_W * TILE_H; i += blockDim.x) {
+    int x = x0 + i % TILE_W, y = y0 + i / TILE_W;
+    if (x < W && y < H) out[y * W + x] = tile[i];
+  }
+}
+
+int main() {
+  const int W = 1000, H = 300;                  // 1000 * 4 bytes: a multiple of 16
+  std::vector<float> h_in(W * H), h_out(W * H, -1.f);
+  for (int i = 0; i < W * H; ++i) h_in[i] = float(i % 997);
+  float *d_in, *d_out;
+  cudaMalloc(&d_in, W * H * sizeof(float));
+  cudaMalloc(&d_out, W * H * sizeof(float));
+  cudaMemcpy(d_in, h_in.data(), W * H * sizeof(float), cudaMemcpyHostToDevice);
+
+  CUtensorMap tmap;
+  cuuint64_t gdim[2]    = {cuuint64_t(W), cuuint64_t(H)};   // innermost first
+  cuuint64_t gstride[1] = {cuuint64_t(W) * sizeof(float)};  // bytes per row
+  cuuint32_t box[2]     = {TILE_W, TILE_H};
+  cuuint32_t estride[2] = {1, 1};
+  CUresult r = cuTensorMapEncodeTiled(&tmap, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, 2, d_in,
+      gdim, gstride, box, estride,
+      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
+      CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  if (r != CUDA_SUCCESS) { printf("tensor map failed: %d\n", int(r)); return 1; }
+
+  dim3 grid((W + TILE_W - 1) / TILE_W, (H + TILE_H - 1) / TILE_H);
+  tile_roundtrip<<<grid, 256>>>(tmap, d_out, W, H);
+  if (cudaDeviceSynchronize() != cudaSuccess) { printf("kernel failed\n"); return 1; }
+
+  cudaMemcpy(h_out.data(), d_out, W * H * sizeof(float), cudaMemcpyDeviceToHost);
+  int bad = 0;
+  for (int i = 0; i < W * H; ++i) bad += (h_in[i] != h_out[i]);
+  printf(bad ? "FAILED: %d mismatches\n" : "Success.\n", bad);
+  return bad != 0;
+}
+```
+</details>
+
+### E2. Vectorised tile copy with CuTe
+
+*Core · Any CUDA GPU, CuTe*
+
+Copy a 256x512 float tensor tile by tile, with each thread moving four contiguous elements per instruction. The point is to practise the divide, partition, fragment and copy sequence that every later kernel repeats.
+
+**Specification**
+
+- Tile the source and destination with a static block shape of 128x64, one block per tile.
+- First write the scalar version with `local_partition` and a (32,8) thread layout.
+- Then write the vectorised version with `make_tiled_copy`: thread layout (32,8), value layout (4,1), a 16-byte `UniversalCopy`.
+- Print the layouts of the tiled tensor and of one thread's partition on the host, and predict them before you run.
+
+**Hints**
+
+- `tiled_divide(tensor, block_shape)` gives a tensor shaped ((M,N), m', n'). Slice it with `make_coord(_,_)` plus the block indices.
+- Use `make_fragment_like` for the register tensor in the vectorised version, since mode 0 is the instruction-local mode.
+
+**You are done when**
+
+- Destination equals source.
+- Change the value layout to (1,4). Does it still vectorise for a column-major tensor? Explain using the strides.
+
+**Common mistakes**
+
+- A block shape with dynamic integers: the copy cannot be vectorised at compile time.
+- Pointers that are not aligned to the vector width.
+
+<details>
+<summary>Reference solution</summary>
+
+The thread layout says which thread owns which position, and the value layout says how many contiguous elements each thread moves per instruction. Their product is the 128x8 footprint that is repeated across the 128x64 tile.
+
+*Condensed from the CUTLASS tutorial examples/cute/tutorial/tiled_copy.cu.*
+
+```cpp
+#include <thrust/host_vector.h>
+#include <thrust/device_vector.h>
+#include <cute/tensor.hpp>
+
+template <class TensorS, class TensorD, class Tiled_Copy>
+__global__ void copy_kernel_vectorized(TensorS S, TensorD D, Tiled_Copy tiled_copy)
+{
+  using namespace cute;
+  // View of this block's tile
+  Tensor tile_S = S(make_coord(_, _), blockIdx.x, blockIdx.y);  // (BlockM, BlockN)
+  Tensor tile_D = D(make_coord(_, _), blockIdx.x, blockIdx.y);  // (BlockM, BlockN)
+
+  // This thread's slice of the tile
+  ThrCopy thr_copy = tiled_copy.get_thread_slice(threadIdx.x);
+  Tensor thr_tile_S = thr_copy.partition_S(tile_S);             // (CopyOp, CopyM, CopyN)
+  Tensor thr_tile_D = thr_copy.partition_D(tile_D);             // (CopyOp, CopyM, CopyN)
+
+  // Register-backed tensor of the same shape
+  Tensor fragment = make_fragment_like(thr_tile_D);
+
+  copy(tiled_copy, thr_tile_S, fragment);                       // GMEM -> RMEM
+  copy(tiled_copy, fragment, thr_tile_D);                       // RMEM -> GMEM
+}
+
+int main()
+{
+  using namespace cute;
+  using Element = float;
+  auto tensor_shape = make_shape(256, 512);
+
+  thrust::host_vector<Element> h_S(size(tensor_shape)), h_D(size(tensor_shape));
+  for (size_t i = 0; i < h_S.size(); ++i) h_S[i] = static_cast<Element>(i);
+  thrust::device_vector<Element> d_S = h_S, d_D = h_D;
+
+  Tensor tensor_S = make_tensor(make_gmem_ptr(thrust::raw_pointer_cast(d_S.data())), make_layout(tensor_shape));
+  Tensor tensor_D = make_tensor(make_gmem_ptr(thrust::raw_pointer_cast(d_D.data())), make_layout(tensor_shape));
+
+  auto block_shape = make_shape(Int<128>{}, Int<64>{});
+  Tensor tiled_S = tiled_divide(tensor_S, block_shape);         // ((M, N), m', n')
+  Tensor tiled_D = tiled_divide(tensor_D, block_shape);
+
+  Layout thr_layout = make_layout(make_shape(Int<32>{}, Int<8>{}));  // (32,8) -> thread index
+  Layout val_layout = make_layout(make_shape(Int<4>{},  Int<1>{}));  // (4,1)  -> value index
+
+  using CopyOp = UniversalCopy<uint_byte_t<sizeof(Element) * size(val_layout)>>;
+  using Atom   = Copy_Atom<CopyOp, Element>;
+  TiledCopy tiled_copy = make_tiled_copy(Atom{}, thr_layout, val_layout);
+
+  dim3 gridDim(size<1>(tiled_D), size<2>(tiled_D));
+  dim3 blockDim(size(thr_layout));
+  copy_kernel_vectorized<<<gridDim, blockDim>>>(tiled_S, tiled_D, tiled_copy);
+  if (cudaDeviceSynchronize() != cudaSuccess) return -1;
+
+  h_D = d_D;
+  for (size_t i = 0; i < h_D.size(); ++i)
+    if (h_S[i] != h_D[i]) { printf("mismatch at %zu\n", i); return -1; }
+  printf("Success.\n");
+  return 0;
+}
+```
+</details>
+
+### E3. Pipelined GEMM with TMA and WGMMA
+
+*Intermediate · Hopper sm_90a, CuTe*
+
+Write a complete half-precision GEMM kernel, C = alpha A B + beta C, where one warpgroup both issues TMA loads into a three-stage shared memory ring and consumes them with WGMMA. Every thread plays both roles, which keeps the synchronisation small enough to hold in your head.
+
+**Specification**
+
+- CTA tile 128x128x64, three pipeline stages, block of 128 threads.
+- A is (M,K) and B is (N,K), both K-major (the 'TN' case). Shared memory layouts are `GMMA::Layout_K_SW128_Atom` tiled to (tile, K, stages).
+- MMA atom `SM90_64x64x16_F16F16F16_SS` with both operands K-major.
+- Two barriers per stage: a transaction barrier that TMA completes (count 1) and a plain barrier that the 128 consumers arrive on.
+- Prefetch all stages, then loop: wait for a stage, run the MMAs, wait for them, release the stage, and let the elected thread refill it.
+- Epilogue: `axpby` straight from the register accumulator to global memory.
+
+**Hints**
+
+- Create the TMA atoms on the host with `make_tma_atom(SM90_TMA_LOAD{}, mA, sA(_,_,0), make_shape(bM,bK))`.
+- In the kernel, `tma_a.get_tma_tensor(shape)` gives the coordinate tensor to tile with `local_tile`.
+- `tma_partition(tma_a, Int<0>{}, Layout<_1>{}, group_modes<0,2>(sA), group_modes<0,2>(gA))` gives the (TMA,k) and (TMA,PIPE) views.
+- `cutlass::PipelineState<P>` tracks the stage index and phase for you.
+
+**You are done when**
+
+- Result matches a host reference GEMM for m=512, n=256, k=1024 and for sizes that are not multiples of the tile.
+- `ptxas` prints no warning about serialized WGMMA.
+- Remove `warpgroup_wait<0>()` before the consumer arrive and explain what can now be overwritten.
+
+**Common mistakes**
+
+- Using one barrier type for both directions. The producer side needs the transaction count, the consumer side does not.
+- Reading `tCrC` before the final wait.
+- Forgetting that the loop runs until the stages already in flight are drained, not until the last load is issued.
+
+<details>
+<summary>Reference solution</summary>
+
+The loop counter runs K_PIPE_MAX iterations past the last load because that many tiles are still in the ring. Loads beyond the end of K fetch zeros, which is harmless. Note that the accumulator here is F16, as in the tutorial. Switch to the F32F16F16 atom and a float fragment for real use.
+
+*Condensed from the CUTLASS tutorial examples/cute/tutorial/hopper/wgmma_tma_sm90.cu.*
+
+```cpp
+#include <cute/tensor.hpp>
+#include "cutlass/cluster_launch.hpp"
+#include "cutlass/arch/barrier.h"
+#include "cutlass/pipeline/sm90_pipeline.hpp"
+#include "cutlass/arch/mma_sm90.h"
+#include "cutlass/device_kernel.h"
+using namespace cute;
+
+template <class ElementA, class ElementB,
+          class SmemLayoutA,   // (M,K,P)
+          class SmemLayoutB>   // (N,K,P)
+struct SharedStorage
+{
+  alignas(128) cute::ArrayEngine<ElementA, cosize_v<SmemLayoutA>> A;
+  alignas(128) cute::ArrayEngine<ElementB, cosize_v<SmemLayoutB>> B;
+  uint64_t tma_barrier[size<2>(SmemLayoutA{})];
+  uint64_t mma_barrier[size<2>(SmemLayoutA{})];
+};
+
+template <class ProblemShape, class CtaTiler,
+          class TA, class SmemLayoutA, class TmaA,
+          class TB, class SmemLayoutB, class TmaB,
+          class TC, class CStride, class TiledMma,
+          class Alpha, class Beta>
+__global__ static
+__launch_bounds__(decltype(size(TiledMma{}))::value)
+void
+gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
+            TA const* A, CUTLASS_GRID_CONSTANT TmaA const tma_a,
+            TB const* B, CUTLASS_GRID_CONSTANT TmaB const tma_b,
+            TC      * C, CStride dC, TiledMma mma,
+            Alpha alpha, Beta beta)
+{
+  // Full tensors. mA and mB are TMA coordinate tensors, not data.
+  auto [M, N, K] = shape_MNK;
+  Tensor mA = tma_a.get_tma_tensor(make_shape(M,K));                   // (M,K)
+  Tensor mB = tma_b.get_tma_tensor(make_shape(N,K));                   // (N,K)
+  Tensor mC = make_tensor(make_gmem_ptr(C), make_shape(M,N), dC);      // (M,N)
+
+  // This block's tiles
+  auto cta_coord = make_coord(blockIdx.x, blockIdx.y, _);              // (m,n,k)
+  Tensor gA = local_tile(mA, cta_tiler, cta_coord, Step<_1, X,_1>{});  // (BLK_M,BLK_K,k)
+  Tensor gB = local_tile(mB, cta_tiler, cta_coord, Step< X,_1,_1>{});  // (BLK_N,BLK_K,k)
+  Tensor gC = local_tile(mC, cta_tiler, cta_coord, Step<_1,_1, X>{});  // (BLK_M,BLK_N)
+
+  // Shared memory
+  extern __shared__ char shared_memory[];
+  using SharedStorage = SharedStorage<TA, TB, SmemLayoutA, SmemLayoutB>;
+  SharedStorage& smem = *reinterpret_cast<SharedStorage*>(shared_memory);
+  Tensor sA = make_tensor(make_smem_ptr(smem.A.begin()), SmemLayoutA{}); // (BLK_M,BLK_K,PIPE)
+  Tensor sB = make_tensor(make_smem_ptr(smem.B.begin()), SmemLayoutB{}); // (BLK_N,BLK_K,PIPE)
+
+  // TMA views: (TMA,k) in global, (TMA,PIPE) in shared. No multicast.
+  auto [tAgA, tAsA] = tma_partition(tma_a, Int<0>{}, Layout<_1>{},
+                                    group_modes<0,2>(sA), group_modes<0,2>(gA));
+  auto [tBgB, tBsB] = tma_partition(tma_b, Int<0>{}, Layout<_1>{},
+                                    group_modes<0,2>(sB), group_modes<0,2>(gB));
+
+  // Bytes delivered per stage
+  constexpr int tma_transaction_bytes = sizeof(make_tensor_like(tensor<0>(tAsA)))
+                                      + sizeof(make_tensor_like(tensor<0>(tBsB)));
+
+  auto K_PIPE_MAX  = size<1>(tAsA);
+  int k_tile_count = size<1>(tAgA);
+  int k_tile = 0;
+
+  // Barriers
+  int warp_idx = cutlass::canonical_warp_idx_sync();
+  int lane_predicate = cute::elect_one_sync();
+  uint64_t* producer_mbar = smem.tma_barrier;
+  uint64_t* consumer_mbar = smem.mma_barrier;
+  using ProducerBarType = cutlass::arch::ClusterTransactionBarrier;  // TMA
+  using ConsumerBarType = cutlass::arch::ClusterBarrier;             // MMA
+  CUTE_UNROLL
+  for (int pipe = 0; pipe < K_PIPE_MAX; ++pipe) {
+    if ((warp_idx == 0) && lane_predicate) {
+      ProducerBarType::init(&producer_mbar[pipe],   1);
+      ConsumerBarType::init(&consumer_mbar[pipe], 128);
+    }
+  }
+  cluster_sync();   // barrier init visible to every block in the cluster
+
+  // Prefetch: fill every stage
+  CUTE_UNROLL
+  for (int pipe = 0; pipe < K_PIPE_MAX; ++pipe) {
+    if ((warp_idx == 0) && lane_predicate) {
+      ProducerBarType::arrive_and_expect_tx(&producer_mbar[pipe], tma_transaction_bytes);
+      copy(tma_a.with(producer_mbar[pipe]), tAgA(_,k_tile), tAsA(_,pipe));
+      copy(tma_b.with(producer_mbar[pipe]), tBgB(_,k_tile), tBsB(_,pipe));
+    }
+    --k_tile_count;
+    ++k_tile;
+  }
+
+  // MMA views. tCrA and tCrB are descriptor tensors over shared memory.
+  ThrMMA thr_mma = mma.get_thread_slice(threadIdx.x);
+  Tensor tCsA = thr_mma.partition_A(sA);                               // (MMA,MMA_M,MMA_K,PIPE)
+  Tensor tCsB = thr_mma.partition_B(sB);                               // (MMA,MMA_N,MMA_K,PIPE)
+  Tensor tCgC = thr_mma.partition_C(gC);                               // (MMA,MMA_M,MMA_N)
+  Tensor tCrC = thr_mma.make_fragment_C(tCgC);                         // (MMA,MMA_M,MMA_N)
+  clear(tCrC);
+  Tensor tCrA = thr_mma.make_fragment_A(tCsA);                         // (MMA,MMA_M,MMA_K,PIPE)
+  Tensor tCrB = thr_mma.make_fragment_B(tCsB);                         // (MMA,MMA_N,MMA_K,PIPE)
+
+  auto write_state = cutlass::PipelineState<K_PIPE_MAX>();             // TMA writes
+  auto read_state  = cutlass::PipelineState<K_PIPE_MAX>();             // MMA reads
+
+  CUTE_NO_UNROLL
+  while (k_tile_count > -K_PIPE_MAX)
+  {
+    // Wait for the stage to be full
+    int read_pipe = read_state.index();
+    ProducerBarType::wait(&producer_mbar[read_pipe], read_state.phase());
+
+    // One k-tile of MMAs
+    warpgroup_arrive();
+    gemm(mma, tCrA(_,_,_,read_pipe), tCrB(_,_,_,read_pipe), tCrC);
+    warpgroup_commit_batch();
+    warpgroup_wait<0>();
+
+    // Release the stage
+    ConsumerBarType::arrive(&consumer_mbar[read_pipe]);
+    ++read_state;
+
+    // Refill it if there is more to load
+    if ((warp_idx == 0) && lane_predicate && (k_tile_count > 0)) {
+      int pipe = write_state.index();
+      ConsumerBarType::wait(&consumer_mbar[pipe], write_state.phase());
+      ProducerBarType::arrive_and_expect_tx(&producer_mbar[pipe], tma_transaction_bytes);
+      copy(tma_a.with(producer_mbar[pipe]), tAgA(_,k_tile), tAsA(_,pipe));
+      copy(tma_b.with(producer_mbar[pipe]), tBgB(_,k_tile), tBsB(_,pipe));
+      ++write_state;
+    }
+    --k_tile_count;
+    ++k_tile;
+  }
+
+  // Epilogue
+  axpby(alpha, tCrC, beta, tCgC);
+}
+
+// Host setup for the TN case
+template <class TA, class TB, class TC, class Alpha, class Beta>
+void gemm_tn(int m, int n, int k, Alpha alpha,
+             TA const* A, int ldA, TB const* B, int ldB,
+             Beta beta, TC* C, int ldC)
+{
+  auto M = int(m); auto N = int(n); auto K = int(k);
+  auto prob_shape = make_shape(M, N, K);
+
+  auto dA = make_stride(ldA, Int<1>{});                      // (dM, dK)
+  auto dB = make_stride(ldB, Int<1>{});                      // (dN, dK)
+  auto dC = make_stride(Int<1>{}, ldC);                      // (dM, dN)
+
+  auto bM = Int<128>{}; auto bN = Int<128>{}; auto bK = Int<64>{};
+  auto cta_tiler = make_shape(bM, bN, bK);
+  auto bP = Int<3>{};                                        // pipeline stages
+
+  auto sA = tile_to_shape(GMMA::Layout_K_SW128_Atom<TA>{}, make_shape(bM,bK,bP));
+  auto sB = tile_to_shape(GMMA::Layout_K_SW128_Atom<TB>{}, make_shape(bN,bK,bP));
+
+  TiledMMA tiled_mma = make_tiled_mma(SM90_64x64x16_F16F16F16_SS<GMMA::Major::K,GMMA::Major::K>{});
+
+  Tensor mA = make_tensor(A, make_shape(M,K), dA);
+  Tensor mB = make_tensor(B, make_shape(N,K), dB);
+  Copy_Atom tmaA = make_tma_atom(SM90_TMA_LOAD{}, mA, sA(_,_,0), make_shape(bM,bK));
+  Copy_Atom tmaB = make_tma_atom(SM90_TMA_LOAD{}, mB, sB(_,_,0), make_shape(bN,bK));
+
+  dim3 dimBlock(size(tiled_mma));
+  dim3 dimCluster(2, 1, 1);
+  dim3 dimGrid(round_up(size(ceil_div(m, bM)), dimCluster.x),
+               round_up(size(ceil_div(n, bN)), dimCluster.y));
+  int smemBytes = sizeof(SharedStorage<TA, TB, decltype(sA), decltype(sB)>);
+
+  auto* kernel_ptr = &gemm_device<decltype(prob_shape), decltype(cta_tiler),
+                                  TA, decltype(sA), decltype(tmaA),
+                                  TB, decltype(sB), decltype(tmaB),
+                                  TC, decltype(dC), decltype(tiled_mma),
+                                  decltype(alpha), decltype(beta)>;
+  CUTE_CHECK_ERROR(cudaFuncSetAttribute(kernel_ptr,
+      cudaFuncAttributeMaxDynamicSharedMemorySize, smemBytes));
+
+  cutlass::ClusterLaunchParams params = {dimGrid, dimBlock, dimCluster, smemBytes};
+  cutlass::Status status = cutlass::launch_kernel_on_cluster(params, (void const*) kernel_ptr,
+      prob_shape, cta_tiler, A, tmaA, B, tmaB, C, dC, tiled_mma, alpha, beta);
+  CUTE_CHECK_LAST();
+  if (status != cutlass::Status::kSuccess) std::cerr << "launch failed" << std::endl;
+}
+```
+</details>
+
+### E4. Split the kernel into a producer and a consumer warpgroup
+
+*Advanced · Hopper sm_90a, CuTe*
+
+Turn the E3 kernel into a warp-specialized one: warpgroup 0 only issues TMA loads, warpgroup 1 only runs WGMMA and the epilogue. The two now run concurrently and meet only at the barriers.
+
+**Specification**
+
+- Launch 256 threads per block. The `TiledMMA` still spans 128 threads, so slice it with `threadIdx.x - 128`.
+- Keep the same shared storage and the same two barriers per stage.
+- Producer: prefetch all stages, then for each further k-tile wait on the stage's consumer barrier, arrive with the expected bytes, and issue both copies. Only one elected thread does anything.
+- Consumer: for each k-tile wait on the stage's producer barrier, run the MMAs, wait for them, arrive on the consumer barrier.
+- Both sides must agree on the number of tiles consumed, including the zero tiles the prefetch loads when K is short.
+- Stretch: lower the producer's register limit and raise the consumer's with `cutlass::arch::warpgroup_reg_dealloc` and `warpgroup_reg_alloc`, keeping the block's total constant.
+
+**Hints**
+
+- Branch on `threadIdx.x / 128`, never on a single thread, around any `.aligned` instruction.
+- Give each side its own `PipelineState`. Start the producer's write state after the prefetch, as E3 does, so its phase lines up with the consumer's releases.
+- Change `__launch_bounds__` and `dimBlock` to 256.
+
+**You are done when**
+
+- Same numerical result as E3.
+- Time both kernels on a large problem (8192 cubed). Explain the difference you see.
+- Put a `printf` of the stage index and phase on each side for a tiny K and check that the sequences interleave as you predicted.
+
+**Common mistakes**
+
+- Slicing the MMA with the raw `threadIdx.x`: the consumer gets a partition that does not exist.
+- A consumer barrier count that no longer matches the number of threads that arrive on it.
+- Register reallocation with values that exceed what the launch bound provides, which blocks forever.
+
+<details>
+<summary>Reference solution</summary>
+
+The consumer waits on parity r mod 2 for the r-th use of a stage. The producer, refilling a stage for round r, must wait for the release of round r-1, which is why its state object is started one round late. This is the same structure as CUTLASS's `KernelTmaWarpSpecialized`, minus the pipeline class and the persistent loop.
+
+*Written for this guide as a modification of E3. Not compiled or run here.*
+
+```cpp
+// Changes relative to the E3 kernel. Everything not shown is unchanged.
+//   __launch_bounds__(256), dimBlock(256)
+
+  int wg_idx   = threadIdx.x / 128;            // 0 = producer, 1 = consumer
+  int warp_idx = cutlass::canonical_warp_idx_sync();
+  int lane_predicate = cute::elect_one_sync();
+
+  // ... barrier init by (warp_idx == 0 && lane_predicate), then cluster_sync(), as in E3 ...
+
+  int k_tiles  = size<1>(tAgA);
+  int k_rounds = k_tiles > int(K_PIPE_MAX) ? k_tiles : int(K_PIPE_MAX);   // tiles the consumer sees
+
+  if (wg_idx == 0)
+  {
+    // ---------------- Producer warpgroup ----------------
+    // Stretch: cutlass::arch::warpgroup_reg_dealloc<N>();
+    if ((warp_idx == 0) && lane_predicate)
+    {
+      // Prefetch every stage. Tiles past the end of K load zeros.
+      CUTE_UNROLL
+      for (int pipe = 0; pipe < K_PIPE_MAX; ++pipe) {
+        ProducerBarType::arrive_and_expect_tx(&producer_mbar[pipe], tma_transaction_bytes);
+        copy(tma_a.with(producer_mbar[pipe]), tAgA(_,pipe), tAsA(_,pipe));
+        copy(tma_b.with(producer_mbar[pipe]), tBgB(_,pipe), tBsB(_,pipe));
+      }
+
+      auto write_state = cutlass::PipelineState<K_PIPE_MAX>();
+      CUTE_NO_UNROLL
+      for (int k_tile = K_PIPE_MAX; k_tile < k_tiles; ++k_tile) {
+        int pipe = write_state.index();
+        // Wait until the consumer has released the previous use of this stage
+        ConsumerBarType::wait(&consumer_mbar[pipe], write_state.phase());
+        ProducerBarType::arrive_and_expect_tx(&producer_mbar[pipe], tma_transaction_bytes);
+        copy(tma_a.with(producer_mbar[pipe]), tAgA(_,k_tile), tAsA(_,pipe));
+        copy(tma_b.with(producer_mbar[pipe]), tBgB(_,k_tile), tBsB(_,pipe));
+        ++write_state;
+      }
+    }
+  }
+  else
+  {
+    // ---------------- Consumer warpgroup ----------------
+    // Stretch: cutlass::arch::warpgroup_reg_alloc<N>();
+    ThrMMA thr_mma = mma.get_thread_slice(threadIdx.x - 128);
+    Tensor tCsA = thr_mma.partition_A(sA);                             // (MMA,MMA_M,MMA_K,PIPE)
+    Tensor tCsB = thr_mma.partition_B(sB);                             // (MMA,MMA_N,MMA_K,PIPE)
+    Tensor tCgC = thr_mma.partition_C(gC);                             // (MMA,MMA_M,MMA_N)
+    Tensor tCrC = thr_mma.make_fragment_C(tCgC);
+    clear(tCrC);
+    Tensor tCrA = thr_mma.make_fragment_A(tCsA);
+    Tensor tCrB = thr_mma.make_fragment_B(tCsB);
+
+    auto read_state = cutlass::PipelineState<K_PIPE_MAX>();
+    CUTE_NO_UNROLL
+    for (int k_tile = 0; k_tile < k_rounds; ++k_tile) {
+      int pipe = read_state.index();
+      ProducerBarType::wait(&producer_mbar[pipe], read_state.phase());
+
+      warpgroup_arrive();
+      gemm(mma, tCrA(_,_,_,pipe), tCrB(_,_,_,pipe), tCrC);
+      warpgroup_commit_batch();
+      warpgroup_wait<0>();
+
+      ConsumerBarType::arrive(&consumer_mbar[pipe]);                   // all 128 consumers arrive
+      ++read_state;
+    }
+
+    axpby(alpha, tCrC, beta, tCgC);
+  }
+```
+</details>
+
+### E5. A production GEMM from the collective builders, with a schedule sweep
+
+*Intermediate · Hopper sm_90a, CUTLASS*
+
+Assemble a full CUTLASS GEMM from the mainloop and epilogue builders, run it, then measure how the kernel schedule and tile shape change throughput. This is the kernel your hand-written ones should be compared against.
+
+**Specification**
+
+- Half-precision A, B, C and D with a float accumulator. Tile 128x128x64, cluster 2x1x1.
+- Build the epilogue collective first, because the mainloop's stage count carves out the epilogue's shared storage.
+- Instantiate the kernel three times, with `KernelTmaWarpSpecialized`, `KernelTmaWarpSpecializedCooperative` and `KernelTmaWarpSpecializedPingpong`, each paired with its matching epilogue schedule.
+- Fill `Gemm::Arguments`, then call `can_implement`, `initialize` and `run`.
+- Time 8192x8192xK for K = 64, 512 and 8192 and report TFLOPS for each schedule.
+
+**Hints**
+
+- Pairings used by the CUTLASS example: `NoSmemWarpSpecialized` with the plain main loop, `TmaWarpSpecialized` with ping-pong, `TmaWarpSpecializedCooperative` with cooperative.
+- The `cutlass/util/...` headers live under `tools/util/include` in the repository, so add that to the include path.
+- Strides come from `cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(M, K, 1))`.
+- Persistent schedules need `hw_info.sm_count`.
+
+**You are done when**
+
+- All three variants pass a reference check.
+- You can explain, from the kernel structure, which schedule wins at K = 64 and which at K = 8192.
+- Try tile 128x256x64 with ping-pong and check the register usage or the timing.
+
+**Common mistakes**
+
+- A cooperative main loop with a non-cooperative epilogue schedule does not compile.
+- Timing the first call, which includes one-off setup.
+
+<details>
+<summary>Reference solution</summary>
+
+`Shape<int,int,int,int>` is (M, N, K, L), where L is a batch count. `LinearCombination` computes D = alpha x acc + beta x C. Swapping it for an EVT type is how you fuse further element-wise work.
+
+*Condensed from the CUTLASS example examples/49_hopper_gemm_with_collective_builder.*
+
+```cpp
+#include "cutlass/cutlass.h"
+#include "cute/tensor.hpp"
+#include "cutlass/gemm/device/gemm_universal_adapter.h"
+#include "cutlass/gemm/kernel/gemm_universal.hpp"
+#include "cutlass/gemm/collective/collective_builder.hpp"
+#include "cutlass/epilogue/collective/collective_builder.hpp"
+#include "cutlass/util/packed_stride.hpp"
+#include "cutlass/util/device_memory.h"
+using namespace cute;
+
+template <class MainloopScheduleType, class EpilogueScheduleType>
+struct GemmRunner
+{
+  using LayoutA = cutlass::layout::RowMajor;
+  using LayoutB = cutlass::layout::ColumnMajor;
+  using LayoutC = cutlass::layout::ColumnMajor;
+  using LayoutD = cutlass::layout::ColumnMajor;
+  using ElementA = cutlass::half_t;
+  using ElementB = cutlass::half_t;
+  using ElementC = cutlass::half_t;
+  using ElementD = cutlass::half_t;
+  using ElementAccumulator = float;
+  using ElementCompute = float;
+  using ElementScalar = float;
+
+  // 16-byte alignment lets the kernel use TMA
+  static constexpr int AlignmentA = 16 / sizeof(ElementA);
+  static constexpr int AlignmentB = 16 / sizeof(ElementB);
+  static constexpr int AlignmentC = 16 / sizeof(ElementC);
+  static constexpr int AlignmentD = 16 / sizeof(ElementD);
+  static constexpr auto RoundStyle = cutlass::FloatRoundStyle::round_to_nearest;
+
+  using FusionOp = cutlass::epilogue::fusion::LinearCombination<
+      ElementD, ElementCompute, ElementC, ElementScalar, RoundStyle>;
+
+  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+      cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
+      Shape<_128,_128,_64>, Shape<_2,_1,_1>,
+      cutlass::epilogue::collective::EpilogueTileAuto,
+      ElementAccumulator, ElementCompute,
+      ElementC, LayoutC, AlignmentC,
+      ElementD, LayoutD, AlignmentD,
+      EpilogueScheduleType,
+      FusionOp
+    >::CollectiveOp;
+
+  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+      cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
+      ElementA, LayoutA, AlignmentA,
+      ElementB, LayoutB, AlignmentB,
+      ElementAccumulator,
+      Shape<_128,_128,_64>, Shape<_2,_1,_1>,
+      cutlass::gemm::collective::StageCountAutoCarveout<
+        static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+      MainloopScheduleType
+    >::CollectiveOp;
+
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+      Shape<int,int,int,int>, CollectiveMainloop, CollectiveEpilogue>;
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+  using StrideA = typename Gemm::GemmKernel::StrideA;
+  using StrideB = typename Gemm::GemmKernel::StrideB;
+  using StrideC = typename Gemm::GemmKernel::StrideC;
+  using StrideD = typename Gemm::GemmKernel::StrideD;
+
+  bool run(int M, int N, int K, float alpha, float beta,
+           ElementA const* A, ElementB const* B, ElementC const* C, ElementD* D)
+  {
+    cutlass::KernelHardwareInfo hw_info;
+    hw_info.device_id = 0;
+    hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
+
+    auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(M, K, 1));
+    auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(N, K, 1));
+    auto stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(M, N, 1));
+    auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(M, N, 1));
+
+    typename Gemm::Arguments arguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {M, N, K, 1},
+      {A, stride_A, B, stride_B},
+      {{}, C, stride_C, D, stride_D},
+      hw_info
+    };
+    arguments.epilogue.thread.alpha = alpha;
+    arguments.epilogue.thread.beta  = beta;
+
+    Gemm gemm_op;
+    size_t workspace_size = Gemm::get_workspace_size(arguments);
+    cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+
+    if (gemm_op.can_implement(arguments) != cutlass::Status::kSuccess) return false;
+    if (gemm_op.initialize(arguments, workspace.get()) != cutlass::Status::kSuccess) return false;
+    if (gemm_op.run() != cutlass::Status::kSuccess) return false;
+    return cudaDeviceSynchronize() == cudaSuccess;
+  }
+};
+
+// The three variants to compare
+using Plain = GemmRunner<cutlass::gemm::KernelTmaWarpSpecialized,
+                         cutlass::epilogue::NoSmemWarpSpecialized>;
+using Coop  = GemmRunner<cutlass::gemm::KernelTmaWarpSpecializedCooperative,
+                         cutlass::epilogue::TmaWarpSpecializedCooperative>;
+using Ping  = GemmRunner<cutlass::gemm::KernelTmaWarpSpecializedPingpong,
+                         cutlass::epilogue::TmaWarpSpecialized>;
+```
+</details>
+
+### E6. GEMM with tcgen05.mma, Tensor Memory and TMA
+
+*Intermediate · Blackwell sm_100a, CuTe*
+
+Write your first Blackwell kernel: one CTA per 128x256 output tile, operands loaded by TMA, MMAs issued by one warp into Tensor Memory, and an epilogue that loads the accumulator from TMEM into registers. One stage, no cluster, so that only the new mechanisms are in play.
+
+**Specification**
+
+- D (f32) = alpha A (f16) B (f16) + beta C (f32). A is (M,K) and B is (N,K), both K-major. C and D are row-major.
+- MMA atom `SM100_MMA_F16BF16_SS` with M=128, N=256, K-major operands. MMA tile K is four instruction Ks, 64.
+- Shared memory layouts from `UMMA::tile_to_mma_shape(UMMA::Layout_K_SW128_Atom<T>{}, partition_shape_A(...))`.
+- Allocate TMEM from one warp with `cute::TMEM::Allocator1Sm`, publish the base address through shared memory, and free it at the end.
+- Two barriers: one for the TMA transaction, one that the MMA commits to. Track a phase bit for each by hand.
+- Per k-tile: load, wait, issue the MMAs from warp 0, commit with `cutlass::arch::umma_arrive`, wait before reusing the operand buffers.
+- Epilogue: `make_tmem_copy(SM100_TMEM_LOAD_32dp32b1x{}, tCtAcc)` for TMEM to registers, then `axpby` and a store.
+
+**Hints**
+
+- Use `tiled_mma.accumulate_ = UMMA::ScaleOut::Zero` for the first MMA and `One` afterwards. No clearing of TMEM is needed.
+- `gemm` handles the single-thread issue internally, so guard it by warp, not by thread.
+- The problem must divide evenly by the MMA tile in this exercise. There is no out-of-bounds handling in the direct global store.
+
+**You are done when**
+
+- Exact match against a host reference for 512x1024x256 with small integer inputs.
+- Allocate fewer TMEM columns than the accumulator needs and observe the failure. How many columns does a 128x256 f32 accumulator need?
+- Remove the wait on the MMA barrier and explain which data race you have created.
+
+**Common mistakes**
+
+- Running the allocator from a single thread. It is a warp-collective instruction.
+- Reading the accumulator pointer before the sync that publishes it.
+- Returning without releasing the allocation lock and freeing the columns.
+
+<details>
+<summary>Reference solution</summary>
+
+Compare with E3: the block still has 128 threads, but only one warp issues MMAs, and all four warps are needed only in the epilogue, because each warp reaches a different 32 lanes of TMEM. The accumulator never touches registers during the main loop.
+
+*Condensed from the CUTLASS tutorial examples/cute/tutorial/blackwell/02_mma_tma_sm100.cu.*
+
+```cpp
+#include <cute/tensor.hpp>
+#include <cute/arch/cluster_sm90.hpp>
+#include <cute/numeric/integral_constant.hpp>
+#include <cute/algorithm/cooperative_copy.hpp>
+#include <cute/arch/tmem_allocator_sm100.hpp>
+#include <cutlass/cluster_launch.hpp>
+#include <cutlass/arch/barrier.h>
+using namespace cute;
+
+template <class TypeA, class TypeB,
+          class ASmemLayout,     // (MmaA, NumMma_M, NumMma_K)
+          class BSmemLayout>     // (MmaB, NumMma_N, NumMma_K)
+struct SharedStorage
+{
+  alignas(128) cute::ArrayEngine<TypeA, cute::cosize_v<ASmemLayout>> A;
+  alignas(128) cute::ArrayEngine<TypeB, cute::cosize_v<BSmemLayout>> B;
+  alignas(16) cute::uint64_t mma_barrier;    // MMA completion
+  alignas(16) cute::uint64_t tma_barrier;    // TMA completion
+  alignas(16) cute::uint32_t tmem_base_ptr;  // TMEM base address
+  CUTE_DEVICE constexpr auto tensor_sA() { return make_tensor(make_smem_ptr(A.begin()), ASmemLayout{}); }
+  CUTE_DEVICE constexpr auto tensor_sB() { return make_tensor(make_smem_ptr(B.begin()), BSmemLayout{}); }
+};
+
+template <class SharedStorage,
+          class ATensor, class BTensor, class CTensor, class DTensor,
+          class MmaTiler_MNK, class TiledMMA, class ClusterShape_MNK,
+          class TmaAtomA, class TmaAtomB,
+          class Alpha, class Beta>
+__global__ static
+void
+gemm_device(ATensor mA,                      // (Gemm_M, Gemm_K)  TMA coordinate tensor
+            BTensor mB,                      // (Gemm_N, Gemm_K)  TMA coordinate tensor
+            CTensor mC,                      // (Gemm_M, Gemm_N)
+            DTensor mD,                      // (Gemm_M, Gemm_N)
+            MmaTiler_MNK mma_tiler,
+            TiledMMA tiled_mma,
+            ClusterShape_MNK cluster_shape,
+            CUTE_GRID_CONSTANT TmaAtomA const tma_atom_A,
+            CUTE_GRID_CONSTANT TmaAtomB const tma_atom_B,
+            Alpha alpha, Beta beta)
+{
+  // ---- Prologue ----
+  // CTA layout within the cluster: (V,M,N,K) -> CTA index
+  Layout cluster_layout_vmnk = tiled_divide(make_layout(cluster_shape),
+                                            make_tile(typename TiledMMA::AtomThrID{}));
+  auto mma_coord_vmnk = make_coord(blockIdx.x % size<0>(cluster_layout_vmnk), // peer CTA
+                                   blockIdx.x / size<0>(cluster_layout_vmnk), // MMA-M
+                                   blockIdx.y,                                // MMA-N
+                                   _);                                        // MMA-K
+  auto mma_coord = select<1,2,3>(mma_coord_vmnk);
+  Tensor gA = local_tile(mA, mma_tiler, mma_coord, Step<_1, X,_1>{});  // (MmaTile_M, MmaTile_K, Tiles_K)
+  Tensor gB = local_tile(mB, mma_tiler, mma_coord, Step< X,_1,_1>{});  // (MmaTile_N, MmaTile_K, Tiles_K)
+  Tensor gC = local_tile(mC, mma_tiler, mma_coord, Step<_1,_1, X>{});  // (MmaTile_M, MmaTile_N)
+  Tensor gD = local_tile(mD, mma_tiler, mma_coord, Step<_1,_1, X>{});  // (MmaTile_M, MmaTile_N)
+
+  extern __shared__ char shared_memory[];
+  SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(shared_memory);
+  Tensor tCsA = shared_storage.tensor_sA();         // (MmaA, NumMma_M, NumMma_K)
+  Tensor tCsB = shared_storage.tensor_sB();         // (MmaB, NumMma_N, NumMma_K)
+
+  // MMA partitioning. On SM100 the MMA partitions per CTA, not per thread.
+  auto mma_v = get<0>(mma_coord_vmnk);
+  ThrMMA cta_mma = tiled_mma.get_slice(mma_v);
+  Tensor tCgA = cta_mma.partition_A(gA);            // (MmaA, NumMma_M, NumMma_K, Tiles_K)
+  Tensor tCgB = cta_mma.partition_B(gB);            // (MmaB, NumMma_N, NumMma_K, Tiles_K)
+  Tensor tCgC = cta_mma.partition_C(gC);            // (MmaC, NumMma_M, NumMma_N)
+  Tensor tCgD = cta_mma.partition_C(gD);            // (MmaC, NumMma_M, NumMma_N)
+
+  // Operand fragments are shared memory descriptors
+  Tensor tCrA = cta_mma.make_fragment_A(tCsA);
+  Tensor tCrB = cta_mma.make_fragment_B(tCsB);
+
+  // The accumulator is a TMEM tensor
+  Tensor tCtAcc = cta_mma.make_fragment_C(tCgC);    // (MmaC, NumMma_M, NumMma_N)
+
+  uint32_t elect_one_thr  = cute::elect_one_sync();
+  uint32_t elect_one_warp = (threadIdx.x / 32 == 0);
+
+  using TmemAllocator = cute::TMEM::Allocator1Sm;
+  TmemAllocator tmem_allocator{};
+  if (elect_one_warp) {
+    tmem_allocator.allocate(cute::TMEM::Sm100TmemCapacityColumns, &shared_storage.tmem_base_ptr);
+  }
+  __syncthreads();                                  // TMEM address visible to all warps
+  tCtAcc.data() = shared_storage.tmem_base_ptr;
+
+  // TMA views: everything in mode 0 moves with one copy call
+  auto [tAgA, tAsA] = tma_partition(tma_atom_A, Int<0>{}, Layout<_1>{},
+                                    group_modes<0,3>(tCsA), group_modes<0,3>(tCgA));
+  auto [tBgB, tBsB] = tma_partition(tma_atom_B, Int<0>{}, Layout<_1>{},
+                                    group_modes<0,3>(tCsB), group_modes<0,3>(tCgB));
+  int tma_transaction_bytes = sizeof(make_tensor_like(tAsA))
+                            + sizeof(make_tensor_like(tBsB));
+
+  if (elect_one_warp && elect_one_thr) {
+    cute::initialize_barrier(shared_storage.mma_barrier, /* num_ctas */ 1);
+    cute::initialize_barrier(shared_storage.tma_barrier, /* num_threads */ 1);
+  }
+  int mma_barrier_phase_bit = 0;
+  int tma_barrier_phase_bit = 0;
+  __syncthreads();                                  // barrier init visible to all threads
+
+  // ---- Main loop ----
+  tiled_mma.accumulate_ = UMMA::ScaleOut::Zero;     // first MMA overwrites the accumulator
+  for (int k_tile = 0; k_tile < size<3>(tCgA); ++k_tile)
+  {
+    // Load one A tile and one B tile
+    if (elect_one_warp && elect_one_thr) {
+      cute::set_barrier_transaction_bytes(shared_storage.tma_barrier, tma_transaction_bytes);
+      copy(tma_atom_A.with(shared_storage.tma_barrier), tAgA(_,k_tile), tAsA);
+      copy(tma_atom_B.with(shared_storage.tma_barrier), tBgB(_,k_tile), tBsB);
+    }
+    cute::wait_barrier(shared_storage.tma_barrier, tma_barrier_phase_bit);
+    tma_barrier_phase_bit ^= 1;
+
+    // One warp issues the MMAs for this tile
+    if (elect_one_warp) {
+      for (int k_block = 0; k_block < size<2>(tCrA); ++k_block) {
+        gemm(tiled_mma, tCrA(_,_,k_block), tCrB(_,_,k_block), tCtAcc);
+        tiled_mma.accumulate_ = UMMA::ScaleOut::One;
+      }
+      cutlass::arch::umma_arrive(&shared_storage.mma_barrier);   // tcgen05.commit
+    }
+    // Operand buffers may be reused only after the MMAs have finished
+    cute::wait_barrier(shared_storage.mma_barrier, mma_barrier_phase_bit);
+    mma_barrier_phase_bit ^= 1;
+  }
+
+  // ---- Epilogue ----
+  TiledCopy tiled_t2r_copy = make_tmem_copy(SM100_TMEM_LOAD_32dp32b1x{}, tCtAcc);
+  ThrCopy   thr_t2r_copy   = tiled_t2r_copy.get_slice(threadIdx.x);
+
+  Tensor tDgC = thr_t2r_copy.partition_D(tCgC);                   // (CpyD, NumCpy_M, NumCpy_N)
+  Tensor tDrC = make_fragment_like(tDgC);
+  copy(tDgC, tDrC);                                               // C: GMEM -> RMEM
+
+  Tensor tDtAcc = thr_t2r_copy.partition_S(tCtAcc);               // (CpyS, NumCpy_M, NumCpy_N)
+  Tensor tDgD   = thr_t2r_copy.partition_D(tCgD);
+  using AccType = typename decltype(tCtAcc)::value_type;
+  Tensor tDrAcc = make_tensor<AccType>(shape(tDgD));
+  copy(tiled_t2r_copy, tDtAcc, tDrAcc);                           // acc: TMEM -> RMEM
+
+  axpby(alpha, tDrAcc, beta, tDrC);                               // tDrC = alpha*acc + beta*C
+  copy(tDrC, tDgD);                                               // D: RMEM -> GMEM
+
+  __syncthreads();
+  if (elect_one_warp) {
+    tmem_allocator.release_allocation_lock();
+    tmem_allocator.free(shared_storage.tmem_base_ptr, cute::TMEM::Sm100TmemCapacityColumns);
+  }
+}
+
+// Host setup
+template <class TypeA, class LayoutA, class TypeB, class LayoutB,
+          class TypeC, class LayoutC, class TypeD, class LayoutD,
+          class Alpha, class Beta>
+void gemm_host(TypeA const* ptr_A, LayoutA layout_A, TypeB const* ptr_B, LayoutB layout_B,
+               TypeC const* ptr_C, LayoutC layout_C, TypeD* ptr_D, LayoutD layout_D,
+               Alpha const alpha, Beta const beta)
+{
+  Tensor mA = make_tensor(make_gmem_ptr(ptr_A), layout_A);      // (Gemm_M, Gemm_K)
+  Tensor mB = make_tensor(make_gmem_ptr(ptr_B), layout_B);      // (Gemm_N, Gemm_K)
+  Tensor mC = make_tensor(make_gmem_ptr(ptr_C), layout_C);      // (Gemm_M, Gemm_N)
+  Tensor mD = make_tensor(make_gmem_ptr(ptr_D), layout_D);      // (Gemm_M, Gemm_N)
+  auto Gemm_M = shape<0>(layout_A);
+  auto Gemm_N = shape<0>(layout_B);
+
+  TiledMMA tiled_mma = make_tiled_mma(SM100_MMA_F16BF16_SS<TypeA, TypeB, TypeC,
+                                                           128, 256,
+                                                           UMMA::Major::K, UMMA::Major::K>{});
+  auto bM = tile_size<0>(tiled_mma);
+  auto bN = tile_size<1>(tiled_mma);
+  auto bK = tile_size<2>(tiled_mma) * Int<4>{};     // four K=16 MMAs per tile
+  auto mma_tiler = make_shape(bM, bN, bK);
+
+  // Post-partitioned shapes, then swizzled shared memory layouts
+  auto mma_shape_A = partition_shape_A(tiled_mma, make_shape(size<0>(mma_tiler), size<2>(mma_tiler)));
+  auto mma_shape_B = partition_shape_B(tiled_mma, make_shape(size<1>(mma_tiler), size<2>(mma_tiler)));
+  auto sA_layout = UMMA::tile_to_mma_shape(UMMA::Layout_K_SW128_Atom<TypeA>{}, mma_shape_A);
+  auto sB_layout = UMMA::tile_to_mma_shape(UMMA::Layout_K_SW128_Atom<TypeB>{}, mma_shape_B);
+  using SMEMStorage = SharedStorage<TypeA, TypeB, decltype(sA_layout), decltype(sB_layout)>;
+
+  auto cluster_shape = make_shape(Int<1>{}, Int<1>{}, Int<1>{});
+  Layout cluster_layout_vmnk = tiled_divide(make_layout(cluster_shape),
+                                            make_tile(typename decltype(tiled_mma)::AtomThrID{}));
+
+  Copy_Atom tma_atom_A = make_tma_atom(SM90_TMA_LOAD{}, mA, sA_layout, select<0,2>(mma_tiler));
+  Tensor mA_tma = tma_atom_A.get_tma_tensor(shape(mA));
+  Copy_Atom tma_atom_B = make_tma_atom(SM90_TMA_LOAD{}, mB, sB_layout, select<1,2>(mma_tiler));
+  Tensor mB_tma = tma_atom_B.get_tma_tensor(shape(mB));
+
+  dim3 dimBlock(128);
+  dim3 dimCluster(size<0>(cluster_shape), size<1>(cluster_shape), size<2>(cluster_shape));
+  dim3 dimGrid(size(ceil_div(Gemm_M, bM * size<1>(cluster_layout_vmnk))) * dimCluster.x,
+               size(ceil_div(Gemm_N, bN * size<2>(cluster_layout_vmnk))) * dimCluster.y);
+  int smemBytes = sizeof(SMEMStorage);
+
+  auto* kernel_ptr = &gemm_device<SMEMStorage,
+                                  decltype(mA_tma), decltype(mB_tma), decltype(mC), decltype(mD),
+                                  decltype(mma_tiler), decltype(tiled_mma), decltype(cluster_shape),
+                                  decltype(tma_atom_A), decltype(tma_atom_B),
+                                  Alpha, Beta>;
+  CUTE_CHECK_ERROR(cudaFuncSetAttribute(kernel_ptr,
+      cudaFuncAttributeMaxDynamicSharedMemorySize, smemBytes));
+
+  cutlass::ClusterLaunchParams params = {dimGrid, dimBlock, dimCluster, smemBytes};
+  cutlass::Status status = cutlass::launch_kernel_on_cluster(params, (void const*) kernel_ptr,
+      mA_tma, mB_tma, mC, mD, mma_tiler, tiled_mma, cluster_shape,
+      tma_atom_A, tma_atom_B, alpha, beta);
+  CUTE_CHECK_LAST();
+  if (status != cutlass::Status::kSuccess) std::cerr << "launch failed" << std::endl;
+}
+```
+</details>
+
+### E7. Add TMA multicast in a 4x4 cluster
+
+*Advanced · Blackwell sm_100a, CuTe*
+
+Extend E6 so that each A tile is loaded once per cluster row and each B tile once per cluster column. Every CTA loads a slice and multicasts it, and every CTA must now coordinate buffer reuse with its row and column peers.
+
+**Specification**
+
+- Cluster shape 4x4x1. Work out each CTA's (V,M,N,K) coordinate in the cluster from its rank.
+- Create the TMA atoms with `SM90_TMA_LOAD_MULTICAST` and the number of CTAs along the multicast mode.
+- Pass the CTA's cluster coordinate and the cluster layout along that mode to `tma_partition`, so each CTA loads its own slice.
+- Build three 16-bit masks: A goes to CTAs along N, B goes to CTAs along M, and the MMA commit goes to both sets.
+- The MMA barrier's arrival count becomes the number of CTAs that multicast into this one: M-size plus N-size minus 1.
+- Replace the block sync after barrier init with a cluster sync.
+
+**Hints**
+
+- `cluster_layout_vmnk.get_flat_coord(int(cute::block_rank_in_cluster()))` gives the CTA's coordinate.
+- `create_tma_multicast_mask<2>(layout, coord)` selects CTAs that vary along mode 2 (N).
+- The transaction byte count per CTA is unchanged: each CTA still receives one full A tile and one full B tile, in slices from several issuers.
+
+**You are done when**
+
+- Exact match against the reference, with grid dimensions that are multiples of 4.
+- Print the three masks for CTA rank 5 and verify them by hand.
+- Set the MMA barrier count back to 1 and explain the resulting corruption or hang.
+
+**Common mistakes**
+
+- Swapping the multicast modes: A is shared along N, B along M.
+- Leaving `__syncthreads()` where a cluster-wide sync is needed.
+- Exiting a CTA while a peer's multicast is still writing into its shared memory.
+
+<details>
+<summary>Reference solution</summary>
+
+Before a CTA may overwrite its operand buffer, every CTA that reads data it multicast must have finished its MMA on that data. That is why the commit is multicast and why seven arrivals are expected in a 4x4 cluster.
+
+*Changes taken from the CUTLASS tutorial examples/cute/tutorial/blackwell/03_mma_tma_multicast_sm100.cu.*
+
+```cpp
+// Changes relative to the E6 kernel and host code. Everything not shown is unchanged.
+
+// ---- Kernel: cluster coordinate of this CTA ----
+  auto cta_in_cluster_coord_vmnk =
+      cluster_layout_vmnk.get_flat_coord(int(cute::block_rank_in_cluster()));
+
+// ---- Kernel: partition the TMA work across the CTAs that share a tile ----
+  auto [tAgA, tAsA] = tma_partition(tma_atom_A,
+                                    get<2>(cta_in_cluster_coord_vmnk),          // CTA coordinate along N
+                                    make_layout(size<2>(cluster_layout_vmnk)),  // CTA layout along N
+                                    group_modes<0,3>(tCsA), group_modes<0,3>(tCgA));
+  auto [tBgB, tBsB] = tma_partition(tma_atom_B,
+                                    get<1>(cta_in_cluster_coord_vmnk),          // CTA coordinate along M
+                                    make_layout(size<1>(cluster_layout_vmnk)),  // CTA layout along M
+                                    group_modes<0,3>(tCsB), group_modes<0,3>(tCgB));
+
+  uint16_t tma_mcast_mask_a = create_tma_multicast_mask<2>(cluster_layout_vmnk, cta_in_cluster_coord_vmnk);
+  uint16_t tma_mcast_mask_b = create_tma_multicast_mask<1>(cluster_layout_vmnk, cta_in_cluster_coord_vmnk);
+  uint16_t mma_mcast_mask_c = create_tma_multicast_mask<0,1>(cluster_layout_vmnk, cta_in_cluster_coord_vmnk) |
+                              create_tma_multicast_mask<0,2>(cluster_layout_vmnk, cta_in_cluster_coord_vmnk);
+
+// ---- Kernel: barrier init ----
+  if (elect_one_warp && elect_one_thr) {
+    int num_mcast_participants = size<1>(cluster_layout_vmnk) + size<2>(cluster_layout_vmnk) - 1;
+    cute::initialize_barrier(shared_storage.mma_barrier, /* num_ctas */ num_mcast_participants);
+    cute::initialize_barrier(shared_storage.tma_barrier, /* num_threads */ 1);
+  }
+  int mma_barrier_phase_bit = 0;
+  int tma_barrier_phase_bit = 0;
+  cute::cluster_sync();           // every CTA in the cluster sees the initialised barriers
+
+// ---- Kernel: main loop ----
+    if (elect_one_warp && elect_one_thr) {
+      cute::set_barrier_transaction_bytes(shared_storage.tma_barrier, tma_transaction_bytes);
+      copy(tma_atom_A.with(shared_storage.tma_barrier, tma_mcast_mask_a), tAgA(_,k_tile), tAsA);
+      copy(tma_atom_B.with(shared_storage.tma_barrier, tma_mcast_mask_b), tBgB(_,k_tile), tBsB);
+    }
+    // ... wait on tma_barrier, issue MMAs as before, then:
+      cutlass::arch::umma_arrive_multicast(&shared_storage.mma_barrier, mma_mcast_mask_c);
+
+// ---- Host ----
+  auto cluster_shape = make_shape(Int<4>{}, Int<4>{}, Int<1>{});
+
+  Copy_Atom tma_atom_A = make_tma_atom(
+      SM90_TMA_LOAD_MULTICAST{},
+      mA, sA_layout,
+      select<0,2>(mma_tiler),
+      size<2>(cluster_layout_vmnk));    // CTAs along N receive the same A tile
+  Copy_Atom tma_atom_B = make_tma_atom(
+      SM90_TMA_LOAD_MULTICAST{},
+      mB, sB_layout,
+      select<1,2>(mma_tiler),
+      size<1>(cluster_layout_vmnk));    // CTAs along M receive the same B tile
+```
+</details>
+
+### E8. Two-SM MMA across a CTA pair
+
+*Advanced · Blackwell sm_100a, CuTe*
+
+Extend E7 so that two neighbouring CTAs execute one 256x256 MMA together. Both CTAs load operands and both hold half of the accumulator, but only the leader CTA waits for the loads and issues the instruction.
+
+**Specification**
+
+- Switch the atom to `SM100_MMA_F16BF16_2x1SM_SS` with M=256, N=256.
+- Switch the allocator to `cute::TMEM::Allocator2Sm`. Both CTAs of a pair take part in the allocation.
+- Define the leader as the CTA whose V coordinate in the cluster is 0.
+- Only the leader sets expected transaction bytes, and it expects the bytes for both CTAs of the pair.
+- Only the leader waits on the TMA barrier and issues `gemm`. It commits with `umma_arrive_multicast_2x1SM`.
+- Every CTA still waits on the MMA barrier before reusing its buffers, and every CTA runs its own epilogue on its half.
+- Create the TMA atoms with `make_tma_atom_A_sm100` and `make_tma_atom_B_sm100` and the `SM100_TMA_2SM_LOAD_MULTICAST` operation.
+
+**Hints**
+
+- The first cluster dimension must stay a multiple of 2.
+- `tiled_mma.get_slice(mma_v)` with the V coordinate now gives each CTA its 128-row half of A and C.
+- The cluster sync after initialisation now also covers TMEM allocation.
+
+**You are done when**
+
+- Exact match against the reference for 1024x1024x256.
+- Explain why the non-leader CTA does not need to wait on its own TMA barrier.
+- Count how many `tcgen05.mma` instructions now execute per 256x256x64 tile, compared with E7 for the same output area.
+
+**Common mistakes**
+
+- Mixing `cta_group::1` and `cta_group::2` instructions in one kernel, for example a 1-SM allocator with a 2-SM MMA.
+- Letting both CTAs of a pair issue the MMA.
+- Halving the expected byte count because 'each CTA loads half'.
+
+<details>
+<summary>Reference solution</summary>
+
+The loads issued by both CTAs complete on the leader's barrier, which is why the leader expects twice the bytes and the follower expects none. The follower's only main-loop duties are issuing its TMA copies and waiting for the commit.
+
+*Changes taken from the CUTLASS tutorial examples/cute/tutorial/blackwell/04_mma_tma_2sm_sm100.cu.*
+
+```cpp
+// Changes relative to the E7 kernel and host code. Everything not shown is unchanged.
+
+// ---- Kernel ----
+  using TmemAllocator = cute::TMEM::Allocator2Sm;
+
+  auto elect_one_cta = get<0>(cta_in_cluster_coord_vmnk) == Int<0>{};   // leader of the pair
+
+  int tma_transaction_bytes = size<0>(cluster_layout_vmnk) * sizeof(make_tensor_like(tAsA))
+                            + size<0>(cluster_layout_vmnk) * sizeof(make_tensor_like(tBsB));
+
+  cute::cluster_sync();   // barrier init and TMEM allocation visible across the cluster
+
+  tiled_mma.accumulate_ = UMMA::ScaleOut::Zero;
+  for (int k_tile = 0; k_tile < size<3>(tCgA); ++k_tile)
+  {
+    if (elect_one_warp && elect_one_thr) {          // one thread per CTA issues its loads
+      if (elect_one_cta) {                          // only the leader tracks the transaction
+        cute::set_barrier_transaction_bytes(shared_storage.tma_barrier, tma_transaction_bytes);
+      }
+      copy(tma_atom_A.with(shared_storage.tma_barrier, tma_mcast_mask_a), tAgA(_,k_tile), tAsA);
+      copy(tma_atom_B.with(shared_storage.tma_barrier, tma_mcast_mask_b), tBgB(_,k_tile), tBsB);
+    }
+
+    if (elect_one_cta) {
+      cute::wait_barrier(shared_storage.tma_barrier, tma_barrier_phase_bit);
+      tma_barrier_phase_bit ^= 1;
+
+      if (elect_one_warp) {
+        for (int k_block = 0; k_block < size<2>(tCrA); ++k_block) {
+          gemm(tiled_mma, tCrA(_,_,k_block), tCrB(_,_,k_block), tCtAcc);
+          tiled_mma.accumulate_ = UMMA::ScaleOut::One;
+        }
+        cutlass::arch::umma_arrive_multicast_2x1SM(&shared_storage.mma_barrier, mma_mcast_mask_c);
+      }
+    }
+    // Every CTA waits for the MMAs before its buffers are overwritten
+    cute::wait_barrier(shared_storage.mma_barrier, mma_barrier_phase_bit);
+    mma_barrier_phase_bit ^= 1;
+  }
+
+// ---- Host ----
+  TiledMMA tiled_mma = make_tiled_mma(SM100_MMA_F16BF16_2x1SM_SS<TypeA, TypeB, TypeC,
+                                                                 256, 256,
+                                                                 UMMA::Major::K, UMMA::Major::K>{});
+
+  Copy_Atom tma_atom_A = make_tma_atom_A_sm100(
+      SM100_TMA_2SM_LOAD_MULTICAST{},
+      mA, sA_layout,
+      mma_tiler,               // full (M,N,K) tiler on SM100
+      tiled_mma,               // needed for CTA-level partitioning
+      cluster_layout_vmnk);
+  Copy_Atom tma_atom_B = make_tma_atom_B_sm100(
+      SM100_TMA_2SM_LOAD_MULTICAST{},
+      mB, sB_layout,
+      mma_tiler,
+      tiled_mma,
+      cluster_layout_vmnk);
+```
+</details>
+
+### E9. A TMA epilogue: load C and store D through shared memory
+
+*Advanced · Blackwell sm_100a, CuTe*
+
+Replace the direct global memory epilogue of E8 with one that loads C by TMA, combines it with the accumulator in registers, and writes D with a TMA store. This is the full data path of a production kernel: global to shared to TMEM-backed math to registers to shared to global.
+
+**Specification**
+
+- Split each CTA's accumulator into four epilogue tiles along N and process them in a loop.
+- Add shared memory buffers for one C tile and one D tile. They may share space with the A and B buffers in a union, since the main loop is finished.
+- Per epilogue tile: TMA-load C and wait, copy C from shared memory to registers, load the accumulator slice from TMEM, apply `axpby`, write D to shared memory.
+- Then `tma_store_fence()`, a block sync, a TMA store from one thread, `tma_store_arrive()` and `tma_store_wait<0>()`, and a final sync.
+- Create a `SM90_TMA_LOAD` atom for C and a `SM90_TMA_STORE` atom for D with the epilogue tiler.
+
+**Hints**
+
+- `zipped_divide(tCtAcc, make_tile(epi_tiler))` gives (EpiTile, NumTiles) views of the accumulator and of C and D.
+- Build the TMEM copy from one epilogue tile, `tAcc_epi(_,_0{})`, then partition TMEM as source and the shared buffers as destination.
+- Reuse the TMA barrier and its phase bit for the C loads.
+
+**You are done when**
+
+- Exact match against the reference with beta = 1 and non-zero C.
+- Remove the fence and run many times. Does it fail? Explain why a missing fence may not show up in a test.
+- Make the problem size not a multiple of the tile and check that edge tiles are still correct. Why does this now work when it did not in E6?
+
+**Common mistakes**
+
+- Issuing the store before all threads have written D and fenced.
+- Overwriting the D buffer for the next epilogue tile before the store has completed.
+- Expecting main-loop byte counts on the barrier during the epilogue.
+
+<details>
+<summary>Reference solution</summary>
+
+The TMA store drops out-of-bounds elements and the TMA load zero-fills them, so the epilogue needs no predication. The syncs around the store are the simple, slow choice. A production kernel rotates buffers and lets the store overlap the next tile.
+
+*Changes taken from the CUTLASS tutorial examples/cute/tutorial/blackwell/05_mma_tma_epi_sm100.cu.*
+
+```cpp
+// Changes relative to the E8 kernel and host code. Everything not shown is unchanged.
+
+// ---- Shared storage: epilogue buffers overlay the main-loop buffers ----
+template <class TypeA, class TypeB, class TypeC, class TypeD,
+          class ASmemLayout, class BSmemLayout,
+          class CSmemLayout, class DSmemLayout>     // (EpiTile_M, EpiTile_N)
+struct SharedStorage
+{
+  alignas(128) union {
+    alignas(128) struct {
+      alignas(128) cute::ArrayEngine<TypeA, cute::cosize_v<ASmemLayout>> A;
+      alignas(128) cute::ArrayEngine<TypeB, cute::cosize_v<BSmemLayout>> B;
+    } mainloop;
+    alignas(128) cute::ArrayEngine<TypeC, cute::cosize_v<CSmemLayout>> C;
+    alignas(128) cute::ArrayEngine<TypeD, cute::cosize_v<DSmemLayout>> D;
+  } tensors;
+  alignas(16) cute::uint64_t mma_barrier;
+  alignas(16) cute::uint64_t tma_barrier;
+  alignas(16) cute::uint32_t tmem_base_ptr;
+  CUTE_DEVICE constexpr auto tensor_sA() { return make_tensor(make_smem_ptr(tensors.mainloop.A.begin()), ASmemLayout{}); }
+  CUTE_DEVICE constexpr auto tensor_sB() { return make_tensor(make_smem_ptr(tensors.mainloop.B.begin()), BSmemLayout{}); }
+  CUTE_DEVICE constexpr auto tensor_sC() { return make_tensor(make_smem_ptr(tensors.C.begin()), CSmemLayout{}); }
+  CUTE_DEVICE constexpr auto tensor_sD() { return make_tensor(make_smem_ptr(tensors.D.begin()), DSmemLayout{}); }
+};
+
+// ---- Kernel: new parameters ----
+//   EpiTiler_MN epi_tiler_mn,
+//   CUTE_GRID_CONSTANT TmaAtomC const tma_atom_C,
+//   CUTE_GRID_CONSTANT TmaAtomD const tma_atom_D
+// mC and mD are now TMA coordinate tensors.
+
+// ---- Kernel: epilogue, replacing the E6 epilogue ----
+  auto epi_tiler_v = make_tile(epi_tiler_mn);               // (EpiTile)
+  Tensor tAcc_epi = zipped_divide(tCtAcc, epi_tiler_v);     // (EpiTile,NumTiles)
+  Tensor gC_epi   = zipped_divide(tCgC,   epi_tiler_v);     // (EpiTile,NumTiles)
+  Tensor gD_epi   = zipped_divide(tCgD,   epi_tiler_v);     // (EpiTile,NumTiles)
+
+  Tensor sC_epi = shared_storage.tensor_sC();               // (EpiTile)
+  Tensor sD_epi = shared_storage.tensor_sD();               // (EpiTile)
+
+  auto [tGS_gC, tGS_sC] = tma_partition(tma_atom_C, sC_epi, gC_epi);   // GMEM -> SMEM
+  auto [tSG_gD, tSG_sD] = tma_partition(tma_atom_D, sD_epi, gD_epi);   // SMEM -> GMEM
+  tma_transaction_bytes = sizeof(make_tensor_like(tGS_sC));
+
+  TiledCopy t2r_copy = make_tmem_copy(SM100_TMEM_LOAD_32dp32b1x{}, tAcc_epi(_,_0{}));
+  ThrCopy   thr_t2r  = t2r_copy.get_slice(threadIdx.x);
+  Tensor tTR_tAcc = thr_t2r.partition_S(tAcc_epi);          // (TmemCpy,NumTmemCpy,NumTiles)
+  Tensor tTR_sC   = thr_t2r.partition_D(sC_epi);            // (TmemCpy,NumTmemCpy)
+  Tensor tTR_sD   = thr_t2r.partition_D(sD_epi);            // (TmemCpy,NumTmemCpy)
+  Tensor tTR_rC = make_tensor_like(tTR_sC);
+  Tensor tTR_rD = make_fragment_like(tTR_sD);
+
+  CUTE_UNROLL
+  for (int epi_tile_idx = 0; epi_tile_idx < size<2>(tTR_tAcc); ++epi_tile_idx) {
+    // C: GMEM -> SMEM by TMA
+    if (elect_one_warp && elect_one_thr) {
+      cute::set_barrier_transaction_bytes(shared_storage.tma_barrier, tma_transaction_bytes);
+      copy(tma_atom_C.with(shared_storage.tma_barrier, 0 /* no multicast */), tGS_gC(_,epi_tile_idx), tGS_sC);
+    }
+    cute::wait_barrier(shared_storage.tma_barrier, tma_barrier_phase_bit);
+    tma_barrier_phase_bit ^= 1;
+
+    copy_aligned(tTR_sC, tTR_rC);                           // C: SMEM -> RMEM
+    copy(t2r_copy, tTR_tAcc(_,_,epi_tile_idx), tTR_rD);     // acc: TMEM -> RMEM
+    axpby(beta, tTR_rC, alpha, tTR_rD);                     // rD = alpha*acc + beta*C
+
+    __syncthreads();                                        // C reads done before smem is reused
+    copy_aligned(tTR_rD, tTR_sD);                           // D: RMEM -> SMEM
+
+    tma_store_fence();                                      // make D visible to the async proxy
+    __syncthreads();                                        // every thread has fenced
+
+    if (elect_one_warp && elect_one_thr) {
+      copy(tma_atom_D, tSG_sD, tSG_gD(_,epi_tile_idx));     // D: SMEM -> GMEM by TMA
+      tma_store_arrive();
+      tma_store_wait<0>();
+    }
+    __syncthreads();                                        // store finished before the next tile
+  }
+
+// ---- Host ----
+  auto mma_shape_C = partition_shape_C(tiled_mma, make_shape(size<0>(mma_tiler), size<1>(mma_tiler)));
+  auto epi_tiler = make_tile(size<0,0>(mma_shape_C), size<0,1>(mma_shape_C) / Int<4>{});  // 4 tiles per CTA
+
+  // MMA K-major corresponds to epilogue N-major
+  auto sC_layout_mn = tile_to_shape(UMMA::Layout_K_SW128_Atom<TypeC>{},
+                                    make_shape(size<0>(epi_tiler), size<1>(epi_tiler)));
+  auto sC_layout = group<0,2>(sC_layout_mn);
+  auto sD_layout_mn = tile_to_shape(UMMA::Layout_K_SW128_Atom<TypeD>{},
+                                    make_shape(size<0>(epi_tiler), size<1>(epi_tiler)));
+  auto sD_layout = group<0,2>(sD_layout_mn);
+
+  using SMEMStorage = SharedStorage<TypeA, TypeB, TypeC, TypeD,
+                                    decltype(sA_layout), decltype(sB_layout),
+                                    decltype(sC_layout), decltype(sD_layout)>;
+
+  Copy_Atom tma_atom_C = make_tma_atom(SM90_TMA_LOAD{},  mC, sC_layout, epi_tiler);
+  Tensor mC_tma = tma_atom_C.get_tma_tensor(shape(mC));
+  Copy_Atom tma_atom_D = make_tma_atom(SM90_TMA_STORE{}, mD, sD_layout, epi_tiler);
+  Tensor mD_tma = tma_atom_D.get_tma_tensor(shape(mD));
+  // Pass mC_tma, mD_tma, epi_tiler, tma_atom_C and tma_atom_D to the kernel.
+```
+</details>
+
+### E10. Capstone: a warp-specialized persistent Blackwell GEMM
+
+*Advanced · Blackwell sm_100a, CuTe and CUTLASS*
+
+Restructure your E9 kernel into the shape of CUTLASS's production kernel: dedicated warps for loading, MMA and epilogue, several shared memory stages, two accumulator stages in TMEM, and a persistent loop over output tiles. Then compare it with the library kernel built below. This is a multi-day project, and the reference solution is the CUTLASS source itself.
+
+**Specification**
+
+- Stage 1, warp roles: 256 threads. Warp 0 issues MMAs, warp 2 issues mainloop TMA loads, warps 4 to 7 run the epilogue. Leave warps 1 and 3 idle for now.
+- Stage 2, load pipeline: several operand stages in shared memory, with a full and an empty barrier per stage, between warp 2 and warp 0. The 'empty' signal is the MMA commit.
+- Stage 3, accumulator pipeline: two accumulator regions in TMEM. Warp 0 alternates between them. Each has a barrier that the MMA commit completes for the epilogue warps, and one the epilogue warps arrive on when they have drained it.
+- Stage 4, persistence with a static schedule: each CTA loops over tiles tile = start + i x grid size. Carry barrier phases across tiles.
+- Stage 5, dynamic scheduling: let warp 1 claim tiles with Cluster Launch Control and publish them to the other warps through a small pipeline.
+- Measure TFLOPS after each stage against the builder kernel below.
+
+**Hints**
+
+- Read `include/cutlass/gemm/kernel/sm100_gemm_tma_warpspecialized.hpp` for the warp roles and pipelines, and `include/cutlass/gemm/collective/sm100_mma_warpspecialized.hpp` for the load and MMA loops.
+- Add `tcgen05.fence::before_thread_sync` and `after_thread_sync` where the epilogue warps hand a TMEM region back to the MMA warp. CUTLASS wraps these in `cutlass::arch::fence_view_async_tmem_load()` and related helpers.
+- Get each stage correct on a 1x1 cluster before returning to the 2-SM configuration.
+
+**You are done when**
+
+- Correct results at every stage for square and very rectangular problems, and for sizes that are not tile multiples.
+- A written explanation, per barrier, of who arrives, who waits, and what the arrival count is.
+- Final throughput within a stated percentage of the builder kernel, with the remaining gap attributed to something specific.
+
+**Common mistakes**
+
+- Changing two pipelines at once. Each stage adds exactly one producer and consumer relationship.
+- A phase bit that is reset at the start of each tile in a persistent loop.
+- Both accumulator stages sized so that together they exceed 512 TMEM columns.
+
+<details>
+<summary>Reference solution</summary>
+
+The code below is the library kernel to measure against, not the answer to the capstone. With a cluster whose first dimension is even, the auto schedule selects the 2-SM MMA and the tile becomes 256x128x64.
+
+*Baseline code condensed from the CUTLASS example examples/71_blackwell_gemm_with_collective_builder. The capstone kernel itself has no solution here.*
+
+```cpp
+#include "cutlass/cutlass.h"
+#include "cute/tensor.hpp"
+#include "cutlass/gemm/device/gemm_universal_adapter.h"
+#include "cutlass/gemm/kernel/gemm_universal.hpp"
+#include "cutlass/gemm/collective/collective_builder.hpp"
+#include "cutlass/epilogue/collective/collective_builder.hpp"
+using namespace cute;
+
+using LayoutA = cutlass::layout::RowMajor;
+using LayoutB = cutlass::layout::ColumnMajor;
+using LayoutC = cutlass::layout::ColumnMajor;
+using LayoutD = cutlass::layout::ColumnMajor;
+using ElementA = cutlass::half_t;
+using ElementB = cutlass::half_t;
+using ElementC = cutlass::half_t;
+using ElementD = cutlass::half_t;
+using ElementAccumulator = float;
+using ElementCompute = float;
+using ElementScalar = float;
+
+using MainloopScheduleType = cutlass::gemm::KernelTmaWarpSpecialized2SmSm100;
+using EpilogueScheduleType = cutlass::epilogue::TmaWarpSpecialized2Sm;
+
+using ClusterShapeMNK = Shape<_2,_2,_1>;
+using MmaTileMNK      = Shape<_256,_128,_64>;     // 2-SM MMA allows M = 256
+
+static constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
+static constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
+static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
+static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
+static constexpr auto RoundStyle = cutlass::FloatRoundStyle::round_to_nearest;
+
+using FusionOp = cutlass::epilogue::fusion::LinearCombination<
+    ElementD, ElementCompute, ElementC, ElementScalar, RoundStyle>;
+
+using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+    cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
+    MmaTileMNK, ClusterShapeMNK,
+    cutlass::epilogue::collective::EpilogueTileAuto,
+    ElementAccumulator, ElementCompute,
+    ElementC, LayoutC, AlignmentC,
+    ElementD, LayoutD, AlignmentD,
+    EpilogueScheduleType,
+    FusionOp
+  >::CollectiveOp;
+
+using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+    cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
+    ElementA, LayoutA, AlignmentA,
+    ElementB, LayoutB, AlignmentB,
+    ElementAccumulator,
+    MmaTileMNK, ClusterShapeMNK,
+    cutlass::gemm::collective::StageCountAutoCarveout<
+      static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+    MainloopScheduleType
+  >::CollectiveOp;
+
+using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int,int,int,int>, CollectiveMainloop, CollectiveEpilogue>;
+using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+// Arguments, can_implement, initialize and run are used exactly as in E5.
+```
+</details>
+
+## Summary
+
+- **Hardware now does the per-thread work.** TMA computes addresses and moves tiles, the tensor
+  core reads operands from shared memory through descriptors, and on Blackwell one thread issues
+  each MMA into Tensor Memory. Kernels are built from warp roles, not from every thread doing
+  everything.
+- **The mbarrier is the one synchronisation primitive.** TMA completion, MMA completion
+  (`tcgen05.commit`) and producer–consumer hand-offs are all mbarrier phases; most hangs come from
+  a wrong arrival count, `expect_tx` byte total or phase parity.
+- **Copy side and math side must agree on the layout.** The TMA swizzle mode and the MMA matrix
+  descriptor name the same shared-memory layout; a mismatch gives wrong numbers, not a fault.
+- **CuTe layouts are functions from coordinates to offsets.** Composition, complement, divides
+  and products tile data and assign it to threads, which is why the same `copy` and `gemm` calls
+  work on Ampere, Hopper and Blackwell with only the atoms changed.
+- **Port in small steps and measure against the tensor-core peak.** Debug on one tile, one stage
+  and a 1 × 1 × 1 cluster first, then add 2-SM MMA, multicast and Cluster Launch Control one at a
+  time.
+
+## References
+
+- [NVIDIA PTX ISA manual](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html)
+- [CUTLASS: Warpgroup MMA programming guide](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/guides/mma/wgmma_programming.html)
+- [CUTLASS: Blackwell SM100 GEMMs](https://docs.nvidia.com/cutlass/4.8.0/media/docs/cpp/blackwell_functionality.html)
+- [CUTLASS: Blackwell Cluster Launch Control](https://docs.nvidia.com/cutlass/4.7.0/media/docs/cpp/blackwell_cluster_launch_control.html)
+- [Cecka, CuTe Layout Representation and Algebra](https://arxiv.org/pdf/2603.02298)
+- [Colfax: A note on the algebra of CuTe layouts](https://research.colfax-intl.com/a-note-on-the-algebra-of-cute-layouts)
+- [Colfax: Mastering the Tensor Memory Accelerator](https://research.colfax-intl.com/tutorial-hopper-tma/)
+- [Colfax: WGMMA on Hopper](https://research.colfax-intl.com/cutlass-tutorial-wgmma-hopper/) and [GEMM kernel design](https://research.colfax-intl.com/cutlass-tutorial-design-of-a-gemm-kernel/)
+- [Colfax: Tensor Memory on Blackwell](https://research.colfax-intl.com/cutlass-tutorial-writing-gemm-kernels-using-tensor-memory-for-nvidia-blackwell-gpus/) and [clusters on Blackwell](https://research.colfax-intl.com/cutlass-tutorial-gemm-with-thread-block-clusters-on-nvidia-blackwell-gpus/)
+- [PyTorch: CUTLASS ping-pong GEMM kernel](https://pytorch.org/blog/cutlass-ping-pong-gemm-kernel/)
+- [NVIDIA: CUTLASS 3.x abstractions for GEMM kernel design](https://developer.nvidia.com/blog/?p=103394)
+- [CCCL: cuda::ptx wrappers for tcgen05](https://nvidia.github.io/cccl/unstable/libcudacxx/ptx/instructions/tcgen05_alloc.html)
+- [CUTLASS CuTe tutorial kernels](https://github.com/NVIDIA/cutlass/tree/b2f249a/examples/cute/tutorial) (Hopper and Blackwell), read at commit b2f249a
