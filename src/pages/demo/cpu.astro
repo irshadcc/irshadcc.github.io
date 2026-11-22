@@ -1,0 +1,57 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import BranchSteps from "../../utils/cpu/BranchSteps.astro";
+import CacheSets from "../../utils/cpu/CacheSets.astro";
+import CoreDiagram from "../../utils/cpu/CoreDiagram.astro";
+import OooSteps from "../../utils/cpu/OooSteps.astro";
+import SpeedupBars from "../../utils/cpu/SpeedupBars.astro";
+import {
+	CHASE,
+	GOLDEN_COVE,
+	LOOP4,
+	MISS_THEN_WORK,
+	NEOVERSE_V2,
+	RANDOM16,
+	SOCKET_MESH,
+	SOCKET_ZEN4,
+	SUM_FOUR_ACC,
+	SUM_ONE_ACC,
+	THREE_MISSES,
+	TOY_CORE,
+	ZEN4,
+} from "../../utils/cpu/cpuFigures";
+---
+
+<Layout title="CPU microarchitecture figures demo">
+	<h1>CPU microarchitecture figures demo</h1>
+	<p>Figures for the CPU microarchitecture post (logic in <code>src/utils/cpu/ooo.ts</code>, <code>branch.ts</code>, <code>cacheSets.ts</code>; data in <code>cpuFigures.ts</code>).</p>
+
+	<h2>CoreDiagram: three cores</h2>
+	<CoreDiagram cores={[{ name: "Intel Golden Cove", ...GOLDEN_COVE }, { name: "AMD Zen 4", ...ZEN4 }, { name: "Arm Neoverse V2", ...NEOVERSE_V2 }]} />
+	<h2>CoreDiagram: sockets</h2>
+	<CoreDiagram cores={[{ name: "AMD Zen 4 CCD + I/O die", ...SOCKET_ZEN4 }, { name: "Mesh (Intel / Arm)", ...SOCKET_MESH }]} cellW={130} />
+
+	<h2>OooSteps</h2>
+	<OooSteps program={SUM_ONE_ACC} machine={TOY_CORE} title="One accumulator" />
+	<OooSteps program={SUM_FOUR_ACC} machine={TOY_CORE} title="Four accumulators" step={12} />
+	<OooSteps program={MISS_THEN_WORK} machine={TOY_CORE} title="A miss fills the ROB" step={10} />
+	<OooSteps program={CHASE} machine={TOY_CORE} title="Pointer chase" />
+	<OooSteps program={THREE_MISSES} machine={TOY_CORE} title="Three independent misses" />
+
+	<h2>BranchSteps</h2>
+	<BranchSteps outcomes={LOOP4} title="Loop of 4" step={15} />
+	<BranchSteps outcomes={RANDOM16} title="Random" step={15} />
+
+	<h2>CacheSets</h2>
+	<CacheSets stride={4096} count={16} title="16 lines 4 KiB apart" />
+	<CacheSets stride={4160} count={16} cache={1} title="Padded stride, Golden Cove" />
+
+	<h2>SpeedupBars</h2>
+	<SpeedupBars
+		title="Before and after"
+		rows={[
+			{ label: "Branch → branchless", before: 2.21, after: 0.38, unit: "ns/order" },
+			{ label: "4096 B books → padded", before: 379.2, after: 60.2, unit: "ns/pass" },
+		]}
+	/>
+</Layout>

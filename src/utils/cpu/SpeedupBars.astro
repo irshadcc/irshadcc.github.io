@@ -1,0 +1,68 @@
+---
+// Before/after bars for several optimisations on a log scale: one row per case, the slow
+// version as a red bar, the fixed version as a green bar, and the speed-up on the right.
+// Hovering a row shows its numbers in a <title> tooltip. Rendered at build time.
+// Usage in .mdx:
+//   <SpeedupBars rows={[{ label: "Branch → branchless", before: 2.21, after: 0.38, unit: "ns/order" }]} />
+import "./cpu.css";
+
+interface Row {
+	label: string;
+	before: number;
+	after: number;
+	unit: string;
+}
+interface Props {
+	rows: Row[];
+	title?: string;
+}
+
+const { rows, title } = Astro.props;
+const LW = 210;
+const BW = 380;
+const RH = 30;
+const vals = rows.flatMap((r) => [r.before, r.after]);
+const lo = Math.log10(Math.min(...vals)) - 0.15;
+const hi = Math.log10(Math.max(...vals)) + 0.05;
+const x = (v: number) => (BW * (Math.log10(v) - lo)) / (hi - lo);
+const W = LW + BW + 120;
+const H = rows.length * RH + 24;
+const fmt = (v: number) =>
+	v >= 10 ? v.toFixed(0) : v >= 1 ? v.toFixed(1) : v.toFixed(2);
+---
+
+<figure class="cpuf">
+	{title && <figcaption class="cpuf-title">{title}</figcaption>}
+	<div class="cpuf-canvas">
+		<svg viewBox={`0 0 ${W} ${H}`} width={W} height={H} role="img">
+			{
+				rows.map((r, i) => {
+					const y = i * RH + 4;
+					return (
+						<g>
+							<title>{`${r.label}: ${r.before} → ${r.after} ${r.unit} (${(r.before / r.after).toFixed(1)}×)`}</title>
+							<text class="t-head" x="0" y={y + 15} style="font-size:10.5px;fill:var(--text)">
+								{r.label}
+							</text>
+							<rect x={LW} y={y} width={x(r.before)} height="10" rx="2" style="fill:var(--cpu-bad)" />
+							<text class="t-small" x={LW + x(r.before) + 4} y={y + 9}>
+								{fmt(r.before)} {r.unit}
+							</text>
+							<rect x={LW} y={y + 12} width={x(r.after)} height="10" rx="2" style="fill:var(--cpu-done)" />
+							<text class="t-small" x={LW + x(r.after) + 4} y={y + 21}>
+								{fmt(r.after)}
+							</text>
+							<text class="t-mono" x={W - 4} y={y + 16} text-anchor="end" style="font-weight:600">
+								{(r.before / r.after).toFixed(1)}×
+							</text>
+						</g>
+					);
+				})
+			}
+			<text class="t-small" x={LW} y={H - 4}>log scale · lower is better</text>
+		</svg>
+	</div>
+	<p class="cpuf-legend">
+		<i style="background:var(--cpu-bad)"></i>slow version <i style="background:var(--cpu-done)"></i>fixed version
+	</p>
+</figure>

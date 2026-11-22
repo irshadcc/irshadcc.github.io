@@ -1,0 +1,290 @@
+/* Shared look of the CPU figures (classes emitted by cpuDraw.ts). Global on purpose: the SVG is
+   built as a string, so Astro's scoped styles would not reach it. */
+.cpuf {
+	--cpu-wait: #d9d2c0;
+	--cpu-exec: #2f6fa8;
+	--cpu-exec-soft: #cfe0f1;
+	--cpu-done: #2f7a3a;
+	--cpu-done-soft: #dcefdd;
+	--cpu-bad: #b3392f;
+	--cpu-bad-soft: #f7dfdc;
+	--cpu-hot: #d88a00;
+	--cpu-hot-soft: #fbe9c4;
+	margin: 1.75rem 0;
+	font-family: var(--sans);
+	outline: none;
+}
+@media (prefers-color-scheme: dark) {
+	.cpuf {
+		--cpu-wait: #3a3a36;
+		--cpu-exec: #8dbbe3;
+		--cpu-exec-soft: #1e2f40;
+		--cpu-done: #7cc488;
+		--cpu-done-soft: #1d3322;
+		--cpu-bad: #ec8a80;
+		--cpu-bad-soft: #3d2220;
+		--cpu-hot: #f1b54a;
+		--cpu-hot-soft: #3b2e14;
+	}
+}
+.cpuf-title {
+	text-align: center;
+	font-size: 0.9rem;
+	font-weight: 600;
+	margin-bottom: 0.3rem;
+}
+.cpuf-canvas {
+	overflow-x: auto;
+	padding: 0.6rem;
+	border: 1px solid var(--faint);
+	border-radius: 10px;
+	background: var(--surface);
+}
+.cpuf-canvas svg {
+	display: block;
+	max-width: none;
+	margin: 0 auto;
+}
+.cpuf-notes {
+	min-height: 3.2em;
+	margin-top: 0.55rem;
+	padding: 0.55rem 0.75rem;
+	border-left: 3px solid var(--accent);
+	background: var(--surface);
+	font-size: 0.82rem;
+	line-height: 1.5;
+}
+.cpuf-notes p {
+	margin: 0;
+}
+.cpuf-notes p[hidden],
+.cpuf [hidden] {
+	display: none !important;
+}
+.cpuf-legend {
+	margin: 0.4rem 0 0;
+	font-size: 0.72rem;
+	color: var(--muted);
+	text-align: center;
+}
+.cpuf-legend i {
+	display: inline-block;
+	width: 0.8em;
+	height: 0.8em;
+	margin: 0 0.25em 0 0.7em;
+	border-radius: 2px;
+	vertical-align: -0.05em;
+}
+.cpuf-controls {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.4rem 1rem;
+	align-items: center;
+	justify-content: center;
+	margin: 0.3rem 0 0.5rem;
+	font-size: 0.8rem;
+}
+.cpuf-controls select,
+.cpuf-controls input[type="number"] {
+	font: inherit;
+	padding: 0.1rem 0.3rem;
+	border: 1px solid var(--faint);
+	border-radius: 6px;
+	background: var(--bg);
+	color: var(--text);
+}
+.cpuf-controls input[type="range"] {
+	width: 9rem;
+	accent-color: var(--accent);
+}
+.cpuf-tabs {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.3rem;
+	justify-content: center;
+	margin-bottom: 0.5rem;
+}
+.cpuf-tabs button {
+	padding: 0.25rem 0.7rem;
+	border: 1px solid var(--faint);
+	border-radius: 999px;
+	background: var(--bg);
+	color: var(--text);
+	font: 600 0.78rem var(--sans);
+	cursor: pointer;
+}
+.cpuf-tabs button[aria-pressed="true"] {
+	background: var(--accent);
+	border-color: var(--accent);
+	color: var(--bg);
+}
+.cpuf-readout {
+	margin-top: 0.4rem;
+	font: 0.78rem var(--mono);
+	text-align: center;
+	color: var(--text);
+}
+.cpuf-readout b {
+	color: var(--cpu-bad);
+}
+
+.cpuf svg text {
+	font-family: var(--sans);
+	fill: var(--text);
+}
+.cpuf .t-mono {
+	font-family: var(--mono);
+	font-size: 10.5px;
+}
+.cpuf .t-head {
+	font-size: 10px;
+	font-weight: 600;
+	fill: var(--muted);
+}
+.cpuf .t-small {
+	font-size: 9px;
+	fill: var(--muted);
+}
+
+/* pipeline diagram */
+.cpuf .pc rect {
+	stroke: var(--bg);
+	stroke-width: 1;
+}
+.cpuf .pc.D rect {
+	fill: var(--cpu-hot-soft);
+}
+.cpuf .pc.w rect {
+	fill: var(--cpu-wait);
+}
+.cpuf .pc.E rect,
+.cpuf .pc.e rect {
+	fill: var(--cpu-exec);
+}
+.cpuf .pc.r rect {
+	fill: var(--cpu-done-soft);
+}
+.cpuf .pc.R rect {
+	fill: var(--cpu-done);
+}
+.cpuf .pc text {
+	font: 600 8.5px var(--mono);
+	text-anchor: middle;
+	fill: var(--text);
+	pointer-events: none;
+}
+.cpuf .pc.E text,
+.cpuf .pc.e text,
+.cpuf .pc.R text {
+	fill: var(--bg);
+}
+.cpuf .pc.future {
+	opacity: 0;
+}
+.cpuf .pcol {
+	fill: none;
+	stroke: var(--accent);
+	stroke-width: 1.6;
+}
+.cpuf .prow.miss .t-mono {
+	fill: var(--cpu-bad);
+}
+.cpuf .stall-mark {
+	fill: var(--cpu-bad);
+	font-size: 9px;
+	font-weight: 700;
+	text-anchor: middle;
+}
+.cpuf .stall-mark.future {
+	opacity: 0;
+}
+
+/* ROB and ports strip */
+.cpuf .slot {
+	fill: var(--bg);
+	stroke: var(--faint);
+}
+.cpuf .slot.used {
+	fill: var(--cpu-exec-soft);
+	stroke: var(--cpu-exec);
+}
+.cpuf .slot.head {
+	stroke: var(--cpu-bad);
+	stroke-width: 2;
+}
+.cpuf .port {
+	fill: var(--bg);
+	stroke: var(--faint);
+}
+.cpuf .port.busy {
+	fill: var(--cpu-exec);
+	stroke: var(--cpu-exec);
+}
+.cpuf .port.busy + text {
+	fill: var(--bg);
+}
+
+/* cache sets */
+.cpuf .way {
+	fill: var(--bg);
+	stroke: var(--faint);
+	stroke-width: 0.6;
+}
+.cpuf .way.on {
+	fill: var(--cpu-done-soft);
+	stroke: var(--cpu-done);
+}
+.cpuf .way.over {
+	fill: var(--cpu-bad-soft);
+	stroke: var(--cpu-bad);
+}
+.cpuf .setcount {
+	font: 600 8px var(--mono);
+	text-anchor: middle;
+	fill: var(--cpu-bad);
+}
+.cpuf .bitbox {
+	stroke: var(--faint);
+}
+.cpuf .bitbox.tag {
+	fill: var(--cpu-hot-soft);
+}
+.cpuf .bitbox.set {
+	fill: var(--cpu-done-soft);
+}
+.cpuf .bitbox.off {
+	fill: var(--cpu-exec-soft);
+}
+
+/* branch predictor */
+.cpuf .bo {
+	stroke: var(--faint);
+	fill: var(--bg);
+}
+.cpuf .bo.T {
+	fill: var(--cpu-done-soft);
+	stroke: var(--cpu-done);
+}
+.cpuf .bo.N {
+	fill: var(--cpu-hot-soft);
+	stroke: var(--cpu-hot);
+}
+.cpuf .bo.miss {
+	stroke: var(--cpu-bad);
+	stroke-width: 2.4;
+}
+.cpuf .bo.cur {
+	stroke: var(--accent);
+	stroke-width: 2.4;
+}
+.cpuf .ctr {
+	fill: var(--bg);
+	stroke: var(--faint);
+}
+.cpuf .ctr.lit {
+	stroke: var(--accent);
+	stroke-width: 2.2;
+}
+.cpuf .ctr-fill {
+	fill: var(--cpu-exec-soft);
+}

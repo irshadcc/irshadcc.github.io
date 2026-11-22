@@ -1,0 +1,909 @@
+---
+title: "A CPU Performance Lab: Finding and Fixing Slow Code with perf and LLVM"
+description: "Nine slow pieces of trading-style C++ code, each diagnosed with perf stat, perf record, perf annotate, perf c2c, llvm-mca, clang optimisation remarks or PGO, then fixed and measured again on a Zen 4 machine, followed by exercises."
+date: 2026-11-22
+tags: [C++/Python, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import SpeedupBars from "../../utils/cpu/SpeedupBars.astro";
+import CacheSets from "../../utils/cpu/CacheSets.astro";
+
+## Background
+
+The [CPU microarchitecture post](/blog/cpu-microarchitecture/) explains how a core runs code:
+branch prediction, out-of-order execution, caches, TLBs, coherence. This post is the practical
+half. It takes nine small pieces of code of the kind found in a trading system, each with one
+performance bug, and for each one goes through the same four steps:
+
+1. **the slow code**, which looks reasonable;
+2. **the diagnosis**: which tool shows the problem, the exact command, and its real output;
+3. **the fix**, and why it works;
+4. **the measurement** before and after.
+
+The point is the method more than the fixes. Each tool answers one kind of question, and knowing
+which to reach for is most of the skill:
+
+| Question | Tool |
+| --- | --- |
+| Is this run slow, and roughly why (IPC, misses)? | `perf stat` |
+| Which function, which instruction? | `perf record` + `perf report` / `perf annotate` |
+| Which cache lines bounce between cores? | `perf c2c` |
+| What will this loop's throughput be, and what limits it? | `llvm-mca` |
+| Why did the compiler not vectorize this? | clang `-Rpass-missed=…`, `-Rpass-analysis=…` |
+| What does the real execution profile say about branch layout? | PGO with `llvm-profdata` |
+
+Everything below was run on an AMD Ryzen 7 7700 (Zen 4, 5.3 GHz) under Linux 6.17, compiled with
+clang 18.1.3 at `-O2 -g -march=native`, with threads pinned to cores.<Sidenote>`perf` needs
+`sudo sysctl -w kernel.perf_event_paranoid=1` (or lower) on most distributions. `perf c2c` on AMD
+uses IBS (instruction-based sampling) and works on Zen 3 and later with a recent kernel. Counter
+totals from `perf stat` cover the whole program, including set-up; where set-up mattered, the
+program was also run with no work and the two counts subtracted, and the text says so.</Sidenote>
+The cases follow the order of the microarchitecture post, and the summary at the end puts all
+nine results on one chart.
+
+## Case 1: a branch on market data
+
+### The slow code
+
+Select the orders priced at or above a limit, for example the resting asks a new buy order
+would cross:
+
+```cpp
+struct Order { int32_t price, qty; };
+
+size_t select_bad(const Order* in, size_t n, int32_t limit, Order* out) {
+    size_t k = 0;
+    for (size_t i = 0; i < n; i++)
+        if (in[i].price >= limit) out[k++] = in[i];
+    return k;
+}
+```
+
+On 4 million random orders, half of which pass, it runs at **2.21 ns per order**. On the same
+orders sorted by price it runs at **0.25 ns**: same instructions, nine times faster.
+
+### Diagnosis: perf stat, then perf record
+
+`perf stat` gives the headline numbers:
+
+```text
+$ perf stat -e cycles,instructions,branches,branch-misses ./branch bad random
+bad random: 2.208 ns/order
+     3,361,585,805      cycles
+     1,511,349,317      instructions        #    0.45  insn per cycle
+       136,766,769      branch-misses       #   35.92% of all branches
+```
+
+An **IPC** (instructions per cycle) of 0.45 on a core that can retire 6 per cycle, and over a
+third of all branches mispredicted: 137 million misses over 268 million orders, about one miss
+for every two orders. To find which branch, sample on the miss event and annotate:
+
+```text
+$ perf record -e branch-misses ./branch bad random
+$ perf report --stdio --sort symbol
+    98.14%  [.] select_bad(Order const*, unsigned long, int, Order*)
+$ perf annotate --stdio --symbol='select_bad(Order const*, unsigned long, int, Order*)'
+    5.93 :   127d:   jge    12c0
+    5.85 :   1284:   jge    12d2
+    5.80 :   128b:   jge    12e5
+    6.43 :   1292:   jge    12f8
+    ...
+    4.46 :   12c4:   mov    %r10,(%rcx,%rax,8)
+```
+
+The compiler unrolled the loop 8 times, and the samples sit on the eight `jge` instructions,
+one per `if`, and on the stores just after them.<Sidenote>Samples often land one instruction after
+the one responsible ("skid"), which is why the stores after each branch also collect samples.
+AMD's IBS and Intel's PEBS (`:pp` modifiers) reduce skid.</Sidenote> The branch outcome depends on
+random prices, so the predictor is right only half the time, and each miss throws away about
+14 cycles of work.
+
+### The fix: make the store unconditional
+
+```cpp
+size_t select_good(const Order* in, size_t n, int32_t limit, Order* out) {
+    size_t k = 0;
+    for (size_t i = 0; i < n; i++) {
+        out[k] = in[i];                  // always write the candidate
+        k += in[i].price >= limit;       // keep it only if it passes
+    }
+    return k;
+}
+```
+
+Every order is written to `out[k]`, and `k` advances only when the order passes, so a rejected
+order is overwritten by the next one. There is no branch left to mispredict; the condition has
+become data (`setge` + `add`). The output buffer needs one spare slot.
+
+| Version | Random prices | Sorted prices | Branch misses |
+| --- | ---: | ---: | ---: |
+| `select_bad` (branch) | 2.21 ns/order | 0.25 ns/order | 136.8 M |
+| `select_good` (branchless) | 0.38 ns/order | 0.34 ns/order | 2.3 M |
+
+The branchless version is 5.8 times faster on random data and slightly slower on sorted data,
+where the branch was predictable. That is the general trade-off: branchless code pays for both
+outcomes every time, so it wins only when the branch is hard to predict.
+
+### A benchmarking trap: the predictor memorised the test
+
+The first version of this benchmark used 65,536 orders and looped over them 4,000 times. The
+branchy version ran at 0.43 ns per order with **0.27% branch misses**: Zen 4's predictor had
+learned the whole 65,536-outcome sequence, because the same sequence came round 4,000 times.
+Production data never repeats like that. Benchmark branchy code on more data than the predictor
+can hold (here 4 million orders), or on fresh data each repetition.
+
+## Case 2: a dependency chain in a reduction
+
+### The slow code
+
+The notional value of a basket:
+
+```cpp
+double notional_bad(const double* px, const double* qty, size_t n) {
+    double total = 0;
+    for (size_t i = 0; i < n; i++) total += px[i] * qty[i];
+    return total;
+}
+```
+
+On 2,048 elements (32 KiB, in L1) it takes **4.0 cycles per element**. Zen 4 can load three
+values and start two fused multiply-adds every cycle, so something other than the hardware's
+width is in the way.
+
+### Diagnosis: clang remarks
+
+First ask the compiler why it did not vectorize:
+
+```text
+$ clang++ -O2 -march=native -c reduce.cpp -Rpass-missed=loop-vectorize -Rpass-analysis=loop-vectorize
+reduce.cpp:5:40: remark: loop not vectorized: cannot prove it is safe to reorder floating-point
+operations; allow reordering by specifying '#pragma clang loop vectorize(enable)' before the loop
+or by providing the compiler option '-ffast-math'.
+```
+
+Vectorizing a sum means adding the elements in a different order, and floating-point addition is
+not associative: `(a + b) + c` can differ from `a + (b + c)` in the last bit. The compiler is not
+allowed to change the result, so it keeps one scalar chain.
+
+### Diagnosis: llvm-mca
+
+`llvm-mca` simulates a block of assembly on a model of a specific core and reports what limits it.
+Extract the inner loop from `clang++ -S` and feed it in:
+
+```text
+$ llvm-mca-18 -mcpu=znver4 -iterations=100 -bottleneck-analysis bad_loop.s
+Iterations:        100
+Instructions:      1900
+Total Cycles:      3211
+IPC:               0.59
+Block RThroughput: 8.0
+
+Cycles with backend pressure increase [ 89.44% ]
+Throughput Bottlenecks:
+  Resource Pressure       [ 0.69% ]
+  Data Dependencies:      [ 88.98% ]
+  - Register Dependencies [ 88.98% ]
+
+Critical sequence based on the simulation:
+ +----< 15.   vfmadd132sd 56(%rsi,%rcx,8), %xmm2, %xmm0
+ |    < loop carried >
+ +----> 2.    vfmadd132sd (%rsi,%rcx,8), %xmm0, %xmm1   ## REGISTER dependency:  %xmm0
+ +----> 4.    vfmadd231sd 8(%rsi,%rcx,8), %xmm2, %xmm1  ## REGISTER dependency:  %xmm1
+ +----> 6.    vfmadd132sd 16(%rsi,%rcx,8), %xmm1, %xmm0 ## REGISTER dependency:  %xmm1
+ ...
+```
+
+Read it in three steps. The loop body (8 elements, unrolled) could issue in 8 cycles if only port
+pressure mattered (`Block RThroughput: 8.0`). The simulation needs 32 cycles per iteration
+($3211 / 100$). And 89% of the stall is **register dependencies**: each `vfmadd` needs the
+previous one's result. clang contracted `total += px * qty` into a fused multiply-add, which has
+a 4-cycle latency on Zen 4, so 8 elements take $8 \times 4 = 32$ cycles, **4 cycles per element**,
+exactly what was measured.
+
+### The fix: independent accumulators
+
+Either split the chain by hand:
+
+```cpp
+double notional_good(const double* px, const double* qty, size_t n) {   // n % 8 == 0
+    double a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0, a6 = 0, a7 = 0;
+    for (size_t i = 0; i < n; i += 8) {
+        a0 += px[i] * qty[i];         a1 += px[i + 1] * qty[i + 1];
+        a2 += px[i + 2] * qty[i + 2]; a3 += px[i + 3] * qty[i + 3];
+        a4 += px[i + 4] * qty[i + 4]; a5 += px[i + 5] * qty[i + 5];
+        a6 += px[i + 6] * qty[i + 6]; a7 += px[i + 7] * qty[i + 7];
+    }
+    return ((a0 + a1) + (a2 + a3)) + ((a4 + a5) + (a6 + a7));
+}
+```
+
+or give the compiler permission for this one loop, as the remark suggested:
+
+```cpp
+#pragma clang loop vectorize(enable) interleave_count(4)
+for (size_t i = 0; i < n; i++) total += px[i] * qty[i];
+```
+
+Eight accumulators match latency × throughput $= 4 \times 2 = 8$ fused multiply-adds in flight.
+clang's SLP vectorizer also packs them into vector registers
+(`remark: SLP vectorized with cost -11`). With the pragma, clang uses four 512-bit accumulators,
+32 elements per iteration; `llvm-mca` predicts 4.14 cycles per iteration, 0.13 cycles per element,
+and the loop is then limited by loads, not by the chain.
+
+| Version | Cycles per element | ns per element |
+| --- | ---: | ---: |
+| One accumulator | 4.0 | 0.76 |
+| Eight accumulators | 0.43 | 0.080 |
+| `#pragma clang loop vectorize(enable)` | 0.37 | 0.069 |
+
+Both fixes change the rounding of the result, in the last bits, which is why they need to be your
+decision and not the compiler's. Prefer the pragma (or a hand split) on the loops you have checked
+over `-ffast-math` on the whole program, which also allows the compiler to assume there are no NaNs
+or infinities.
+
+## Case 3: data layout, from a list of fat objects to a flat hot array
+
+### The slow code
+
+Sum the resting quantity in a 100-tick price band, over 1 million orders kept in a
+`std::list` of full order records:
+
+```cpp
+struct OrderFat {
+    uint64_t id; std::string client; int64_t price; int32_t qty;
+    uint64_t ts_recv, ts_exch; char venue[16];
+};                                                   // sizeof = 88
+
+int64_t band_list(const std::list<OrderFat>& l, int64_t lo, int64_t hi) {
+    int64_t s = 0;
+    for (const auto& o : l) if (o.price >= lo && o.price <= hi) s += o.qty;
+    return s;
+}
+```
+
+The list was built in random order with other allocations in between, as happens to a
+long-running book. It takes **12.2 ns per order**.
+
+### Diagnosis: perf stat with cache events
+
+```text
+$ perf stat -e cycles,instructions,L1-dcache-load-misses ./layout list 50
+$ perf stat -e cycles,instructions,L1-dcache-load-misses ./layout list 0    # set-up only
+```
+
+Subtracting the set-up run and dividing by the 52.4 million order visits:
+
+| Version | Cycles per order | L1D misses per order | ns per order |
+| --- | ---: | ---: | ---: |
+| `std::list<OrderFat>` | 65.6 | 4.7 | 12.2 |
+| `std::vector<OrderFat>` | 24.3 | 1.17 | 4.96 |
+| `std::vector<Hot>` (16 bytes) | about 2 | 0.30 | 0.22 |
+
+The list is a **pointer chase**: every node's address is in the previous node, so misses cannot
+overlap (see [memory-level parallelism](/blog/cpu-microarchitecture/#memory-level-parallelism)),
+and each node is scattered on its own lines. Moving the same records into a `std::vector`
+removes the chase: the prefetcher streams the array, and misses drop to 1.17 per order, close to
+$88 / 64 = 1.375$ lines per order minus what the prefetcher hides. The loop is now limited by
+memory bandwidth: the loop needs only two fields, but it pulls 88 MiB through the caches to read
+16 MiB of useful data.
+
+### The fix: split hot from cold
+
+```cpp
+struct Hot  { int64_t price; int32_t qty; uint32_t cold_idx; };   // 16 bytes, 4 per line
+// id, client, timestamps, venue live in a separate array indexed by cold_idx
+
+int64_t band_hot(const std::vector<Hot>& v, int64_t lo, int64_t hi) {
+    int64_t s = 0;
+    for (const auto& o : v) s += (o.price >= lo && o.price <= hi) ? o.qty : 0;
+    return s;
+}
+```
+
+The hot array is 16 MiB, so it fits in Zen 4's 32 MiB L3, and the loop has no data-dependent
+branch, so clang vectorizes it. From list to hot array: **55 times faster**. Two changes did the
+work, and they are worth separating when you reason about your own code: contiguous storage
+(2.5×) and a working set that is 5.5 times smaller (another 22×, partly because it now fits in
+L3).
+
+## Case 4: TLB misses on a large hash table
+
+### The slow code
+
+An order-id → order-slot table with open addressing, 1 GiB, as a venue with many live orders
+needs. Each market-data message looks up one id, and in a real handler the next message is
+processed only after this one is done. The benchmark mimics that with a fake dependence on the
+previous result:
+
+```cpp
+uint64_t prev = 1;
+for (size_t j = 0; j < Q; j++) {
+    uint64_t key = q[j] + (prev == 0);          // depends on the last lookup (prev is never 0)
+    size_t i = hash(key) & mask;
+    while (t[i].key != key) i = (i + 1) & mask;
+    prev = t[i].val;
+}
+```
+
+It takes **98.6 ns per lookup**. A DRAM access is about 78 ns on this machine; where do the other
+20 come from?
+
+### Diagnosis: TLB counters
+
+```text
+$ perf list | grep -i tlb
+  dTLB-loads, dTLB-load-misses
+  ls_l1_d_tlb_miss.all
+  ls_l1_d_tlb_miss.all_l2_miss
+  ...
+$ perf stat -e cycles,ls_l1_d_tlb_miss.all_l2_miss ./tlb dep4k 5000000
+$ perf stat -e cycles,ls_l1_d_tlb_miss.all_l2_miss ./tlb dep4k 16      # set-up only
+```
+
+`ls_l1_d_tlb_miss.all_l2_miss` counts loads that missed both levels of the data TLB and had to walk
+the page table. After subtracting set-up: **1.01 page walks per lookup**. With 4 KiB pages, Zen
+4's 3,072-entry L2 TLB covers 12 MiB of a 1 GiB table, so almost every lookup walks the page table,
+and the walk's own loads (four levels of page table) partly miss the cache too.
+
+### The fix: huge pages, then batching
+
+```cpp
+void* t = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+madvise(t, bytes, MADV_HUGEPAGE);   // 2 MiB pages: 3,072 entries now cover 6 GiB
+memset(t, 0, bytes);                // fault every page in now, not on the hot path
+```
+
+When lookups do not depend on each other (a packet with many order ids, or a batch of
+messages), issue all the address computations and prefetches first, then do the lookups:
+
+```cpp
+constexpr size_t B = 16;
+for (size_t j = 0; j < Q; j += B) {
+    size_t idx[B];
+    for (size_t b = 0; b < B; b++) { idx[b] = hash(q[j + b]) & mask; __builtin_prefetch(&t[idx[b]]); }
+    for (size_t b = 0; b < B; b++) { size_t i = idx[b]; while (t[i].key != q[j + b]) i = (i + 1) & mask; s += t[i].val; }
+}
+```
+
+| Version | ns per lookup | Page walks per lookup |
+| --- | ---: | ---: |
+| Dependent lookups, 4 KiB pages | 98.6 | 1.01 |
+| Dependent lookups, 2 MiB pages | 81.9 | 0.01 |
+| Independent lookups, 4 KiB pages | 14.1 | 0.99 |
+| Independent lookups, 2 MiB pages | 12.8 | 0.01 |
+| Independent, 2 MiB pages, batched prefetch | 10.5 | 0.01 |
+
+Two lessons are in this table. Huge pages remove the page walk: 17 ns off a dependent lookup.
+And independence matters far more than either: when the loop body is short, the out-of-order core
+already overlaps about seven lookups by itself (98.6 vs 14.1 ns), and explicit prefetching adds a
+little more. In a real handler the work between lookups fills the reorder buffer, so the
+independent rows are only reachable if the code is structured to issue lookups together.
+
+## Case 5: books that are exactly 4 KiB
+
+### The slow code
+
+A strategy reads the top four bid and ask levels of each of 32 instruments. Each instrument's book
+is a fixed array of 128 levels per side, 16 bytes per level:
+
+```cpp
+struct Level { int64_t price, qty; };                  // 16 bytes
+struct Book  { Level bid[128]; Level ask[128]; };      // 4096 bytes
+
+int64_t top_depth(const Book* books, int nb) {
+    int64_t s = 0;
+    for (int b = 0; b < nb; b++)
+        for (int l = 0; l < 4; l++) s += books[b].bid[l].qty + books[b].ask[l].qty;
+    return s;
+}
+```
+
+It touches 64 cache lines (4 KiB of data), which fits in L1D eight times over, yet one pass takes
+**379 ns**.
+
+### Diagnosis: L1 miss ratio
+
+```text
+$ perf stat -e cycles,L1-dcache-loads,L1-dcache-load-misses ./alias bad
+bad, 32 books: 379.2 ns per pass
+       531,270,296      L1-dcache-loads
+       459,442,405      L1-dcache-load-misses   #   86.48% of all L1-dcache accesses
+```
+
+86% of loads miss L1 on a 4 KiB working set. That is the signature of a **set conflict**: the
+lines are few, but they all map to the same few sets. Every `Book` is exactly 4,096 bytes, so
+`books[b].bid[0]` is at `base + 4096 * b`: the same set index (address bits 6 to 11) for all 32
+books. Zen 4's L1D has 64 sets of 8 ways, so 32 lines in one set cannot fit, and with LRU
+replacement each one is evicted just before it is read again. The figure shows the placement
+(change the stride to 4160 to see the fix):
+
+<CacheSets stride={4096} count={32} title="The 32 bid[0] lines of 4 KiB books in Zen 4's L1D" />
+
+### The fix: pad the stride
+
+```cpp
+struct PaddedBook { Level bid[128]; Level ask[128]; char pad[64]; };   // 4160 bytes
+```
+
+| Version | ns per pass | L1D miss ratio |
+| --- | ---: | ---: |
+| `Book` (4096 bytes) | 379.2 | 86.5% |
+| `PaddedBook` (4160 bytes) | 60.2 | 0.03% |
+
+One extra cache line per book spreads the 32 books over 32 different sets: 6.3 times faster.
+Powers of two are the natural sizes to pick for buffers and tables, which is why this bug is
+common. If a loop walks across many objects whose size is a multiple of 4 KiB, pad them.
+
+## Case 6: false sharing between feed threads
+
+### The slow code
+
+Four feed-handler threads, on four different cores, each count their own messages and bytes:
+
+```cpp
+struct Stats { uint64_t msgs, bytes; };      // 16 bytes
+Stats stats[4];                               // one entry per thread
+
+// thread k:
+stats[k].msgs++;
+stats[k].bytes += len;
+```
+
+The threads never touch each other's entry, yet each update costs **9.0 ns**.
+
+### Diagnosis: perf c2c
+
+`perf c2c` ("cache to cache") samples loads and stores and finds cache lines that are written on one
+core and read on another, which show up as **HITM** events (a load that hit a line *modified* in
+another core's cache):
+
+```text
+$ perf c2c record ./share bad
+$ perf c2c report --stdio
+  Load Local HITM                   :        134
+  Total Shared Cache Lines          :          1
+
+  Shared Data Cache Line Table
+#    Cacheline          Tot Hitm  LclHitm  Total records  Loads  Stores
+  0  0x617124e800c0     100.00%      134           1320    473     847
+
+  Shared Cache Line Distribution Pareto
+#  LclHitm  L1 Hit   Offset   Code address     lcl hitm cycles   cpu cnt
+   38.06%    0.00%   0x10     0x617124e7cb0a   451               1
+    0.00%   32.70%   0x10     0x617124e7cb13                     1
+   34.33%    0.00%   0x20     0x617124e7cb0a   705               1
+   27.61%    0.00%   0x30     0x617124e7cb0a   505               1
+```
+
+Every HITM in the program is on **one cache line**, and the Pareto table shows why: offsets 0x10,
+0x20 and 0x30 of that line are each written by a different CPU (`cpu cnt` 1 per offset), and the
+loads that hit them pay 450 to 700 cycles. Those offsets are `stats[1]`, `stats[2]` and `stats[3]`:
+the four 16-byte entries share one 64-byte line, so every increment takes the line away from the
+other three cores. (Offset 0x00, thread 0, had no samples here; sampling catches a subset of
+accesses.)
+
+### The fix: one line per thread
+
+```cpp
+struct alignas(64) PaddedStats { uint64_t msgs, bytes; };   // sizeof = 64
+PaddedStats stats[4];
+```
+
+| Version | ns per update per thread |
+| --- | ---: |
+| `Stats` (4 per line) | 9.04 |
+| `PaddedStats` (1 per line) | 1.93 |
+
+A 4.7 times speed-up from padding. Use `alignas(64)` (or
+`std::hardware_destructive_interference_size`) for anything written by different threads; on Intel
+cores that prefetch adjacent line pairs, use 128 bytes.
+
+## Case 7: sequentially consistent atomics in a queue
+
+### The slow code
+
+A single-producer, single-consumer ring between a feed thread and a strategy thread (the design from
+the [microarchitecture post](/blog/cpu-microarchitecture/#core-to-core-latency)), written with the
+default memory order:
+
+```cpp
+bool push(const Msg& v) {
+    uint64_t t = tail_.load(std::memory_order_relaxed);
+    if (t - cached_head_ == N) { cached_head_ = head_.load(); if (t - cached_head_ == N) return false; }
+    buf_[t & (N - 1)] = v;
+    tail_.store(t + 1);                 // default: memory_order_seq_cst
+    return true;
+}
+```
+
+It moves 50 million 32-byte messages at **27.1 ns per message**.
+
+### Diagnosis: perf record and annotate
+
+```text
+$ perf record ./spsc bad
+$ perf report --stdio --sort symbol
+    39.09%  [.] Spsc<Msg, 4096ul, true>::push(Msg const&)
+    34.33%  [.] std::thread::_State_impl<...>::_M_run()
+    23.99%  [.] Spsc<Msg, 4096ul, true>::pop(Msg&)
+$ perf annotate --stdio --symbol='Spsc<Msg, 4096ul, true>::push(Msg const&)'
+    0.30 :   1788:   vmovups %ymm0,0x100(%rdi,%rcx,1)
+    2.64 :   1791:   xchg   %rax,0x80(%rdi)
+   59.89 :   1798:   mov    $0x1,%al
+   30.01 :   179a:   vzeroupper
+```
+
+90% of the time in `push` lands just after one instruction: `xchg`. A sequentially consistent store
+on x86 compiles to `xchg`, a locked instruction that waits for the store buffer to drain, including
+the 32-byte message write just before it, which needs the line to be fetched for ownership. (The
+samples land on the next instructions because of skid.) The consumer's `head_.store` does the same.
+
+### The fix: release and acquire
+
+The queue only needs the message-passing guarantee: the consumer that sees the new `tail_` must
+also see the message. That is exactly release (on the store) and acquire (on the load):
+
+```cpp
+tail_.store(t + 1, std::memory_order_release);          // plain mov on x86, stlr on Arm
+cached_head_ = head_.load(std::memory_order_acquire);   // plain mov on x86, ldapr on Arm
+```
+
+| Version | ns per message |
+| --- | ---: |
+| `seq_cst` (default) | 27.1 |
+| release / acquire | 9.0 |
+
+Three times faster, and still correct on both x86 and Arm. On x86 the release store is an ordinary
+`mov`: x86's memory model already gives store-store ordering for free.
+
+## Case 8: an early-exit search that will not vectorize
+
+### The slow code
+
+Find the first of 64 ascending ask levels priced at or above a limit:
+
+```cpp
+int find_scalar(const int32_t* a, int n, int32_t x) {
+    for (int i = 0; i < n; i++)
+        if (a[i] >= x) return i;
+    return n;
+}
+```
+
+With limits spread uniformly over the book: **13.1 ns per search**.
+
+### Diagnosis: remarks and branch misses
+
+```text
+$ clang++ -O2 -march=native -c search.cpp -Rpass-missed=loop-vectorize -Rpass-analysis=loop-vectorize
+search.cpp:5:3: remark: loop not vectorized: could not determine number of loop iterations
+```
+
+The loop exits as soon as it finds the answer, so the trip count is unknown and clang 18 will not
+vectorize it. `perf stat` shows the other half of the problem:
+
+| Version | ns per search | Instructions per search | Branch misses per search |
+| --- | ---: | ---: | ---: |
+| Scalar early exit | 13.1 | 195 | 1.35 |
+| AVX2, 8 at a time, early exit | 8.8 | 54 | 0.93 |
+| Count of levels below the limit (no exit) | 2.8 | 65 | 0.01 |
+
+(Per-search figures: counts from `perf stat` divided by the 84 million searches; set-up is a small
+share here.)
+
+### The fix: vectorize, then remove the exit
+
+The first fix is the one in the microarchitecture post, comparing 8 prices per instruction with
+AVX2:
+
+```cpp
+int find_avx2(const int32_t* a, int n, int32_t x) {        // n % 8 == 0, x > INT32_MIN
+    __m256i vx = _mm256_set1_epi32(x - 1);
+    for (int i = 0; i < n; i += 8) {
+        __m256i gt = _mm256_cmpgt_epi32(_mm256_loadu_si256((const __m256i*)(a + i)), vx);
+        int m = _mm256_movemask_ps(_mm256_castsi256_ps(gt));
+        if (m) return i + __builtin_ctz(m);
+    }
+    return n;
+}
+```
+
+It cuts instructions by 3.6 times but still exits after a random number of iterations, and still
+mispredicts that exit about once per search. Because the levels are sorted, the answer is also the
+number of levels below the limit, which needs no exit at all:
+
+```cpp
+int find_count(const int32_t* a, int n, int32_t x) {
+    int k = 0;
+    for (int i = 0; i < n; i++) k += a[i] < x;
+    return k;
+}
+```
+
+```text
+search.cpp:20:3: remark: vectorized loop (vectorization width: 16, interleaved count: 4)
+```
+
+clang vectorizes this one itself (16 lanes of AVX-512), there is no data-dependent branch, and it is
+4.7 times faster than the original, although it always looks at all 64 levels. For short arrays,
+doing a fixed amount of work without branches often beats doing the minimum with them. All three
+versions were checked against each other on 1,000 queries before timing.
+
+## Case 9: dispatch, and a PGO regression
+
+### The slow code
+
+A feed handler dispatches each message to a handler object through a virtual call. 90% of messages
+are AddOrder, 6% Cancel, 3.9% Trade and 0.1% malformed:
+
+```cpp
+struct Handler { virtual void on(const Msg&, Book&) = 0; };
+void run_feed(const Msg* msgs, size_t n, Book& b) {
+    for (size_t i = 0; i < n; i++) handlers[msgs[i].type]->on(msgs[i], b);
+}
+```
+
+**2.31 ns per message.** The disassembly (`llvm-objdump -d`) shows the loop around one instruction,
+`callq *(%rax)`: an indirect call that the predictor must guess from the message type, which is
+random.
+
+### Fix 1: profile-guided optimisation
+
+**PGO** compiles an instrumented binary, runs it on representative input, and recompiles with the
+recorded counts, so the compiler knows which branches are hot:
+
+```bash
+clang++ -O2 -march=native -fprofile-instr-generate feed.cpp -o feed_gen
+LLVM_PROFILE_FILE=feed.profraw ./feed_gen          # run on representative input
+llvm-profdata merge -o feed.profdata feed.profraw  # combine raw profiles
+llvm-profdata show --all-functions --counts feed.profdata | grep -A4 run_feed
+clang++ -O2 -march=native -fprofile-instr-use=feed.profdata feed.cpp -o feed_opt
+```
+
+PGO can promote a hot indirect call to a direct, inlined one (`if (target == AddH::on) inline...`).
+Here it did not: the virtual call survived unchanged, and the time improved only from 2.31 to 2.16
+ns from better code layout elsewhere. Check what PGO actually did in the disassembly instead of
+assuming it.
+
+### Fix 2: a switch with a cold path
+
+Replace the virtual call with a `switch`, inline the common handlers, and move the rare one out of
+line:
+
+```cpp
+__attribute__((cold, noinline)) void on_bad(const Msg& m, Book& b);   // formatting, logging
+
+void run_feed_switch(const Msg* msgs, size_t n, Book& b) {
+    for (size_t i = 0; i < n; i++) {
+        const Msg& m = msgs[i];
+        switch (m.type) {
+            case 0: (m.price < 10100 ? b.bid_qty : b.ask_qty) += m.qty; break;   // AddOrder
+            case 1: b.bid_qty -= m.qty & 1; break;
+            case 2: b.trades += m.qty; break;
+            default: [[unlikely]] on_bad(m, b);
+        }
+    }
+}
+```
+
+**1.19 ns per message**, twice as fast: direct branches, no call overhead, and the bid/ask choice
+compiled to `setge` + indexed `add`, with no branch.
+
+### The regression: PGO on the switch
+
+Building the switch version with the same PGO flags made it **2.5 times slower**:
+
+```text
+$ perf stat -e cycles,branch-misses ./feed_plain       # switch, no PGO
+1.19 ns/msg       22,587,838  branch-misses
+$ perf stat -e cycles,branch-misses ./feed_opt         # switch, with PGO
+3.00 ns/msg      127,427,177  branch-misses
+```
+
+Branch misses went from 0.11 to 0.61 per message. The disassembly shows why. Without PGO the bid/ask
+choice is branchless:
+
+```text
+cmpl   $0x2774, 0x8(%r15)       # price vs 10100
+setge  %cl
+addq   %rax, (%rbx,%rcx,8)
+```
+
+With PGO it is a branch:
+
+```text
+cmpl   $0x2774, 0x8(%r15)
+movq   %rbx, %rax
+jl     0x12a1
+movq   %r12, %rax
+```
+
+The profile records how often each side ran (about 50/50) but not whether the outcome was
+predictable. A 50/50 branch whose outcome alternates regularly is perfectly predictable, and with
+that information alone the compiler chose a branch. On random prices it mispredicts half the time.
+
+The fix is to tell the compiler the condition is unpredictable:
+
+```cpp
+case 0: (__builtin_unpredictable(m.price < 10100) ? b.bid_qty : b.ask_qty) += m.qty; break;
+```
+
+| Version | ns per message |
+| --- | ---: |
+| Virtual call | 2.31 |
+| Virtual call + PGO | 2.16 |
+| Switch | 1.19 |
+| Switch + PGO | 3.00 |
+| Switch + `__builtin_unpredictable` + PGO | 1.08 |
+
+With the hint, PGO keeps the branchless select and still lays out the hot case first: the fastest
+version, at 1.08 ns. The general lesson: PGO is a measurement of one input, and a change that should
+be a win must still be measured, with `perf stat` and with a look at the generated code.
+
+## Summary of the results
+
+<SpeedupBars
+	title="All nine cases: slow version vs fixed version (Zen 4, measured)"
+	rows={[
+		{ label: "1 Branch → branchless select", before: 2.21, after: 0.38, unit: "ns/order" },
+		{ label: "2 One accumulator → vectorized", before: 0.76, after: 0.069, unit: "ns/elem" },
+		{ label: "3 std::list of fat → hot array", before: 12.2, after: 0.22, unit: "ns/order" },
+		{ label: "4 4 KiB pages → 2 MiB (dependent)", before: 98.6, after: 81.9, unit: "ns/lookup" },
+		{ label: "5 4096 B books → padded", before: 379.2, after: 60.2, unit: "ns/pass" },
+		{ label: "6 False sharing → alignas(64)", before: 9.04, after: 1.93, unit: "ns/update" },
+		{ label: "7 seq_cst → release/acquire", before: 27.1, after: 9.0, unit: "ns/msg" },
+		{ label: "8 Early-exit loop → branchless count", before: 13.1, after: 2.8, unit: "ns/search" },
+		{ label: "9 Virtual call → switch + hint + PGO", before: 2.31, after: 1.08, unit: "ns/msg" },
+	]}
+/>
+
+- Start with `perf stat`: IPC and the miss counts usually name the problem (branch, cache, TLB).
+- Then locate it: `perf record` and `perf annotate` for an instruction, `perf c2c` for a cache line
+  shared between cores.
+- For a hot loop, ask the compiler (`-Rpass-missed`, `-Rpass-analysis`) and ask a model of the core
+  (`llvm-mca -bottleneck-analysis`) before rewriting it.
+- Benchmark on data the predictor and the caches cannot memorise, subtract set-up from counter
+  totals, and check the disassembly of both versions.
+- Treat PGO and every other "free" optimisation as a hypothesis to measure.
+
+## Exercises
+
+#### 1. Read a perf stat
+
+A handler shows `0.38 insn per cycle` and `branch-misses: 1.2% of all branches`, and
+`L1-dcache-load-misses` is 40% of loads. Which case above does it resemble, and which tool do you run
+next?
+
+<details>
+<summary>Answer</summary>
+
+A low IPC with few branch misses and a high L1 miss rate points to memory, not branches: Case 3
+(layout), 4 (TLB) or 5 (set conflict). Next, `perf record -e L1-dcache-load-misses` and
+`perf annotate` to find the loads that miss, then look at the data structure they read: a pointer
+chase (Case 3), a large random-access table (add the TLB events, Case 4) or a small working set that
+still misses (Case 5).
+
+</details>
+
+#### 2. Predict with llvm-mca
+
+The reduction in Case 2 is changed to integers: `int64_t total; total += px[i] * qty[i];` with
+`int64_t` arrays. Will clang vectorize it without a pragma? Check with `-Rpass=loop-vectorize`.
+
+<details>
+<summary>Answer</summary>
+
+Yes. Integer addition is associative (wrap-around arithmetic gives the same result in any order), so
+reordering the sum is always allowed and clang vectorizes it at `-O2` with no pragma. The pragma is
+needed only for floating point.
+
+</details>
+
+#### 3. Fix the latency, not the bandwidth
+
+In Case 2 with one accumulator, would moving the arrays from L1 to L2 make the loop slower?
+
+<details>
+<summary>Answer</summary>
+
+Hardly. The loop is bound by the 4-cycle FMA chain, 4 cycles per element; loads from L2 (with the
+prefetcher streaming the arrays) can supply 16 bytes per element well within those 4 cycles. Only
+once the chain is split does the data's location start to matter.
+
+</details>
+
+#### 4. Size the batch
+
+In Case 4, DRAM latency is about 80 ns and a core can track a few dozen outstanding L1 misses. Why
+does a batch of 16 lookups suffice, and what happens with 256?
+
+<details>
+<summary>Answer</summary>
+
+Each lookup is about one miss, so 16 in flight is already within what the core can track, and the
+measured time (10.5 ns) is about $80 / 8$, meaning about 8 misses are effectively overlapped. With
+256, the prefetches for the first lookups may be evicted, or the miss buffers fill and later
+prefetches are dropped, before the lookups that need them run, so it gets no faster and can get
+slower. Batch sizes of 8 to 32 are typical.
+
+</details>
+
+#### 5. Spot the conflict
+
+A struct of per-instrument state is `alignas(4096)`. A loop reads one 8-byte field of each of 24
+instruments. On Zen 4 (32 KiB, 8-way, 64 sets) and Golden Cove (48 KiB, 12-way, 64 sets), how many of
+those lines fit in L1D? Check with the figure in Case 5 (set the count to 24, switch caches).
+
+<details>
+<summary>Answer</summary>
+
+All 24 lines map to the same set. Zen 4 holds 8 of them, Golden Cove 12, so a loop cycling through all
+24 misses on every access on both. `alignas(4096)` forces the conflict; remove it or offset each
+instrument's hot field by a different multiple of 64 bytes.
+
+</details>
+
+#### 6. False sharing that does not look like it
+
+```cpp
+struct Queue { std::atomic<uint64_t> head; std::atomic<uint64_t> tail; Msg buf[1024]; };
+```
+
+The producer writes `tail`, the consumer writes `head`. What will `perf c2c` show, and what is the fix?
+
+<details>
+<summary>Answer</summary>
+
+`head` and `tail` are 8 bytes apart, on the same line, so `perf c2c` reports one hot line with HITMs
+from both cores at offsets 0x0 and 0x8. Put each on its own line (`alignas(64)` on both members), and
+give each side a cached copy of the other's index, as in the queue in Case 7.
+
+</details>
+
+#### 7. Which memory order?
+
+A strategy thread publishes a new quote price (a `double`) and a sequence number for an order-gateway
+thread. Which loads and stores need which memory orders, on x86 and on Arm?
+
+<details>
+<summary>Answer</summary>
+
+Write the price (relaxed atomic or plain, before), then store the sequence number with
+`memory_order_release`; the gateway loads the sequence number with `memory_order_acquire`, then reads
+the price. On x86 both compile to plain `mov`; on Arm to `stlr` and `ldapr`/`ldar`. If the gateway
+can read while the strategy writes the next price, use a seqlock (read the sequence number before and
+after, retry if it changed or is odd) and make the price itself a relaxed atomic.
+
+</details>
+
+#### 8. When is the early exit worth it?
+
+In Case 8 the array has 64 levels. Roughly how long would it need to be before the AVX2 early-exit
+version beats the branchless count again, if the answer is usually in the first 8 levels?
+
+<details>
+<summary>Answer</summary>
+
+If the answer is almost always in the first 8 levels, the early-exit branch becomes predictable
+(it nearly always exits in the first iteration), so AVX2 early exit costs one compare and one
+correctly predicted branch, while the count still reads every level: one 512-bit compare per 16
+levels, so 4 compares plus a horizontal sum at 64 levels, and twice that at 128. With such a skewed
+distribution early exit can win already at 64 levels; it lost here because the answer's position
+was uniform, which made the exit unpredictable. Measure with your real price distribution.
+
+</details>
+
+#### 9. Use PGO safely
+
+Name two things to check after turning on PGO for a trading binary.
+
+<details>
+<summary>Answer</summary>
+
+(1) That the training run is representative: a profile from a quiet session tells the compiler the
+wrong branches are hot. (2) That data-dependent selects stayed branchless: compare `branch-misses`
+before and after, and grep the hot functions' disassembly for new conditional jumps; mark such
+conditions with `__builtin_unpredictable`. Also re-run the latency percentiles, not only the mean.
+
+</details>

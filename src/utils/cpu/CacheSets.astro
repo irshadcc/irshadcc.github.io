@@ -1,0 +1,76 @@
+---
+// Where `count` cache lines at a fixed `stride` land in a set-associative cache (cacheSets.ts):
+// a sets × ways grid, with sets that receive more lines than they have ways in red (under LRU
+// every access to them misses when the loop cycles through the lines). Controls pick the cache,
+// the stride and the count; a slider picks one line to show its address split into tag, set
+// index and offset.
+// Usage in .mdx:
+//   <CacheSets stride={4096} count={16} title="16 lines, 4 KiB apart" />
+import "./cpu.css";
+import { CACHES, place } from "./cacheSets";
+import { drawCache } from "./cpuDraw";
+
+interface Props {
+	stride?: number;
+	count?: number;
+	cache?: number;
+	title?: string;
+}
+
+const { stride = 4096, count = 16, cache = 0, title } = Astro.props;
+const g = CACHES[cache];
+const p = place(g, stride, count);
+const svg = drawCache(g, p, stride, 1);
+const strides = [64, 128, 256, 1024, 4096, 4160, 8192];
+---
+
+<figure class="cpuf cpu-cache" data-stride={stride} data-count={count} data-cache={cache}>
+	{title && <figcaption class="cpuf-title">{title}</figcaption>}
+	<div class="cpuf-controls">
+		<label
+			>cache <select class="cc-cache"
+				>{CACHES.map((c, i) => <option value={i} selected={i === cache}>{c.name}</option>)}</select
+			></label
+		>
+		<label
+			>stride <select class="cc-stride"
+				>{strides.map((s) => <option value={s} selected={s === stride}>{s} B</option>)}</select
+			></label
+		>
+		<label>lines <input class="cc-count" type="range" min="1" max="64" value={count} /> <span class="cc-count-v">{count}</span></label>
+		<label>show line <input class="cc-pick" type="range" min="0" max={count - 1} value="1" /></label>
+	</div>
+	<div class="cpuf-canvas cc-canvas" set:html={svg} />
+	<p class="cpuf-readout cc-readout">
+		{p.used} {p.used === 1 ? "set" : "sets"} used, {p.missing} of {count} lines miss every pass
+	</p>
+	<p class="cpuf-legend">
+		<i style="background:var(--cpu-done-soft)"></i>line held <i style="background:var(--cpu-bad-soft)"></i>set
+		over-subscribed (number = lines mapped) · bits: <i style="background:var(--cpu-hot-soft)"></i>tag
+		<i style="background:var(--cpu-done-soft)"></i>set index <i style="background:var(--cpu-exec-soft)"></i>offset
+	</p>
+</figure>
+
+<script>
+	import { CACHES, place } from "./cacheSets";
+	import { drawCache } from "./cpuDraw";
+	for (const fig of document.querySelectorAll<HTMLElement>(".cpu-cache")) {
+		const q = <T extends HTMLElement>(s: string) => fig.querySelector<T>(s) as T;
+		const cacheSel = q<HTMLSelectElement>(".cc-cache");
+		const strideSel = q<HTMLSelectElement>(".cc-stride");
+		const countIn = q<HTMLInputElement>(".cc-count");
+		const pickIn = q<HTMLInputElement>(".cc-pick");
+		const render = () => {
+			const g = CACHES[Number(cacheSel.value)];
+			const stride = Number(strideSel.value);
+			const count = Number(countIn.value);
+			pickIn.max = String(count - 1);
+			const pick = Math.min(Number(pickIn.value), count - 1);
+			const p = place(g, stride, count);
+			q(".cc-canvas").innerHTML = drawCache(g, p, stride, pick);
+			q(".cc-count-v").textContent = String(count);
+			q(".cc-readout").innerHTML = `${p.used} set${p.used === 1 ? "" : "s"} used, ${p.missing ? `<b>${p.missing}</b>` : 0} of ${count} lines miss every pass`;
+		};
+		for (const el of [cacheSel, strideSel, countIn, pickIn]) el.addEventListener("input", render);
+	}
+</script>

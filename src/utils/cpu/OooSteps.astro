@@ -1,0 +1,95 @@
+---
+// Step-through of a short program on a toy out-of-order core (ooo.ts): one row per
+// instruction, one column per cycle, cells revealed up to the current cycle. D = renamed into
+// the ROB, grey = waiting for operands or a port, blue = executing (E on the issue cycle),
+// light green = finished but waiting for older instructions, R = retired. Under the diagram:
+// ROB slots and port use in that cycle, and a note on what happened. A red "!" marks a cycle in
+// which rename stalled because the ROB was full.
+// Usage in .mdx:
+//   import { SUM_ONE_ACC, TOY_CORE } from "../../utils/cpu/cpuFigures";
+//   <OooSteps program={SUM_ONE_ACC} machine={TOY_CORE} title="One accumulator" />
+import StepControls from "../compiler/StepControls.astro";
+import "./cpu.css";
+import { drawPipeline, drawStrip } from "./cpuDraw";
+import { type Instr, type Machine, simulate } from "./ooo";
+
+interface Props {
+	program: Instr[];
+	machine: Machine;
+	title?: string;
+	step?: number;
+}
+
+const { program, machine, title, step = 0 } = Astro.props;
+const sim = simulate(program, machine);
+const at = Math.max(0, Math.min(sim.total - 1, step));
+const list = (xs: number[]) =>
+	xs.length === 1 ? `#${xs[0]}` : `#${xs[0]}–#${xs[xs.length - 1]}`;
+const notes = sim.cycles.map((c) => {
+	const p: string[] = [];
+	if (c.dispatched.length) p.push(`renamed ${list(c.dispatched)} into the ROB`);
+	if (c.issued.length)
+		p.push(
+			`issued ${c.issued.map((i) => `#${i} on ${sim.timing[i].port}`).join(", ")}`,
+		);
+	if (c.retired.length) p.push(`retired ${list(c.retired)}`);
+	let s = `<b>Cycle ${c.cycle}:</b> ${p.length ? p.join("; ") : "nothing issues or retires: every instruction in the window is waiting"}.`;
+	if (c.stall) s += ` <span style="color:var(--cpu-bad)">${c.stall}.</span>`;
+	if (c.cycle === sim.total - 1)
+		s += ` Done: ${program.length} instructions in ${sim.total} cycles.`;
+	return s;
+});
+const svg = drawPipeline(program, sim);
+---
+
+<figure class="cpuf cpu-ooo" data-step={at} tabindex="-1">
+	{title && <figcaption class="cpuf-title">{title} ({sim.total} cycles)</figcaption>}
+	<StepControls labels={sim.cycles.map((c) => `${c.cycle}`)} step={at} />
+	<div class="cpuf-canvas">
+		<div class="ooo-diagram" set:html={svg} />
+		<div class="ooo-strips">
+			{sim.cycles.map((_, c) => <div class="ooo-strip" hidden={c !== at} set:html={drawStrip(sim, machine, c)} />)}
+		</div>
+	</div>
+	<p class="cpuf-legend">
+		<i style="background:var(--cpu-hot-soft)"></i>D renamed <i style="background:var(--cpu-wait)"></i>waiting
+		<i style="background:var(--cpu-exec)"></i>executing <i style="background:var(--cpu-done-soft)"></i>done, not
+		retired <i style="background:var(--cpu-done)"></i>R retired
+	</p>
+	<div class="cpuf-notes">
+		{notes.map((n, c) => <p hidden={c !== at} set:html={n} />)}
+	</div>
+</figure>
+
+<style>
+	.ooo-strips {
+		margin-top: 0.5rem;
+		overflow-x: auto;
+	}
+</style>
+
+<script>
+	import { bindStepper } from "../compiler/stepper";
+	for (const fig of document.querySelectorAll<HTMLElement>(".cpu-ooo")) {
+		const cells = [...fig.querySelectorAll<SVGElement>("[data-c]")];
+		const col = fig.querySelector<SVGRectElement>(".pcol");
+		const strips = [...fig.querySelectorAll<HTMLElement>(".ooo-strip")];
+		const notes = [...fig.querySelectorAll<HTMLElement>(".cpuf-notes p")];
+		const x0 = Number(col?.getAttribute("x") ?? 0);
+		bindStepper(
+			fig,
+			strips.length,
+			(i) => {
+				for (const c of cells) c.classList.toggle("future", Number(c.dataset.c) > i);
+				col?.setAttribute("x", String(x0 + i * 15));
+				strips.forEach((s, k) => {
+					s.hidden = k !== i;
+				});
+				notes.forEach((n, k) => {
+					n.hidden = k !== i;
+				});
+			},
+			700,
+		);
+	}
+</script>

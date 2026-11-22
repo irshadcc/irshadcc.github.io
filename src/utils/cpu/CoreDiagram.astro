@@ -1,0 +1,69 @@
+---
+// Block diagrams of several CPU cores (or sockets) behind tabs, one BoxDiagram per tab: click a
+// tab to switch core, click a block to read what it does. Data in cpuFigures.ts.
+// Usage in .mdx:
+//   import { GOLDEN_COVE, ZEN4, NEOVERSE_V2 } from "../../utils/cpu/cpuFigures";
+//   <CoreDiagram cores={[{ name: "Intel Golden Cove", ...GOLDEN_COVE }, { name: "Arm Neoverse V2", ...NEOVERSE_V2 }]} />
+import BoxDiagram from "../payments/BoxDiagram.astro";
+import type { BoxEdge, BoxNode } from "../payments/boxDiagram";
+import "./cpu.css";
+
+interface Props {
+	cores: {
+		name: string;
+		nodes: BoxNode[];
+		edges: BoxEdge[];
+		selected?: string;
+	}[];
+	title?: string;
+	/** Grid cell width in px (default 64). */
+	cellW?: number;
+}
+
+const { cores, title, cellW = 64 } = Astro.props;
+---
+
+<figure class="cpuf cpu-core">
+	{title && <figcaption class="cpuf-title">{title}</figcaption>}
+	{
+		cores.length > 1 && (
+			<div class="cpuf-tabs" role="group">
+				{cores.map((c, i) => (
+					<button type="button" aria-pressed={String(i === 0)} data-i={i}>
+						{c.name}
+					</button>
+				))}
+			</div>
+		)
+	}
+	{
+		cores.map((c, i) => (
+			<div class="core-pane" hidden={i !== 0}>
+				<BoxDiagram nodes={c.nodes} edges={c.edges} selected={c.selected} grid={{ cellW, cellH: 38, gapX: 6, gapY: 22 }} />
+			</div>
+		))
+	}
+</figure>
+
+<style>
+	.cpu-core :global(.boxd) {
+		margin: 0;
+	}
+</style>
+
+<script>
+	for (const fig of document.querySelectorAll<HTMLElement>(".cpu-core")) {
+		const tabs = [...fig.querySelectorAll<HTMLButtonElement>(".cpuf-tabs button")];
+		const panes = [...fig.querySelectorAll<HTMLElement>(".core-pane")];
+		for (const t of tabs)
+			t.addEventListener("click", () => {
+				const i = Number(t.dataset.i);
+				tabs.forEach((b, k) => {
+					b.setAttribute("aria-pressed", String(k === i));
+				});
+				panes.forEach((p, k) => {
+					p.hidden = k !== i;
+				});
+			});
+	}
+</script>

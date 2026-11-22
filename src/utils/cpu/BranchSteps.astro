@@ -1,0 +1,58 @@
+---
+// Step-through of two branch predictors on one branch's outcomes (branch.ts): a single 2-bit
+// counter (bimodal) and a table of 2-bit counters indexed by the last h outcomes (local
+// history). Mispredicted guesses are outlined in red; the highlighted counter is the one the
+// history predictor reads for this outcome (its value before the update).
+// Usage in .mdx:
+//   import { LOOP4 } from "../../utils/cpu/cpuFigures";
+//   <BranchSteps outcomes={LOOP4} title="A 4-iteration loop" />
+import StepControls from "../compiler/StepControls.astro";
+import "./cpu.css";
+import { runPredictors } from "./branch";
+import { drawBranch } from "./cpuDraw";
+
+interface Props {
+	outcomes: string;
+	history?: number;
+	title?: string;
+	step?: number;
+}
+
+const { outcomes, history = 3, title, step = 0 } = Astro.props;
+const steps = runPredictors(outcomes, history);
+const at = Math.max(0, Math.min(steps.length - 1, step));
+const notes = steps.map((s, i) => {
+	const b = s.bimodal;
+	const h = s.history;
+	return `<b>Outcome ${i + 1}: ${s.outcome === "T" ? "taken" : "not taken"}.</b> One counter held ${b.counter}, guessed ${b.predict}${b.miss ? ' (<span style="color:var(--cpu-bad)">miss</span>)' : ""}. History ${i < history ? "(still filling) " : ""}${h.pattern} selects counter ${h.counter}, guessed ${h.predict}${h.miss ? ' (<span style="color:var(--cpu-bad)">miss</span>)' : ""}. Misses so far: ${s.missesBimodal} vs ${s.missesHistory}.`;
+});
+---
+
+<figure class="cpuf cpu-br" data-step={at} tabindex="-1">
+	{title && <figcaption class="cpuf-title">{title}</figcaption>}
+	<StepControls labels={steps.map((_, i) => `${i + 1}`)} step={at} />
+	<div class="cpuf-canvas">
+		{steps.map((_, i) => <div class="br-frame" hidden={i !== at} set:html={drawBranch(steps, i, history)} />)}
+	</div>
+	<p class="cpuf-legend">
+		<i style="background:var(--cpu-done-soft)"></i>T taken <i style="background:var(--cpu-hot-soft)"></i>N not taken
+		<i style="border:2px solid var(--cpu-bad)"></i>mispredicted; counters 0–1 predict N, 2–3 predict T
+	</p>
+	<div class="cpuf-notes">{notes.map((n, i) => <p hidden={i !== at} set:html={n} />)}</div>
+</figure>
+
+<script>
+	import { bindStepper } from "../compiler/stepper";
+	for (const fig of document.querySelectorAll<HTMLElement>(".cpu-br")) {
+		const frames = [...fig.querySelectorAll<HTMLElement>(".br-frame")];
+		const notes = [...fig.querySelectorAll<HTMLElement>(".cpuf-notes p")];
+		bindStepper(fig, frames.length, (i) => {
+			frames.forEach((f, k) => {
+				f.hidden = k !== i;
+			});
+			notes.forEach((n, k) => {
+				n.hidden = k !== i;
+			});
+		}, 900);
+	}
+</script>

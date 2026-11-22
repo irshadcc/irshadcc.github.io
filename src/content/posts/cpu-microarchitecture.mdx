@@ -1,0 +1,1059 @@
+---
+title: "CPU Microarchitecture for Low-Latency Code"
+description: "How a modern x86 and Arm core actually runs your code: front end, branch prediction, renaming and the reorder buffer, execution ports, caches, TLBs, coherence and memory ordering, with block diagrams of Golden Cove, Zen 4 and Neoverse V2 and measured numbers for every effect a trading system cares about."
+date: 2026-11-22
+tags: [C++/Python, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import CoreDiagram from "../../utils/cpu/CoreDiagram.astro";
+import OooSteps from "../../utils/cpu/OooSteps.astro";
+import BranchSteps from "../../utils/cpu/BranchSteps.astro";
+import CacheSets from "../../utils/cpu/CacheSets.astro";
+import SequenceSteps from "../../utils/payments/SequenceSteps.astro";
+import LineChart from "../../utils/charts/LineChart.astro";
+import {
+	GOLDEN_COVE, ZEN4, NEOVERSE_V2, SOCKET_ZEN4, SOCKET_MESH,
+	TOY_CORE, SUM_ONE_ACC, SUM_FOUR_ACC, MISS_THEN_WORK, CHASE, THREE_MISSES,
+	LOOP4, RANDOM16, CHASE_NS_4K, CHASE_NS_2M, CHASE_X, chaseAt,
+	MESI_PARTICIPANTS, MESI_MESSAGES,
+} from "../../utils/cpu/cpuFigures";
+
+## Background
+
+Most programmers think of a CPU as a machine that runs one instruction after another. That is the
+contract the instruction set promises, and it is a fiction. A modern server core fetches and
+decodes six or eight instructions per cycle, keeps several hundred of them in flight at once,
+runs them in whatever order their inputs allow, guesses which way every branch will go before
+it knows, and only at the end puts the results back into program order. A single load can take
+anything from 1 ns to 90 ns depending on where its cache line lives.
+
+For most software these details average out. For a trading system they decide the outcome. A
+market-data handler that turns a packet into an order-book update and an order has a budget of
+a few hundred nanoseconds from wire to wire, and **tail latency** matters more than the average:
+the trade you lose is the one where a branch mispredicted, a line was in another core's cache,
+or a page walk went to DRAM. Each of those costs between 3 and 100 ns, and each is invisible in
+the source code. The way to control them is to know the machine.
+
+This post walks through a core from front to back, then out to the rest of the chip. It covers:
+
+1. the **big picture**: a block diagram of three real cores (Intel Golden Cove, AMD Zen 4, Arm
+   Neoverse V2) and of the socket around them;
+2. the **front end**: fetch, decode, the micro-op cache and **branch prediction**;
+3. the **out-of-order back end**: register renaming, the reorder buffer, schedulers and ports,
+   and the difference between **latency** and **throughput**;
+4. the **memory hierarchy**: cache lines, sets and ways, memory-level parallelism, TLBs and huge
+   pages, prefetchers and the store buffer;
+5. **multiple cores**: cache coherence, false sharing, core-to-core latency and the **memory
+   models** of x86 and Arm;
+6. **SIMD** on both ISAs;
+7. a latency budget for a market-data hot path, and the system settings that keep it stable.
+
+Every number marked "measured" was measured for this post on an AMD Ryzen 7 7700 (Zen 4, 8 cores,
+boosting to 5.3 GHz, DDR5), with small C++ benchmarks compiled by GCC 13.3 at `-O2`. Cycle
+counts use a clock calibrated by a chain of dependent `add` instructions (one cycle each). Arm
+numbers come from Arm's published figures and from Chips and Cheese's measurements on AWS
+Graviton 4 and NVIDIA Grace; there was no Arm machine to measure on. The
+[order book post](/blog/order-book-cpp/) applies many of these ideas to one data structure. Each section ends with exercises, and a companion
+[performance lab](/blog/cpu-performance-lab/) takes nine slow programs through `perf` and LLVM's tools
+to a fix.
+
+## The machine you are programming
+
+### From one instruction to a pipeline
+
+Running an instruction takes several steps: **fetch** its bytes from memory, **decode** them into
+an operation, **read** its source registers, **execute**, and **write** the result. A
+**pipeline** overlaps these steps the way an assembly line does: while one instruction executes,
+the next is being decoded and the one after that fetched. With five stages, five instructions
+are in progress at once and, ideally, one finishes every cycle.
+
+Modern cores go three steps further:
+
+- **Superscalar**: they fetch, decode and finish several instructions per cycle (six on the
+  cores in this post), so the best case is not 1 but 6 **instructions per cycle (IPC)**.
+- **Out of order**: an instruction whose inputs are ready may run before an older one that is
+  still waiting, for example for a cache miss. A **reorder buffer** puts the results back into
+  program order at the end, so the program cannot tell.
+- **Speculative**: the core guesses the direction of every branch and runs down the guessed
+  path. If the guess was wrong, it throws the work away and starts again from the right path.
+
+So a core has two halves with a queue between them. The **front end** works in program order:
+it predicts branches, fetches and decodes instructions into **micro-operations (uops)**, the
+simple fixed-format operations the back end actually executes. The **back end** works out of
+order: it renames registers, waits for operands, executes on **execution ports**, and finally
+**retires** uops in program order.
+
+### Core block diagrams: x86 and Arm
+
+The figure below draws three current server cores at the same level of detail. Read it top to
+bottom: the front end (blue) feeds rename and the reorder buffer (red), which feed the
+schedulers and the execution ports (green: arithmetic; orange: memory), which talk to the L1 data
+cache and the private L2 (grey). Switch between the cores with the tabs, and click any block
+to read what it does and its size.
+
+<CoreDiagram
+	title="Three server cores, front end at the top (click a block)"
+	cores={[
+		{ name: "Intel Golden Cove (x86)", ...GOLDEN_COVE },
+		{ name: "AMD Zen 4 (x86)", ...ZEN4 },
+		{ name: "Arm Neoverse V2 (AArch64)", ...NEOVERSE_V2 },
+	]}
+/>
+
+Golden Cove is the performance core in Intel's Alder Lake desktop chips and in Sapphire Rapids
+Xeons. Zen 4 is in AMD's Ryzen 7000 and EPYC Genoa. Neoverse V2 is Arm's server core, used in
+AWS Graviton 4 and NVIDIA Grace. The three are close relatives in shape. The table puts the
+numbers side by side.<Sidenote>Sources: Chips and Cheese's articles "Popping the Hood on Golden
+Cove" (2021), "AMD's Zen 4 Part 1" (2022), "Hot Chips 2023: Arm's Neoverse V2" and "Arm's
+Neoverse V2 in AWS's Graviton 4" (2024); Intel's optimization manual for the Golden Cove load and
+store buffers. Arm's own numbers (8-wide rename, 6 integer ALUs) are Hot Chips claims; Chips and
+Cheese measured 6 renames and 4 integer adds per cycle on Graviton 4.</Sidenote>
+
+| | Golden Cove | Zen 4 | Neoverse V2 |
+| --- | ---: | ---: | ---: |
+| ISA | x86-64 | x86-64 | AArch64 (Armv9) |
+| Used in | Sapphire Rapids, Alder Lake | Ryzen 7000, EPYC Genoa | Graviton 4, Grace |
+| Decoders | 6 | 4 | 6 |
+| Micro-op cache (entries) | 4K | 6.75K | 1.5K |
+| Rename per cycle | 6 | 6 | 6–8 |
+| Reorder buffer | 512 | 320 | ≈ 320 |
+| Integer ALUs | 5 | 4 | 4–6 |
+| Loads + stores per cycle | 3 + 2 | 3 memory ops (≤ 2 stores) | 3 memory ops |
+| Vector width × pipes (FMA) | 512 b × 2 (server) | 256 b × 2 | 128 b × 4 |
+| L1D | 48 KiB, 12-way, 5 cycles | 32 KiB, 8-way, 4–5 cycles | 64 KiB, 4 cycles |
+| L2 (private) | 1.25–2 MiB | 1 MiB, ~14 cycles | 1–2 MiB, 10–11 cycles |
+| General-purpose registers | 16 | 16 | 31 |
+
+Two differences between the ISAs show up directly in the diagram:
+
+- **Decode.** x86 instructions are 1 to 15 bytes long, and the decoder has to find where each
+  one starts before it can decode it. That is expensive, so x86 cores lean on a large
+  **micro-op cache** that stores already-decoded uops (Zen 4 has 6.75K entries but only 4
+  decoders). AArch64 instructions are always 4 bytes, so wide decode is cheap, and Neoverse V2
+  gets by with a much smaller micro-op cache.
+- **Registers.** x86-64 has 16 general-purpose registers, AArch64 has 31. With fewer
+  architectural registers the compiler spills more values to the stack. The out-of-order engine
+  hides most of that cost, because a store followed by a load from the same address is
+  forwarded inside the core (see [stores](#stores-the-store-buffer-and-forwarding)), but
+  each spill still uses a load and a store slot.
+
+### The socket: cores, caches and the interconnect
+
+A core never works alone. Each one has private L1 and L2 caches. A **last-level cache (L3)** is
+shared by a group of cores, and an **interconnect** joins the cores, the L3, the memory
+controllers and the I/O (PCIe, where the network card sits). The two common layouts are drawn
+below.
+
+<CoreDiagram
+	title="Around the core: two ways to build a socket (click a block)"
+	cellW={130}
+	cores={[
+		{ name: "AMD: CCD + I/O die", ...SOCKET_ZEN4 },
+		{ name: "Intel / Arm: mesh of tiles", ...SOCKET_MESH },
+	]}
+/>
+
+AMD groups 8 cores and a 32 MiB L3 into a **core complex die (CCD)**; memory and PCIe sit on a
+separate I/O die. Two threads on the same CCD share the L3 and talk through it. Two threads on
+different CCDs (on EPYC or the 16-core Ryzens) go through the I/O die, which costs much more.
+Intel's Xeons and Arm's servers build a **mesh**: a grid of tiles, each with a core, its L2 and
+one **slice** of the L3. A cache line's address is hashed to pick its home slice, so most L3
+hits travel a few mesh hops.
+
+For a trading system the socket layout decides **where to put threads**. The packet-receiving
+thread, the book-building thread and the strategy thread exchange data on every message, so
+they belong on cores that share an L3 (one CCD on AMD, one socket on Intel and Arm), on the same
+**NUMA node** as the network card and the memory they use.
+
+#### Exercises
+
+**1. Where should the threads go?** A Zen 4 EPYC has 12 CCDs of 8 cores. A system has a NIC-polling thread, a book-building thread and a strategy thread that pass every message along in that order. Where do you pin them, and why?
+
+<details>
+<summary>Answer</summary>
+
+On three cores of **one CCD**, on the socket (NUMA node) the NIC is attached to. Every message moves a cache line from one thread's core to the next; inside a CCD that goes through the shared L3 (about 20 ns measured), across CCDs it goes through the I/O die and costs several times more. Keep the cores' SMT siblings idle.
+
+</details>
+
+**2. Count the cycles.** A handler makes 3 dependent loads that hit L3 and 1 that goes to DRAM. Using the measured latencies (L3 9.7 ns, DRAM 78 ns), how long is that, and how many cycles at 5.3 GHz?
+
+<details>
+<summary>Answer</summary>
+
+$3 \times 9.7 + 78 = 107.1$ ns, or $107.1 \times 5.3 \approx 568$ cycles. At 4 instructions per cycle that is the time of about 2,300 instructions, more than the rest of a typical handler.
+
+</details>
+
+**3. x86 or Arm?** Name two differences between x86-64 and AArch64 that change how you write or tune C++ code, and one that does not matter.
+
+<details>
+<summary>Answer</summary>
+
+Matters: the **memory model** (Arm needs explicit acquire/release where x86 code got away with relaxed or plain accesses) and the **register count** (31 vs 16 general registers, so register-hungry loops spill less on Arm). Vector width also matters (128-bit NEON/SVE2 vs 256/512-bit AVX). Instruction encoding (fixed 4 bytes vs 1 to 15 bytes) changes how the front end is built but not how you write code.
+
+</details>
+
+The [performance lab](/blog/cpu-performance-lab/) applies these ideas to nine broken programs, with `perf` and LLVM tool output for each.
+
+## The front end
+
+### Fetch, decode and the micro-op cache
+
+Every cycle the front end must produce the next group of instructions for rename. It does so in
+four steps:
+
+1. The **branch predictor** picks the address of the next 32- or 64-byte fetch block. It runs
+   ahead of everything else and does not wait for decode.
+2. **Fetch** reads those bytes from the **L1 instruction cache (L1I)**, translating the address
+   through the **instruction TLB**.
+3. **Decode** turns instructions into uops. On x86 most instructions become one uop, and an
+   instruction with a memory operand (`add rax, [rdi]`) stays one fused uop through rename.
+4. The uops go into a **queue** in front of rename.
+
+The **micro-op cache** is a shortcut around steps 2 and 3: if the uops for this address have been
+decoded recently, they come straight from it, 8 per cycle on Golden Cove and up to 9 on Zen 4.
+A hot loop that fits in it never touches the decoders.
+
+What this means for low-latency code:
+
+- **Keep the hot path small and contiguous.** An order handler that jumps through many small
+  functions spread across the binary touches many L1I lines and micro-op cache entries. Profile
+  -guided optimization (`-fprofile-use`) and link-time layout tools such as BOLT move hot code
+  together and cold code (error handling, logging) out of the way.
+- **The front end goes cold between messages.** If the hot path runs only when a packet
+  arrives, other code in the meantime (the kernel, a logging thread on the same core) evicts its
+  instructions and predictor state. That is one reason trading systems spin on a dedicated core
+  instead of sleeping, and why some keep the path warm by running it on fake input between
+  real messages.
+
+### Branch prediction
+
+A branch's direction is known only when it executes, many cycles after it was fetched. The
+front end cannot wait, so it **predicts**: the **branch target buffer (BTB)** remembers where each
+taken branch went, and a **direction predictor** guesses taken or not taken. If the guess is
+right, the branch is free. If it is wrong, every uop fetched after it is discarded when the
+branch executes, and fetch restarts from the correct address: a **misprediction** costs roughly
+the length of the pipeline from fetch to execute.
+
+The simplest direction predictor is a **2-bit saturating counter** per branch: values 0 and 1
+predict not taken, 2 and 3 predict taken, and each outcome moves the counter one step towards
+itself. Two wrong guesses in a row are needed to flip the prediction, so a loop branch that is
+taken many times and then falls through costs one miss per loop exit. Real predictors add
+**history**: they index a table of counters with the outcomes of the last few branches, so a
+pattern can select its own counter. The figure runs both on a loop of 4 iterations, whose branch
+goes taken, taken, taken, not taken, and so on.
+
+<BranchSteps outcomes={LOOP4} title="A 4-iteration loop branch: one counter vs 3 bits of history" step={15} />
+
+Step to the end. The single counter mispredicts every fourth outcome (the loop exit), 4 misses in
+16. The history predictor misses once, at the first exit, while it is still learning: after that,
+the history `TTT` always selects a counter that has learned "not taken", and the other patterns
+select counters that predict "taken". Modern cores use **TAGE**-style predictors (Neoverse V2's
+has 8 components), which keep several tables with different history lengths and use the longest
+one that matches, so they learn patterns dozens of branches long.
+
+No predictor can learn randomness. The same two predictors on a random branch:
+
+<BranchSteps outcomes={RANDOM16} title="A data-dependent branch on random data" step={15} />
+
+Here the single counter misses 12 times in 16 and the history predictor 7: both are guessing.
+In a trading system, branches that depend on market data (is this order on the bid or the ask?
+did it cross the spread? is this the instrument we trade?) are exactly this kind.
+
+**Measured cost.** The benchmark sums the elements of a 64K-element array that are at least 128,
+with values uniform in 0–255, once in random order and once sorted.
+Compiled so that the `if` stays a branch, the random array runs at **8.30 cycles per element**
+and the sorted one at **1.50**. The random branch mispredicts about half the time, so each
+misprediction costs about $(8.30 - 1.50) / 0.5 \approx 13.6$ cycles, or 2.6 ns at 5.3 GHz.<Sidenote>GCC turns this `if` into a
+conditional move by default at `-O2`. The branchy version was compiled with
+`-fno-if-conversion -fno-if-conversion2`, and both builds were checked in the disassembly.</Sidenote>
+
+**Branchless code.** If the compiler turns the `if` into a conditional move (`cmov` on x86,
+`csel` on AArch64), there is no branch to mispredict: the same loop runs at **2.0 cycles per
+element** on both the random and the sorted array. A conditional move turns a **control
+dependence** into a **data dependence**: the result waits for both inputs, but nothing is ever
+thrown away.
+
+```cpp
+// Branchy: fast when predictable, ~13.6 cycles extra on every misprediction.
+if (x >= threshold) sum += x;
+
+// Branchless: always pays for both sides, never mispredicts.
+sum += (x >= threshold) ? x : 0;        // cmov / csel
+sum += x & -int64_t(x >= threshold);    // mask, if the compiler will not emit a cmov
+```
+
+The rule: make **predictable** branches branches (error checks, "is the feed alive"), and
+data-dependent ones branchless. Use `[[likely]]` and `[[unlikely]]` (C++20) to put the rare
+path out of line, which helps code layout more than prediction. Do not make a predictable branch
+branchless: the conditional move puts both inputs on the critical path, which a correctly
+predicted branch does not.
+
+#### Exercises
+
+**4. Predict the misses.** An inner loop runs exactly 4 iterations and is itself run 1,000 times. How many times does its loop branch mispredict with a single 2-bit counter, and with the 3-outcome history predictor from the figure?
+
+<details>
+<summary>Answer</summary>
+
+The branch executes 4,000 times with the pattern `TTTN`. The single counter stays at 2 or 3 and mispredicts every `N`: **1,000 misses** (25%). The history predictor learns that `TTT` is followed by `N` after the first round and then never misses: **about 1** (the figure shows 1 miss in 16 outcomes, all during warm-up).
+
+</details>
+
+**5. Branchy or branchless?** In the measured loop the branchy version costs 1.50 cycles per element plus 13.6 cycles per misprediction, and the branchless version 2.00 cycles. Above what misprediction rate should you switch to branchless?
+
+<details>
+<summary>Answer</summary>
+
+Branchless wins when $1.50 + 13.6\,p > 2.00$, i.e. $p > 0.5 / 13.6 \approx 3.7\%$. A branch on market data that goes the 'unusual' way more than about 1 time in 27 is a candidate. Measure $p$ with `perf stat -e branches,branch-misses`, or per instruction with `perf record -e branch-misses`.
+
+</details>
+
+**6. Find the slow path.** Why is it a good idea to move logging and error formatting into a separate `__attribute__((cold, noinline))` function even if it never runs?
+
+<details>
+<summary>Answer</summary>
+
+Code that never runs still occupies the hot function's cache lines, uop-cache entries and branch-predictor entries if it is inlined, and it spreads the hot instructions over more bytes. Moving it out of line keeps the hot path dense, so it fetches from fewer lines and fits in the uop cache. Case 9 of the [lab](/blog/cpu-performance-lab/#case-9-dispatch-and-a-pgo-regression) does this.
+
+</details>
+
+## The out-of-order back end
+
+### Renaming and the reorder buffer
+
+The program names 16 (x86) or 31 (Arm) **architectural registers**. If the core used them
+directly, two unrelated computations that both happen to use `rax` would have to run in order.
+**Register renaming** removes those false dependences: every instruction that writes a register
+gets a fresh **physical register** from a pool of a few hundred (224 integer registers on Zen 4),
+and a **register alias table** records which physical register currently holds each
+architectural one. After renaming, the only dependences left are the true ones: an instruction
+waits only for the instructions whose results it reads.
+
+Renamed uops enter the **reorder buffer (ROB)** in program order and wait in a **scheduler**
+until their inputs are ready. Each cycle the scheduler sends the oldest ready uops to free
+execution ports. When a uop finishes, it stays in the ROB until every older uop has finished,
+then **retires**: its result becomes architectural, its old physical register is freed, and if
+it was a store, the store may now be written to the cache.
+
+Two consequences matter most:
+
+- The ROB size is how far ahead the core can look. While a load waits 80 ns for DRAM, the core
+  can keep renaming new instructions only until the ROB is full: at 6 per cycle, Zen 4's 320
+  entries fill in about 53 cycles, 10 ns, a small fraction of the miss.
+- Retirement is in order. One slow instruction at the head of the ROB blocks everything behind
+  it from retiring, however fast those instructions are.
+
+The figure runs a short program on a toy core, scaled down from the real ones: 4-wide, a
+16-entry ROB, two ALU, two floating-point and two load ports. Each row is an instruction and each
+column a cycle. The first instruction is a load that misses (30 cycles here, scaled down from
+hundreds), followed by 18 independent additions and one addition that uses the load's result.
+
+<OooSteps program={MISS_THEN_WORK} machine={TOY_CORE} title="A cache miss fills the reorder buffer" step={12} />
+
+Look at three things. First, the independent `add`s execute in cycles 1 to 8, long before the
+load finishes: that is out-of-order execution. Second, from cycle 4 the red marks show rename
+stalling: the ROB holds 16 instructions and cannot accept more, so instructions 16 to 19 are not
+even renamed until cycle 31. Third, the finished `add`s (light green) sit in the ROB doing
+nothing: they cannot retire until the load at the head does. The core did 16 instructions of
+useful work during a 30-cycle miss and then waited. A real core has a 20 times bigger ROB but
+faces misses 10 times longer, so the picture is the same.
+
+### Latency and throughput
+
+Every instruction has two costs, and confusing them is the most common performance mistake:
+
+- **Latency**: cycles from when an instruction starts until a dependent instruction can use its
+  result. A 64-bit floating-point add on Zen 4 has a latency of 3 cycles.
+- **Throughput**: how many such instructions the core can start per cycle. Zen 4 has two
+  floating-point add pipes, so it can start two adds every cycle.
+
+A chain of dependent instructions runs at the speed of latency. Independent instructions run at
+the speed of throughput. Summing an array into one accumulator is a dependent chain: every add
+needs the previous sum.
+
+<OooSteps program={SUM_ONE_ACC} machine={TOY_CORE} title="Summing 8 doubles into one accumulator" step={29} />
+
+The loads all finish by cycle 8, but the adds on `acc0` run one at a time, three cycles apart,
+on one FP port while the other is idle: 30 cycles. Split the sum over four accumulators and the
+same eight adds form four independent chains:
+
+<OooSteps program={SUM_FOUR_ACC} machine={TOY_CORE} title="The same sum over four accumulators" step={12} />
+
+Now both FP ports are busy and the program takes 13 cycles. The measured version, summing a
+4032-element array of doubles with scalar `vaddsd` (vectorization disabled to isolate the
+effect):
+
+| Accumulators | Measured cycles per add | Adds per cycle |
+| ---: | ---: | ---: |
+| 1 | 2.99 | 0.33 |
+| 2 | 1.49 | 0.67 |
+| 3 | 1.00 | 1.00 |
+| 4 | 0.75 | 1.34 |
+| 6 | 0.50 | 1.99 |
+| 8 | 0.50 | 2.00 |
+
+With one accumulator each add costs its full latency, 3 cycles. Each extra chain adds a third of
+an add per cycle until the two FP pipes are full at 2 per cycle. The number of chains needed is
+**latency × throughput** $= 3 \times 2 = 6$, which is where the table flattens. This is
+**Little's law** (items in flight = rate × time in the system), and it appears again with cache
+misses below. Check one entry: with 4 chains, four adds start every 3 cycles, so
+$3 / 4 = 0.75$ cycles per add, as measured.
+
+The compiler will not split a floating-point sum by itself, because it changes the rounding of
+the result; `-ffast-math` (or `-fassociative-math`) allows it. For integers it is always allowed.
+In trading code the same idea applies to anything computed in a loop: running sums for VWAP,
+exponential moving averages over many instruments, or the risk checks on an order. Find the
+loop-carried dependence and break it into independent chains.
+
+### Ports and port pressure
+
+When chains are independent, the limit is the number of ports that can execute each kind of
+uop. On Golden Cove, five ports run integer ALU uops, three run loads, two compute store
+addresses and two carry store data. A loop that is all loads cannot exceed 3 per cycle however
+it is written. Tools that model this per instruction:
+
+- **uops.info** lists the latency, throughput and ports of every x86 instruction on every Intel
+  and AMD generation, measured. Agner Fog's instruction tables cover the same ground.
+- **llvm-mca** and **uiCA** take a loop's assembly and predict its throughput and bottleneck
+  port. `llvm-mca -mcpu=znver4` and `-mcpu=neoverse-v2` both exist.
+- Arm's **Software Optimization Guides** list latency and pipes for every instruction on each
+  Neoverse core.
+
+Some uops never reach a port. **Move elimination** handles `mov rax, rbx` in the rename stage
+by pointing two architectural registers at one physical register, and **zeroing idioms** such as
+`xor eax, eax` are recognised as "the result is zero" with no input dependence. That is why
+compilers zero registers with `xor`.
+
+#### Exercises
+
+**7. How much does the ROB hide?** Zen 4 renames 6 uops per cycle into a 320-entry ROB. A load misses to DRAM (413 cycles at 5.3 GHz). For how much of the miss can the core keep renaming new work?
+
+<details>
+<summary>Answer</summary>
+
+$320 / 6 \approx 53$ cycles, about **13%** of the 413-cycle miss. After that the ROB is full and rename stalls until the load retires, as in the toy figure. This is why independent misses (memory-level parallelism) matter more than ROB size.
+
+</details>
+
+**8. How many accumulators?** On Zen 4 a fused multiply-add has a latency of 4 cycles and two FMA pipes. How many independent accumulators does a dot product need to reach peak throughput?
+
+<details>
+<summary>Answer</summary>
+
+Latency × throughput $= 4 \times 2 = 8$. Case 2 of the [lab](/blog/cpu-performance-lab/#case-2-a-dependency-chain-in-a-reduction) measures exactly this: 4.0 cycles per element with one accumulator, 0.43 with eight, and `llvm-mca` finds the loop-carried FMA chain.
+
+</details>
+
+**9. Port limits.** A loop iteration on Golden Cove does 4 loads, 1 store and 3 integer adds, all independent. What is the lowest possible cycles per iteration, and which ports set it?
+
+<details>
+<summary>Answer</summary>
+
+Ignoring loop overhead: loads, 4 loads / 3 load ports = 1.33 cycles; stores, 1 / 2 store ports = 0.5; adds, 3 / 5 ALU ports = 0.6; rename, 8 uops / 6 per cycle = 1.33 (a store is one micro-fused uop at rename and splits into address and data uops only at execution). So **about 1.33 cycles**, set by the load ports and the rename width together. `llvm-mca -mcpu=goldencove` would report the same bound as `Block RThroughput`.
+
+</details>
+
+## The memory hierarchy
+
+### Cache lines and the latency ladder
+
+Memory moves between DRAM and the caches in **cache lines** of 64 bytes. Reading one byte brings
+in its whole line; two variables in the same line share its fate in cache, and, as shown later,
+in coherence traffic too. Each level of cache is bigger and slower than the one before.
+
+The benchmark measures **load-to-use latency** by following a chain of pointers through a buffer
+in random order, one pointer per cache line, so every load depends on the previous one and the
+hardware prefetchers cannot guess the next address. The time per step is the latency of
+wherever the buffer fits. It was run with ordinary 4 KiB pages and with 2 MiB huge pages (see
+[TLBs](#tlbs-and-huge-pages)).
+
+<LineChart
+	title="Measured load-to-use latency vs working-set size (Zen 4, random pointer chase)"
+	x={() => CHASE_X}
+	series={[
+		{ name: "4 KiB pages", fn: (x) => chaseAt(CHASE_NS_4K, x) },
+		{ name: "2 MiB huge pages", fn: (x) => chaseAt(CHASE_NS_2M, x) },
+	]}
+	xLabel="log2(working set in KiB): 5 = 32 KiB, 10 = 1 MiB, 15 = 32 MiB, 20 = 1 GiB"
+	yLabel="ns per load"
+	height={300}
+/>
+
+The steps are the cache levels:
+
+| Level | Size on Zen 4 | Measured latency | At 5.3 GHz |
+| --- | ---: | ---: | ---: |
+| L1D | 32 KiB per core | 0.94 ns | 5 cycles |
+| L2 | 1 MiB per core | 2.83 ns | 15 cycles |
+| L3 | 32 MiB per CCD | 9.7 ns (16 MiB, huge pages) | 52 cycles |
+| DRAM | | 78 ns (1 GiB, huge pages) | 412 cycles |
+
+The L1 figure is 5 cycles because the benchmark indexes the array (`a[p]`); a pure
+`mov rax, [rax]` chase measured 4 cycles, Zen 4's best case. The curve does not step cleanly at
+32 MiB because the L3 is shared with the rest of the system and is a victim cache filled from L2.
+
+The ratio is what matters: a DRAM access costs about **80 L1 hits**. An order book whose hot
+levels fit in L1 and L2 answers in nanoseconds. The same code on a book scattered over a few
+hundred megabytes waits on DRAM for every message. Two practical rules follow:
+
+- **Make the hot data small.** Store prices as integer ticks in 4 or 8 bytes, not as
+  `double` plus metadata; use `uint32_t` indices instead of 8-byte pointers; split structs so
+  that the fields the hot path reads are together and the rest (strings, timestamps for audit)
+  live elsewhere (**hot/cold splitting**).
+- **Make the access pattern predictable.** Arrays beat linked structures: a scan of a contiguous
+  array is prefetched, a tree walk is a pointer chase.
+
+```cpp
+// 40+ bytes per order, half of it never read on the matching path.
+struct Order { std::string client; double price; int qty; uint64_t id, ts; Order* next; };
+
+// Hot part: 16 bytes, four orders per cache line, linked by 32-bit indices into a pool.
+struct OrderHot  { int64_t price_ticks; int32_t qty; uint32_t next; };
+struct OrderCold { uint64_t id, ts_recv; char client[16]; };   // same index, separate array
+```
+
+### Sets, ways and the critical stride
+
+A cache is not a pool where any line can go anywhere. It is split into **sets**, and each address
+maps to exactly one set; within the set, a line can go in any of its **ways**. The address bits
+pick the set: the low 6 bits are the **offset** within the 64-byte line, the next bits are the
+**set index**, and the rest is the **tag** that identifies which line is stored.
+
+Zen 4's L1D has $32\ \text{KiB} / (8 \times 64\ \text{B}) = 64$ sets, so bits 6 to 11 choose the
+set. Golden Cove's 48 KiB, 12-way L1D also has 64 sets. That is not a coincidence: with 64 sets
+the set index lies inside the 4 KiB page offset, so the cache can be looked up with the virtual
+address while the TLB translates it in parallel. The price is that **addresses 4 KiB apart land
+in the same set**. The figure places 16 lines spaced 4096 bytes apart in Zen 4's L1D.
+
+<CacheSets stride={4096} count={16} title="16 cache lines, 4 KiB apart, in Zen 4's L1D (change the stride)" />
+
+All 16 lines land in set 0, which has only 8 ways. When a loop cycles through them, true LRU
+evicts each line just before it is needed again and every access misses, although the L1 is 64
+times larger than the data. Change the stride to 4160 bytes (4096 + 64) and the lines spread over
+16 sets. Measured with a pointer chase through those 16 lines:
+
+| Stride | Lines | Measured latency |
+| ---: | ---: | ---: |
+| 4096 B | 8 | 3.98 cycles (all fit in 8 ways) |
+| 4096 B | 16 | 13.16 cycles (L2: the set overflows) |
+| 4160 B | 16 | 4.00 cycles |
+
+Check one entry by hand: line 3 at stride 4096 is address $3 \times 4096 = 12288 = $ `0x3000`.
+Its bits 6 to 11 are all zero, so set 0, tag 3; at stride 4160 it is `0x30C0`, set 3. Move the
+"show line" slider in the figure to see the split.
+
+This bites real code: an array of per-instrument structs that are exactly 4 KiB each, a matrix
+with rows of 1024 floats, or several buffers that the allocator happened to align to page
+boundaries and that a loop reads together. The fix is to pad (add 64 bytes to the stride) or to
+interleave the data. Golden Cove's 12 ways give more slack, but 16 lines still overflow; switch
+the cache in the figure to see it.
+
+### Memory-level parallelism
+
+A DRAM access takes 78 ns, but a core does not have to wait for one before starting the next.
+Each core can track a few dozen outstanding L1 misses at once (in **miss status holding
+registers** or fill buffers; Arm gives Neoverse V2 a 96-entry queue for L2 misses). Independent misses overlap;
+dependent ones, where the next address comes from the previous load, do not. On the toy core:
+
+<OooSteps program={CHASE} machine={TOY_CORE} title="Pointer chase: each address comes from the previous load" step={37} />
+
+<OooSteps program={THREE_MISSES} machine={TOY_CORE} title="Three independent misses overlap" step={14} />
+
+Three dependent misses take 38 cycles; three independent ones take 15, limited only by the two
+load ports. The measured version runs 1, 2, 4 or 8 independent pointer chases through a 512 MiB
+buffer, interleaved in one loop:
+
+| Independent chains | Measured ns per load | Speed-up |
+| ---: | ---: | ---: |
+| 1 | 76.3 | 1.0× |
+| 2 | 38.0 | 2.0× |
+| 4 | 20.5 | 3.7× |
+| 8 | 10.5 | 7.3× |
+
+Eight chains get 7.3 times the throughput from the same DRAM latency. This is **memory-level
+parallelism (MLP)**, and Little's law again says how much you need: to stream at 20 GB/s with
+78 ns latency, a core must keep $20 \times 78 / 64 \approx 24$ lines in flight.
+
+The lesson for data structures: a hash table probe, a tree walk or a linked list is a chain of
+dependent loads, and its cost is the sum of its misses. When you must look up several keys (all
+the instruments in a basket, all the orders hit by a sweep), issue the independent lookups
+together, or use `__builtin_prefetch` on the next key's bucket while processing the current one.
+
+### TLBs and huge pages
+
+Programs use virtual addresses, and every load must be translated to a physical one. The page
+table lives in memory, so a translation cache, the **translation lookaside buffer (TLB)**, holds
+recent translations. Zen 4 has a 72-entry L1 data TLB and a 3072-entry L2 TLB (AMD's figures). With 4 KiB pages
+the L2 TLB covers $3072 \times 4\ \text{KiB} = 12$ MiB; beyond that, a load that misses the TLB
+starts a **page walk** through four levels of page table, each level a dependent load that may
+itself miss in cache.
+
+The latency chart shows it. Up to 8 MiB the two curves almost overlap. At 16 MiB, 4 KiB pages
+cost 13.6 ns per load against 9.7 ns with 2 MiB pages, 3.9 ns of page walking per load; at
+24 MiB the gap is 9.7 ns. With 2 MiB pages, 72 L1 TLB entries already cover 144 MiB, and
+translation drops out of the picture.
+
+For a trading process that touches more than a few megabytes:
+
+- Back the order books, pools and queues with **huge pages**: `mmap` with `MAP_HUGETLB` from a
+  pre-reserved pool (`vm.nr_hugepages`), or `madvise(MADV_HUGEPAGE)` with transparent huge pages
+  set to `madvise`. The benchmark used `madvise`.
+- **Allocate and touch everything at start-up** (pre-faulting, or `MAP_POPULATE`) so that no page
+  fault happens on the hot path, and `mlockall` so nothing is swapped.
+- Do not let transparent huge pages run in `always` mode with background compaction on a
+  latency-critical host: the compaction itself causes stalls.
+- On Arm, the base page size can be 4, 16 or 64 KiB. A 64 KiB-page kernel multiplies TLB reach
+  by 16 without huge pages.
+
+### Prefetchers
+
+Hardware **prefetchers** watch the stream of misses and fetch lines before they are asked for.
+They recognise sequential access, constant strides and, in the L1, the next line. They cannot
+predict a pointer chase or a hash table, which is why the benchmark above used a random
+permutation. Two consequences:
+
+- Sequential scans of arrays run at close to memory bandwidth, not at memory latency. A sorted
+  vector of price levels scanned linearly is fast for this reason.
+- Prefetchers generally do not cross 4 KiB page boundaries (they see physical addresses, and the
+  next virtual page may be anywhere), so a stride pattern restarts its training on each new page.
+
+Software prefetch (`__builtin_prefetch(p)`, which becomes `prefetcht0` on x86 and `prfm pldl1keep`
+on Arm) helps when you know an address early, for example the bucket of the next message's order
+id. Prefetching too late does nothing, and prefetching too much evicts useful data.
+
+### Stores: the store buffer and forwarding
+
+A store does not write the cache when it executes. It goes into the **store buffer**, and is
+written to L1D only after it retires, in program order. This lets stores execute speculatively
+(a store on a mispredicted path is just dropped from the buffer) and hides store misses: the
+core moves on while the line is fetched for ownership.
+
+A later load from the same address must see the stored value even though it is not in the cache
+yet. The core checks the store buffer, and if an older store covers the load's bytes, it
+**forwards** the data directly. **Store-to-load forwarding** costs a few cycles (5 on Neoverse V2;
+Chips and Cheese measured 10–11 cycles when it fails, for example when a load needs bytes from
+two different stores). Avoid writing a value in small pieces and reading it back whole:
+
+```cpp
+// Writes two 4-byte halves, then reads 8 bytes: the load needs two stores, so forwarding fails.
+msg.lo = a; msg.hi = b; uint64_t key = *reinterpret_cast<uint64_t*>(&msg);
+// Build it in a register instead.
+uint64_t key = (uint64_t(b) << 32) | a;
+```
+
+The store buffer is also why x86 is not sequentially consistent, as the
+[memory-model section](#memory-ordering-x86-tso-vs-arm) shows.
+
+#### Exercises
+
+**10. Which set?** On Zen 4's L1D (64 sets, 64-byte lines), which byte offset and which set does the address `0x7ffd1234abe8` map to?
+
+<details>
+<summary>Answer</summary>
+
+Offset = low 6 bits = `0x28` = **40**. Set = bits 6 to 11 = `(0x7ffd1234abe8 >> 6) & 63` = **47**. The tag is the rest, `0x7ffd1234a`. Move the 'show line' slider in the figure above to see the same split for other addresses.
+
+</details>
+
+**11. Shrink the struct.** What is `sizeof` of `struct A { char side; double px; int32_t qty; char flag; uint64_t id; };` on x86-64, and how small can you make it by reordering the fields?
+
+<details>
+<summary>Answer</summary>
+
+32 bytes: `side` (1) + 7 padding + `px` (8) + `qty` (4) + `flag` (1) + 3 padding + `id` (8). Ordered largest first, `{ double px; uint64_t id; int32_t qty; char side; char flag; }` is **24** bytes (checked with `sizeof`). For a hot array that is 25% fewer cache lines; also ask whether `px` can be an `int32_t` tick count.
+
+</details>
+
+**12. TLB reach.** Zen 4 has a 72-entry L1 DTLB and a 3,072-entry L2 TLB. What memory do they cover with 4 KiB pages and with 2 MiB pages?
+
+<details>
+<summary>Answer</summary>
+
+L1 DTLB: $72 \times 4$ KiB = 288 KiB, or $72 \times 2$ MiB = 144 MiB. L2 TLB: $3072 \times 4$ KiB = 12 MiB, or $3072 \times 2$ MiB = 6 GiB. That matches the latency chart, where 4 KiB pages start to cost more above about 8 to 16 MiB. Case 4 of the [lab](/blog/cpu-performance-lab/#case-4-tlb-misses-on-a-large-hash-table) measures one page walk per lookup on a 1 GiB table.
+
+</details>
+
+**13. Little's law.** DRAM latency is 100 ns. How many cache lines must be in flight to read 20 GB/s?
+
+<details>
+<summary>Answer</summary>
+
+$20 \times 10^9 \times 100 \times 10^{-9} / 64 \approx 31$ lines. One pointer chase has 1 in flight (0.64 GB/s); a sequential scan reaches 31 only because the prefetchers run ahead.
+
+</details>
+
+## Multiple cores
+
+### Cache coherence and false sharing
+
+Each core has its own L1 and L2, so the same line can be cached in several places. A **coherence
+protocol** keeps the copies consistent. In the **MESI** family, each cached line is in one of
+four states: **M**odified (only this cache has it, dirty), **E**xclusive (only this cache, clean),
+**S**hared (several caches, read-only) or **I**nvalid. A core can write a line only in M or E, so
+before writing, it must invalidate every other copy. Intel uses MESIF and AMD MOESI, which add a
+state for forwarding shared lines, but the write rule is the same.
+
+The rule applies to whole lines, not to variables. Two threads that write *different* variables
+in the *same* line take the line away from each other on every write. That is **false sharing**,
+stepped through below.
+
+<SequenceSteps participants={MESI_PARTICIPANTS} messages={MESI_MESSAGES} title="Two cores increment adjacent counters (false sharing)" />
+
+Measured with two threads on different cores, each doing 100 million relaxed atomic increments
+of its own counter:
+
+| Layout | Measured ns per increment |
+| --- | ---: |
+| Both counters in one 64-byte line | 11.24 |
+| Each counter on its own line (`alignas(64)`) | 1.39 |
+
+An 8-fold slow-down from the placement of two variables. (1.39 ns is 7.4 cycles, roughly the cost of
+an uncontended `lock xadd`.) Separate anything written by different threads onto different lines:
+the producer's and consumer's indices in a queue, per-thread statistics, and the fields of a
+shared struct. C++17 provides `std::hardware_destructive_interference_size` for this (64 on
+these cores), and some Intel cores prefetch lines in adjacent pairs, so 128-byte separation is
+the safe choice there.
+
+### Core-to-core latency
+
+When one thread hands data to another, the cache line must move between their caches. A
+ping-pong benchmark measures this: two threads take turns writing a shared flag and waiting for
+the other's reply, so each round trip is two line transfers.
+
+| Cores | Measured one-way latency |
+| --- | ---: |
+| Two cores on the same CCD | 18–20 ns |
+| Two hardware threads of one core (SMT), with `pause` in the spin loop | 13 ns |
+| Two hardware threads of one core, without `pause` | 23 ns |
+
+Twenty nanoseconds is 100 cycles, about twice an L3 hit. Every hand-off between threads in a
+pipeline (NIC thread → book thread → strategy thread) pays it at least once, so the cheapest
+pipeline has as few stages as possible. Across CCDs or sockets it is several times higher.
+
+The SMT rows show why `pause` belongs in every spin loop on x86 (`yield` on Arm): it tells the
+core that this thread is waiting, so its sibling gets the execution resources. Even so, most
+trading setups **disable SMT** on latency-critical cores, because a sibling shares the L1, L2,
+ROB and ports and adds jitter.
+
+A **single-producer single-consumer (SPSC)** ring is the standard way to pass messages between
+two threads. The version below keeps each index on its own line and gives each side a cached
+copy of the other's index, so in the common case the producer and consumer each touch the
+shared index lines only when the queue looks full or empty:
+
+```cpp
+template <class T, size_t N>  // N a power of two
+class Spsc {
+  alignas(64) std::atomic<uint64_t> head_{0};  // written by the consumer only
+  alignas(64) uint64_t cached_tail_ = 0;       // consumer's copy of tail_
+  alignas(64) std::atomic<uint64_t> tail_{0};  // written by the producer only
+  alignas(64) uint64_t cached_head_ = 0;       // producer's copy of head_
+  alignas(64) T buf_[N];
+ public:
+  bool push(const T& v) {                      // producer thread
+    uint64_t t = tail_.load(std::memory_order_relaxed);
+    if (t - cached_head_ == N) {               // looks full: refresh the copy
+      cached_head_ = head_.load(std::memory_order_acquire);
+      if (t - cached_head_ == N) return false;
+    }
+    buf_[t & (N - 1)] = v;
+    tail_.store(t + 1, std::memory_order_release);  // publish
+    return true;
+  }
+  bool pop(T& v) {                             // consumer thread
+    uint64_t h = head_.load(std::memory_order_relaxed);
+    if (h == cached_tail_) {                   // looks empty: refresh the copy
+      cached_tail_ = tail_.load(std::memory_order_acquire);
+      if (h == cached_tail_) return false;
+    }
+    v = buf_[h & (N - 1)];
+    head_.store(h + 1, std::memory_order_release);
+    return true;
+  }
+};
+```
+
+With 32-byte messages and the two threads on different cores of the CCD, this queue moved 50
+million messages at 7.9 ns per message (measured twice; the consumer checked every sequence
+number, and both sides spin with `pause` when the queue is full or empty).
+That is throughput with a full pipeline. The latency of a single message through an idle queue is
+the core-to-core latency above, about 20 ns, because the consumer has to pull the line across.
+
+### Memory ordering: x86 TSO vs Arm
+
+The store buffer means a core's own stores reach other cores later than its loads read memory.
+Each ISA defines a **memory model**: which reorderings other cores may observe.
+
+- **x86 is TSO (total store order).** Loads are not reordered with other loads, stores are not
+  reordered with other stores, and a store is not reordered with an older load. The one
+  reordering allowed is a **store followed by a load** from a different address: the load can
+  complete while the store still sits in the store buffer.
+- **AArch64 is weakly ordered.** Any two accesses to different addresses may be observed out of
+  order, unless a dependency, a barrier or an acquire/release instruction orders them.
+
+The classic **store-buffering** test shows the x86 reordering. Two threads start with `X = Y = 0`:
+
+```cpp
+// Thread A           // Thread B
+X = 1;                Y = 1;
+r1 = Y;               r2 = X;
+```
+
+Under sequential consistency at least one thread must see the other's store, so `r1 == r2 == 0`
+is impossible. On the Zen 4 machine, with the two threads on different cores, it happened **1,828
+times in 2 million runs**: both loads read 0 because both stores were still in store buffers.
+With an `mfence` between the store and the load it happened **0 times**.<Sidenote>The count
+depends heavily on how tightly the harness lines the two threads up (an earlier version of the
+same test gave 161 in 2 million); what matters is that it is not zero without the fence and is
+zero with it.</Sidenote>
+
+You rarely write fences by hand. C++ atomics express the ordering you need, and the compiler
+emits the right instructions for each ISA. Compiled with clang 18 (`-O2`; `-march=armv8.4-a` for AArch64):
+
+| C++ operation | x86-64 | AArch64 (Armv8.4) |
+| --- | --- | --- |
+| `load(acquire)` | `mov` | `ldapr` |
+| `store(release)` | `mov` | `stlr` |
+| `load(seq_cst)` | `mov` | `ldar` |
+| `store(seq_cst)` | `xchg` | `stlr` |
+| `fetch_add(relaxed)` | `lock xadd` | `ldadd` (LSE atomics) |
+| `atomic_thread_fence(seq_cst)` | `mfence` | `dmb ish` |
+
+On x86, acquire and release cost nothing: TSO already provides them, so the only expensive
+operations are sequentially consistent stores and read-modify-writes (both use a locked
+instruction, which drains the store buffer). On Arm, acquire and release use dedicated
+instructions that are cheap but not free. Two practical points:
+
+- Use `memory_order_acquire` and `release` for hand-offs such as the SPSC queue, not the
+  `seq_cst` default: on x86 a `seq_cst` store becomes an `xchg`, which waits for the store buffer
+  to drain.
+- Code that "works on x86" with plain variables or `volatile` is relying on TSO and the
+  compiler's mercy. Ported to Graviton or Grace, it can break. Use atomics with explicit orders,
+  and on Arm compile with `-march=armv8.1-a` or later (or `-moutline-atomics`) so that
+  read-modify-writes use the single-instruction LSE atomics instead of retry loops.
+
+#### Exercises
+
+**14. Find the false sharing.** `struct Spsc { std::atomic<uint64_t> head; std::atomic<uint64_t> tail; Msg buf[1024]; };` What is wrong, and how would `perf c2c` show it?
+
+<details>
+<summary>Answer</summary>
+
+`head` (written by the consumer) and `tail` (written by the producer) are on the same 64-byte line, so every push and pop takes the line from the other core. `perf c2c report` would show one line with HITMs from two CPUs at offsets 0x0 and 0x8. Fix: `alignas(64)` on each, plus cached copies of the other side's index, as in the queue above.
+
+</details>
+
+**15. Does this work on Arm?** A producer writes `data = 42; ready.store(1, std::memory_order_relaxed);` and a consumer spins on `ready.load(std::memory_order_relaxed)` and then reads `data`. Why does it seem to work on x86, and what can go wrong on Graviton?
+
+<details>
+<summary>Answer</summary>
+
+x86 keeps stores in order and loads in order, so the consumer that sees `ready == 1` also sees `data == 42`. AArch64 may reorder the two stores, or the two loads, so the consumer can see `ready == 1` and an old `data`. Use `store(1, release)` and `load(acquire)`: free on x86, `stlr`/`ldapr` on Arm.
+
+</details>
+
+**16. Cost of a pipeline.** A message passes NIC thread → book thread → strategy thread → gateway thread, each hand-off about 20 ns. How much latency does the pipeline add, and what is the alternative?
+
+<details>
+<summary>Answer</summary>
+
+Three hand-offs, about **60 ns**, before any work. The alternative is fewer stages: run book building and strategy on the same thread (run-to-completion), and keep separate threads only where work must run in parallel or must not be delayed (for example logging, which goes to a queue drained by another core).
+
+</details>
+
+## SIMD on x86 and Arm
+
+**SIMD** (single instruction, multiple data) instructions apply one operation to a vector of
+values. x86 has SSE (128-bit), AVX2 (256-bit) and AVX-512 (512-bit, with mask registers). Arm
+has NEON (128-bit) and **SVE/SVE2**, whose vector length is chosen by the hardware (128 bits on
+Neoverse V2) and read at run time, so the same binary runs on wider future cores. The core
+diagrams above show how each core reaches its peak: Zen 4 with two 256-bit FMA pipes, Neoverse
+V2 with four 128-bit pipes, and Sapphire Rapids with two 512-bit FMA units.
+
+A small example from an order book: find the first of 8 ascending price levels that is at least
+`p`. Comparing all 8 at once turns a loop with a data-dependent exit (a mispredicting branch)
+into a fixed sequence of instructions. On x86 with AVX2, `movemask` collects one bit per lane:
+
+```cpp
+#include <immintrin.h>
+// Index of the first of 8 ascending prices that is >= p (8 if none).
+int first_ge(const int32_t* prices, int32_t p) {
+  __m256i v  = _mm256_loadu_si256((const __m256i*)prices);
+  __m256i ge = _mm256_cmpgt_epi32(v, _mm256_set1_epi32(p - 1));  // v > p-1  <=>  v >= p
+  unsigned m = _mm256_movemask_ps(_mm256_castsi256_ps(ge));     // 1 bit per lane
+  return m ? __builtin_ctz(m) : 8;
+}
+```
+
+NEON has no `movemask`. The usual replacement narrows each lane's all-ones or all-zeros result
+with a shift-and-narrow (`shrn`) into a 64-bit value with 8 bits per lane:
+
+```cpp
+#include <arm_neon.h>
+int first_ge(const int32_t* prices, int32_t p) {
+  int32x4_t t  = vdupq_n_s32(p);
+  uint32x4_t a = vcgeq_s32(vld1q_s32(prices), t);
+  uint32x4_t b = vcgeq_s32(vld1q_s32(prices + 4), t);
+  uint16x8_t n = vcombine_u16(vmovn_u32(a), vmovn_u32(b));               // 8 lanes of 0 or 0xFFFF
+  uint64_t m = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(n, 4)), 0);  // 8 bits per lane
+  return m ? __builtin_ctzll(m) / 8 : 8;
+}
+```
+
+The AVX2 logic was checked against `std::lower_bound` on 100,000 random sorted arrays. The NEON
+version was compiled for AArch64 with clang 18 (it becomes `cmge`, `uzp1`, `xtn`, `rbit`, `clz`)
+but not run, as there was no Arm machine; its bit trick was checked in a short emulation for
+every `p` from 95 to 119 on the levels 100, 101, 103, 104, 107, 108, 110, 115.
+
+Two cautions. On some Intel cores, heavy 512-bit instructions lower the core's clock for a while
+(the **license** levels of Skylake-SP and Ice Lake); Sapphire Rapids reduced this, and Zen 4 has
+no such penalty because it executes 512-bit instructions as two 256-bit halves. And moving data
+between vector and general-purpose registers costs a few cycles each way, so SIMD pays off over
+batches of work, not one comparison in the middle of scalar code.
+
+#### Exercises
+
+**17. Lanes.** How many 32-bit price comparisons does one instruction do with AVX2, AVX-512 and NEON, and how many compare instructions does a 64-level search need with each?
+
+<details>
+<summary>Answer</summary>
+
+AVX2: 8 per instruction, 8 instructions. AVX-512: 16, 4 instructions. NEON (128-bit): 4, 16 instructions; Neoverse V2 has four 128-bit pipes, so it can issue 4 per cycle and keep up.
+
+</details>
+
+**18. Early exit or not?** Case 8 of the [lab](/blog/cpu-performance-lab/#case-8-an-early-exit-search-that-will-not-vectorize) found that counting all 64 levels below the limit (2.8 ns) beat an AVX2 loop that stops at the first match (8.8 ns). Why?
+
+<details>
+<summary>Answer</summary>
+
+The AVX2 loop exits after a data-dependent number of iterations, so its exit branch mispredicts about once per search (0.93 misses per search measured), costing about 14 cycles each time. The counting loop always does the same work, has no data-dependent branch, and clang vectorizes it 16 wide by itself.
+
+</details>
+
+## Putting it together: a market-data hot path
+
+Take a single market-data message: an order is added at a price level. The hot path reads the
+packet, finds the instrument's book, updates one price level and the order index, decides, and
+maybe writes an order. Count the cache lines it must touch: the packet itself, the instrument
+lookup, the price level, the order-index bucket, the strategy's state and the outgoing message,
+about six. Their cost depends entirely on where they are:
+
+| All six lines in | Measured latency each | Total for 6 dependent loads |
+| --- | ---: | ---: |
+| L1D | 0.94 ns | 5.6 ns |
+| L2 | 2.83 ns | 17 ns |
+| L3 | 9.7 ns | 58 ns |
+| DRAM | 78 ns | 468 ns |
+
+The other events on the path, from the same measurements:
+
+| Event | Measured cost | In cycles at 5.3 GHz |
+| --- | ---: | ---: |
+| Mispredicted branch | 2.6 ns | 14 |
+| L3 hit, 4 KiB pages, 16 MiB working set (TLB miss) | 13.6 ns | 72 |
+| Cache line handed to another core | 18–20 ns | ~100 |
+| Falsely shared counter, per write | 11.2 ns | 60 |
+
+Add one hand-off between threads (about 20 ns) and two or three data-dependent branches at
+2.6 ns per misprediction. The same code costs under 40 ns warm and close to half a microsecond
+cold. The work of low-latency engineering is moving the path from the bottom rows to the top
+ones and keeping it there:
+
+1. **Keep it warm.** Spin on a dedicated core so the caches, TLBs and branch predictors keep the
+   hot path's state; some systems also feed fake messages through the path between real ones.
+2. **Keep it small.** Compact data structures (integer ticks, 32-bit indices, hot/cold
+   splitting) so the working set fits in L1 and L2, and huge pages so it never needs a page walk.
+3. **Keep it local.** Put cooperating threads on cores that share an L3, on the NIC's NUMA node,
+   with no false sharing and as few hand-offs as possible.
+4. **Keep it predictable.** Branchless code for data-dependent decisions, arrays instead of
+   pointer chains, independent loads issued together.
+
+#### Exercises
+
+**19. A budget.** The six lines of a handler's hot path all hit L2 (2.83 ns each, dependent). Add one thread hand-off (20 ns) and two mispredicted branches (2.6 ns each). What is the total, and which single change would save the most?
+
+<details>
+<summary>Answer</summary>
+
+$6 \times 2.83 + 20 + 2 \times 2.6 \approx 42$ ns. The hand-off is the largest item (20 ns): removing a pipeline stage saves more than moving all six lines from L2 to L1 ($6 \times 1.9 \approx 11$ ns).
+
+</details>
+
+## Practical considerations
+
+**Isolate the cores.** Boot with `isolcpus=` (or cgroup cpusets), `nohz_full=` and `rcu_nocbs=`
+for the trading cores so the scheduler, the timer tick and RCU callbacks stay off them; pin each
+thread with `pthread_setaffinity_np` or `taskset`; steer interrupts away with
+`/proc/irq/*/smp_affinity`.
+
+**Fix the clock.** Turbo and power-saving states change the cycle time and add wake-up latency.
+Latency-critical hosts usually disable deep C-states (`intel_idle.max_cstate=0`,
+`processor.max_cstate=1` or the BIOS equivalent) and pin the frequency, accepting the power cost.
+The benchmarks here ran at the CPU's normal boost clock; their cycle counts would be the same at
+any fixed frequency, their nanoseconds would not.
+
+**Bypass the kernel for the network.** The kernel network stack adds microseconds. Kernel-bypass
+libraries (Solarflare/AMD ef_vi and Onload, DPDK, or the vendor's FPGA NIC API) let a user thread
+poll the NIC's receive ring directly. On Intel servers, **DDIO** lets the NIC write packets
+straight into L3, so the polling core finds them one L3 hit away.
+
+**Measure with counters, not guesses.** `perf stat -e cycles,instructions,branch-misses,cache-misses`
+gives IPC and miss rates for a run; `perf record` with precise events (PEBS on Intel, IBS on AMD,
+SPE on Arm) points at the exact instruction. Intel's **top-down** method (`perf stat --topdown`,
+or `toplev`; on Zen 4, `perf stat -M PipelineL1`) splits pipeline slots into front-end bound,
+bad speculation, back-end bound and retiring, which says which section of this post to reread. For latency itself, read the
+timestamp counter (`rdtsc` on x86, `cntvct_el0` on Arm) around the hot path and look at the 99th
+and 99.9th percentiles, not the mean.
+
+**Microbenchmark carefully.** The numbers in this post needed care: GCC turned the branchy loop
+into a `cmov` and vectorized the accumulator loop until told not to, a modulo in the stride
+benchmark hid the effect being measured, and the SMT ping-pong doubled in cost without `pause`.
+Check the disassembly of every benchmark and run it more than once.
+
+#### Exercises
+
+**20. Tool for the job.** For each symptom, name the first tool to use: (a) IPC dropped after a code change; (b) a loop you expected to be vectorized is slow; (c) two threads that share nothing slow each other down; (d) you want to know whether a loop is limited by latency or by ports.
+
+<details>
+<summary>Answer</summary>
+
+(a) `perf stat`, then `perf record`/`perf annotate` on the hot function; (b) clang `-Rpass-missed=loop-vectorize -Rpass-analysis=loop-vectorize`; (c) `perf c2c record` / `report`; (d) `llvm-mca -mcpu=<core> -bottleneck-analysis` on the loop's assembly. The [performance lab](/blog/cpu-performance-lab/) shows each one on a real example.
+
+</details>
+
+## Summary
+
+- A core is a front end that predicts and decodes in order, and an out-of-order back end that
+  renames, schedules on ports and retires in order. Golden Cove, Zen 4 and Neoverse V2 all
+  follow this shape at 6 or more instructions per cycle; x86 leans on a micro-op cache because
+  its decode is expensive, and Arm has twice as many registers and a weaker memory model.
+- Dependent chains run at latency, independent work at throughput. Break loop-carried
+  dependences into latency × throughput independent chains (6 floating-point accumulators on
+  Zen 4), and overlap independent cache misses (8 chains gave 7.3 times the DRAM throughput).
+- Memory dominates: an L1 hit costs 1 ns and DRAM 78 ns on the test machine. Keep hot data small,
+  contiguous and on huge pages, and watch for strides that map to one cache set (4 KiB apart).
+- A mispredicted branch costs about 14 cycles. Make data-dependent decisions branchless and keep
+  predictable branches as branches.
+- Between cores, everything moves in 64-byte lines: separate data written by different threads
+  (false sharing cost 8 times here), minimise thread hand-offs (about 20 ns each), and use
+  acquire/release atomics, which are free on x86 and cheap on Arm but must be explicit on Arm.
+
+## References
+
+- Chester Lam, Chips and Cheese: "Popping the Hood on Golden Cove" (2021); "AMD's Zen 4 Part 1:
+  Frontend and Execution Engine" (2022); "Hot Chips 2023: Arm's Neoverse V2"; "Arm's Neoverse V2
+  in AWS's Graviton 4" (2024); "Grace Hopper: Nvidia's Halfway APU" (2024).
+- Intel, *Intel 64 and IA-32 Architectures Optimization Reference Manual*, Golden Cove chapter.
+- AMD, *Software Optimization Guide for the AMD Zen 4 Microarchitecture*.
+- Arm, *Arm Neoverse V2 Core Software Optimization Guide* (document 109898).
+- Agner Fog, *The microarchitecture of Intel, AMD and VIA CPUs* and *Instruction tables*.
+- Andreas Abel and Jan Reineke, uops.info: measured latency, throughput and ports of x86
+  instructions.
+- Peter Sewell et al., "x86-TSO: A Rigorous and Usable Programmer's Model for x86
+  Multiprocessors" (CACM, 2010).
+- Ulrich Drepper, "What Every Programmer Should Know About Memory" (2007).
+- John L. Hennessy and David A. Patterson, *Computer Architecture: A Quantitative Approach*,
+  chapters on instruction-level parallelism and memory hierarchy.
