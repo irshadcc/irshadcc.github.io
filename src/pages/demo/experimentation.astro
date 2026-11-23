@@ -1,12 +1,16 @@
 ---
 import Layout from "../../layouts/Layout.astro";
 import ExperimentLayers from "../../utils/experimentation/ExperimentLayers.astro";
+import NullWorld from "../../utils/experimentation/NullWorld.astro";
 import PowerExplorer from "../../utils/experimentation/PowerExplorer.astro";
 ---
 
 <Layout title="Experimentation components">
 	<main>
 		<h1>Experimentation components</h1>
+		<NullWorld mode="pvalue" baseline={0.1} n={10000} observed={0.005} />
+		<NullWorld mode="power" baseline={0.1} n={10000} lift={0.01} />
+		<NullWorld mode="aa" baseline={0.1} n={10000} />
 		<PowerExplorer baseline={0.1} lift={0.01} alpha={0.05} targetPower={0.8} />
 		<ExperimentLayers users={12} buckets={16} />
 	</main>

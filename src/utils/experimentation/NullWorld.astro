@@ -1,0 +1,285 @@
+---
+// Explains a p-value, statistical power and A/A tests by simulating many repeated
+// conversion experiments (logic in nullWorld.ts, seeded so the text can quote the counts).
+//   mode="pvalue": histogram of gaps from experiments where the change does nothing, with the
+//     observed gap marked; the bars at least as far from zero are the p-value.
+//   mode="power": the same no-effect histogram plus experiments where the change really works;
+//     the share of "works" experiments beyond the 5% cutoff is the power.
+//   mode="aa": p-values of many A/A tests (uniform, about 5% below 0.05), with a checkbox that
+//     peeks after every one of 14 days and keeps the smallest p-value.
+// Props: mode, baseline (conversion rate), n (users per arm), observed (gap for pvalue mode,
+// absolute, e.g. 0.005), lift (true effect for power mode), sims, seed.
+// Usage in .mdx:
+//   <NullWorld mode="pvalue" baseline={0.1} n={10000} observed={0.005} />
+//   <NullWorld mode="power" baseline={0.1} n={10000} lift={0.01} />
+//   <NullWorld mode="aa" baseline={0.1} n={10000} />
+interface Props {
+	mode?: "pvalue" | "power" | "aa";
+	baseline?: number;
+	n?: number;
+	observed?: number;
+	lift?: number;
+	sims?: number;
+	seed?: number;
+}
+const {
+	mode = "pvalue",
+	baseline = 0.1,
+	n = 10000,
+	observed = 0.005,
+	lift = 0.01,
+	sims = 4000,
+	seed = 1,
+} = Astro.props;
+const config = { mode, baseline, n, observed, lift, sims, seed };
+const captions = {
+	pvalue:
+		"Grey bars: the gap between treatment and control in simulated experiments where the change does nothing. The orange bars are gaps at least as large as the one we observed (in either direction); their share is the p-value.",
+	power:
+		"Grey: experiments where the change does nothing. Blue: experiments where it really adds the chosen lift. Dashed lines: the gap a 5% test needs before it says “significant”. Power is the share of blue experiments outside the dashed lines.",
+	aa: "p-values from simulated A/A tests (both arms identical). Each bar holds 5 percentage points of p. Checked once at the end, the bars are flat and about 5% of tests fall below 0.05. Peeking every day and stopping at the first p < 0.05 piles tests into the first bar.",
+};
+---
+
+<figure class="null-world" data-config={JSON.stringify(config)}>
+	<div class="nw-controls">
+		<label>Users per arm <span data-out="n"></span>
+			<input data-key="n" type="range" min="1000" max="50000" step="1000" value={n} />
+		</label>
+		{mode === "pvalue" && (
+			<label>Observed gap <span data-out="observed"></span>
+				<input data-key="observed" type="range" min="0" max="0.02" step="0.0005" value={observed} />
+			</label>
+		)}
+		{mode === "power" && (
+			<label>True lift <span data-out="lift"></span>
+				<input data-key="lift" type="range" min="0.001" max="0.02" step="0.001" value={lift} />
+			</label>
+		)}
+		{mode === "aa" && (
+			<label class="nw-check"><input data-key="peek" type="checkbox" /> Peek after each of 14 days</label>
+		)}
+		<button type="button" class="nw-rerun">Run again</button>
+	</div>
+	<p class="nw-readout" aria-live="polite"></p>
+	<svg viewBox="0 0 720 290" role="img" aria-label="Histogram of simulated experiments">
+		<g class="nw-grid"></g>
+		<g class="nw-bars"></g>
+		<g class="nw-marks"></g>
+		<g class="nw-axes"></g>
+	</svg>
+	<div class="nw-legend"></div>
+	<figcaption>{captions[mode]} Baseline conversion {(baseline * 100).toFixed(0)}%, {sims.toLocaleString("en-US")} simulated experiments.</figcaption>
+</figure>
+
+<script>
+	import {
+		cutoff,
+		formulaPValue,
+		histogram,
+		shareBeyond,
+		simulateAa,
+		simulateDiffs,
+		simulatedPValue,
+		nullSe,
+	} from "./nullWorld";
+
+	type Config = {
+		mode: "pvalue" | "power" | "aa";
+		baseline: number;
+		n: number;
+		observed: number;
+		lift: number;
+		sims: number;
+		seed: number;
+	};
+	const NS = "http://www.w3.org/2000/svg";
+	const box = { left: 56, right: 704, top: 14, bottom: 238 };
+	const pct = (x: number, d = 1) => `${(x * 100).toFixed(d)}%`;
+	const pp = (x: number) => `${(x * 100).toFixed(2)} pp`;
+
+	for (const root of document.querySelectorAll<HTMLElement>(".null-world")) {
+		const cfg = JSON.parse(root.dataset.config ?? "{}") as Config;
+		const svg = root.querySelector("svg") as SVGSVGElement;
+		const layers = {
+			grid: svg.querySelector(".nw-grid") as SVGGElement,
+			bars: svg.querySelector(".nw-bars") as SVGGElement,
+			marks: svg.querySelector(".nw-marks") as SVGGElement,
+			axes: svg.querySelector(".nw-axes") as SVGGElement,
+		};
+		const readout = root.querySelector(".nw-readout") as HTMLElement;
+		const legend = root.querySelector(".nw-legend") as HTMLElement;
+		const input = (k: string) => root.querySelector<HTMLInputElement>(`[data-key="${k}"]`);
+		let seed = cfg.seed;
+
+		const add = (parent: Element, name: string, attrs: Record<string, string | number>, text?: string) => {
+			const el = document.createElementNS(NS, name);
+			for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, String(v));
+			if (text !== undefined) el.textContent = text;
+			parent.append(el);
+			return el;
+		};
+		const clear = () => {
+			for (const g of Object.values(layers)) g.replaceChildren();
+		};
+
+		/** Draw histograms (counts per bin) over [lo, hi) with a shared y scale. */
+		function drawBars(
+			sets: { counts: number[]; cls: (binLo: number, binHi: number) => string }[],
+			lo: number,
+			hi: number,
+			xTicks: number[],
+			xFmt: (v: number) => string,
+			xLabel: string,
+		) {
+			const bins = sets[0].counts.length;
+			const maxCount = Math.max(1, ...sets.flatMap((s) => s.counts));
+			const x = (v: number) => box.left + ((v - lo) / (hi - lo)) * (box.right - box.left);
+			const y = (c: number) => box.bottom - (c / maxCount) * (box.bottom - box.top);
+			const w = (box.right - box.left) / bins;
+			for (const f of [0.25, 0.5, 0.75, 1]) {
+				add(layers.grid, "line", { x1: box.left, x2: box.right, y1: y(maxCount * f), y2: y(maxCount * f) });
+			}
+			for (const s of sets) {
+				s.counts.forEach((c, i) => {
+					if (c === 0) return;
+					const bLo = lo + ((hi - lo) * i) / bins;
+					const bHi = lo + ((hi - lo) * (i + 1)) / bins;
+					add(layers.bars, "rect", {
+						x: box.left + i * w + 0.5,
+						y: y(c),
+						width: Math.max(0.5, w - 1),
+						height: box.bottom - y(c),
+						class: s.cls(bLo, bHi),
+					});
+				});
+			}
+			add(layers.axes, "line", { x1: box.left, x2: box.right, y1: box.bottom, y2: box.bottom, class: "nw-axis" });
+			for (const t of xTicks) {
+				add(layers.axes, "line", { x1: x(t), x2: x(t), y1: box.bottom, y2: box.bottom + 5, class: "nw-axis" });
+				add(layers.axes, "text", { x: x(t), y: box.bottom + 20, "text-anchor": "middle" }, xFmt(t));
+			}
+			add(layers.axes, "text", { x: (box.left + box.right) / 2, y: 284, "text-anchor": "middle" }, xLabel);
+			add(layers.axes, "text", { x: 14, y: (box.top + box.bottom) / 2, "text-anchor": "middle", transform: `rotate(-90 14 ${(box.top + box.bottom) / 2})` }, "experiments");
+			return x;
+		}
+
+		function vline(x: number, cls: string, label?: string, anchor = "middle") {
+			add(layers.marks, "line", { x1: x, x2: x, y1: box.top, y2: box.bottom, class: cls });
+			if (label) add(layers.marks, "text", { x, y: box.top + 2, "text-anchor": anchor, class: "nw-mark-label", dy: "0.8em" }, label);
+		}
+
+		function gapAxis(lo: number, hi: number) {
+			const step = [0.001, 0.002, 0.0025, 0.005, 0.01, 0.02].find((s) => (hi - lo) / s <= 9) ?? 0.05;
+			const ticks: number[] = [];
+			for (let t = Math.ceil(lo / step) * step; t <= hi + 1e-12; t += step) ticks.push(Math.round(t / step) * step);
+			return ticks;
+		}
+		const fmtGap = (v: number) => `${v > 0 ? "+" : ""}${(v * 100).toFixed(Math.abs(v * 100) < 1 && v !== 0 ? 2 : 1).replace(/\.?0+$/, "")}`;
+
+		function draw() {
+			clear();
+			const n = Number(input("n")?.value ?? cfg.n);
+			(root.querySelector('[data-out="n"]') as HTMLElement).textContent = n.toLocaleString("en-US");
+			const se = nullSe(cfg.baseline, n);
+			const bins = 60;
+
+			if (cfg.mode === "pvalue") {
+				const obs = Number(input("observed")?.value ?? cfg.observed);
+				(root.querySelector('[data-out="observed"]') as HTMLElement).textContent = `+${pp(obs)}`;
+				const diffs = simulateDiffs(cfg.baseline, 0, n, cfg.sims, seed);
+				const half = Math.max(4.5 * se, obs + 1.5 * se);
+				const counts = histogram(diffs, -half, half, bins);
+				const a = Math.abs(obs);
+				const x = drawBars(
+					[{ counts, cls: (l, h) => ((h <= -a + 1e-12 || l >= a - 1e-12) && a > 0 ? "nw-tail" : "nw-null") }],
+					-half, half, gapAxis(-half, half), fmtGap, "gap: treatment − control (percentage points)",
+				);
+				vline(x(obs), "nw-obs", `observed +${pp(obs)}`, obs > half * 0.5 ? "end" : "start");
+				if (obs > 0) vline(x(-obs), "nw-obs nw-mirror", `−${pp(obs)}`, "end");
+				const sim = simulatedPValue(diffs, obs);
+				const k = Math.round(sim * cfg.sims);
+				readout.innerHTML = `<strong>${k.toLocaleString("en-US")} of ${cfg.sims.toLocaleString("en-US")}</strong> no-effect experiments gave a gap at least ${pp(obs)} away from zero → simulated p-value <strong>${sim.toFixed(3)}</strong> (formula: ${formulaPValue(cfg.baseline, obs, n).toFixed(3)})`;
+				legend.innerHTML = `<i class="nw-null"></i> change does nothing <i class="nw-tail"></i> at least as extreme as observed`;
+			} else if (cfg.mode === "power") {
+				const lift = Number(input("lift")?.value ?? cfg.lift);
+				(root.querySelector('[data-out="lift"]') as HTMLElement).textContent = `+${pp(lift)}`;
+				const d0 = simulateDiffs(cfg.baseline, 0, n, cfg.sims, seed);
+				const d1 = simulateDiffs(cfg.baseline, lift, n, cfg.sims, seed + 1);
+				const c = cutoff(cfg.baseline, n);
+				const seAlt = Math.sqrt((cfg.baseline * (1 - cfg.baseline) + (cfg.baseline + lift) * (1 - cfg.baseline - lift)) / n);
+				const lo = -Math.max(4.2 * se, c * 1.4);
+				const hi = Math.max(4.2 * se, lift + 4.2 * seAlt);
+				const x = drawBars(
+					[
+						{ counts: histogram(d0, lo, hi, bins), cls: () => "nw-null nw-ghost" },
+						{ counts: histogram(d1, lo, hi, bins), cls: (l, h) => (h <= -c + 1e-12 || l >= c - 1e-12 ? "nw-alt" : "nw-alt nw-miss") },
+					],
+					lo, hi, gapAxis(lo, hi), fmtGap, "gap: treatment − control (percentage points)",
+				);
+				vline(x(c), "nw-cut", `cutoff +${pp(c)}`, "start");
+				if (-c > lo) vline(x(-c), "nw-cut", `−${pp(c)}`, "end");
+				const power = shareBeyond(d1, c);
+				const missed = Math.round((1 - power) * cfg.sims);
+				readout.innerHTML = `A result needs a gap beyond ±${pp(c)} to be significant. Of the experiments where the change really adds ${pp(lift)}, <strong>${pct(power)}</strong> get past that line: that is the power. The other ${missed.toLocaleString("en-US")} miss a real effect.`;
+				legend.innerHTML = `<i class="nw-null"></i> change does nothing <i class="nw-alt"></i> change works, detected <i class="nw-alt nw-miss"></i> change works, missed`;
+			} else {
+				const peek = input("peek")?.checked ?? false;
+				const { final, smallestDaily } = simulateAa(cfg.baseline, n, 14, cfg.sims, seed);
+				const ps = peek ? smallestDaily : final;
+				const counts = histogram(ps, 0, 1, 20);
+				drawBars(
+					[{ counts, cls: (l) => (l < 0.05 - 1e-12 ? "nw-tail" : "nw-null") }],
+					0, 1, [0, 0.05, 0.25, 0.5, 0.75, 1], (v) => (v === 0.05 ? ".05" : v.toFixed(2).replace(/^0/, "").replace(/\.00$/, "").replace(/^1\.$/, "1") || "0"), "p-value",
+				);
+				const share = ps.filter((p) => p < 0.05).length / ps.length;
+				readout.innerHTML = peek
+					? `Checking after every day and stopping at the first p < 0.05: <strong>${pct(share)}</strong> of A/A tests “find” an effect that does not exist.`
+					: `Checked once at the end: <strong>${pct(share)}</strong> of A/A tests have p < 0.05, close to the promised 5%.`;
+				legend.innerHTML = `<i class="nw-tail"></i> p &lt; 0.05 (false alarm) <i class="nw-null"></i> p ≥ 0.05`;
+			}
+		}
+
+		root.querySelectorAll("input").forEach((el) => el.addEventListener("input", draw));
+		(root.querySelector(".nw-rerun") as HTMLButtonElement).addEventListener("click", () => {
+			seed += 101;
+			draw();
+		});
+		draw();
+	}
+</script>
+
+<style>
+	.null-world { margin: 2rem 0; padding: 1rem; border: 1px solid var(--faint); border-radius: .6rem; background: var(--surface); --nw-orange: #d9772b; }
+	.nw-controls { display: flex; flex-wrap: wrap; gap: 1rem 1.5rem; align-items: end; font: .85rem var(--sans); color: var(--muted); }
+	.nw-controls label { display: grid; grid-template-columns: 1fr auto; gap: .3rem; min-width: 12rem; flex: 1; }
+	.nw-controls label.nw-check { display: flex; align-items: center; gap: .4rem; flex: 0 1 auto; }
+	.nw-controls input[type="range"] { grid-column: 1 / -1; width: 100%; accent-color: var(--accent); }
+	.nw-controls span { color: var(--text); font-variant-numeric: tabular-nums; }
+	.nw-rerun { font: .8rem var(--sans); color: var(--text); background: var(--bg, var(--surface)); border: 1px solid var(--faint); border-radius: .35rem; padding: .35rem .7rem; cursor: pointer; }
+	.nw-rerun:hover { border-color: var(--accent); }
+	.nw-readout { margin: .9rem 0 .3rem; font: .9rem var(--sans); color: var(--text); text-align: center; min-height: 2.6em; }
+	svg { display: block; width: 100%; overflow: visible; }
+	svg :global(.nw-grid line) { stroke: var(--faint); stroke-width: 1; }
+	svg :global(.nw-axes) { fill: var(--muted); font: 12px var(--sans); }
+	svg :global(.nw-axis) { stroke: var(--muted); }
+	svg :global(rect.nw-null) { fill: color-mix(in srgb, var(--muted) 55%, var(--surface)); }
+	svg :global(rect.nw-ghost) { opacity: .55; }
+	svg :global(rect.nw-tail) { fill: var(--nw-orange); }
+	svg :global(rect.nw-alt) { fill: var(--accent); opacity: .85; }
+	svg :global(rect.nw-alt.nw-miss) { opacity: .3; }
+	svg :global(.nw-obs) { stroke: var(--nw-orange); stroke-width: 2; }
+	svg :global(.nw-mirror) { stroke-dasharray: 4 4; }
+	svg :global(.nw-cut) { stroke: var(--text); stroke-width: 1.5; stroke-dasharray: 5 4; }
+	svg :global(.nw-mark-label) { fill: var(--text); font: 600 12px var(--sans); paint-order: stroke; stroke: var(--surface); stroke-width: 4px; }
+	.nw-legend { margin-top: .5rem; color: var(--muted); font: .78rem var(--sans); text-align: center; }
+	.nw-legend :global(i) { display: inline-block; width: .8rem; height: .8rem; margin: 0 .25rem 0 .8rem; border-radius: 2px; vertical-align: -1px; }
+	.nw-legend :global(i.nw-null) { background: color-mix(in srgb, var(--muted) 55%, var(--surface)); }
+	.nw-legend :global(i.nw-tail) { background: var(--nw-orange); }
+	.nw-legend :global(i.nw-alt) { background: var(--accent); }
+	.nw-legend :global(i.nw-alt.nw-miss) { opacity: .3; }
+	figcaption { color: var(--muted); font-size: .85rem; text-align: center; margin-top: .6rem; }
+	@media (prefers-color-scheme: dark) {
+		.null-world { --nw-orange: #f0a35c; }
+	}
+</style>

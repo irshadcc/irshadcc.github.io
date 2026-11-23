@@ -1,180 +1,187 @@
 ---
 title: "A/B Testing: Power, p-Values, and Experimentation at Scale"
-description: "How randomized product experiments establish causality, how power and p-values answer different questions, and how layers and deterministic bucketing let many tests run safely at once."
+description: "A plain-language tour of online controlled experiments, following the structure of Kohavi, Tang and Xu's book: p-values and power by simulation, metrics and the OEC, building a platform, trust checks, and A/B tests for recommendations and ads."
 date: 2026-10-02
-updated: 2026-10-03
+updated: 2026-11-23
 tags: [Machine learning, Draft]
 ---
 
 import Sidenote from "../../components/Sidenote.astro";
 import PowerExplorer from "../../utils/experimentation/PowerExplorer.astro";
 import ExperimentLayers from "../../utils/experimentation/ExperimentLayers.astro";
+import NullWorld from "../../utils/experimentation/NullWorld.astro";
+import BoxDiagram from "../../utils/payments/BoxDiagram.astro";
+import LineChart from "../../utils/charts/LineChart.astro";
+import { platformNodes, platformEdges } from "../../utils/experimentation/abTestingFigures";
 
 ## Background
 
-A product metric rises after a new ranking model ships. The model may have caused the rise, but
-the calendar, a marketing campaign, or a different mix of users may have caused it too. A
-before-and-after comparison cannot separate those explanations because time changed along with
-the product.
+A team ships a new checkout page and sales go up the next week. Did the page cause it? Maybe. But
+the week may also have had a holiday, a marketing email or simply more visitors. When you compare
+"before" with "after", time changes together with the product, so you cannot tell which one
+moved the number.
 
-An **A/B test**, or **online controlled experiment**, solves this by randomly assigning units to
-a **control**, which receives the current experience, or a **treatment**, which receives the
-change. Both groups run at the same time. Randomization makes their expected composition equal,
-so a systematic difference in outcomes can be attributed to the treatment. This is why controlled
-experiments are useful for model launches as well as button colours: they measure causal impact,
-not merely offline model quality.
+An **A/B test**, also called an **online controlled experiment**, fixes this. Each user is
+randomly sent to one of two versions: the **control** (A, what exists today) or the **treatment**
+(B, the change). Both groups use the product during the same days. Because a coin flip decides
+who goes where, the two groups are alike in every way except the change. So if the treatment group
+buys more, the change is the most likely reason.
 
-This post follows Ron Kohavi, Diane Tang, and Ya Xu's *Trustworthy Online Controlled Experiments*.<Sidenote>The author's name is Ron Kohavi; the book is sometimes found through the misspelling “Kahavi.”</Sidenote>
-We will design one experiment, distinguish statistical power from the p-value, compare testing
-methods, apply them to recommendation and advertising systems, and then build up the layers and
-buckets that let a platform run many experiments at once.
+This post follows Ron Kohavi, Diane Tang and Ya Xu's book *Trustworthy Online Controlled
+Experiments* (2020).<Sidenote>The first author's name is Ron Kohavi; the book is sometimes searched for as "Kahavi".</Sidenote>
+It walks through the book's five parts in order, one section per chapter, in plain language:
 
-## From a product question to an experiment
+| book part | chapters | section here |
+| --- | --- | --- |
+| I. Introductory topics | 1–4 | [Part I](#part-i-the-basics): why experiment, a worked example (with p-values and power), Twyman's law, platform and culture |
+| II. Selected topics for everyone | 5–9 | [Part II](#part-ii-topics-for-everyone): speed, metrics, the OEC, institutional memory, ethics |
+| III. Complementary and alternative techniques | 10–11 | [Part III](#part-iii-other-ways-to-learn): user research, surveys, observational studies |
+| IV. Building a platform | 12–16 | [Part IV](#part-iv-building-an-experimentation-platform): client-side tests, logging, randomization unit, ramping, scaling |
+| V. Analysing experiments | 17–23 | [Part V](#part-v-analysing-experiments): the statistics, variance, A/A tests, triggering, SRM, interference, long-term effects |
 
-Suppose a checkout team believes a shorter form will increase completed purchases. A useful
-experiment specification fixes six choices *before* looking at results:
+After the five parts, a final section applies everything to [recommendation and advertising
+systems](#ab-tests-for-recommendations-and-ads), where feedback loops and auctions make
+experiments harder to read.
+
+## Part I: The basics
+
+### Why experiment
+
+Ideas are cheap; knowing which ones help is hard. Most teams believe their ideas will work, but
+when ideas are tested, most of them do not move the metric they were meant to move. The book
+reports that at Microsoft about a third of experiments improved their target metric, and at Bing
+and Google only about 10–20% did. Without testing, a team ships the losers along with the winners
+and never learns which was which.
+
+Controlled experiments sit at the top of the **hierarchy of evidence**: the ranking of ways to
+learn what causes what. From weakest to strongest:
+
+| evidence | example | why it can mislead |
+| --- | --- | --- |
+| Anecdote, expert opinion | "Users told me they hate the menu" | A few loud voices, no comparison |
+| Before/after comparison | Sales the week after launch vs the week before | Time changed too: seasons, campaigns |
+| Observational study | Users who use feature X buy more | Heavy users use X *and* buy more |
+| Randomized controlled experiment | 50% get X, 50% do not | Only the change differs between groups |
+
+Small changes can be worth a lot. One example from the book: a Bing engineer proposed making ad
+headlines longer by moving text from the line below into the title. The idea sat in the backlog for
+months. When it was finally tested, revenue rose by about 12%, worth over 100 million dollars a year
+in the US alone. Nobody predicted it; the experiment found it.
+
+Three conditions make experiments useful, and the book calls them **tenets**:
+
+1. **The organization wants data-driven decisions** and has written down what "better" means
+   (the metrics, see [the OEC](#the-overall-evaluation-criterion)).
+2. **It can afford the infrastructure and tests** and can ship changes that are cheap enough to try.
+3. **It accepts that it is poor at guessing** which ideas work.
+
+### An end-to-end example
+
+Suppose an online shop's checkout team thinks a shorter checkout form will increase purchases.
+(The book's own example tests adding a coupon-code box to checkout; the steps are the same.)
+
+**Step 1: write down the plan before starting.**
 
 | choice | example |
 | --- | --- |
-| Hypothesis | A shorter form increases checkout conversion |
+| Hypothesis | A shorter form increases the share of users who buy |
 | Randomization unit | Signed-in user |
-| Control | Existing form |
-| Treatment | Short form |
-| Primary metric | Purchases / eligible users over 14 days |
-| Guardrails | Refund rate, page latency, support contacts |
+| Control / treatment | Current form / short form |
+| Main metric | Purchases ÷ users who reached checkout, over 14 days |
+| Guardrails | Refund rate, page load time, support contacts |
+| Practical significance | A lift smaller than 0.5 percentage points is not worth the work |
 
-The **randomization unit** is the object assigned once to a variant. User-level assignment keeps
-a returning user in one experience. Session-level assignment gives more independent-looking
-observations, but the same person can see both forms; that can cause learning or confusion and
-violates the assumption that units do not affect one another. For a collaborative feature, even
-user assignment can be wrong: everyone in a company or conversation may need the same variant,
-so the tenant or group becomes the unit.
+The **randomization unit** is what gets assigned to A or B. A **metric** is a number computed
+from user behaviour. The **practical significance** boundary is the smallest change the business
+cares about. It is a business choice, and it matters as much as any statistics.
 
-The **analysis unit** is the object over which the metric is computed. If assignment is by user,
-an analysis that treats every page view as independent invents precision: page views from one
-person are correlated. Aggregate to the user or use a variance estimator that respects the
-clusters.
+**Step 2: run it.** Ten thousand users go to each version. Control has 1,000 purchases (10.0%).
+Treatment has 1,050 purchases (10.5%). The treatment is 0.5 percentage points (pp) better.
 
-The **overall evaluation criterion** (OEC) is the small set of metrics used to decide whether the
-change is good. The primary metric should capture the intended value; guardrails catch damage
-elsewhere. A ranking change may improve clicks while making pages slower. Declaring hundreds of
-metrics to be independent reasons to ship all but guarantees chance “wins.”
+**Step 3: ask whether that gap is real.** A 0.5 pp gap could be the form, or it could be luck: if
+you split 20,000 people into two random halves, the halves never buy at exactly the same rate.
+The p-value answers how big a gap luck alone tends to make.
 
-### The estimand and estimator
+### The p-value, in plain words
 
-Let $Y_i(1)$ be user $i$'s outcome under treatment and $Y_i(0)$ the outcome under control. The
-individual treatment effect $Y_i(1)-Y_i(0)$ cannot be observed: each user sees only one variant.
-The target is therefore the **average treatment effect**
+Imagine a world where the short form does **nothing**: both groups buy at exactly 10%. Run the same
+experiment in that world thousands of times. Each run gives a slightly different gap, just from who
+happened to land in which group. Most gaps are near zero; a few are large.
 
-$$
-\tau = \mathbb E[Y(1)-Y(0)].
-$$
+The **p-value** asks one question:
 
-With random assignment, the difference in sample means is an unbiased estimator:
+> In that no-effect world, how often does luck alone produce a gap **at least as big as the one we
+> saw**?
 
-$$
-\widehat\tau = \overline Y_T-\overline Y_C.
-$$
+The figure runs that thought experiment: 4,000 simulated experiments with 10,000 users per arm in
+which the change does nothing. Look at where the orange line (our +0.5 pp) falls. Many grey bars
+lie beyond it on either side. Those bars, coloured orange, are the no-effect experiments that
+looked as good as ours, or as bad.
 
-Randomization does the causal work. The statistical test then asks whether the observed
-difference is distinguishable from sampling noise.
+<NullWorld mode="pvalue" baseline={0.1} n={10000} observed={0.005} />
 
-## What a p-value says
+In this run, 936 of 4,000 no-effect experiments (23.4%) produced a gap of 0.5 pp or more in either
+direction. So the p-value is about 0.23; the exact formula in [Part V](#the-statistics) gives 0.24.
+A gap like ours happens almost one time in four *even when the change does nothing*. That is not
+rare, so the data give us no good reason to believe the form helped.
 
-Start with a **null hypothesis** $H_0$: the treatment effect is zero. The alternative $H_1$ says
-it is not zero. For two conversion rates, a large-sample test statistic is
+Now drag "Observed gap" to 1.0 pp. Almost no grey experiments reach that far, so the p-value drops
+to about 0.02. Such a gap would be surprising if the form did nothing, so we start to believe it
+did something. Drag "Users per arm" up and the grey hill gets narrower: with more users, luck makes
+smaller gaps, so the same 0.5 pp becomes harder to explain by chance.
 
-$$
-z = \frac{\widehat p_T-\widehat p_C}
-{\sqrt{\widehat p(1-\widehat p)(1/n_T+1/n_C)}},
-$$
+**The decision rule.** Before the test, teams pick a cut-off, usually 0.05. If the p-value is below
+it, the result is called **statistically significant**. The cut-off is called the **significance
+level**, written $\alpha$ (alpha). Using $\alpha = 0.05$ means: when the change truly does
+nothing, we will wrongly call it a win about 5% of the time. That mistake is a **false positive**
+(or Type I error).
 
-where $\widehat p$ pools successes across both arms. Under $H_0$ and the test assumptions, $z$
-is approximately standard normal.
+Three common misreadings:
 
-The **p-value** is the probability, *assuming the null hypothesis and the model are true*, of a
-test statistic at least as extreme as the observed one. For a two-sided z-test,
+| it is tempting to say | what is actually true |
+| --- | --- |
+| "p = 0.24, so there is a 24% chance the form does nothing" | The p-value assumes the form does nothing and asks how surprising the data are. It is not the chance that the assumption is true. |
+| "p is above 0.05, so the form has no effect" | It means we could not tell. Here the 95% confidence interval runs from −0.34 to +1.34 pp: a small loss, nothing, or a useful gain are all still possible. |
+| "p is tiny, so the effect is big" | With millions of users, even a 0.01 pp gap can have a tiny p-value. The p-value says nothing about size; the confidence interval does. |
 
-$$
-p\text{-value}=2\left[1-\Phi(|z|)\right].
-$$
+A **confidence interval** is the range of effects that fit the data. For our test it is −0.34 to
++1.34 pp, which is wide: the experiment was too small to settle the question. That leads to power.
 
-It is not the probability that the null hypothesis is true. It is not the probability that the
-result happened “by chance.” It does not measure the size or business value of the effect. A tiny
-effect can have a tiny p-value with enough traffic; a valuable effect can miss significance in a
-small experiment.
+### Power, in plain words
 
-### A worked result
+The p-value guards against believing in effects that are not there. **Power** guards against the
+opposite mistake: missing an effect that *is* there.
 
-Take 10,000 users in each arm. Control has 1,000 purchases and treatment has 1,050:
+> If the change really works by a certain amount, how often will our experiment notice?
 
-$$
-\widehat p_C=0.100,\qquad
-\widehat p_T=0.105,\qquad
-\widehat\tau=0.005.
-$$
+Think of a smoke detector. Its false-alarm rate is $\alpha$: how often it beeps when there is no
+fire. Its power is how often it beeps when there *is* a fire. A detector that never beeps has no
+false alarms and is useless.
 
-The pooled rate is $2{,}050/20{,}000=0.1025$, giving
+The figure adds a second world, in blue, where the short form really adds 1 pp (10% → 11%). The
+dashed lines are the cut-off: with 10,000 users per arm and $\alpha = 0.05$, a gap must be beyond
+±0.83 pp to count as significant. Each blue experiment beyond the dashed line is a success; each
+faded blue one is a real effect we missed.
 
-$$
-\operatorname{SE}_{H_0}
-=\sqrt{0.1025(1-0.1025)(1/10{,}000+1/10{,}000)}
-=0.004289.
-$$
+<NullWorld mode="power" baseline={0.1} n={10000} lift={0.01} />
 
-Therefore $z=0.005/0.004289=1.166$ and the two-sided p-value is $0.244$. At a preselected
-significance level $\alpha=0.05$, we do not reject $H_0$.
+Here 65.6% of the blue experiments clear the line, so the power is about 66% (the formula gives
+63.6%). One time in three, this experiment would fail to detect a real 1 pp improvement. Missing a
+real effect is a **false negative** (or Type II error).
 
-“Not statistically significant” does not mean “no effect.” A 95% confidence interval using the
-unpooled standard error is $[-0.34, 1.34]$ percentage points. The data are compatible with a
-small loss, no effect, or a useful gain. The experiment is inconclusive at the precision the team
-asked for.
+Drag "Users per arm" to the right. Both hills get narrower, they overlap less, and more blue
+experiments clear the line. That is the main way to get more power: more users. Teams usually aim
+for 80% power at the smallest effect they care about, the **minimum detectable effect** (MDE).
 
-The **significance level** $\alpha$ limits the long-run probability of a **Type I error**: rejecting
-a true null hypothesis. If thousands of valid A/A tests compare identical variants at
-$\alpha=0.05$, about 5% will be significant. This statement concerns the testing procedure over
-repetitions, not the truth of one result.
-
-## Statistical power
-
-An experiment can control false positives and still miss real improvements. A **Type II error**
-occurs when the test fails to reject $H_0$ even though a specified effect exists. If its
-probability is $\beta$, then **statistical power** is
-
-$$
-\text{power}=1-\beta
-=\Pr(\text{reject }H_0\mid\text{specified effect is real}).
-$$
-
-Power is a property of a test design at a particular true effect, not a label attached to the
-observed p-value. Teams commonly plan for 80% or 90% power at a **minimum detectable effect**
-(MDE): the smallest effect worth reliably detecting. An MDE is a product choice before it becomes
-a statistical input.
-
-For two equally sized groups with baseline rate $p_0$, target rate $p_1$, two-sided $\alpha$, and
-target power $1-\beta$, the normal approximation gives the per-arm sample size
-
-$$
-n \approx
-\frac{\left[
-z_{1-\alpha/2}\sqrt{2\bar p(1-\bar p)}+
-z_{1-\beta}\sqrt{p_0(1-p_0)+p_1(1-p_1)}
-\right]^2}{(p_1-p_0)^2},
-\qquad \bar p=\frac{p_0+p_1}{2}.
-$$
-
-For $p_0=10\%$, an absolute MDE of one percentage point, $\alpha=5\%$, and 80% power,
-$z_{0.975}=1.960$ and $z_{0.8}=0.842$. Substitution gives 14,751 users per arm, or 29,502 total.
-This is a planning approximation; very rare events and small samples need exact or simulation-based
-calculations.
+The next figure turns this into a planning tool. It shows power against sample size; the marker shows
+how many users per arm are needed for 80% power.
 
 <PowerExplorer baseline={0.1} lift={0.01} alpha={0.05} targetPower={0.8} />
 
-The curve explains why the worked experiment was inconclusive. With 10,000 users per arm, it had
-only 63.6% power to detect a true move from 10% to 11%. Repeating that design when the effect is
-exactly one point would fail to reach significance about 36.4% of the time.
+For a 10% baseline and a 1 pp MDE, the answer is 14,751 users per arm. Our test had 10,000, which
+is why it came out inconclusive:
 
-| users per arm | power for 10% → 11% |
+| users per arm | power to detect 10% → 11% |
 | ---: | ---: |
 | 1,000 | 11.3% |
 | 5,000 | 37.1% |
@@ -182,746 +189,651 @@ exactly one point would fail to reach significance about 36.4% of the time.
 | 15,000 | 80.7% |
 | 30,000 | 97.9% |
 
-Four levers increase power:
+Four things raise power:
 
-- **More units.** Standard error falls roughly as $1/\sqrt n$, so halving the MDE usually needs
-  about four times the traffic.
-- **A larger true effect.** Its signal sits farther from the null distribution.
-- **Less variance.** Better metrics, stratification, or CUPED can remove predictable noise.
-- **A larger $\alpha$.** This makes rejection easier but permits more false positives; it is a
-  trade, not free power.
+- **More users.** Noise shrinks with the square root of the sample size, so detecting an effect
+  half as big needs about **four times** as many users.
+- **A bigger real effect.** Bold changes are easier to detect than tweaks.
+- **A less noisy metric.** "Did the user buy?" is less noisy than "how much did they spend?" (see
+  [variance](#variance-and-sensitivity)).
+- **A looser $\alpha$.** Easier to pass, but more false alarms; this is a trade, not free power.
 
-Unequal allocation also costs power for a fixed total sample. A 50/50 split minimizes the variance
-when observations cost the same. Teams sometimes begin at 1% treatment to limit blast radius,
-then ramp toward 50% after safety metrics look healthy.
+**Reading the result.** Putting p-value, confidence interval and practical significance together
+gives a short decision table:
 
-### Power is not the positive predictive value
+| result | what to do |
+| --- | --- |
+| Significant, and the whole interval is above the practical boundary | Launch (if guardrails pass) |
+| Significant, but the effect may be smaller than the boundary | Probably not worth it; maybe rerun with more power |
+| Not significant, interval is narrow around zero | The change does little; stop |
+| Not significant, interval is wide (our case) | Inconclusive; run longer or with more users |
 
-Even 80% power and 5% significance do not imply that 80% or 95% of significant results are true.
-That probability also depends on how many tested ideas truly work. If only 10 of 100 ideas have
-the planned effect, an illustrative batch expects 8 true positives and $0.05\times90=4.5$ false
-positives. Only about $8/(8+4.5)=64\%$ of significant results would be true in that simplified
-model. Better hypotheses, lower $\alpha$, replication, and multiple-testing control all matter.
+### Twyman's law and trustworthiness
 
-## Different ways to run a test
+**Twyman's law** says, roughly: a number that looks surprising or extraordinary is usually wrong.
+When a test shows a huge win, first suspect a bug. Typical traps:
 
-“A/B testing” names a family of designs and analyses. The right choice depends on whether the goal
-is inference, safe rollout, or reward during the experiment.
+- **Peeking.** Checking the p-value every day and stopping at the first value below 0.05 inflates
+  false alarms. With 14 daily looks, about 22% of no-effect tests "win" instead of 5% (see the
+  [A/A figure](#the-aa-test)).
+- **Many metrics.** Look at 100 metrics and about 5 will be "significant" by luck alone.
+- **Broken randomization.** If the split is not the planned 50/50, something filtered users
+  unevenly; see [SRM](#sample-ratio-mismatch).
+- **Survivorship and post-treatment filters.** Analysing "users who stayed for 30 days" ignores the
+  ones the treatment drove away. Always analyse everyone who was assigned (**intention to treat**).
+- **Leftovers from earlier tests.** Users who just saw a bad treatment may still be unhappy when
+  re-used in a new test (**carryover**).
+- **Novelty and primacy.** A new design gets clicks because it is new (**novelty effect**), or
+  loses at first because users are used to the old one (**primacy effect**). Both fade over time.
 
-### Fixed-horizon frequentist A/B
+**Simpson's paradox** shows how combining periods can flip a result. Suppose a test runs at 1%
+treatment on day 1 and 50% on day 2:
 
-Choose the MDE, $\alpha$, power, sample size, metric, and duration in advance. Analyze once at the
-end with a z-test, t-test, bootstrap, or randomization test appropriate to the metric. This is the
-default because its error rates are straightforward when the assumptions hold.
+| day | control users | control buys | treatment users | treatment buys |
+| --- | ---: | ---: | ---: | ---: |
+| Day 1 (1% ramp) | 99,000 | 1,980 (2.00%) | 1,000 | 23 (2.30%) |
+| Day 2 (50/50) | 50,000 | 500 (1.00%) | 50,000 | 550 (1.10%) |
+| Both days | 149,000 | 2,480 (1.66%) | 51,000 | 573 (1.12%) |
 
-Do not check an ordinary p-value each hour and stop at the first value below 0.05. Every extra look
-is another chance for noise to cross the boundary, inflating the false-positive rate. Also run for
-at least a full business cycle when day-of-week effects matter; reaching the sample size on Friday
-does not make a Monday-only sample representative.
+Treatment wins on each day but loses overall. The reason: day 1 had a higher buying rate, and
+control has most of its users on day 1. Compare like with like (day by day), or analyse only the
+period with a fixed split.
 
-### Sequential tests
+### Platform and culture
 
-A **sequential test** allows planned interim looks while preserving an error guarantee. Group
-sequential designs spend the Type I error across checkpoints; always-valid p-values and confidence
-sequences remain valid under continuous monitoring. Sequential methods can stop early for a clear
-win, harm, or futility, but their stopping rule and estimator must match. Ordinary fixed-horizon
-thresholds do not become sequential merely because a dashboard updates continuously.
+An organization usually grows into experimentation in stages. The book calls them **crawl, walk,
+run, fly**:
 
-### A/B/n and factorial tests
+| stage | roughly how many tests a year | what it looks like |
+| --- | --- | --- |
+| Crawl | ~10 | Build basic logging and one-off analyses; prove a test can be trusted |
+| Walk | ~50 | Standard metrics, A/A tests, SRM checks, a simple platform |
+| Run | ~250 | Most changes are tested; an agreed OEC; many tests at once |
+| Fly | thousands | Testing is the default for every change; results feed a shared memory |
 
-An **A/B/n test** compares several treatments with one control. It explores more alternatives but
-creates more opportunities for a false winner, so use a family-wise procedure such as Holm's method
-or control the false discovery rate when that matches the decision problem.
+Leadership matters as much as code. Leaders must accept that most ideas fail, judge teams by
+outcomes in experiments rather than by features shipped, and be willing to stop a favourite project
+when the data say no.
 
-A **factorial design** independently randomizes two or more factors, such as button text and button
-colour. A $2\times2$ design estimates both main effects and their interaction. It is more efficient
-than isolated tests when factors do not interact, and it reveals when the combination behaves
-differently from the sum of its parts.
+A platform has four parts: an interface where owners set up experiments, assignment of
+users to variants, instrumentation that logs what happened, and the analysis that
+turns logs into a scorecard. Click a box to see what it does.
 
-### Cluster and switchback experiments
+<BoxDiagram nodes={platformNodes} edges={platformEdges} selected="assign" title="Parts of an experimentation platform" />
 
-User randomization fails when one user's treatment changes another user's outcome. Marketplaces
-have shared inventory; social products have networks; delivery algorithms affect a common pool of
-drivers. A **cluster-randomized test** assigns whole stores, regions, teams, or network clusters.
-A **switchback test** alternates control and treatment for the whole market across time blocks.
-Both usually have fewer effective independent units than a user test, so power calculations must
-include within-cluster or within-period correlation.
+To run many tests at once, the assignment service splits users into **buckets** using a hash of the
+user ID. Inside one **layer**, each user belongs to only one experiment, so tests that touch the
+same feature never collide. Different layers re-hash the same users independently, so a checkout
+test and a ranking test can share the same traffic. Hover over a user to follow them.
 
-### Bayesian experiments
+<ExperimentLayers users={12} buckets={16} />
 
-A Bayesian analysis combines a prior with the likelihood to produce a posterior distribution for
-the effect. It can answer questions such as $\Pr(\tau>0\mid\text{data})$ or the probability that
-the gain exceeds a business threshold. Those are not p-values. Bayesian designs make assumptions
-through the prior and decision rule, and repeated monitoring is safe only relative to a specified
-Bayesian stopping and loss framework.
+The figure shows 12 users and 16 buckets so it fits on screen; real systems use thousands of
+buckets. The bucket is computed as
 
-### Multi-armed bandits
+$$
+\text{bucket} = \operatorname{hash}(\text{user ID}, \text{layer ID}) \bmod B,
+$$
 
-A **multi-armed bandit** adapts traffic toward variants that currently appear better, reducing
-lost reward during allocation. That is an optimization goal. A balanced randomized test is usually
-better for precise causal estimates, guardrail measurement, and learning about segments. Adaptive
-allocation also complicates conventional estimators. Use bandits for persistent choices with
-rapid feedback; use experiments when learning the treatment effect is the primary goal.
+where $B$ is the number of buckets. For example, with 10,000 buckets, checkout experiment E1 can own
+buckets 0–999 (half control, half treatment, so 10% of traffic), and search experiment E2 can own
+1,000–2,999 in the same layer. A ranking test in another layer can use all 10,000 buckets at once.
+Never change the bucket count of a running layer: that reshuffles users between variants.
+
+## Part II: Topics for everyone
+
+### Speed matters
+
+Many changes make a page slower as a side effect: a bigger model, an extra call, more images. How
+much does slowness cost? You cannot test "make it faster" cheaply, but you can test the reverse: a
+**slowdown experiment** adds a deliberate delay (say 100 ms) for the treatment group and measures the
+loss.
+
+If a small delay hurts the metric by some amount, a small speed-up of the same size helps by about
+the same amount, as long as the change is small enough to treat the curve as a straight line. The
+book reports that at Bing every 100 ms of speed-up was worth about 0.6% of revenue. This gives teams
+an exchange rate: a feature that adds 50 ms must win at least about 0.3% revenue to break even.
+
+Where you add the delay matters. Slowing the part users see first (the top of the page) hurts more
+than slowing content far below.
+
+### Organizational metrics
+
+Before you can test, you need to agree on what to measure. The book sorts metrics by purpose:
+
+| type | question it answers | example (video app) |
+| --- | --- | --- |
+| **Goal** (success) metric | What does the company ultimately want? | Long-term retention, revenue |
+| **Driver** (surrogate) metric | What moves quickly and predicts the goal? | Days active per week, satisfied sessions |
+| **Guardrail** metric | What must not get worse? | Page speed, crash rate, unsubscribes |
+| **Diagnostic** (debug) metric | Why did something move? | Clicks per position, error counts |
+
+Good driver metrics are **aligned** with the goal, **actionable** (teams can move them), **sensitive**
+(they move within a test's duration) and **hard to game**. Watch out for Goodhart's law: once a
+number becomes a target, people find ways to move the number without moving the thing it stood for.
+
+### The overall evaluation criterion
+
+The **overall evaluation criterion** (OEC) is the one metric, or small weighted combination, that
+decides whether a test wins. It should be measurable in a short test, yet predict long-term value.
+
+Picking it is harder than it looks. The book tells of a Bing bug that showed worse search results:
+queries per user went up about 10% and ad revenue per user about 30%. Users were searching more
+because they could not find what they wanted. "Queries per user" would have rewarded a broken
+product; "sessions per user" (people coming back) is a better OEC for search.
+
+A worked example with made-up numbers: a shop tests sending more promotional emails. Per user,
+treatment brings in 0.40 dollars more in email revenue, but 0.5% more users unsubscribe. If each
+unsubscribed user would have brought 100 dollars of future email revenue, the hidden cost is
+$0.005 \times 100 = 0.50$ dollars per user. The OEC "email revenue minus expected unsubscribe cost"
+is $0.40 - 0.50 = -0.10$ dollars per user: the test loses, even though short-term revenue went up.
+
+### Institutional memory and meta-analysis
+
+Once a company has run hundreds of experiments, the collection itself is valuable. Keeping every
+test's hypothesis, design and result in a searchable store (**institutional memory**) lets
+teams:
+
+- see which kinds of ideas tend to win and which tend to fail,
+- learn how often metrics move together, to pick better drivers and OECs,
+- avoid re-running a test someone already ran,
+- estimate realistic effect sizes, which feeds power planning.
+
+Studying many past experiments together is **meta-analysis**.
+
+### Ethics
+
+Experiments test changes on real people, so they need rules. The book borrows three principles
+from the Belmont Report, the standard US guide for research on people:
+
+- **Respect for persons:** be open with users and let them choose where possible.
+- **Beneficence:** keep risk low and make benefits worth it.
+- **Justice:** do not put the risks on one group and the benefits on another.
+
+Useful questions before a test: Would a user be surprised or upset to learn about it? Is the risk
+more than they face in normal use? Would we be comfortable shipping either variant to everyone?
+(If every variant is something you would ship anyway, testing it is usually low risk.) Is the data
+collected the minimum needed, and is it protected? Tests that deliberately harm or deceive users,
+such as a social network changing people's feeds to see if it changes their mood, cross the line
+and need review.
+
+## Part III: Other ways to learn
+
+### Complementary techniques
+
+A/B tests tell you *what* happened at scale, not *why*. Other methods fill that gap. They trade
+**scale** (how many users) against **depth** (how much you learn from each):
+
+| method | users | good for |
+| --- | --- | --- |
+| Logs analysis | Millions | Finding what people already do; sizing an opportunity |
+| Human evaluation (raters) | Hundreds of judgements | Labelling relevance or quality |
+| User experience research (lab, interviews, eye tracking) | ~10 | Seeing *why* users struggle |
+| Focus groups | ~10 per group | Early reactions to an idea |
+| Surveys | Thousands | Questions logs cannot answer (satisfaction, intent) |
+| External data | Varies | Benchmarks, competitors, panels |
+
+These methods generate ideas to test and help validate metrics. They rarely replace the test itself.
+
+### Observational causal studies
+
+Sometimes you cannot randomize: the change is a whole-company switch, a price rule, or something
+users choose themselves. **Observational causal studies** try to estimate the effect from data that
+were not randomized:
+
+| method | idea in one line |
+| --- | --- |
+| Interrupted time series | Predict what the metric would have done without the change, compare with what it did |
+| Interleaving | Mix two rankers' results in one list and see which one's items get clicked |
+| Regression discontinuity | Compare users just above and just below a cut-off (e.g. age 21) |
+| Instrumental variables | Use something random that pushes some users into the treatment |
+| Propensity score matching | Compare treated users with similar-looking untreated users |
+| Difference in differences | Compare the change over time in a treated region with an untreated one |
+
+All of these rest on assumptions you cannot fully check, and they fail when there is a hidden common
+cause. The book's example: Office 365 users who saw more error messages were *less* likely to
+leave. Errors do not keep users; heavy users simply see more errors *and* are loyal. Studies that
+compared observational estimates of ad effects with real experiments (at Facebook, for example)
+found the observational ones were often far off. Use these methods when you must, and prefer an
+experiment when you can.
+
+## Part IV: Building an experimentation platform
+
+### Client-side experiments
+
+Web servers can change what users see instantly. Phone and desktop apps cannot: new code ships
+through an app store, users update when they like, and many versions are in use at once. This
+changes how tests work:
+
+- **Ship the code early, switch it on later.** Put both variants in the app behind a **feature
+  flag** and turn the treatment on from the server.
+- **Expect delayed and missing data.** Phones go offline and batch their logs; some events arrive
+  days late or never.
+- **Trigger at the right moment.** A user is assigned when the app fetches its configuration, which
+  may be long before they reach the changed screen.
+- **Watch app health.** Measure crashes, start-up time, battery and data use as guardrails.
+
+### Instrumentation
+
+You can only analyse what you log. **Instrumentation** is the code that records what users saw and
+did. Client-side logs (in the browser or app) see what users actually did: scrolls, what was on
+screen, time spent. Server-side logs are more reliable and complete but miss what happened on the
+device. Most platforms use both and join them with a shared ID. Every event should carry the
+experiment and variant IDs, and teams should treat missing or broken logging as a bug that blocks
+launch.
+
+### Choosing a randomization unit
+
+The randomization unit is the thing that gets assigned to A or B:
+
+| unit | good for | problem |
+| --- | --- | --- |
+| Page view | Invisible backend changes (e.g. latency) | One user sees both variants |
+| Session | Changes that do not carry across visits | Same user switches between variants |
+| User (signed-in ID or cookie) | Most product changes | Cookies get deleted, so one person can become two |
+| Group (company, household, market) | Collaborative or shared features | Far fewer units, so less power |
+
+Two rules of thumb. First, the randomization unit should be at least as large as the unit you
+analyse: if you randomize by user, compute metrics per user, not per page view. Second, if users
+could notice that the product keeps changing, randomize by user so their experience stays
+consistent.
+
+### Ramping
+
+A new change should not go to everyone at once. **Ramping** means increasing the treatment's share
+of traffic in steps. The book balances three goals: **speed** (decide quickly), **quality**
+(measure precisely) and **risk** (limit harm if something is broken). It describes four phases:
+
+1. **Limit risk:** start small (employees, then 1%, then 5%) and watch for crashes and big drops.
+2. **Measure:** move to the **maximum power ramp** (MPR), normally 50/50 because an even split gives
+   the most power, and run for about a week to cover weekdays and weekends.
+3. **Scale up:** ramp to 100% while watching servers and capacity.
+4. **Long-term holdout (optional):** keep a small group, say 5%, on the old version for weeks or
+   months to measure lasting effects.
+
+Only the MPR phase is used for the main statistical decision; the early small phases are for
+catching disasters, not for reading p-values.
+
+### Scaling experiment analyses
+
+Analysing thousands of experiments a day needs an automated pipeline:
+
+1. **Process the data:** collect logs, remove bots, join client and server events, and attach each
+   event to the user's variants.
+2. **Compute:** first build one row per user and metric, then compute means, variances, confidence
+   intervals and p-values for each experiment.
+3. **Summarise:** a **scorecard** shows the OEC first, then guardrails and trust checks, then
+   diagnostic metrics, with segments (country, device, new vs returning users) one click away.
+
+## Part V: Analysing experiments
+
+### The statistics
+
+This section puts formulas behind the [p-value](#the-p-value-in-plain-words) and
+[power](#power-in-plain-words) ideas from Part I.
+
+**The difference and its noise.** The effect estimate is the difference in averages,
+$\Delta = \bar Y_T - \bar Y_C$. Its **standard error** (how much $\Delta$ would wobble if you reran
+the test) is
+
+$$
+\operatorname{SE}(\Delta) = \sqrt{\frac{\sigma_T^2}{n_T} + \frac{\sigma_C^2}{n_C}},
+$$
+
+where $\sigma^2$ is the variance of the metric across users and $n$ is the number of users in each
+arm. For a conversion rate $p$, the variance per user is $p(1-p)$.
+
+**The test statistic.** Divide the gap by its noise: $z = \Delta / \operatorname{SE}$. In the
+no-effect world, $z$ follows a bell curve (standard normal), so the two-sided p-value is
+
+$$
+p\text{-value} = 2\bigl(1 - \Phi(|z|)\bigr),
+$$
+
+with $\Phi$ the normal cumulative distribution function. (For small samples the book uses the
+two-sample *t*-test, which is almost identical once each arm has a few hundred users.)
+
+**Worked example** (the checkout test). With a pooled rate of $2{,}050/20{,}000 = 0.1025$:
+
+$$
+\operatorname{SE} = \sqrt{0.1025 \times 0.8975 \times \left(\tfrac{1}{10{,}000} + \tfrac{1}{10{,}000}\right)} = 0.00429,
+\qquad z = \frac{0.005}{0.00429} = 1.17,
+$$
+
+so the p-value is $2(1 - \Phi(1.17)) = 0.244$. The 95% confidence interval is
+$0.005 \pm 1.96 \times 0.00429$, or $-0.34$ to $+1.34$ pp. Check: $1.96 \times 0.429 = 0.84$, and
+$0.5 - 0.84 = -0.34$.
+
+**Sample size.** A handy rule from the book for 80% power at $\alpha = 0.05$ is
+
+$$
+n \approx \frac{16\,\sigma^2}{\delta^2} \text{ users per arm},
+$$
+
+where $\delta$ is the MDE. For the checkout test, $\sigma^2 = 0.1 \times 0.9 = 0.09$ and
+$\delta = 0.01$, so $n \approx 16 \times 0.09 / 0.0001 = 14{,}400$, close to the exact 14,751. The
+16 comes from $2 \times (1.96 + 0.84)^2 \approx 15.7$.
+
+**When is the bell curve safe?** The normal approximation needs enough users. The book's rule of
+thumb is $n > 355\, s^2$ per arm, where $s$ is the skewness of the metric. Revenue is often very
+skewed: with $s = 10$ you need more than 35,500 users per arm. Capping extreme values reduces $s$.
+
+**Many tests at once.** Each metric tested at 0.05 adds a 5% chance of a false alarm. Simple
+defences: decide the OEC and a few key metrics in advance; use a stricter threshold for metrics you
+did not expect to move (the book suggests tiers such as 0.05, 0.01 and 0.001); or use a correction
+such as Benjamini–Hochberg. Be careful with surprising segment results: with 50 segments, a couple
+will look "significant" by chance.
+
+**Most significant results are not as strong as they look.** If only 10 of 100 ideas truly work and
+the test has 80% power, you expect 8 true wins and $0.05 \times 90 = 4.5$ false ones. Only
+$8 / 12.5 = 64\%$ of "winners" are real. Replicating surprising wins helps.
+
+### Variance and sensitivity
+
+A metric's variance controls how many users you need, so getting it right, and making it smaller,
+pays off.
+
+**Getting it right.** The simple formula assumes each row is an independent unit. Ratio metrics such
+as **click-through rate** (CTR, clicks ÷ page views) break that when you randomize by user: one
+user's page views are related. Treating each page view as independent makes the interval too narrow
+and gives false wins. Use the **delta method** (a formula for the variance of a ratio of two
+averages) or the **bootstrap** (resample users many times and measure the spread). The same care is
+needed for relative changes ("+2%"), because the control mean in the denominator is also noisy.
+
+**Making it smaller** (more sensitive tests):
+
+- **CUPED** (Controlled-experiment Using Pre-Experiment Data): subtract the part of each user's
+  metric that their behaviour *before* the test predicts. If pre-test data explain 36% of the
+  variance, the variance shrinks to $1 - 0.36 = 0.64$ of its old value, and the required sample
+  shrinks by the same factor.
+- **Triggering:** analyse only users who could have been affected (see [triggering](#triggering)).
+- **Capping and binarizing:** cap extreme values (bots, bulk buyers), or switch from "revenue" to
+  "made a purchase".
+- **Stratification:** split users into similar groups (by country, device) and combine.
+- **Pick less noisy metrics:** a metric with smaller variance relative to its effect.
+
+### The A/A test
+
+An **A/A test** splits users into two groups that get the *same* experience. Since nothing differs,
+it should "find" an effect only about 5% of the time, and its p-values should be spread evenly
+between 0 and 1. If not, something in the platform or the analysis is broken.
+
+The figure runs 4,000 A/A tests of 10,000 users per arm over 14 days. Checked once at the end, the
+bars are flat and 5.0% land below 0.05. Tick "Peek after each of 14 days": now each test is
+checked daily and stopped at the first p below 0.05, and 21.9% of tests "find" something that does
+not exist.
+
+<NullWorld mode="aa" baseline={0.1} n={10000} />
+
+Common reasons an A/A test fails:
+
+- **Wrong variance**, for example treating page views as independent when users were randomized.
+- **Very skewed metrics** where the normal approximation is not yet valid.
+- **Carryover**: one group was in a previous experiment and still behaves differently.
+- **Bots, broken hashing or uneven data loss.**
+
+Run A/A tests continuously in the background: they are the platform's smoke alarm.
+
+### Triggering
+
+Many changes affect only some users. A checkout change only matters to users who reach checkout.
+Including everyone else adds noise without signal. **Triggering** means analysing only the users who
+reached the point where the variants differ (in both arms, using the same rule).
+
+A worked example with made-up numbers. 10% of users reach checkout; they spend 30 dollars on
+average (standard deviation 60), and everyone else spends 2 dollars. The treatment raises
+checkout users' spending by 3%.
+
+- **Triggered analysis:** effect 0.90 dollars on a standard deviation of 60. With the
+  [16σ²/δ² rule](#the-statistics), that needs about 71,000 triggered users per arm, which means
+  about 711,000 assigned users per arm.
+- **Everyone:** the effect is diluted to 0.09 dollars per user, and the standard deviation across all
+  users is about 22.8. The rule gives about 1,028,000 users per arm, 1.45 times more.
+
+To report the effect on the whole site, scale it back: overall change = triggered change × the
+triggered users' share of the metric. Here $3\% \times (3 / 4.8) = 1.875\%$, because triggered users
+bring 3.00 of the 4.80 dollars spent per user.
+
+The trigger must be decided the same way in both arms. A good approach is **counterfactual
+logging**: in control, also compute what the treatment would have shown and log whether it would
+have been different.
+
+### Sample ratio mismatch
+
+If you planned 50/50, you should get close to 50/50. A **sample ratio mismatch** (SRM) means the
+counts differ more than luck allows. It is the single most useful trust check: an SRM means some
+users were lost or added unevenly, so the groups are no longer comparable and the results cannot be
+trusted.
+
+Check with a chi-squared test. Example: 50,000 users in control and 49,000 in treatment. Expected is
+49,500 each, so
+
+$$
+\chi^2 = \frac{500^2}{49{,}500} + \frac{500^2}{49{,}500} = 10.1, \qquad p = 0.0015.
+$$
+
+That is very unlikely by chance: stop and debug. (A split of 50,000 vs 49,700 gives $p = 0.34$,
+which is fine.) Common causes:
+
+- The treatment redirects users to a new page, and some are lost on the way.
+- The treatment crashes or logs differently, so some of its users disappear from the data.
+- Bot filtering removes more users from one arm.
+- The trigger condition depends on the treatment.
+- Assignment was changed mid-test, or the hash is not uniform.
+
+Other **trust guardrails** worth checking in every test: fraction of events logged
+(**telemetry fidelity**), cache hit rates, cookie write rates, and any metric the treatment should
+not be able to move (country mix, pre-test activity).
+
+### Leakage and interference
+
+The analysis assumes one user's variant does not affect another user's outcome (the **stable unit
+treatment value assumption**, or SUTVA). That breaks in two ways:
+
+- **Direct connections:** on a social network, a treatment user's new sharing feature sends
+  messages to control users, so control changes too.
+- **Indirect connections** through a shared resource: a two-sided marketplace (riders and drivers),
+  advertiser budgets, a shared machine-learning model trained on both arms' clicks, or shared
+  servers and caches.
+
+When it happens, the measured difference is wrong, often too small or even the wrong sign. Fixes:
+
+| approach | how |
+| --- | --- |
+| Split the resource | Give each arm its own budget, inventory or model |
+| Geo randomization | Assign whole cities or regions |
+| Time-based (switchback) | Switch the whole market between A and B in time blocks |
+| Cluster randomization | Assign groups of connected friends together |
+| Ego-centric randomization | Treat a user and their direct connections as one cluster |
+| Rule of thumb | Credit actions with their downstream value (e.g. count messages received too) |
+
+Each of these has fewer independent units than user-level tests, so it has less power.
+
+### Long-term effects
+
+What you measure in a two-week test may not be what you get after a year:
+
+- **Users learn.** Novelty wears off; or users slowly learn to ignore ads, or to trust a better
+  feature.
+- **Network effects** take time to spread.
+- **Delayed outcomes:** a subscription renewal happens after the test ends.
+- **The world changes:** competitors, seasons and other launches shift the baseline.
+
+The figure is an illustration (made-up curves, not data): a novelty effect that starts at +3% and
+settles at +0.5%, and a primacy effect that starts negative and ends positive. A one-week test
+would get both wrong.
+
+<LineChart
+  x={() => Array.from({ length: 61 }, (_, i) => i)}
+  series={[
+    { name: "novelty: starts high, fades", fn: (t) => 0.5 + 2.5 * Math.exp(-t / 7) },
+    { name: "primacy: starts low, recovers", fn: (t) => 1.0 - 2.5 * Math.exp(-t / 7) },
+  ]}
+  xLabel="days since the test started"
+  yLabel="treatment effect (%)"
+  title="Illustrative treatment effect over time"
+  height={260}
+/>
+
+Ways to measure long-term effects:
+
+- **Run long:** keep the test going for months, while watching for cookie churn and drop-outs.
+- **Cohort analysis:** follow a fixed group of users who were stable (for example, signed in).
+- **Post-period analysis:** after the test, give both groups the same experience and see whether
+  the old treatment group still behaves differently. Google used this to show that users learn to
+  respond less to ads when ad load is high.
+- **Time-staggered starts:** start several treatment groups at different times and compare.
+- **Holdbacks and reverse tests:** after launching, keep a small group on the old version, or switch
+  a group back, and measure the difference weeks later.
 
 ## A/B tests for recommendations and ads
 
-A ranking system does not change one isolated button. It chooses which items receive exposure,
-where they appear, and which interactions become tomorrow's training data. An ads system adds an
-auction: candidates compete for limited slots, advertisers have budgets, and the platform must
-balance user value, advertiser value, and revenue. These feedback loops make randomization more
-important, but they also make a naive user-level A/B test easier to misread.
+The book's ideas apply directly to ranking and advertising systems, but these systems add their own
+traps. A recommender chooses what users see, where it appears, and what tomorrow's model learns
+from. An ad system adds an auction with budgets and prices. This section walks through the most
+common problems, each with a small example.
 
-The product question must come before the model metric. For recommendations, a useful question is
-“does this ranking policy improve users' experience over the next four weeks?” For ads, it may be
-“does this campaign cause purchases that would not otherwise happen?” or “does this auction change
-improve total marketplace value?” These are three different **estimands**. They require different
-units, metrics, and sometimes different experimental designs.
+**Pick the metric from the product question.** Click-through rate (CTR) is a diagnostic, not a goal:
+clicks can come from a catchy thumbnail or a high position.
 
-| system and decision | randomization unit | primary metric | important guardrails |
+| system | randomization unit | main metric | guardrails |
 | --- | --- | --- | --- |
-| Recommendation ranker | User or account | Sessions, satisfied watch time, or retention per eligible user | Latency, hides/reports, diversity, creator or seller concentration |
-| Ad creative or advertiser lift | User, cookie, or geography | Incremental conversions, profit, or revenue per assigned unit | Frequency, user complaints, organic conversions |
-| Platform ad ranker or auction | User when markets are separable; otherwise geo or time block | Revenue or welfare per request/user | Ad load, relevance, latency, advertiser ROI and spend concentration |
+| Recommendation ranker | User | Satisfied sessions or retention per user | Latency, hides and reports, diversity |
+| Ad campaign lift | User or region | Extra conversions caused by the ads | Ad frequency, complaints |
+| Ad ranker or auction | User, or region/time if markets are shared | Revenue per user and advertiser value | Ad load, relevance, advertiser return |
 
-CTR is usually diagnostic, not a complete objective. A click can be caused by a tempting thumbnail,
-a high position, or an accidental tap. A recommendation can reduce clicks yet increase completed
-plays because users choose more carefully. An ad ranker can raise click-through rate (CTR) while
-lowering revenue if it selects cheap ads or while harming advertiser value if clicks do not convert.
-Netflix describes offline evaluation as a filter and A/B tests of retention and medium-term
-engagement as the basis for product decisions; Google researchers similarly study immediate
-behaviour as a surrogate for much sparser long-term revisits.
+#### Problem 1: the denominator changes
 
-### Problem 1: the denominator changes
+Treatment gets more users active but fewer minutes per active user. Who won?
 
-**Interview question.** Treatment increases the number of active users but lowers watch time per
-active user. Did the recommender win?
-
-Suppose 10,000 users are assigned to each arm. In control, 6,000 users become active and watch 30
-minutes each. In treatment, 6,500 become active and watch 29 minutes each.
-
-| arm | assigned users | active users | minutes / active user | total minutes | minutes / assigned user |
+| arm | assigned | active | minutes per active user | total minutes | minutes per assigned user |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Control | 10,000 | 6,000 | 30 | 180,000 | 18.00 |
 | Treatment | 10,000 | 6,500 | 29 | 188,500 | 18.85 |
 
-Among active users, treatment looks 3.3% worse. Per assigned user, it is 4.7% better. Conditioning
-on “became active” is dangerous because activity happens after treatment: the treatment changed who
-entered that denominator. Use all eligible assigned users for the primary intention-to-treat metric.
-Then report activation rate and minutes per active user as decomposition metrics. The correct launch
-decision still depends on quality guardrails; 8,500 extra minutes are not a win if they came from
-low-quality or harmful consumption.
+Per active user, treatment looks 3.3% worse; per assigned user, it is 4.7% better. "Active" happens
+*after* the treatment and the treatment changed who is in that group, so always use all assigned
+users for the main metric and report the rest as breakdowns.
 
-This example also explains why impression-level tests are often wrong. If assignment is by user,
-heavy users create many correlated impressions. Treating one million impressions as one million
-independent observations makes the confidence interval too narrow. Aggregate outcomes per user or
-use a cluster-robust variance estimator. For intuition, if each user contributes 20 observations and
-the within-user correlation is 0.05, the standard **design effect** is
+Also do not treat each impression as an independent data point. If each user gives 20 impressions
+and those are slightly correlated (correlation 0.05), the **design effect** is
+$1 + (20 - 1) \times 0.05 = 1.95$: one million impressions carry about as much information as
+512,821 independent ones. Compute metrics per user.
 
-$$
-1+(20-1)(0.05)=1.95.
-$$
+#### Problem 2: position bias
 
-One million rows then contain only about $1{,}000{,}000/1.95=512{,}821$ independent-observation
-equivalents under this simplified equal-cluster model.
+Items at the top get clicked more because they are at the top. A whole-ranker A/B test still answers
+the launch question ("are users better off with the new ranker?"), but it does not tell you whether
+individual items are more relevant. Compare the two policies per user; do not compare CTR on the
+items each one happened to show.
 
-### Problem 2: position bias and the changing slate
+#### Problem 3: the test changes its own training data
 
-**Interview question.** Treatment's CTR is higher. How do you know its items are more relevant and
-not merely shown higher on the page?
+If both arms' models retrain on a shared log of clicks, control learns from treatment and vice versa,
+which breaks SUTVA (Google researchers call this **symbiosis bias**). Options:
 
-A **slate** is the ordered set of items shown in one request. Position is part of a ranking policy:
-the first item is examined more often than the tenth. Therefore a whole-policy A/B test answers the
-right launch question—whether users do better under the entire treatment slate—but it does *not*
-identify an item's intrinsic relevance. “Treatment caused more clicks” and “treatment selected
-better items” are different claims.
+1. **Freeze both models** during the test: clean, but measures the short-term effect only.
+2. **Train each model only on its own arm's data:** isolates learning, but each model sees less data.
+3. **Split users and the training data together**, so each policy lives in its own world.
+4. **Randomize clusters** of connected users, creators or markets.
 
-Solve the launch question by assigning users persistently and comparing policy-level outcomes per
-eligible user or request. Keep layout, item-card design, and ad load fixed if the goal is to isolate
-the ranker. Log the candidate set, scores, positions, final slate, and exposure. Break the result down
-into a metric tree: impressions → examined or viewable items → clicks → qualified consumption or
-conversion. If the question is item relevance, collect randomized position data or use a separately
-validated examination model; ordinary click logs confound relevance with exposure.
+Say in the report which one you used.
 
-Do not compare click-through rate on the items that each policy happened to show as if the item sets
-were fixed. Treatment may explore harder cases, expose more long-tail items, or generate more total
-impressions. The end-to-end randomized policy comparison remains causal even when the slates differ;
-post-treatment filtering of those slates generally does not.
+#### Problem 4: attribution is not incrementality
 
-### Problem 3: the experiment changes its own training data
+An advertiser sees 900 purchases after ad clicks. How many did the ads *cause*? Ads are shown to
+people already likely to buy, so you need a test: hide the advertiser's ads from a random control
+group. (A **ghost ad** design also logs, in control, the auctions the ad *would* have won.)
 
-Recommenders learn from clicks, plays, purchases, and skips generated by the current policy. If both
-variants retrain from a shared log, control influences treatment's model and treatment influences
-control's model. This violates the “no hidden versions of treatment” part of the stable unit treatment
-value assumption (SUTVA). Recent work calls the resulting contamination **symbiosis bias**.
+| arm | users | purchases | rate |
+| --- | ---: | ---: | ---: |
+| Ads hidden (control) | 50,000 | 2,000 | 4.00% |
+| Ads shown (treatment) | 50,000 | 2,125 | 4.25% |
 
-Choose the design that matches the launch decision:
+The lift is 0.25 pp, which is $50{,}000 \times 0.0025 = 125$ extra purchases, not 900 or 2,125. The
+95% interval is 0.003 to 0.497 pp, with $p = 0.047$: significant, but barely, so the size is still
+uncertain. If each purchase earns 80 dollars of margin and the campaign cost 15,000 dollars, the
+incremental return on ad spend is $125 \times 80 / 15{,}000 = 0.67$: the campaign loses money. The
+attribution count would have claimed $900 \times 80 / 15{,}000 = 4.8$.
 
-1. **Frozen-model test.** Freeze both candidate models and compare only serving policies. This gives
-   a clean short-run answer, but not the steady-state effect after retraining.
-2. **Data-diverted test.** Train each model only on feedback from its own arm. This isolates learning,
-   but each model receives less data than it would after launch, so model quality and learning speed
-   change.
-3. **User–corpus co-diversion.** Partition both users and the feedback corpus consistently so each
-   policy serves and learns within its own world. This better represents a learning policy, at the
-   cost of operational complexity and statistical power.
-4. **Cluster randomization.** Assign connected users, creators, sellers, or markets together when
-   their behaviour affects one another. Analyze at the cluster level and plan for the loss of
-   effective sample size.
+#### Problem 5: auctions and budgets connect the arms
 
-A good report labels the target explicitly: “two-week effect with frozen models” is not an estimate
-of “fully ramped effect after three months of online learning.” Run long enough to observe novelty
-and learning, plot the treatment effect by experiment age, and retain a small long-lived holdout when
-the long-term effect matters.
+If treatment wins more auctions early in the day, it can spend an advertiser's daily budget, leaving
+fewer ads for control later. The arms are no longer independent. Randomize by region if markets are
+separate, or run a **switchback** test that switches the whole market between A and B in time blocks.
 
-### Problem 4: ad attribution is not incrementality
+#### Guardrails with a harm margin
 
-**Interview question.** An advertiser reports 900 purchases after ad clicks. How many purchases did
-the ads cause?
+"No significant drop" is a weak guardrail: a small test almost never shows a significant drop. Instead
+pick a **non-inferiority margin**: the largest harm you accept. The guardrail passes only if the upper
+end of the confidence interval for the harm is below that margin.
 
-The number cannot be recovered from exposed users alone. Ad delivery targets people who are likely
-to buy, so a high conversion rate after exposure mixes selection with causation. Randomly suppress
-the advertiser's eligible ads for a control group, while treatment users enter the normal auction.
-Compare outcomes by original assignment. A **ghost-ad** design additionally records control auctions
-in which the focal ad would have won, creating a more precise “would have been exposed” comparison
-without charging for or displaying the focal ad.
+Example: complaint rate is 0.20% in control and 0.22% in treatment, and we accept at most +0.05 pp.
+With 100,000 users per arm the increase is 0.020 pp with standard error 0.0205 pp. The one-sided 95%
+upper bound is $0.020 + 1.645 \times 0.0205 = 0.0537$ pp, which is above 0.05: **fail**, because we
+cannot rule out unacceptable harm. With 200,000 users per arm and the same rates, the bound is 0.0438
+pp: **pass**. So size the test for guardrails too, not only for the main metric. For very rare
+harms, remember the rule of three: if zero events occur in $n$ users, the 95% upper bound on the rate
+is about $3/n$.
 
-Consider 50,000 users per arm over a fixed attribution window:
+#### Sample sizes for typical metrics
 
-| arm | purchases | conversion rate |
-| --- | ---: | ---: |
-| Suppressed control | 2,000 | 4.00% |
-| Eligible treatment | 2,125 | 4.25% |
-
-The estimated incremental lift is $0.25$ percentage points, or $6.25\%$ relative to control. That
-corresponds to $50{,}000\times0.0025=125$ incremental purchases in the treatment population—not the
-2,125 purchases that happened after assignment and not the 900 that an attribution rule credited.
-The unpooled standard error is 0.126 percentage points, so the approximate 95% confidence interval is
-$[0.003, 0.497]$ percentage points and the two-sided p-value is 0.047.
-
-If contribution margin is \$80 per purchase and campaign spend is \$15,000, incremental return on ad
-spend is
+**Watch time.** Mean 20 minutes per user per day, standard deviation 40, MDE 1 minute (5%). Using
+$n = 2\sigma^2 (1.96 + 0.84)^2 / \delta^2$:
 
 $$
-\operatorname{iROAS}=\frac{125\times\$80}{\$15{,}000}=0.67.
+n = \frac{2 \times 40^2 \times 2.80^2}{1^2} \approx 25{,}117 \text{ users per arm}.
 $$
 
-An attribution-based calculation using 900 purchases would report 4.8. The experiment answers the
-budget question because it measures what happened *because of* eligibility. The interval is also a
-warning: barely crossing 0.05 does not make the economic estimate precise. Power the test for the
-smallest profitable lift, and allow for delayed conversions before closing the attribution window.
-
-### Problem 5: auctions and shared inventory create interference
-
-**Interview question.** Why can a user-randomized test of a new ad auction be biased even with a
-perfect hash?
-
-Advertiser budgets and pacing couple the two arms. If treatment wins more impressions early, it can
-consume a campaign's daily budget and leave fewer bids for control later. Competing ads can change
-prices. A seller's or creator's limited inventory can likewise move between recommendation arms.
-One unit's treatment has changed another unit's outcome, violating SUTVA.
-
-First identify the interference boundary. If budgets are partitioned by market and users do not
-cross markets, randomize geographic clusters. If the marketplace cannot be partitioned, alternate
-the whole market between control and treatment in randomized time blocks: a **switchback
-experiment**. Blocks must be long enough for stable measurement, and transitions need a washout when
-budget pacing, cached rankings, or learned state carries over. Analyze block-level outcomes with
-time-of-day and day-of-week controls; the number of requests is not the number of independent units.
-
-For an advertiser-specific lift test, user-level suppression or ghost ads may still be appropriate
-because the estimand is the advertiser's incremental effect. For a platform-wide auction mechanism,
-the equilibrium response of advertisers may take weeks. A short switchback estimates the immediate
-mechanical effect, not the eventual equilibrium after bids and budgets adapt.
-
-### Guardrail metrics: define how the experiment can lose
-
-A **guardrail metric** measures harm that the primary metric may hide. The primary metric answers
-“did the change create the intended value?” A guardrail answers “did it remain acceptable on every
-dimension we refuse to trade away?” Guardrails are decision constraints, not decorative numbers on
-the experiment dashboard.
-
-For example, a recommendation ranker may increase watch time by recommending sensational content.
-An ads ranker may increase revenue by adding more ads, selecting poorly matched high bids, or slowing
-the page. The primary metric can improve while the product, users, advertisers, or content ecosystem
-becomes worse.
-
-#### A guardrail hierarchy for recommendations and ads
-
-Use a small set that covers distinct failure modes:
-
-| guardrail class | recommendation examples | advertising examples | likely action |
-| --- | --- | --- | --- |
-| Correctness and safety | Broken slates, policy-violating content, hide/report rate | Invalid creatives, billing errors, policy violations | Stop or roll back immediately |
-| Reliability | Empty-result rate, serving errors, fallback rate | Auction failures, missing ads, billing pipeline errors | Stop ramp; investigate |
-| Performance | Ranking latency, page-load time, device resource use | Auction latency, page-load time, timeout rate | Block launch beyond a preset budget |
-| User experience | Uninstalls, complaints, satisfaction, retention | Ad hides, complaints, session abandonment, organic engagement | Require non-inferiority or explicit trade-off review |
-| Marketplace health | Creator coverage, catalog diversity, seller concentration | Advertiser ROI, reach, spend concentration, small-advertiser participation | Extend test or block if ecosystem harm is material |
-| Integrity of measurement | Exposure loss, sample ratio mismatch, event-join rate | Conversion-log loss, auction-eligibility mismatch, billing reconciliation | Invalidate the experiment rather than interpret impact |
-
-Some metrics are **invariants**, not outcome guardrails. Assignment should not change pre-treatment
-country, device, or historical activity. A sample ratio mismatch or treatment-dependent logging loss
-means the experiment may be untrustworthy; it is not a product trade-off that a large primary win can
-cancel.
-
-#### Pick guardrails from the mechanism
-
-Do not copy the same scorecard into every experiment. Start with a causal story about how the change
-could cause harm.
-
-- A heavier recommendation model can improve relevance but increase p95 and p99 latency, timeouts,
-  fallback ranking, and battery use. Those are its first guardrails.
-- A diversity reranker can improve long-term discovery while reducing immediate CTR. CTR is then a
-  diagnostic or secondary outcome, not automatically a hard guardrail.
-- Higher ad load can increase short-run revenue but reduce organic clicks, session depth, retention,
-  and user satisfaction. Those user metrics must constrain the revenue decision.
-- A new auction objective can improve platform revenue while reducing advertiser conversions or
-  return on ad spend. Measure both advertiser value and the concentration of gains across large and
-  small advertisers.
-- A new exploration policy can help cold-start items but expose low-quality content. Guard on hides,
-  reports, qualified consumption, and per-user exposure caps—not only aggregate clicks.
-
-Metrics should be sensitive enough to react during the experiment and attributable to the change.
-Annual retention may represent the right value but cannot protect a two-week ramp by itself. Use a
-validated short-term proxy for monitoring and preserve a long-lived holdout for the slower outcome.
-
-#### Predefine the acceptable harm margin
-
-“No statistically significant regression” is a weak guardrail rule. An underpowered metric can have
-$p>0.05$ even when substantial harm is plausible. Instead define a **non-inferiority margin**
-$\Delta_G$: the largest degradation the business is willing to accept.
-
-For a metric where higher is worse, such as complaint rate, let
-
-$$
-d=\widehat p_T-\widehat p_C.
-$$
-
-The treatment passes a one-sided 5% non-inferiority check when the upper 95% confidence bound is
-below the harm margin:
-
-$$
-d+z_{0.95}\operatorname{SE}(d) < \Delta_G,
-\qquad z_{0.95}=1.645.
-$$
-
-This reverses the usual burden of proof. The question is not “can we prove complaints increased?”
-but “can we rule out an unacceptable increase?”
-
-**Worked guardrail.** Suppose control complaints are 0.20%, treatment complaints are 0.22%, and the
-maximum acceptable increase is 0.05 percentage points. With 100,000 users per arm, the observed
-increase is 0.02 percentage points and its standard error is 0.0205 percentage points. The one-sided
-upper bound is
-
-$$
-0.020+1.645(0.0205)=0.0537\text{ percentage points}.
-$$
-
-Because 0.0537 exceeds the 0.05-point margin, the guardrail does not pass. The result is not proof of
-harm; it is insufficient evidence that unacceptable harm is absent. With 200,000 users per arm and
-the same observed rates, the smaller standard error gives an upper bound of 0.0438 points, which
-passes. Guardrail precision therefore belongs in the power plan.
-
-For a metric where lower is worse, such as advertiser conversion value, use the lower confidence
-bound and require it to stay above the negative margin. For latency percentiles and heavy-tailed
-metrics, bootstrap or use a distribution-aware method rather than applying a mean-based normal test
-blindly.
-
-#### Power the experiment for guardrails too
-
-Sizing only for the primary metric can produce “primary wins, safety unknown.” Calculate sample size
-for each hard guardrail's harm margin, then use the largest requirement among the primary metric and
-the launch-blocking guardrails. Rare events such as severe reports or billing failures may require
-much more traffic than engagement.
-
-Some harms are too rare or serious for an ordinary significance test. Enforce deterministic quality
-checks, rate limits, and automated rollback thresholds as well. Zero observed severe events does not
-prove zero risk: with no events in $n$ independent observations, the rough 95% “rule of three” upper
-bound on the event probability is $3/n$.
-
-#### Many guardrails and repeated monitoring
-
-Ten guardrails tested independently at 5% create many chances to block a good treatment because of
-noise. At the same time, a blanket Bonferroni correction can make important safety checks
-insensitive. Classify metrics before launch:
-
-1. **Hard guardrails** represent non-negotiable safety, correctness, legal, or reliability limits.
-   Give each an explicit threshold and conservative monitoring rule.
-2. **Launch guardrails** use prespecified non-inferiority margins. Control the family-wise error rate
-   when the decision requires all of them to pass; Holm's procedure is less conservative than plain
-   Bonferroni.
-3. **Diagnostic metrics** explain the result and generate hypotheses. Do not let a chance movement
-   become a retroactive launch criterion.
-
-Continuous safety monitoring is operationally necessary, but ordinary fixed-horizon p-values are not
-valid stopping rules. Use alert thresholds designed for repeated looks, confidence sequences, or a
-separate safety policy with clearly documented error trade-offs. A rollback for an obvious outage
-does not need to wait for statistical significance.
-
-#### Make the launch rule explicit
-
-A useful pre-registered rule looks like this:
-
-| primary metric | hard guardrails | launch guardrails | decision |
-| --- | --- | --- | --- |
-| Wins or is practically positive | Pass | Pass | Launch or ramp |
-| Wins | Any fail | Any result | Stop or roll back |
-| Wins | Pass | Inconclusive | Continue to planned sample; do not silently waive |
-| Neutral | Pass | Pass | Usually do not launch unless cost, simplicity, or strategic value justifies it |
-| Loses | Pass | Pass | Do not launch merely because it is safe |
-
-Segment checks matter even when the aggregate passes. Inspect guardrails across device capability,
-country, new versus established users, and marketplace participant size when there is a plausible
-mechanism for heterogeneous harm. Prespecify critical segments and their margins; searching hundreds
-of slices after the test will manufacture apparent regressions.
-
-Finally, report effect sizes and confidence intervals for every guardrail. “Green” should mean the
-data rule out the predefined unacceptable harm—not merely that a two-sided p-value stayed above
-0.05.
-
-### Holdout experiments
-
-A **holdout** is a randomly selected population that deliberately does not receive a change. The
-word is used for several designs that answer different questions:
-
-| holdout | treatment population | control population | question answered |
-| --- | --- | --- | --- |
-| Experiment control | Candidate ranker or ad policy | Current production policy | Should this one change launch? |
-| Campaign suppression | Eligible for the advertiser's campaign | Focal advertiser suppressed | What conversions did this campaign cause? |
-| Long-lived holdout | All launches in a product area | Frozen earlier experience | What is the cumulative, persistent effect after novelty fades? |
-| Global holdout | Stack of many eligible launches | Baseline stack without those launches | What is the combined effect of the program? |
-| Model-training holdout | Served and learned from treatment data | Served and learned from control data | What is the effect including feedback and retraining? |
-
-The first row is an ordinary A/B test. The others exist because summing individual experiment lifts
-usually does not recover the total product impact. Effects can overlap, interact, decay, or displace
-one another. A long-lived or global holdout measures the bundle directly.
-
-#### Designing a long-lived holdout
-
-Suppose a recommendation organization launches dozens of ranking changes each quarter. Reserve,
-for example, 2% of eligible users before those experiments begin. Keep their assignment sticky and
-serve them the agreed baseline stack. The remaining 98% receives normal launches and continues to
-participate in short-term experiments. Compare the two populations on retention, satisfied usage,
-complaints, content diversity, and creator outcomes after 30, 60, and 90 days.
-
-Several details determine what this estimate means:
-
-- **Freeze the policy definition, not necessarily every binary.** Security fixes and correctness
-  changes may need to reach both arms. Version the set of behavioural features withheld from the
-  holdout so the contrast is reconstructable.
-- **Keep eligibility symmetric.** Decide eligibility before treatment. Removing unhappy holdout
-  users or adding only newly active treatment users breaks randomization.
-- **Prevent leakage.** Account-level assignment is preferable when people use several devices.
-  Shared households, social connections, caches, and cross-device identifiers can still contaminate
-  the contrast.
-- **Separate concurrent layers.** A global holdout for recommendations should not accidentally
-  suppress unrelated payment or safety changes. Put the holdout at the correct product boundary.
-- **Monitor the holdout itself.** Check sample ratio mismatch, invariant attributes, assignment loss,
-  and metric logging over time. Attrition caused by treatment is an outcome, not a reason to drop a
-  user from analysis.
-- **Budget the opportunity cost.** A persistent control withholds improvements. Use the smallest arm
-  that achieves useful precision, rotate only at planned boundaries, and apply non-negotiable safety
-  fixes to everyone.
-
-A rolling holdout is not equivalent to a persistent one. Re-randomizing 2% each week measures a
-short exposure to the baseline and mixes users with different histories. A persistent holdout
-measures cumulative treatment, but its baseline grows older. Teams often use both: short-lived
-controls for individual launch decisions and a small persistent holdout for cumulative impact.
-
-#### Holdouts for advertising
-
-For advertiser lift, assign eligible users before the auction. In the treatment arm, let the focal
-campaign compete normally. In the holdout arm, suppress only that campaign and allow other ads or
-organic content to fill the slot. This measures incremental conversions against the realistic
-alternative, rather than against an empty ad slot.
-
-Three denominators must be logged separately:
-
-1. **Eligible users:** could have entered the campaign experiment.
-2. **Reached users:** actually received the advertiser's ad in treatment.
-3. **Converting users:** completed the outcome inside the prespecified window.
-
-The intention-to-treat effect divides by eligible assigned users. Dividing by reached treatment
-users but by all control users is not randomized. Ghost ads can identify comparable control auction
-opportunities, but their auction prediction and logging need validation through A/A-style checks.
-
-Campaign holdouts can also interfere through budgets. Suppressing ads for control users may redirect
-the saved budget toward treatment users, increasing their frequency. That total policy effect may be
-exactly what the advertiser wants, but it is not the effect of one extra impression. Log spend,
-frequency, reach, and auction eligibility; state whether the estimand holds budget fixed or lets the
-campaign reallocate it.
-
-### Define the MDE before sample size
-
-The **minimum detectable effect** (MDE) is the smallest true change for which the chosen test has the
-target probability of rejecting the null. It is not the smallest effect the metric can display, the
-observed lift, or a guarantee that every significant result is worth shipping.
-
-Choose the MDE from a decision threshold:
-
-1. Translate the metric into product value. How much is one additional retained user, qualified
-   hour, incremental purchase, or dollar of advertiser value worth?
-2. Subtract implementation, inference, latency, support, and opportunity costs. Include downside on
-   other sides of the marketplace.
-3. Find the smallest effect whose expected value justifies launching. This is the practical MDE.
-4. Check whether available traffic can measure it in a useful time. If not, improve the metric or
-   design, accept a larger MDE, or admit that the experiment cannot answer the question precisely.
-
-Always specify whether an MDE is **absolute** or **relative**. Moving conversion from 2.00% to 2.10%
-is an absolute increase of 0.10 percentage points but a relative lift of 5%. Saying “a 5% MDE”
-without the baseline is incomplete.
-
-Statistical significance and practical significance form four different decisions:
-
-| statistical result | business magnitude | interpretation |
-| --- | --- | --- |
-| Significant | Larger than practical threshold | Evidence supports shipping, subject to guardrails |
-| Significant | Smaller than practical threshold | Precisely measured but probably not worth shipping |
-| Not significant | Interval excludes valuable effects | Evidence supports stopping or accepting equivalence |
-| Not significant | Interval includes valuable effects | Inconclusive; do not call it “no effect” |
-
-For the third row, teams can predefine an equivalence or non-inferiority margin instead of trying to
-infer “no harm” from $p>0.05$.
-
-### Sample size for a recommendation metric
-
-**Interview question.** Baseline watch time is 20 minutes per eligible user per day with a standard
-deviation of 40 minutes. How many users are needed per arm to detect a one-minute increase with 80%
-power and a two-sided 5% significance level?
-
-For a difference in means with equal allocation, a planning approximation is
-
-$$
-n_{\text{per arm}} \approx
-\frac{2\sigma^2(z_{1-\alpha/2}+z_{1-\beta})^2}{\delta^2},
-$$
-
-where $\sigma$ is the user-level standard deviation and $\delta$ is the absolute MDE. Here,
-$\sigma=40$, $\delta=1$, $z_{0.975}=1.960$, and $z_{0.8}=0.842$:
-
-$$
-n \approx
-\frac{2(40)^2(1.960+0.842)^2}{1^2}
-=25{,}116.4.
-$$
-
-Round up to 25,117 users per arm, or 50,234 total. The one-minute MDE is a 5% relative increase over
-the 20-minute baseline. The formula assumes one independent user-level outcome, stable variance,
-equal allocation, and a normal approximation. Watch time is often zero-inflated and heavy-tailed, so
-estimate variance from a representative pre-period and validate power with a bootstrap or simulation.
-
-Traffic determines duration only after sample size. If 10,000 *new eligible, assignable* users enter
-per day and allocation is 50/50, each arm receives about 5,000. Enrollment takes
-$25{,}117/5{,}000=5.02$ days. The experiment should still span complete weekly cycles and allow the
-outcome window to mature, so a planned 14-day run may be more defensible than stopping on day six.
-
-#### Variance reduction and repeated observations
-
-If pre-experiment watch time explains 36% of outcome variance, a correctly implemented CUPED-style
-covariate can reduce variance by a factor of approximately $1-R^2=0.64$. Under the same assumptions,
-the required sample becomes
-
-$$
-25{,}117\times0.64=16{,}075\text{ users per arm}.
-$$
-
-Use only covariates measured before assignment and apply the same transformation to both arms.
-Estimate the expected reduction from historical or A/A data rather than assuming it. CUPED improves
-precision; it does not repair selection bias, interference, or incorrect logging.
-
-Repeated daily observations do not automatically multiply sample size. A user who contributes 14
-days of watch time still represents one randomized unit. Either aggregate the 14-day outcome per user
-or use a repeated-measures model that accounts for within-user correlation.
-
-### Sample size for a rare ad conversion
-
-**Interview question.** Purchase conversion is 2%. The smallest profitable effect is a 5% relative
-lift. How much traffic is required for 80% power with two-sided $\alpha=0.05$?
-
-The treatment target is
-
-$$
-p_1=0.02(1+0.05)=0.021,
-$$
-
-so the absolute MDE is only $0.001$, or 0.10 percentage points. Substituting $p_0=0.020$ and
-$p_1=0.021$ into the two-proportion formula from the power section gives 315,206 users per arm, or
-630,412 total.
-
-Rare outcomes are expensive because most assigned users contribute zeros. Doubling the relative MDE
-to 10% changes the target to 2.20% and reduces the requirement to 80,682 users per arm—not half as
-many, but roughly one quarter, because sample size scales approximately with $1/\delta^2$.
-
-Do not replace purchase conversion with CTR merely to obtain power unless CTR is a validated
-surrogate for incremental profit. Better options include running longer, enlarging the eligible
-population, using pre-treatment covariates, or pooling evidence through a prespecified model. For
-very rare conversions, use simulation or exact methods and model delayed conversion maturity,
-identity loss, and over-dispersion rather than trusting the normal approximation blindly.
-
-### Adjust sample size for the real design
-
-The textbook calculation is a starting point. Adjust it before reserving traffic:
-
-- **Unequal allocation.** A small treatment arm protects users but increases variance. For a fixed
-  total sample, 50/50 is most efficient when arms have similar cost and variance.
-- **Clustering.** With equal cluster size $m$ and intracluster correlation $\rho$, multiply by the
-  design effect $1+(m-1)\rho$. If clusters contain 100 users and $\rho=0.02$, the factor is 2.98;
-  the recommendation example grows from 25,117 to about 74,849 users per arm.
-- **Attrition and eligibility.** Inflate for expected loss only when it is assignment-independent.
-  Treatment-caused inactivity is an outcome and must not be removed.
-- **Multiple treatments.** Power each planned contrast and control the relevant family of tests.
-  Reusing one control can save traffic, but correlated comparisons still require a valid correction.
-- **Sequential monitoring.** Use group-sequential boundaries or always-valid methods and calculate
-  power for that design. A fixed-horizon sample calculation does not authorize stopping whenever
-  $p<0.05$.
-- **Triggered experiments.** Base duration on the trigger rate, not total site traffic. Define the
-  trigger upstream of treatment and retain assignment for everyone who qualifies.
-- **Finite clusters or markets.** Ten million requests across eight geographic markets do not create
-  ten million independent units. Power may be limited by eight clusters; use randomization inference
-  or a longer switchback with enough randomized blocks.
-
-Before launch, save the assumptions next to the experiment configuration: baseline mean or rate,
-variance, absolute and relative MDE, $\alpha$, target power, allocation, eligible traffic per day,
-trigger rate, outcome delay, planned duration, and any variance-reduction factor. After the test,
-report confidence intervals and compare the observed control variance with the planning value.
-
-### A practical experiment plan
-
-For a new recommendation or ads ranker, a defensible sequence is:
-
-1. Validate logging and randomization with an A/A test. Check sample ratio mismatch overall and by
-   eligibility, device, country, and experiment day.
-2. Run offline replay only as a gate. Historical logs were generated by the old policy, so offline
-   NDCG, AUC, or revenue replay cannot establish the online causal effect of a new policy.
-3. Start with a small treatment ramp for safety, then reach the allocation used in the power plan.
-   Do not treat the ramp's repeated peeks as a fixed-horizon significance test.
-4. Keep assignment sticky at the user or account level. Log assignment separately from actual
-   exposure and analyze intention to treat.
-5. Predeclare one primary metric, guardrails, an MDE, duration, and a delayed-outcome window. Add
-   advertiser-, creator-, and content-side metrics for a multi-sided marketplace.
-6. Diagnose the metric tree and segments, but do not promote whichever slice happens to be
-   significant. Correct confirmatory families for multiple testing and replicate surprising effects.
-7. Measure novelty, carryover, and learning dynamics. If the product changes future training data,
-   state whether models were frozen or data was isolated.
-
-#### More common interview questions
-
-**Offline NDCG rose 5%, but online engagement fell. Why?** The logged test set reflects the old
-policy and observes feedback only for exposed items. The offline metric may weight positions or
-labels differently from the product objective; the new model may also add latency, reduce diversity,
-or exploit a biased click label. Verify the serving path, latency and candidate coverage, then use
-the randomized online result for the launch decision.
-
-**CTR rose 3%, but revenue fell 2%. Ship?** Not from those facts. Decompose revenue into eligible
-requests, ad load, click probability, conversion or advertiser value, price, and fill. Check the
-predeclared primary metric and guardrails. A CTR-optimized ranker may prefer low-price ads. If revenue
-is primary and the loss is precise and practically meaningful, do not ship merely because CTR won.
-
-**Clicks arrive immediately but purchases take seven days. When do you read the result?** Assign by
-event time, but mature each user's outcome for the full seven-day window. Either stop enrollment and
-wait seven days or use a prespecified delayed-outcome method. Comparing mature control users with
-immature treatment users creates a time-window bias.
-
-**Can we analyze only users who saw a recommendation or ad?** Only when exposure is a valid
-pre-treatment trigger that both variants reach under identical logic. “Saw the treatment card” or
-“treatment won the auction” is post-treatment selection. Use intention to treat; use a ghost-ad or
-other purpose-built design when the desired estimand is effect among those who would be exposed.
-
-**How long should the test run?** Long enough to reach the planned sample size, cover full product
-cycles, and mature delayed outcomes—while respecting the prespecified stopping rule. Recommendation
-tests may need additional time for novelty to fade and feedback loops to develop. “One week” is not
-a universal answer.
-
-## Control, experiments, layers, and buckets
-
-At platform scale, assignment must be stable, reproducible, and able to support concurrent tests.
-The useful hierarchy is:
-
-- A **variant** is one experience, usually control or treatment.
-- An **experiment** owns a population slice and divides it among variants.
-- A **layer** is a namespace of mutually exclusive experiments. One unit can enter at most one
-  experiment in a layer.
-- A **bucket** is a small allocation slot. An experiment reserves a set of buckets and maps those
-  buckets to variants.
-
-<ExperimentLayers users={12} buckets={16} />
-
-A service can compute
-
-$$
-b=\operatorname{hash}(\text{unit ID},\text{layer ID},\text{salt})\bmod B,
-$$
-
-where $B$ is the bucket count. The hash must be deterministic and close to uniform. Adding the
-layer ID re-randomizes the same user independently in each layer. Adding an experiment-specific
-salt can independently split the users reserved for that experiment into variants.
-
-Suppose a layer has 10,000 buckets. Checkout experiment E1 reserves buckets 0–999: 0–499 are
-control and 500–999 treatment, so it receives 10% of eligible traffic in a 50/50 split. Search
-experiment E2 can reserve 1,000–2,999 in the same layer without overlap. A ranking experiment in a
-different layer may use all 10,000 buckets, allowing E1 and the ranking test to run concurrently.
-
-Layers increase throughput, but only when cross-layer interactions are unlikely. A button-colour
-test and a ranking-model test may safely overlap. Two tests that both change checkout should share
-a layer and be mutually exclusive, or use an explicit factorial design. Hidden interactions make
-each experiment's effect depend on the other experiment's assignment.
-
-Do not bucket by `hash(user_id) % 100` and then change the modulus or boundaries casually. That can
-reshuffle existing users between variants and produce carryover. Production systems use stable
-hashes, many fine-grained buckets, versioned configuration, eligibility filters applied consistently,
-and logged assignment exposure so the analysis can reconstruct what a user actually received.
-
-### Triggering and exposure
-
-Assignment is not the same as exposure. A user may be assigned to the checkout experiment but never
-open checkout. **Triggered analysis** includes a unit once it reaches the point where treatment
-could affect it, improving sensitivity by excluding unaffected traffic. The trigger must be defined
-before assignment can influence it; filtering on a post-treatment action can bias the groups.
-
-Analyze by the original assignment—**intention to treat**—when delivery is imperfect. Comparing
-only users who successfully received treatment can destroy randomization because delivery failure
-may correlate with device, geography, or outcome.
-
-## Trust checks before reading impact
-
-A polished p-value cannot repair a broken experiment. Check trustworthiness first.
-
-1. **Run an A/A test.** Send both arms the same experience. Significant metrics should occur at
-   their advertised rate, and confidence intervals should have their advertised coverage.
-2. **Check sample ratio mismatch (SRM).** If a 50/50 experiment has a highly implausible assignment
-   count, investigate missing logs, eligibility differences, bad hashing, or crashes before reading
-   treatment effects.
-3. **Check invariant metrics.** Assignment should not change pre-experiment attributes such as
-   historical activity or country mix.
-4. **Verify exposure and telemetry.** The variant served, assignment ID, randomization unit, trigger,
-   and metric events must join without treatment-dependent loss.
-5. **Inspect novelty and carryover.** Users may explore a new interface briefly, while cached state
-   or learned behaviour can survive reassignment.
-6. **Treat guardrails as decisions.** A primary-metric win does not excuse a material regression in
-   latency, errors, safety, or long-term retention.
-
-Kohavi, Tang, and Xu emphasize this distinction: calculating numbers is easy; obtaining numbers
-that deserve trust requires engineering and diagnostic checks around the statistical test.
+With CUPED removing 36% of the variance, that drops to $25{,}117 \times 0.64 = 16{,}075$. If users
+come in clusters of 100 with within-cluster correlation 0.02, multiply by the design effect
+$1 + 99 \times 0.02 = 2.98$, giving about 74,849.
+
+**Rare ad conversion.** Baseline 2.0%, MDE 5% relative (2.0% → 2.1%, only 0.1 pp). The two-proportion
+formula gives 315,206 users per arm. Doubling the MDE to 10% relative cuts this to 80,682, about a
+quarter, because sample size scales with $1/\delta^2$.
+
+#### Holdouts
+
+A **holdout** is a random group that does not get a change. Different holdouts answer different
+questions:
+
+| holdout | question |
+| --- | --- |
+| Normal control | Should this one change launch? |
+| Campaign suppression | What did this ad campaign cause? |
+| Long-lived holdout (e.g. 2% of users for a quarter) | What is the total, lasting effect of all launches? |
+
+Adding up the lifts of individual tests usually overstates the total, because effects overlap and
+fade. A long-lived holdout measures the bundle directly. Keep its assignment fixed, apply safety
+fixes to everyone, and keep it as small as possible, since those users miss improvements.
+
+#### Quick interview answers
+
+- **Offline NDCG went up, online engagement went down?** Offline logs come from the old ranker and
+  only show feedback on items it chose; latency or diversity may also have changed. Trust the online
+  test.
+- **CTR up 3%, revenue down 2%?** Do not ship on CTR. Break revenue down into ad load, clicks, price
+  and conversion, and decide on the pre-chosen OEC.
+- **Purchases arrive up to 7 days after a click?** Give every user the full 7-day window before
+  comparing, so control and treatment are measured alike.
+- **How long to run?** Until the planned sample size is reached, covering at least full weeks, and
+  long enough for delayed outcomes and novelty to settle.
 
 ## Summary
 
-- Random assignment makes control and treatment comparable in expectation, turning a product
-  comparison into an estimate of causal effect.
-- A p-value asks how surprising the observed statistic would be under the null; it is not the
-  probability that the null is true or a measure of effect size.
-- Power is the chance that a design detects a specified real effect. Choose the MDE, $\alpha$,
-  target power, and sample size before reading the data.
-- Fixed-horizon, sequential, factorial, cluster, Bayesian, and bandit methods answer different
-  operational questions; their stopping and analysis rules are not interchangeable.
-- Recommendation and ads experiments must account for position bias, post-treatment denominators,
-  delayed outcomes, learning from shared data, auction interference, and multi-sided guardrails.
-- Guardrails define unacceptable harm. Give hard and launch guardrails explicit margins, power the
-  experiment to rule those margins out, and treat broken randomization or telemetry as invalidation.
-- MDE is a product decision expressed as an absolute effect. Sample size then follows from the MDE,
-  baseline variance, error rates, allocation, clustering, and the experiment's stopping rule.
-- Short-term controls answer individual launch questions; persistent and global holdouts measure
-  cumulative effects, decay, interactions, and feedback over time.
-- Stable hashing assigns units to buckets. Mutually exclusive experiments share a layer, while
-  separate layers let compatible experiments reuse traffic.
-- Validate assignment, exposure, metric logging, and SRM before interpreting any impact estimate.
+- Random assignment makes the two groups alike except for the change, so a difference in outcomes
+  measures what the change caused.
+- The **p-value** asks: if the change did nothing, how often would luck give a gap this large? It is
+  not the chance the change does nothing, and it says nothing about size. The **confidence interval**
+  shows the size.
+- **Power** is the chance the test detects an effect that really exists. Choose the MDE first, then
+  the sample size (about $16\sigma^2/\delta^2$ per arm for 80% power); half the effect needs four
+  times the users.
+- Trust before impact: follow Twyman's law, run A/A tests, check for sample ratio mismatch, do not
+  peek, and analyse everyone assigned.
+- A good OEC predicts long-term value; guardrails protect what must not get worse; interference,
+  feedback loops and long-term effects need special designs.
 
 ## References
 
@@ -929,22 +841,22 @@ that deserve trust requires engineering and diagnostic checks around the statist
    Guide to A/B Testing*](https://www.cambridge.org/core/books/trustworthy-online-controlled-experiments/BFFD7CC0B7325B5DCEEFFB1DD9401F7E), Cambridge University Press, 2020.
 2. Ron Kohavi et al., [“Controlled experiments on the web: survey and practical guide”](https://link.springer.com/article/10.1007/s10618-008-0114-1), *Data Mining and Knowledge Discovery*, 2009.
 3. Diane Tang et al., [“Overlapping Experiment Infrastructure: More, Better, Faster Experimentation”](https://research.google.com/pubs/archive/36500.pdf), *KDD*, 2010.
-4. Somit Gupta et al., [“The Anatomy of a Large-Scale Experimentation Platform”](https://www.microsoft.com/en-us/research/publication/the-anatomy-of-a-large-scale-experimentation-platform/), *ICSA*, 2018.
-5. NIST/SEMATECH, [“Critical values and p-values”](https://www.itl.nist.gov/div898/handbook/prc/section1/prc131.htm), *e-Handbook of Statistical Methods*.
-6. Carlos A. Gomez-Uribe and Neil Hunt, [“The Netflix Recommender System: Algorithms,
-   Business Value, and Innovation”](https://doi.org/10.1145/2843948), *ACM Transactions on
-   Management Information Systems*, 2015.
-7. Can Xu et al., [“Surrogate for Long-Term User Experience in Recommender
-   Systems”](https://research.google/pubs/surrogate-for-long-term-user-experience-in-recommender-systems/),
-   *KDD*, 2022.
-8. Jennifer Brennan et al., [“Reducing Symbiosis Bias through Better A/B Tests of Recommendation
+4. Alex Deng, Ya Xu, Ron Kohavi, and Toby Walker, [“Improving the Sensitivity of Online Controlled
+   Experiments by Utilizing Pre-Experiment Data”](https://exp-platform.com/Documents/2013-02-CUPED-ImprovingSensitivityOfControlledExperiments.pdf), *WSDM*, 2013.
+5. Aleksander Fabijan et al., [“Diagnosing Sample Ratio Mismatch in Online Controlled
+   Experiments”](https://exp-platform.com/Documents/2019_KDDFabijanGupchupFuptaOmhoverVermeerDmitriev.pdf), *KDD*, 2019.
+6. Henning Hohnhold, Deirdre O'Brien, and Diane Tang, [“Focusing on the Long-term: It's Good for
+   Users and Business”](https://research.google/pubs/focusing-on-the-long-term-its-good-for-users-and-business/), *KDD*, 2015.
+7. Brett R. Gordon et al., [“A Comparison of Approaches to Advertising Measurement: Evidence from Big
+   Field Experiments at Facebook”](https://doi.org/10.1287/mksc.2018.1135), *Marketing Science*, 2019.
+8. Somit Gupta et al., [“The Anatomy of a Large-Scale Experimentation Platform”](https://www.microsoft.com/en-us/research/publication/the-anatomy-of-a-large-scale-experimentation-platform/), *ICSA*, 2018.
+9. Jennifer Brennan et al., [“Reducing Symbiosis Bias through Better A/B Tests of Recommendation
    Algorithms”](https://research.google/pubs/reducing-symbiosis-bias-through-better-ab-tests-of-recommendation-algorithms/),
    *The Web Conference*, 2025.
-9. Garrett A. Johnson, Randall A. Lewis, and Elmar I. Nubbemeyer, [“Ghost Ads: Improving the
-   Economics of Measuring Online Ad Effectiveness”](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2620078),
-   *Journal of Marketing Research*, 2017.
-10. Iavor Bojinov, David Simchi-Levi, and Jinglong Zhao, [“Design and Analysis of Switchback
+10. Garrett A. Johnson, Randall A. Lewis, and Elmar I. Nubbemeyer, [“Ghost Ads: Improving the
+    Economics of Measuring Online Ad Effectiveness”](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2620078),
+    *Journal of Marketing Research*, 2017.
+11. Iavor Bojinov, David Simchi-Levi, and Jinglong Zhao, [“Design and Analysis of Switchback
     Experiments”](https://arxiv.org/abs/2009.00148), 2020.
-11. Alex Deng and Ronny Kohavi, [“External Validity of Online Experiments: Can We Predict the
-    Future?”](https://www.microsoft.com/en-us/research/articles/external-validity-of-online-experiments-can-we-predict-the-future/),
-    Microsoft Experimentation Platform, 2024.
+12. National Commission for the Protection of Human Subjects, [*The Belmont
+    Report*](https://www.hhs.gov/ohrp/regulations-and-policy/belmont-report/index.html), 1979.
