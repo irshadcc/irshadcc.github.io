@@ -1,0 +1,26 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import BoxDiagram from "../../utils/payments/BoxDiagram.astro";
+import RaceCheck from "../../utils/verification/RaceCheck.astro";
+import SymExecTree from "../../utils/verification/SymExecTree.astro";
+import {
+	gapCode,
+	gapTree,
+	mlStackEdges,
+	mlStackNodes,
+} from "../../utils/verification/verificationFigures";
+---
+
+<Layout title="Formal verification figures">
+	<h1>Formal verification figures</h1>
+	<h2>SymExecTree</h2>
+	<SymExecTree code={gapCode} nodes={gapTree} title="Symbolic execution of gap(x, y)" />
+	<SymExecTree code={gapCode} nodes={gapTree} step={4} title="Starting at step 5 (first bug)" />
+	<h2>RaceCheck</h2>
+	<RaceCheck n={8} variant="none" t1={0} t2={2} title="n = 8, no barrier" />
+	<RaceCheck n={8} variant="barrier" title="n = 8, barrier after the if" />
+	<RaceCheck n={16} variant="inside" t1={0} t2={9} title="n = 16, barrier inside the if" />
+	<RaceCheck n={4} variant="none" t1={1} t2={0} title="n = 4" />
+	<h2>BoxDiagram: ML compiler stack</h2>
+	<BoxDiagram nodes={mlStackNodes} edges={mlStackEdges} selected="graph" />
+</Layout>

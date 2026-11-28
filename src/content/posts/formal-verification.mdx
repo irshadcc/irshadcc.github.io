@@ -1,0 +1,1074 @@
+---
+title: "Formal Verification: From Python Functions to GPU Kernels and ML Compilers"
+description: "What it means to prove a program correct, shown with Z3 and CrossHair on small Python functions, then the same ideas applied to GPU kernels (data races, barrier divergence) and ML compilers (translation validation, tensor rewrite rules, floating point, Mirage's probabilistic checks)."
+date: 2026-11-28
+tags: [Compilers, Draft]
+---
+
+import Sidenote from "../../components/Sidenote.astro";
+import BoxDiagram from "../../utils/payments/BoxDiagram.astro";
+import SymExecTree from "../../utils/verification/SymExecTree.astro";
+import RaceCheck from "../../utils/verification/RaceCheck.astro";
+import DependencyGraph from "../../utils/graph/DependencyGraph.astro";
+import {
+	gapCode,
+	gapTree,
+	mlStackNodes,
+	mlStackEdges,
+	tvNodes,
+	tvEdges,
+	twoThreadNodes,
+	twoThreadEdges,
+	paperNodes,
+	paperEdges,
+} from "../../utils/verification/verificationFigures";
+
+## Background
+
+Every programmer knows how to check a function: run it on some inputs and compare the outputs to
+what you expected. A test suite does this a few thousand times. But a test only says something
+about the inputs it tried. A 32-bit function has $2^{32}$ inputs per argument, a kernel runs on
+thousands of threads in orders nobody controls, and a compiler is run on programs its authors
+never saw. The bug is usually in the input nobody tried.
+
+**Formal verification** is the other approach: state precisely what the program should do (a
+**specification**), then *prove*, by a mechanical argument that covers every input, that the
+program meets it. When the proof fails, a good tool hands back a **counterexample**: a concrete
+input that breaks the specification. This matters most where bugs are expensive and hard to see by
+testing: a data race in a GPU kernel that shows up once a week on one GPU model, or a compiler
+rewrite that is wrong only for negative zero.
+
+The post builds up in three parts:
+
+1. **The ideas, on Python functions.** Why testing misses bugs, how to write a specification, how
+   an SMT solver (Z3) proves or refutes it, symbolic execution, and loop invariants. Every example
+   is runnable Python.
+2. **GPU kernels.** What can go wrong (races, barrier divergence, out-of-bounds accesses), and how
+   GPUVerify's two-thread reduction turns a kernel with thousands of threads into a small
+   sequential problem, re-implemented in a few lines of Z3.
+3. **ML compilers.** Translation validation (Alive2), verifying tensor graph rewrite rules for all
+   shapes (TASO, TensorRight), why floating point breaks algebra, and Mirage's probabilistic
+   equivalence checks.
+
+A final section goes through the important papers behind all three parts, from Hoare (1969) to
+TensorRight and Mirage (2025), with what each one contributed.
+
+All the code below was run with `z3-solver` 5.4.1, `crosshair-tool` 0.0.114 and `hypothesis`
+6.170 on Python 3.12, and the outputs shown are copied from those runs. The [PTX
+post](/blog/ptx/) and the [LLVM NVPTX backend post](/blog/llvm-nvptx-backend/) give background
+on the GPU side; [TorchInductor](/blog/torch-inductor/) and [MLIR](/blog/mlir/) on the compiler
+side.
+
+## Testing is not enough
+
+Take the midpoint of a binary search, written the way it is in C, Java or a CUDA kernel, with
+32-bit signed integers. Python integers never overflow, so `wrap32` imitates the 32-bit
+wraparound:
+
+```python
+def wrap32(v):                       # signed 32-bit wraparound, like C's int
+    v &= 0xFFFFFFFF
+    return v - (1 << 32) if v >= (1 << 31) else v
+
+def mid_bad(lo, hi):
+    return wrap32(lo + hi) // 2      # (lo + hi) / 2 in C
+
+def mid_good(lo, hi):
+    return lo + (hi - lo) // 2
+```
+
+The specification is short: if $0 \le lo \le hi$, the midpoint lies in $[lo, hi]$. A million random
+tests on arrays of up to 10,000 elements all pass:
+
+```python
+import random
+random.seed(0)
+fails = 0
+for _ in range(1_000_000):
+    n = random.randint(1, 10_000)
+    lo = random.randint(0, n - 1); hi = random.randint(lo, n - 1)
+    if not (lo <= mid_bad(lo, hi) <= hi):
+        fails += 1
+print("failures:", fails)
+```
+
+```text
+failures: 0
+```
+
+Yet the function is wrong. When $lo + hi > 2^{31} - 1$ the sum wraps to a negative number and the
+"midpoint" is negative. That needs an array of more than a billion elements, which no test above
+generates.<Sidenote>This is the bug Joshua Bloch described in 2006 in the JDK's
+`Arrays.binarySearch`, which had shipped for about nine years. It had been in *Programming
+Pearls*' binary search too.</Sidenote> The tests did not fail because the inputs that fail are
+rare, not because there are none.
+
+## Specifications
+
+Before proving anything we must say what "correct" means. The classic form is the **Hoare
+triple** $\{P\}\ C\ \{Q\}$: if the **precondition** $P$ holds before code $C$ runs, then the
+**postcondition** $Q$ holds after it. For the midpoint:
+
+$$
+\{\, 0 \le lo \le hi < 2^{31} \,\}\quad m = (lo + hi) / 2 \quad \{\, lo \le m \le hi \,\}
+$$
+
+In Python, a precondition is an `assert` at the top of the function and a postcondition is an
+`assert` before the `return`, or a contract in a docstring that a tool reads (CrossHair below
+uses `post: ...` lines). Three kinds of property come up again and again:
+
+| Property | Question | Example in this post |
+| --- | --- | --- |
+| **Safety** | Can something bad ever happen? | an assertion fails, a data race, an out-of-bounds read |
+| **Functional correctness** | Does the output equal the specification? | the loop computes $n(n-1)/2$ |
+| **Equivalence** | Do two programs compute the same thing? | an optimised kernel vs the reference, a rewrite rule |
+
+Equivalence is the one compilers care about: a compiler pass is correct if its output means the
+same as its input, whatever that input does.
+
+## Proving with an SMT solver
+
+A **SAT solver** decides whether a Boolean formula has a satisfying assignment. An **SMT solver**
+(satisfiability modulo theories) does the same for formulas that also contain integers,
+bit-vectors, arrays, reals or floating-point numbers, using a decision procedure for each
+**theory**. Z3, from Microsoft Research, is the one most tools build on, and it has Python
+bindings (`pip install z3-solver`).
+
+The trick that turns a solver into a prover: to prove a claim $F$ for all inputs, ask the solver
+for an input where $\lnot F$ holds. If it answers **unsat** (no such input), $F$ is true for every
+input. If it answers **sat**, the satisfying assignment (the **model**) is a counterexample.
+
+```python
+from z3 import *
+
+def verify(name, claim):
+    s = Solver()
+    s.add(Not(claim))            # look for a counterexample
+    if s.check() == unsat:
+        print(f"{name}: proved")
+    else:
+        print(f"{name}: counterexample", s.model())
+
+x = BitVec("x", 32)              # a 32-bit machine integer, not a math integer
+verify("x*2 == x<<1", x * 2 == x << 1)
+verify("x+1 > x (signed)", x + 1 > x)
+verify("x & (x-1) == 0  <=>  x is 0 or a power of two",
+      (x & (x - 1) == 0) == Or(x == 0, *[x == (1 << k) for k in range(32)]))
+```
+
+```text
+x*2 == x<<1: proved
+x+1 > x (signed): counterexample [x = 2147483647]
+x & (x-1) == 0  <=>  x is 0 or a power of two: proved
+```
+
+Each "proved" covers all $2^{32}$ values of `x` at once; Z3 did not try them one by one. The second
+claim, true for mathematical integers, is false for machine integers: $2^{31} - 1 + 1$ wraps to
+$-2^{31}$. The choice of **theory** (here 32-bit bit-vectors) is part of the specification. Prove
+the right claim about the wrong number system and the proof means nothing.
+
+### The midpoint, proved and refuted
+
+Now the binary-search midpoint, with `lo` and `hi` as 32-bit bit-vectors. Z3's `/` on bit-vectors
+is signed division that rounds toward zero, the same as C's:
+
+```python
+lo, hi = BitVec("lo", 32), BitVec("hi", 32)
+
+s = Solver()
+s.add(lo >= 0, hi >= 0, lo <= hi)          # precondition (signed comparisons)
+mid = (lo + hi) / 2
+s.add(mid < lo)                             # negation of (part of) the postcondition
+print("bad:", s.check())
+m = s.model()
+print("  lo =", m[lo].as_signed_long(), " hi =", m[hi].as_signed_long(),
+      " mid =", m.eval(mid).as_signed_long())
+
+s = Solver()
+s.add(lo >= 0, hi >= 0, lo <= hi)
+mid = lo + (hi - lo) / 2
+s.add(Or(mid < lo, mid > hi))
+print("good:", s.check())
+```
+
+```text
+bad: sat
+  lo = 52170755  hi = 2138767357  mid = -1052014592
+good: unsat
+```
+
+Check the counterexample by hand. The sum is $52170755 + 2138767357$, which is $2190938112$. That
+is above $2^{31} - 1 = 2147483647$, so it wraps to $2190938112 - 2^{32}$, which is
+$-2104029184$, and half of that is $-1052014592$.<Sidenote>Z3 returns *a* model, not a canonical one, and which one depends on the
+solver's version and on what was asked before in the same session. The outputs in this post come
+from running all its Python blocks in order in one process; if you run a block on its own, you may
+see a different counterexample, which is equally valid.</Sidenote> The fixed version is **unsat**: for every one of the roughly
+$2^{61}$ valid pairs, the midpoint is in range. That is the difference between a test and a proof.
+
+## Symbolic execution
+
+A solver needs a formula, so something must turn a program into one. **Symbolic execution** does
+it by running the program on symbols instead of numbers. Each variable holds an expression over
+the inputs. At each `if`, execution forks: one copy assumes the condition, the other its negation.
+The conjunction of conditions along a path is the **path condition**. The solver decides whether
+a path condition is satisfiable (the path is reachable) and, at an `assert`, whether the assertion
+can fail on that path.
+
+Here is a small function with a planted bug and a line of dead code:
+
+```python
+def gap(x: int, y: int) -> int:
+    if x > y:
+        z = x - y
+    else:
+        z = y - x
+    if z < 0:
+        return -1          # dead code?
+    if z == 7:
+        assert x != 10     # the bug
+    return z
+```
+
+Step through the exploration below. Watch the two `z < 0` nodes go grey: the solver proves those
+paths infeasible, which no amount of testing can do. Then watch the two red nodes, each with a
+concrete input that fails the assertion.
+
+<SymExecTree code={gapCode} nodes={gapTree} title="Symbolic execution of gap(x, y), depth first. Hover a node for its path condition and model." />
+
+Eight paths cover every pair of Python ints. The same exploration, by hand, in Z3:
+
+```python
+x, y = Ints("x y")       # unbounded integers, like Python's int
+
+def check(*conds):
+    s = Solver(); s.add(*conds)
+    r = s.check()
+    return r, (s.model() if r == sat else None)
+
+for c, z in ((x > y, x - y), (x <= y, y - x)):
+    print(c, "| z < 0:", check(c, z < 0)[0],
+          "| assert fails:", check(c, z >= 0, z == 7, x == 10))
+```
+
+```text
+x > y | z < 0: unsat | assert fails: (sat, [x = 10, y = 3])
+x <= y | z < 0: unsat | assert fails: (sat, [x = 10, y = 17])
+```
+
+You don't write this loop yourself. **CrossHair** symbolically executes ordinary Python (it
+replaces arguments with symbolic proxy objects and asks Z3 about each branch) and checks
+`assert`s and docstring contracts:
+
+```bash
+$ crosshair check --analysis_kind=PEP316 gap.py      # gap's docstring: """post: _ >= 0"""
+gap.py:10: error: AssertionError:  when calling gap(10, 17)
+```
+
+For comparison, 20 runs of Hypothesis, a property-based random tester, at its default 100
+examples each, never found this input. The failing set is the line $y - x = 7$ through one point
+in a plane of integer pairs, and random sampling rarely lands on a line.<Sidenote>Hypothesis is
+very good at the bugs it is designed for (boundaries such as 0, −1 and large values, and shrinking
+a failure to a small one). It is not a substitute for a solver when the bug needs an exact
+equation between inputs, and a solver is not a substitute for Hypothesis when the code calls
+something the solver cannot model.</Sidenote>
+
+Symbolic execution has one big limit: the number of paths grows exponentially with the number of
+branches, and a loop whose trip count depends on the input has unboundedly many paths. Tools
+either stop after a fixed depth (CrossHair has a time budget per function) or need the next idea.
+
+## Loops: invariants
+
+To prove a loop for any number of iterations, give it a **loop invariant**: a formula that holds
+every time execution reaches the loop test. The proof is induction, in three checks, each a
+loop-free formula a solver can decide:
+
+1. **Initiation.** The precondition implies the invariant before the first iteration.
+2. **Preservation.** If the invariant and the loop condition hold, one execution of the body
+   re-establishes the invariant.
+3. **Exit.** The invariant and the negated loop condition imply the postcondition.
+
+Example: the sum $0 + 1 + \dots + (n - 1)$.
+
+```python
+def sum_to(n):
+    assert n >= 0                       # precondition
+    i, s = 0, 0
+    while i < n:                        # invariant: 0 <= i <= n and 2*s == i*(i-1)
+        s += i
+        i += 1
+    assert 2 * s == n * (n - 1)         # postcondition
+    return s
+```
+
+The three checks in Z3. `substitute` builds the invariant at the state after one iteration:
+$I(i + 1, s + i)$:
+
+```python
+n, i, s = Ints("n i s")
+
+def valid(name, f):
+    so = Solver(); so.add(Not(f))
+    print(f"  {name}:", "valid" if so.check() == unsat else f"FAILS, e.g. {so.model()}")
+
+def vcs(label, inv):
+    print(label)
+    pre, post = n >= 0, 2 * s == n * (n - 1)
+    I = lambda i_, s_: substitute(inv, (i, i_), (s, s_))
+    valid("init     pre => I(0,0)", Implies(pre, I(IntVal(0), IntVal(0))))
+    valid("preserve I & i<n => I(i+1, s+i)", Implies(And(pre, inv, i < n), I(i + 1, s + i)))
+    valid("exit     I & !(i<n) => post", Implies(And(pre, inv, Not(i < n)), post))
+
+vcs("correct invariant: 0<=i<=n and 2s == i(i-1)", And(0 <= i, i <= n, 2 * s == i * (i - 1)))
+vcs("wrong invariant: 0<=i<=n and 2s == i(i+1)", And(0 <= i, i <= n, 2 * s == i * (i + 1)))
+vcs("too weak: 0<=i<=n", And(0 <= i, i <= n))
+vcs("no bound on i: 2s == i(i-1)", 2 * s == i * (i - 1))
+```
+
+```text
+correct invariant: 0<=i<=n and 2s == i(i-1)
+  init     pre => I(0,0): valid
+  preserve I & i<n => I(i+1, s+i): valid
+  exit     I & !(i<n) => post: valid
+wrong invariant: 0<=i<=n and 2s == i(i+1)
+  init     pre => I(0,0): valid
+  preserve I & i<n => I(i+1, s+i): FAILS, e.g. [i = 1, s = 1, n = 14]
+  exit     I & !(i<n) => post: FAILS, e.g. [n = 1, i = 1, s = 1]
+too weak: 0<=i<=n
+  init     pre => I(0,0): valid
+  preserve I & i<n => I(i+1, s+i): valid
+  exit     I & !(i<n) => post: FAILS, e.g. [s = -6, n = 12, i = 12]
+no bound on i: 2s == i(i-1)
+  init     pre => I(0,0): valid
+  preserve I & i<n => I(i+1, s+i): valid
+  exit     I & !(i<n) => post: FAILS, e.g. [n = 1, s = 1, i = 2]
+```
+
+Read the failures, because they are how a verifier talks to you:
+
+- **Wrong invariant.** From $i = 1, s = 1$ (where $2s = i(i+1) = 2$ holds), one iteration gives
+  $i = 2, s = 2$, and $2 \cdot 2 \ne 2 \cdot 3$. The formula is not preserved, so it is not an
+  invariant.
+- **Too weak.** $0 \le i \le n$ is a true invariant, but it says nothing about `s`, so the exit
+  check cannot conclude the postcondition: at exit with $i = n = 12$, `s = -6` is consistent with
+  everything it says.
+- **No bound on i.** Without $i \le n$, exiting the loop only tells us $i \ge n$, not $i = n$.
+  The solver found $i = 2 > n = 1$ with $2s = i(i-1) = 2$, where the postcondition needs $2s = 0$.
+
+Only the first invariant passes all three. The model shows the invariant is wrong or too weak,
+never that the program is wrong; finding the invariant is the creative part, and the reason tools
+for unbounded verification ask for annotations. This is how **deductive verifiers** work: Dafny,
+Why3, Frama-C for C, Nagini for Python (built on the Viper framework), VerCors for GPU programs.
+They compute these **verification conditions** from annotated code and send them to an SMT
+solver.
+
+## The verification toolbox
+
+The examples above sit on a spectrum, from cheap and partial to expensive and complete:
+
+| Approach | What it gives, at what cost | Examples: Python; GPUs and compilers |
+| --- | --- | --- |
+| Testing, fuzzing | evidence on the inputs tried; cheap | Hypothesis; NNSmith |
+| Bounded model checking | proof up to a size or loop bound; automatic, grows with the bound | CrossHair (time-bounded); Alive2, TASO |
+| Symbolic execution | per-path proof and counterexamples; automatic, path explosion | CrossHair; GKLEE, Faial |
+| Deductive verification | proof for all inputs; needs invariants and contracts | Nagini; GPUVerify, VerCors |
+| Proof assistant | machine-checked proof of anything you can state; expert work | Lean, Coq / Rocq; PTX memory model, Lean-MLIR, CompCert |
+| Random tests with a theorem | proof with error probability at most $\delta$; needs a restricted program class | NumPy; Mirage |
+
+Two terms are worth defining here. A verifier is **sound** if "verified" really means correct (no
+missed bugs within its model). It is **complete** if every correct program can be verified (no false
+alarms). Undecidability means no tool is both for all programs, so each picks a side. GPUVerify is
+sound but can raise false alarms; Hypothesis never raises a false alarm but can miss bugs.
+
+## Verifying GPU kernels
+
+### What goes wrong
+
+A CUDA kernel is a function run by thousands of threads at once. Threads in one block share fast
+**shared memory** and synchronise with `__syncthreads()`, a **barrier**: no thread passes it until
+every thread in the block has reached it. Three bug classes are specific to this model:
+
+- **Data race.** Two threads access the same address, at least one writes, and nothing orders the
+  accesses. CUDA does not define the result. The value read depends on scheduling, so the kernel
+  can pass a test a thousand times and fail on the next GPU generation.
+- **Barrier divergence.** A `__syncthreads()` inside a branch that some threads of the block take
+  and others do not. CUDA requires every thread of the block to reach the same barrier; if they do
+  not, the behaviour is undefined (a hang, or silently wrong synchronisation).
+- **Out-of-bounds access** from an index computed from `threadIdx`, `blockIdx` and the problem
+  size, typically on the last, partial tile.
+
+Testing finds these badly. A race needs an unlucky schedule; an out-of-bounds read of shared
+memory often returns garbage without crashing. And a kernel is meant to work for every block size
+and problem size, not the three a test tries.
+
+### The two-thread reduction
+
+The obvious encoding, one copy of the state per thread and every interleaving of their steps, does
+not scale beyond a few threads. **GPUVerify** (Betts, Chong, Donaldson, Qadeer, Thomson et al.,
+OOPSLA 2012 and TOPLAS 2015) observed that both properties are about *pairs*: a race is a conflict
+between two threads, and barrier divergence is two threads disagreeing about a barrier. So it
+suffices to check **one arbitrary pair** of distinct threads, with symbolic ids $t_1 \ne t_2$. If no
+pair can conflict, no two threads in the kernel can.
+
+<BoxDiagram nodes={twoThreadNodes} edges={twoThreadEdges} selected="pick" title="GPUVerify's pipeline: from n threads to one sequential program for Z3" />
+
+Three details make it work:
+
+- **Lock-step between barriers.** GPUVerify's semantics (synchronous, delayed visibility) runs the
+  two threads in lock-step as one *sequential* program of parallel assignments, so there are no
+  interleavings to explore. Writes are logged rather than made visible, and a barrier checks the
+  logs and then clears them.
+- **The other threads are abstracted.** Under the **adversarial abstraction**, a read of shared
+  memory returns an arbitrary value, since some other thread may have written anything. The
+  **equality abstraction** lets both threads read the same arbitrary value, which some kernels need
+  (when control flow depends on shared data). GPUVerify picks per array with a taint analysis.
+- **Loop invariants are inferred.** GPUVerify generates candidate invariants and keeps the largest
+  inductive subset with the **Houdini** algorithm, then Boogie produces verification conditions
+  for Z3.
+
+The TOPLAS paper evaluates GPUVerify on 162 OpenCL and CUDA kernels; for 132 of them verification
+took less than 10 seconds, and on a held-out set of 70 kernels it verified 49 fully
+automatically.<Sidenote>Numbers from Betts et al., *The Design and Implementation of a Verification
+Technique for GPU Kernels*, TOPLAS 2015. The 49 of 70 (69%) is for the evaluation set kept apart
+from the kernels used to develop the invariant-inference rules.</Sidenote>
+
+### A tree reduction in Z3
+
+The classic shared-memory sum over a block of $n$ threads halves the stride each round:
+
+```cpp
+for (int s = n / 2; s > 0; s >>= 1) {
+    if (tid < s) sdata[tid] += sdata[tid + s];   // read tid, read tid + s, write tid
+    __syncthreads();
+}
+```
+
+The two-thread encoding needs only the accesses of thread $t$ in the round with stride $s$: read
+`sdata[t]`, read `sdata[t + s]`, write `sdata[t]`, all guarded by $t < s$. With the barrier, the
+two threads are always in the same round. Without it, one may be a round ahead of the other. Here
+$n$, $s$, $t_1$ and $t_2$ are *all* symbolic, so one query covers every block size:
+
+```python
+from z3 import *
+
+def accesses(t, s):                  # (kind, address, enabled) for thread t, stride s
+    en = t < s
+    return [("R", t, en), ("R", t + s, en), ("W", t, en)]
+
+def race_query(N, t1, t2, s1, s2, extra):
+    sol = Solver()
+    sol.add(N >= 2, 0 <= t1, t1 < N, 0 <= t2, t2 < N, t1 != t2, *extra)
+    conflicts = [And(e1, e2, a1 == a2)
+                 for k1, a1, e1 in accesses(t1, s1)
+                 for k2, a2, e2 in accesses(t2, s2) if "W" in (k1, k2)]
+    sol.add(Or(*conflicts))
+    return sol
+
+N, t1, t2, s1, s2 = Ints("N t1 t2 s1 s2")
+stride_ok = lambda s: And(s >= 1, 2 * s <= N)
+
+sol = race_query(N, t1, t2, s1, s2, [stride_ok(s1), s1 == s2])      # with barrier
+print("with barrier:", sol.check())
+
+sol = race_query(N, t1, t2, s1, s2, [stride_ok(s1), stride_ok(s2), s1 == 2 * s2,
+                                     N == 8])                        # no barrier
+print("no barrier, n = 8:", sol.check(), sol.model())
+```
+
+```text
+with barrier: unsat
+no barrier, n = 8: sat [t1 = 2, s2 = 2, t2 = 0, s1 = 4, N = 8]
+```
+
+With the barrier: **unsat**, so the kernel is race-free for every $n$ and every pair of threads.
+The argument the solver found is short: within one round, a write by $t_1$ to `sdata[t1]` could
+only clash with $t_2$'s read of `sdata[t2 + s]`, which needs $t_1 = t_2 + s \ge s$, but $t_1$ only
+writes when $t_1 < s$.
+
+Without the barrier: thread 2, still in round $s = 4$, writes `sdata[2]` while thread 0, already in
+round $s = 2$, reads `sdata[2]`. Two more queries in the same style (not shown) check
+the other bug classes: the read `sdata[t + s]` is always in bounds ($t < s$ and $2s \le n$ imply
+$t + s < n$: unsat for an out-of-bounds index), and moving the barrier inside the `if` is
+barrier divergence (sat with $t_1 = 0, t_2 = 1, s = 1$).<Sidenote>Thread 0 and thread 2 are in the
+same warp at $n = 8$. Before Volta, warps ran in lock-step, and "warp-synchronous" code like this
+often worked by accident. Since Volta's independent thread scheduling it is not guaranteed, and
+CUDA's memory model counts it as a race either way; the fix is `__syncwarp()` or a barrier.</Sidenote>
+
+### Explore the races
+
+The figure enumerates the same accesses concretely for $n = 8$. Each arc goes from the cell a
+thread reads (`sdata[t + s]`) to the cell it writes (`sdata[t]`). Start with "no barrier" and the
+pair $t_1 = 0, t_2 = 2$: the red outline marks `sdata[2]`, written by thread 2 in round 4 and
+read by thread 0 in round 2. Switch to "barrier after the if" and the race disappears for every
+pair; "Find a bad pair" then reports that none exists. "Barrier inside the if" turns the last
+barrier red for any pair that disagrees on `tid < s`.
+
+<RaceCheck n={8} variant="none" t1={0} t2={2} title="Two-thread check of a tree reduction, n = 8 (scaled down from a typical 256-thread block)" />
+
+At $n = 8$ without the barrier, 3 of the 28 thread pairs race: (0, 1), (0, 2) and (1, 3). The
+count grows as $n/2 - 1$ (1 pair at $n = 4$, 7 at $n = 16$, 15 at $n = 32$), and checking by
+enumeration costs $O(n^2)$ pairs, which is exactly why GPUVerify keeps the ids symbolic and asks one query
+instead.
+
+### Beyond races
+
+Race freedom is the start, not the end. Current work, roughly in order of ambition:
+
+- **Faial** (Cogumbreiro, Lange et al., CAV 2021) extracts a *memory access protocol* from a CUDA
+  kernel and checks data-race freedom compositionally; its authors report verifying 218 of 227
+  real-world kernels, with symbolic array sizes.
+- **Equivalence checking of ML kernels.** Volta (Driscoll, Dubey, Wei, Kayal, Sharma, Aiken,
+  arXiv 2511.12638) describes itself as the first equivalence checker for GPU kernels: it proves
+  that an optimised kernel, written by hand, by an LLM or by a compiler, computes the same output as
+  a reference, and is sound, and complete for a defined class of kernels that includes
+  convolutions, matrix multiplications and attention variants.
+- **Functional proofs.** VerCors, a deductive verifier with permission-based separation logic,
+  proves memory safety, race freedom and functional properties of GPU programs from annotations;
+  recent work drives it, or the Lean proof assistant, with LLMs to verify LLM-generated kernels,
+  and formalises PTX itself in Lean.
+- **The memory model.** What a load may return when threads share memory without a barrier is
+  defined by the PTX memory consistency model. Lustig, Sahasrabuddhe and Giroux (ASPLOS 2019)
+  turned NVIDIA's English specification into an axiomatic model, tested the mapping from scoped
+  C++ atomics onto it in Alloy, and proved that mapping sound in Coq for programs of any size.
+
+## Verifying ML compilers
+
+### Where the bugs are
+
+An ML compiler lowers a tensor program through several representations, and each stage rewrites
+the program. A wrong rewrite is a **miscompilation**: the model runs and produces slightly wrong
+numbers, which in training looks like a loss curve that is a bit worse for no clear reason. Click
+the stages below to see which verification technique fits where.
+
+<BoxDiagram nodes={mlStackNodes} edges={mlStackEdges} selected="graph" title="An ML compiler stack and the verifiers that apply at each level" />
+
+These bugs are common. Differential testing, compiling random models and comparing against a
+reference, keeps finding them: NNSmith (ASPLOS 2023) reported 72 new bugs in TVM, TensorRT,
+ONNXRuntime and PyTorch. Testing finds bugs; the techniques below rule them out for a whole class
+of inputs.
+
+### Translation validation
+
+Proving a whole compiler correct is possible (CompCert, a C compiler verified in Coq, took years
+of expert effort), but nobody will do it for LLVM or XLA. **Translation validation** proves
+something smaller and practical: that *this* output of the compiler is correct for *this* input.
+The pass itself stays unverified.
+
+<BoxDiagram nodes={tvNodes} edges={tvEdges} selected="smt" title="Translation validation: check each compile, not the compiler" />
+
+For a compiler the right notion is **refinement**, not equality: the target may be *more* defined
+than the source, never less. LLVM has **poison** values, the result of an operation that broke a
+promise (for example `add nsw`, "no signed wrap", that did overflow). Poison lets the compiler
+assume the promise holds. So the target refines the source if, for every input where the source is
+not poison, the target is not poison and has the same value. Here is that check for five peephole
+rewrites, on 8-bit integers so the counterexamples are readable:
+
+```python
+from z3 import *
+x = BitVec("x", 8)
+one, two, zero = BitVecVal(1, 8), BitVecVal(2, 8), BitVecVal(0, 8)
+
+def refines(name, src, src_poison, tgt, tgt_poison=BoolVal(False)):
+    s = Solver()
+    s.add(Not(src_poison), Or(tgt_poison, tgt != src))   # src defined, tgt differs
+    if s.check() == unsat:
+        print(f"{name}: correct")
+    else:
+        m = s.model(); v = m.eval(x, model_completion=True)
+        print(f"{name}: WRONG for x = {v.as_signed_long()}: "
+              f"src = {m.eval(src, True).as_signed_long()}, tgt = {m.eval(tgt, True).as_signed_long()}")
+
+cmp = If(x + one > x, one, zero)                              # icmp sgt (x + 1), x
+refines("icmp sgt (add x, 1), x      =>  true", cmp, BoolVal(False), one)
+refines("icmp sgt (add nsw x, 1), x  =>  true", cmp, Not(BVAddNoOverflow(x, one, True)), one)
+refines("mul x, 2   =>  shl x, 1",  x * two,       BoolVal(False), x << 1)
+refines("udiv x, 2  =>  lshr x, 1", UDiv(x, two),  BoolVal(False), LShR(x, 1))
+refines("sdiv x, 2  =>  ashr x, 1", x / two,       BoolVal(False), x >> 1)
+```
+
+```text
+icmp sgt (add x, 1), x      =>  true: WRONG for x = 127: src = 0, tgt = 1
+icmp sgt (add nsw x, 1), x  =>  true: correct
+mul x, 2   =>  shl x, 1: correct
+udiv x, 2  =>  lshr x, 1: correct
+sdiv x, 2  =>  ashr x, 1: WRONG for x = -49: src = -24, tgt = -25
+```
+
+The first two lines are the same rewrite with and without `nsw`: the flag makes overflow poison,
+the solver may then ignore $x = 127$, and the rewrite becomes correct. The last one is the classic
+trap: signed division rounds toward zero ($-49 / 2 = -24$), an arithmetic shift rounds toward
+$-\infty$ ($-49 \gg 1 = -25$).
+
+**Alive2** (Lopes, Lee, Hur, Liu, Regehr, PLDI 2021) does this for real LLVM IR, with undef, poison,
+immediate undefined behaviour and memory, for any intra-procedural pass. It is *bounded*: loops are
+unrolled a fixed number of times, so it can miss bugs that need more iterations. Run over LLVM's
+own unit tests, it found 47 new bugs, 28 of which had been fixed by publication.
+
+### Verifying graph rewrites
+
+Tensor compilers rewrite whole graphs: fold a transpose into a matmul, fuse a pad into a
+convolution, reassociate a chain of matmuls. A graph rewrite rule is used on every model the
+compiler sees, so it is worth proving the rule once, for all inputs, instead of validating each
+compile.
+
+The simplest approach checks the rule on symbolic tensors of one concrete shape. Every element is
+a symbolic real, and Z3 proves the two sides are equal elementwise:
+
+```python
+def mat(name, r, c): return [[Real(f"{name}{i}{j}") for j in range(c)] for i in range(r)]
+def mm(A, B): return [[Sum([A[i][k] * B[k][j] for k in range(len(B))])
+                       for j in range(len(B[0]))] for i in range(len(A))]
+def T(A): return [list(r) for r in zip(*A)]
+def eq(A, B): return And([A[i][j] == B[i][j] for i in range(len(A)) for j in range(len(A[0]))])
+
+A, B = mat("a", 2, 3), mat("b", 3, 2)
+verify("(A@B).T == B.T @ A.T   [A: 2x3, B: 3x2]", eq(T(mm(A, B)), mm(T(B), T(A))))
+A2, B2 = mat("a", 2, 2), mat("b", 2, 2)
+verify("(A@B).T == A.T @ B.T   [2x2]", eq(T(mm(A2, B2)), mm(T(A2), T(B2))))
+```
+
+```text
+(A@B).T == B.T @ A.T   [A: 2x3, B: 3x2]: proved
+(A@B).T == A.T @ B.T   [2x2]: counterexample [b10 = 0,
+ b00 = 0,
+ a00 = -1,
+ b11 = 0,
+ a10 = 0,
+ b01 = -1,
+ a11 = 0,
+ a01 = 0]
+```
+
+Check the counterexample. On the left, $(AB)_{01} = a_{00} b_{01} + a_{01} b_{11}$, which is
+$(-1)(-1) + 0 = 1$, so $(AB)^\top_{10} = 1$. On the right,
+$(A^\top B^\top)_{10} = a_{01} b_{00} + a_{11} b_{01} = 0$.
+
+This is the approach of **TASO** (Jia, Padon, Thomas, Warszawski, Zaharia, Aiken, SOSP 2019), which
+generates candidate rewrites automatically and verifies them against operator properties written
+as first-order axioms. The weakness: the axioms themselves are checked only on small,
+concrete-sized tensors, and a rule proved for $2 \times 3$ may not hold for all shapes.
+
+**TensorRight** (Arora et al., POPL 2025) closes that gap. It represents tensors by their index
+functions, introduces an **aggregated axis** that stands for any number of axes, and proves a bound
+on the ranks that matter, so a finite number of bounded checks implies correctness for every rank
+and size. The core idea fits in a few lines of Z3: treat a tensor as an uninterpreted function from
+index to value, and keep the sizes symbolic. The rule "slicing `x` back out of `pad(x)` gives `x`",
+for 1-D tensors of any length $n$ and any padding:
+
+```python
+X = Function("X", IntSort(), RealSort())       # an arbitrary 1-D tensor x[j]
+n, lo, hi, i = Ints("n lo hi i")
+
+def pad(x, lo, n):                              # pad(x, lo, hi)[j]
+    return lambda j: If(And(lo <= j, j < lo + n), x(j - lo), RealVal(0))
+
+def slice_(y, start):                           # slice(y, start, start + len)[i]
+    return lambda i: y(start + i)
+
+pre = And(n >= 1, lo >= 0, hi >= 0)
+verify("slice(pad(x, lo, hi), lo, lo+n) == x   for all n, lo, hi",
+      Implies(And(pre, 0 <= i, i < n), slice_(pad(X, lo, n), lo)(i) == X(i)))
+```
+
+```text
+slice(pad(x, lo, hi), lo, lo+n) == x   for all n, lo, hi: proved
+```
+
+With the slice starting anywhere other than `lo`, Z3 returns a counterexample ($n = 1$, $lo = 0$,
+$hi = 1$, slice from 1, picking the padding zero). This is also where **preconditions** enter:
+many XLA rules are correct only when, say, a padding is zero or a stride is one, and the
+verifier must prove the rule under that condition.<Sidenote>TensorRight's evaluation, Section 8:
+of the 175 rules in XLA's algebraic simplifier, 121 could be expressed in its DSL, 118 were
+implemented and 115 verified for arbitrary rank and size, 108 of them in under a second, using Z3
+and, for one rule with `exp`, cvc5. The 3 remaining failures were timeouts on `div` and `rem`. For
+comparison, TASO could express 14 of the rules and PET 18. The authors also used the tool to prove
+a more general version of XLA's `FoldConvInputPad` rule, with a weaker precondition than the one
+the compiler uses.</Sidenote>
+
+### Floating point breaks algebra
+
+Every rule above was proved over integers or reals. Kernels compute in floating point, where most
+algebraic laws are false. Z3 has a theory of IEEE floating point, so it can check this too. Here in
+`Float16` with round-to-nearest-even, comparing results bit for bit:
+
+```python
+F, rm = Float16(), RNE()
+a, b, c, x = FP("a", F), FP("b", F), FP("c", F), FP("x", F)
+
+def same(u, v):     # bitwise-identical result (all NaNs count as equal)
+    return Or(And(fpIsNaN(u), fpIsNaN(v)), fpToIEEEBV(u) == fpToIEEEBV(v))
+
+def show(m, e):     # a Float16 value from the model, as a Python float
+    return float(m.eval(fpToReal(e), True).as_fraction()) if not m.eval(fpIsZero(e) & fpIsNegative(e), True) else -0.0
+
+for name, src, tgt in [
+    ("x * 1.0  =>  x", fpMul(rm, x, FPVal(1.0, F)), x),
+    ("x + 0.0  =>  x", fpAdd(rm, x, FPVal(0.0, F)), x),
+    ("x + -0.0 =>  x", fpAdd(rm, x, FPVal(-0.0, F)), x),
+    ("(a+b)+c  =>  a+(b+c)", fpAdd(rm, fpAdd(rm, a, b), c), fpAdd(rm, a, fpAdd(rm, b, c))),
+]:
+    sol = Solver(); sol.add(Not(same(src, tgt)))
+    if sol.check() == unsat:
+        print(f"{name}: correct")
+    else:
+        m = sol.model()
+        ins = {str(v): show(m, v) for v in (a, b, c, x) if any(str(v) == str(d) for d in m.decls())}
+        print(f"{name}: WRONG", ins, "src", show(m, src), "tgt", show(m, tgt))
+```
+
+```text
+x * 1.0  =>  x: correct
+x + 0.0  =>  x: WRONG {'x': -0.0} src 0.0 tgt -0.0
+x + -0.0 =>  x: correct
+(a+b)+c  =>  a+(b+c): WRONG {'a': 58.71875, 'b': -79.25, 'c': 12.7265625} src -7.8046875 tgt -7.78125
+```
+
+In a table:
+
+| Rewrite | Result | Counterexample |
+| --- | --- | --- |
+| `x * 1.0 → x` | correct | |
+| `x + 0.0 → x` | **wrong** | $x = -0.0$: $-0.0 + 0.0 = +0.0$ |
+| `x + -0.0 → x` | correct | |
+| `(a + b) + c → a + (b + c)` | **wrong** | $a = 58.71875$, $b = -79.25$, $c = 12.7265625$: $-7.8046875$ vs $-7.78125$ |
+
+The reassociation counterexample checks out in NumPy's `float16`. On the left, $a + b = -20.53125$
+is exact and so is the final sum, $-7.8046875$, which is the true answer. On the right,
+$b + c = -66.5234375$ needs more bits than `float16` has: between 64 and 128 its spacing is
+$0.0625$, so it rounds to $-66.5$, and that error of $0.0234$ survives into
+$a + (-66.5) = -7.78125$. That is why
+reassociating a reduction, splitting a K loop, or switching to a tree reduction changes the bits of
+the result, and why compilers only do it under a flag (`-ffast-math`, `reassoc`), and why kernel
+verifiers state precisely which arithmetic they verify. Most tensor-level tools (TASO, TensorRight,
+Mirage) prove equivalence over the reals or a finite field, and say so: a "verified" fused kernel is
+equal to the reference *in exact arithmetic*, and within rounding error in practice.
+
+### Probabilistic equivalence: Mirage
+
+A superoptimiser such as **Mirage** (Wu et al., OSDI 2025) searches over millions of candidate
+kernels, each a graph across the kernel, thread-block and thread levels (a **µGraph**). An SMT query
+per candidate is too slow, and tensors with millions of elements are too big to encode. Mirage
+instead uses **polynomial identity testing**: two polynomials of degree $d$ that differ agree on a
+uniformly random point of a finite field $\mathbb{Z}_p$ with probability at most $d/p$
+(Schwartz–Zippel). Matmuls and convolutions are multilinear, so the outputs of two candidate
+programs are polynomials in their inputs. Evaluate both on random inputs mod $p$; if they differ
+anywhere, they are different programs; if they agree, they are equal with high probability.
+
+A small experiment: a reference $(AB)C$, a correct reassociation $A(BC)$, and a buggy "split-K"
+kernel that forgets the last slice of the $K$ dimension, all mod $p = 227$, the prime Mirage
+uses:
+
+```python
+import numpy as np
+p, rng = 227, np.random.default_rng(0)
+M, K, N = 4, 8, 4
+ref   = lambda A, B, C: ((A @ B) % p) @ C % p
+fused = lambda A, B, C: A @ ((B @ C) % p) % p
+buggy = lambda A, B, C: ((A[:, :K-1] @ B[:K-1, :]) % p) @ C % p   # drops k = K-1
+
+trials, ok_fused, ok_bug_one, ok_bug_all = 20000, 0, 0, 0
+for _ in range(trials):
+    A, B, C = (rng.integers(0, p, s) for s in ((M, K), (K, N), (N, N)))
+    R = ref(A, B, C)
+    ok_fused   += np.array_equal(R, fused(A, B, C))
+    Bg = buggy(A, B, C)
+    ok_bug_one += R[0, 0] == Bg[0, 0]
+    ok_bug_all += np.array_equal(R, Bg)
+print(ok_fused, ok_bug_one / trials, ok_bug_all)
+```
+
+| Check, 20,000 random tests | Passes |
+| --- | ---: |
+| correct reassociation $A(BC)$ | 20,000 |
+| buggy kernel, comparing only `out[0, 0]` | 170 (0.85%) |
+| buggy kernel, comparing all 16 outputs | 0 |
+
+The single-entry pass rate, 0.85%, is under the Schwartz–Zippel bound for a degree-3 polynomial,
+$3/227 = 1.3\%$. Comparing every output element, as Mirage does, drives it to zero here, and
+repeating the test $r$ times multiplies the bounds. Mirage's contribution is making this sound for
+more than polynomials. It restricts candidates to a fragment called **LAX**: multilinear operators,
+division (for normalisation), and exponentiation at most once along any path (for softmax and
+activations). It evaluates in two fields at once, $\mathbb{Z}_p$ outside exponents and
+$\mathbb{Z}_q$ inside them, with $q$ dividing $p - 1$ so that $\omega^{x}$ for a $q$-th root of
+unity $\omega$ stands in for $e^{x}$. Its implementation uses $p = 227$ and $q = 113$, the largest
+pair whose product fits in 16 bits, so tests run fast on the GPU.<Sidenote>Mirage, Section 5,
+Theorems 2 and 3 give the bound on a single test and the number of tests needed for a target
+error $\delta$. The paper notes the implementation runs a single random test per candidate during
+search, comparing all output elements; a wrong program accepted that way is a false positive the
+theorem bounds, not a guarantee of zero.</Sidenote>
+
+## Practical considerations
+
+- **Specify the right thing.** Every proof in this post is relative to a model: 32-bit
+  bit-vectors, exact reals, one block, two threads with abstracted neighbours. Bugs outside the
+  model (rounding, the memory model, inter-block synchronisation, the hardware) are not ruled out.
+  State the model next to the claim.
+- **Start bounded, go unbounded where it pays.** Bounded checks (Alive2's unrolled loops, TASO's
+  small shapes, CrossHair's time budget) are automatic and find most bugs. Unbounded proofs
+  (invariants, TensorRight's rank bound, symbolic $n$ in the race query) cost more effort and are
+  worth it for code that runs on every input, such as a compiler's rewrite rules.
+- **Pick the cheapest technique that answers the question.** Data-race freedom of a kernel is
+  fully automatic today; functional correctness of a hand-tuned FlashAttention still needs
+  annotations or an equivalence checker like Volta; a superoptimiser's candidates need checks in
+  microseconds, which is why Mirage uses random tests with a theorem.
+- **Verify the checker's assumptions too.** Translation validation trusts the encoding of the
+  source language's semantics. Alive2's bugs often came from LLVM developers and the semantics
+  disagreeing about undef and poison. When the verifier and the compiler disagree, either can be
+  wrong.
+- **Keep testing.** Verification covers the stated property, fuzzing (NNSmith, Hypothesis) covers
+  the crashes and specification gaps nobody thought to state.
+
+## Important papers
+
+Everything in this post comes from a fairly small set of papers. This section goes through them in
+the order the ideas appeared: the problem each one solved, its key idea, what it showed, and where
+it shows up above. The graph shows which work built on which: an arrow from A to B means B builds
+on A, answers it, or was motivated by it. Hover a paper for its one-line contribution.
+
+<DependencyGraph nodes={paperNodes} edges={paperEdges} rankdir="LR" directed title="The papers behind this post. PL = foundations, CC = compilers, GPU = kernels, ML = tensor compilers." hint="Hover a paper for its contribution; click one to keep its links highlighted." />
+
+#### Foundations: what a proof of a program is
+
+**R. W. Floyd, "Assigning Meanings to Programs" (1967)** and **C. A. R. Hoare, ["An Axiomatic
+Basis for Computer Programming"](https://doi.org/10.1145/363235.363259) (CACM, 1969).** Before
+these, "the program is correct" had no precise meaning. Floyd attached assertions to the arrows of
+a flowchart and proved each step preserves them; Hoare turned that into a logic: the triple
+$\{P\}\ C\ \{Q\}$ and one rule per kind of statement. The rule for `while` is the one that matters
+most: it needs an invariant $I$, and its three premises are exactly the initiation, preservation
+and exit checks the [loop section](#loops-invariants) ran in Z3. Every deductive verifier since
+(Dafny, Boogie, VerCors, Nagini) is a mechanisation of this logic.
+
+**E. W. Dijkstra, ["Guarded Commands, Nondeterminacy and Formal Derivation of
+Programs"](https://doi.org/10.1145/360933.360975) (CACM, 1975).** Hoare's rules check a proof; they
+don't say how to find the formulas. Dijkstra's **weakest precondition** $wp(C, Q)$ is the weakest
+formula that guarantees $Q$ after $C$, and it can be computed backwards through the code, for
+example $wp(x := e,\ Q) = Q[x := e]$. With $wp$, the only thing a person must supply is the loop
+invariant; everything else becomes a formula for a solver. That is the `substitute` call in the
+invariant example.
+
+**J. C. King, ["Symbolic Execution and Program Testing"](https://doi.org/10.1145/360248.360252)
+(CACM, 1976).** King proposed running a program on symbols instead of values, forking at
+branches and carrying a path condition, as a middle ground between testing one input and proving
+all of them. It became practical only decades later, once solvers were fast enough (KLEE below).
+The `gap` figure is King's idea on an eight-path program.
+
+**Model checking: E. M. Clarke and E. A. Emerson (1981), J.-P. Queille and J. Sifakis (1982);
+bounded model checking: A. Biere, A. Cimatti, E. Clarke, Y. Zhu, "Symbolic Model Checking without
+BDDs" (TACAS 1999).** Model checking explores every reachable state of a finite system and checks
+a temporal-logic property, returning a counterexample trace when it fails; Clarke, Emerson and Sifakis
+shared the 2007 Turing Award for it. Biere et al. made it scale with SAT: unroll the system $k$ steps into one
+formula and ask a solver. That unrolling is what "bounded" means in Alive2 and in CrossHair's time
+budget: no bug within the bound, nothing said beyond it.
+
+**R. Zippel (1979), J. T. Schwartz, "Fast Probabilistic Algorithms for Verification of Polynomial
+Identities" (JACM, 1980).** If a polynomial of degree $d$ is not identically zero, a random point of
+a field of size $p$ is a root with probability at most $d/p$. So to check that two polynomial
+programs are equal, evaluate both at random points. This one lemma is the basis of Mirage's checks
+and of the $3/227$ bound in the [finite-field experiment](#probabilistic-equivalence-mirage).
+
+#### Making it automatic: solvers and tools
+
+**C. Flanagan and K. R. M. Leino, "Houdini, an Annotation Assistant for ESC/Java" (FME 2001).**
+Invariants are the bottleneck of deductive verification. Houdini guesses a large pool of
+candidate invariants from templates, asks the prover which ones are not inductive, removes them and
+repeats until a fixed point: what remains is the largest inductive subset. It needs a linear number
+of prover calls, and it is the engine GPUVerify uses to verify kernels with no annotations.
+
+**L. de Moura and N. Bjørner, "Z3: An Efficient SMT Solver" (TACAS 2008).** Z3 combined a fast SAT
+core with decision procedures for bit-vectors, arithmetic, arrays and uninterpreted functions
+behind one API. Nearly every tool in this section sends its formulas to Z3, and every example in
+this post ran on it.
+
+**C. Cadar, D. Dunbar, D. Engler, ["KLEE: Unassisted and Automatic Generation of High-Coverage
+Tests for Complex Systems Programs"](https://llvm.org/pubs/2008-12-OSDI-KLEE.html) (OSDI 2008).**
+KLEE made King's symbolic execution practical on real C code: it runs on LLVM bitcode, models the
+file system and environment, and simplifies queries before they reach the solver. On the 89
+programs of GNU Coreutils 6.10 its generated tests covered 84.5% of lines, beating the developers'
+own suite, built over fifteen years, by 16.8%, and it found 56 serious bugs across its targets,
+three of which had been in Coreutils for over fifteen years. CrossHair is the same idea for Python.
+
+#### Compilers: verify the compiler, or check its output
+
+**A. Pnueli, M. Siegel, E. Singerman, "Translation Validation" (TACAS 1998)** and **G. C. Necula,
+"Translation Validation for an Optimizing Compiler" (PLDI 2000).** Proving a whole optimising
+compiler correct looked out of reach, so Pnueli et al. proposed checking each run instead: after
+compiling, prove that this target implements this source. Necula applied it to the real
+optimisation passes of gcc. The [translation-validation diagram](#translation-validation) is this
+design: the pass is untrusted, the check is per compile.
+
+**X. Leroy, "Formal Verification of a Realistic Compiler" (CACM 2009; first in POPL 2006).**
+CompCert is a C compiler, written and proved correct in the Coq proof assistant: the generated
+assembly behaves as the C source says, for every source program without undefined behaviour that
+the compiler accepts. It showed the
+"verify the compiler" route is possible for a realistic compiler, at the cost of years of expert
+work and fewer optimisations than gcc or LLVM.
+
+**X. Yang, Y. Chen, E. Eide, J. Regehr, ["Finding and Understanding Bugs in C
+Compilers"](https://www-old.cs.utah.edu/~regehr/papers/pldi11-preprint.pdf) (PLDI 2011).** Csmith
+generates random C programs that avoid undefined behaviour and compares the output of several
+compilers on them. It found more than 325 previously unknown bugs in mainstream compilers. Its
+most quoted result is about CompCert: Csmith found bugs in CompCert's unproved parts, but the
+version under development was the only compiler tested where it found no wrong-code errors, after
+about six CPU-years of testing. That is the strongest evidence that verified compiler code
+actually has fewer bugs. Csmith also showed LLVM's InstCombine pass to be especially buggy, which
+motivated Alive.
+
+**N. P. Lopes, D. Menendez, S. Nagarakatte, J. Regehr, ["Provably Correct Peephole Optimizations
+with Alive"](https://users.cs.utah.edu/~regehr/papers/pldi15.pdf) (PLDI 2015).** Alive is a small
+language for LLVM peephole rewrites ("this pattern becomes that pattern, under this
+precondition"), each checked with an SMT solver for every type assignment up to a bit-width bound, with LLVM's
+undefined-behaviour rules (`nsw`, `undef`, poison) built in. The authors translated 334
+InstCombine transformations and found 8 of them wrong; the
+[`icmp`/`nsw` example](#translation-validation) is the kind of rule it checks. A later CACM article
+reports 23 bugs found in InstCombine in total.
+
+**N. P. Lopes, J. Lee, C.-K. Hur, Z. Liu, J. Regehr, "Alive2: Bounded Translation Validation for
+LLVM" (PLDI 2021).** Alive2 moves from hand-written rules to whole functions: it checks that each
+optimised LLVM function refines the original, for any intra-procedural pass, with loops unrolled to a
+bound. It found 47 new bugs from LLVM's own unit tests alone, and LLVM developers use it routinely.
+It combines three lines of work in the graph: translation validation, bounded checking and Alive's
+encoding of undefined behaviour.
+
+#### GPU kernels
+
+**G. Li and G. Gopalakrishnan, "Scalable SMT-Based Verification of GPU Kernel Functions" (FSE
+2010).** PUG was the first SMT-based verifier for CUDA kernels. It encodes a kernel's threads
+symbolically and checks for data races, incorrectly synchronised barriers and bank conflicts; its
+authors ran it on over a hundred CUDA kernels and found bugs and undocumented assumptions. It
+showed the problem could be posed to a solver at all.
+
+**G. Li, P. Li, G. Sawaya, G. Gopalakrishnan, I. Ghosh, S. P. Rajan, ["GKLEE: Concolic
+Verification and Test Generation for GPUs"](https://doi.org/10.1145/2145816.2145844) (PPoPP
+2012).** GKLEE extends KLEE to CUDA: it executes the kernel with concrete and symbolic values
+mixed (concolic), and every reported race or performance problem comes with a concrete input as a
+witness. It found previously unknown bugs in commercial SDK kernels. The trade-off: like all
+symbolic execution, it explores paths for a given configuration rather than proving the kernel for
+every thread count.
+
+**A. Betts, N. Chong, A. F. Donaldson, S. Qadeer, P. Thomson, "GPUVerify: a Verifier for GPU
+Kernels" (OOPSLA 2012); journal version TOPLAS 2015.** The paper behind the
+[GPU section](#the-two-thread-reduction). Its contributions are a formal semantics for barrier
+divergence (which had none before), the proof that checking two symbolic threads suffices, the
+adversarial and equality abstractions for everyone else's writes, and Houdini-based invariant
+inference so that most kernels need no annotations. Built on Clang, Boogie and Z3, it verified 49
+of 70 held-out kernels automatically.
+
+**N. Chong, A. F. Donaldson, P. Kelly, S. Qadeer, J. Ketema, "Barrier Invariants: A Shared State
+Abstraction for the Analysis of Data-Dependent GPU Kernels" (OOPSLA 2013).** The two-thread
+reduction forgets what other threads wrote, which breaks on kernels such as
+`A[B[tid]] = ...` after a prefix sum into `B`: race freedom depends on the values in `B` being
+distinct. Barrier invariants let the user state such a property at a barrier, prove it there, and
+use it afterwards.
+
+**D. Lustig, S. Sahasrabuddhe, O. Giroux, "A Formal Analysis of the NVIDIA PTX Memory Consistency
+Model" (ASPLOS 2019).** Race checkers assume a meaning for racy code; this paper supplies it for
+NVIDIA GPUs. It formalises the PTX memory model axiomatically, tests the mapping of scoped C++
+atomics onto it in Alloy, and proves that mapping sound in Coq for programs of any size. Without
+it, "this kernel is correct with these fences" has no definition to be checked against.
+
+**T. Cogumbreiro, J. Lange, D. Liew, H. Zicarelli, "Checking Data-Race Freedom of GPU Kernels,
+Compositionally" (CAV 2021).** Faial abstracts a kernel into a *memory access protocol*: which
+addresses each thread reads and writes and where the barriers are, with the data values stripped
+out. It then checks race freedom on the protocol, compositionally. Its authors report 218 of 227 real-world kernels verified, with symbolic
+array sizes, more than earlier tools in their comparison.
+
+**B. Driscoll, K. Dubey, A. Wei, N. Kayal, R. Sharma, A. Aiken, "Equivalence Checking of ML GPU
+Kernels" (2025).** Race freedom says a kernel is well defined, not that it computes the right
+thing. Volta checks that an optimised kernel, by a person, an LLM or a compiler, computes the
+same function as a reference, and is sound, and complete for a defined class covering
+convolutions, matmuls and attention. As LLMs write more kernels, this is the property that
+matters.
+
+#### ML compilers
+
+**Z. Jia, O. Padon, J. Thomas, T. Warszawski, M. Zaharia, A. Aiken, "TASO: Optimizing Deep Learning
+Computation with Automatic Generation of Graph Substitutions" (SOSP 2019).** Hand-written graph
+rewrites were the norm in TensorFlow and TVM, and each was a chance for a bug. TASO generates
+candidate substitutions by enumerating small graphs and keeps only those it can verify with Z3
+against a list of operator properties written as first-order axioms. It moved tensor compilers
+from "trust the rule writer" to "every rule is checked", with the limit that the axioms themselves
+were only checked on small, concrete tensors.
+
+**Y. Yang, P. M. Phothilimthana, Y. R. Wang, M. Willsey, S. Roy, J. Pienaar, ["Equality Saturation
+for Tensor Graph Superoptimization"](https://arxiv.org/abs/2101.01332) (MLSys 2021)** and **H.
+Wang et al., ["PET: Optimizing Tensor Programs with Partially Equivalent Transformations and
+Automated Corrections"](https://www.usenix.org/conference/osdi21/presentation/wang) (OSDI 2021).**
+Two follow-ups to TASO. TENSAT keeps TASO's verified rules but applies them all at once in an
+e-graph (equality saturation), avoiding the order-of-rewrites problem. PET goes the other way: it
+allows transformations that are equal on only part of the output, finds the wrong part, and adds
+correction kernels to restore full equivalence, with statistical testing for the guarantee.
+
+**J. Liu, J. Lin, F. Ruffy, C. Tan, J. Li, A. Panda, L. Zhang, "NNSmith" (ASPLOS 2023).** Csmith
+for DL compilers: generate random but *valid* models (operator shape constraints solved with an SMT
+solver, and input values searched with gradients so operators don't produce NaN or infinity), compile them, and compare against a reference. 72
+new bugs in TVM, TensorRT, ONNXRuntime and PyTorch. A reminder that the compilers being verified
+in this section are, in practice, still full of bugs.
+
+**J. Arora et al., "TensorRight: Automated Verification of Tensor Graph Rewrites" (POPL 2025).**
+The answer to TASO's limit. TensorRight proves XLA rewrite rules, preconditions included, for
+tensors of every rank and size, by proving a bound on the ranks that matter and discharging a
+finite number of bounded checks with Z3 (and cvc5 for one rule). 115 of the 175 rules in XLA's
+algebraic simplifier verified, most in under a second.
+
+**M. Wu et al., "Mirage: A Multi-Level Superoptimizer for Tensor Programs" (OSDI 2025).**
+Superoptimisers propose too many candidates for an SMT query each. Mirage restricts candidates to
+the LAX fragment and checks them with random evaluation over two finite fields, using a
+Schwartz–Zippel-style theorem to bound the chance of accepting a wrong program. More than forty years after
+Schwartz and Zippel, polynomial identity testing ended up checking GPU kernels.
+
+#### A reading order
+
+If you read five: Hoare (1969) for what a proof of a program is; King (1976) and KLEE (2008) for
+how tools find bugs automatically; GPUVerify (TOPLAS 2015) for how a concurrency problem becomes a
+sequential one; Alive (2015) for how to verify a compiler one rule at a time; and TensorRight
+(2025) for the same idea lifted to tensors of any shape. Csmith (2011) is the best single argument
+for why any of this is worth the effort.
+
+## Summary
+
+- A test checks the inputs it tries; a proof covers all of them. An SMT solver proves a claim by
+  showing its negation is **unsat**, and otherwise returns a concrete counterexample.
+- **Symbolic execution** turns code into path conditions, proves dead code unreachable and finds
+  inputs that fail assertions; loops need **invariants**, checked by initiation, preservation and
+  exit.
+- **GPU kernels**: races and barrier divergence are pairwise, so GPUVerify checks two symbolic
+  threads in lock-step. A tree reduction with its barrier is race-free for every block size; without
+  it, threads 0 and 2 race on `sdata[2]` at $n = 8$.
+- **ML compilers**: translation validation (Alive2) checks refinement per compile; rewrite rules can
+  be proved once for all shapes (TensorRight, 115 of XLA's 175 simplifier rules); floating point
+  breaks rules such as `x + 0.0 → x` and reassociation.
+- **The papers** form a few lines of descent: Hoare → Dijkstra → Houdini → GPUVerify for proofs,
+  King → KLEE → GKLEE for symbolic execution, Pnueli → Necula → Alive → Alive2 for compilers, and
+  TASO → TensorRight / Mirage for tensor programs.
+- **Probabilistic checks** (Mirage) evaluate both programs on random inputs over a finite field,
+  with a theorem bounding the chance of accepting a wrong one, fast enough for a search over
+  millions of kernels.
+
+## References
+
+- A. Betts, N. Chong, A. F. Donaldson, J. Ketema, S. Qadeer, P. Thomson, J. Wickerson. [The Design
+  and Implementation of a Verification Technique for GPU Kernels](https://johnwickerson.github.io/papers/gpuverify_toplas.pdf).
+  TOPLAS 2015. First version: [GPUVerify: a Verifier for GPU Kernels](https://www.doc.ic.ac.uk/~afd/papers/2012/OOPSLA.pdf),
+  OOPSLA 2012.
+- T. Cogumbreiro, J. Lange, D. Liew, H. Zicarelli. [Checking Data-Race Freedom of GPU Kernels,
+  Compositionally](https://link.springer.com/chapter/10.1007/978-3-030-81685-8_19). CAV 2021 (Faial).
+- B. Driscoll, K. Dubey, A. Wei, N. Kayal, R. Sharma, A. Aiken. [Equivalence Checking of ML GPU
+  Kernels](https://arxiv.org/abs/2511.12638). arXiv 2511.12638.
+- D. Lustig, S. Sahasrabuddhe, O. Giroux. [A Formal Analysis of the NVIDIA PTX Memory Consistency
+  Model](https://research.nvidia.com/publication/2019-04_formal-analysis-nvidia-ptx-memory-consistency-model).
+  ASPLOS 2019.
+- N. P. Lopes, J. Lee, C.-K. Hur, Z. Liu, J. Regehr. [Alive2: Bounded Translation Validation for
+  LLVM](https://www-old.cs.utah.edu/~regehr/alive2-pldi21.pdf). PLDI 2021.
+- Z. Jia, O. Padon, J. Thomas, T. Warszawski, M. Zaharia, A. Aiken. TASO: Optimizing Deep Learning
+  Computation with Automatic Generation of Graph Substitutions. SOSP 2019.
+- J. Arora, S. Lu, D. Jain, T. Xu, F. Houshmand, P. M. Phothilimthana, M. Lesani, P. Narayanan,
+  K. S. Murthy, R. Bodik, A. Sabne, C. Mendis. [TensorRight: Automated Verification of Tensor Graph
+  Rewrites](https://arxiv.org/abs/2511.17838). POPL 2025.
+- M. Wu, X. Cheng, S. Liu, C. Shi, J. Ji, K. Ao, P. Velliengiri, X. Miao, O. Padon, Z. Jia.
+  [Mirage: A Multi-Level Superoptimizer for Tensor Programs](https://arxiv.org/abs/2405.05751).
+  OSDI 2025.
+- J. Liu, J. Lin, F. Ruffy, C. Tan, J. Li, A. Panda, L. Zhang. [NNSmith: Generating Diverse and
+  Valid Test Cases for Deep Learning Compilers](https://arxiv.org/abs/2207.13066). ASPLOS 2023.
+- L. de Moura, N. Bjørner. Z3: An Efficient SMT Solver. TACAS 2008. Python API:
+  [z3-solver](https://pypi.org/project/z3-solver/).
+- [CrossHair](https://github.com/pschanely/CrossHair), symbolic execution for Python;
+  [Hypothesis](https://hypothesis.readthedocs.io/), property-based testing.

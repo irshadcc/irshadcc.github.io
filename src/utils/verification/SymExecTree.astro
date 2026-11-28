@@ -1,0 +1,378 @@
+---
+// Step-through symbolic execution of a small function. Left: the source with the line the
+// current path has reached highlighted. Right: the tree of paths explored so far, depth first;
+// each edge adds a branch condition, each node is coloured by what the solver said about its path
+// condition (feasible, infeasible = pruned, assertion can fail = bug, path finished). Below: the
+// current node's path condition and the solver's model, a concrete input that follows the path.
+// Hover or focus a revealed node to read its path condition. The last step counts the paths.
+// Layout in symExec.ts.
+// Usage in .mdx:
+//   import SymExecTree from "../../utils/verification/SymExecTree.astro";
+//   import { gapCode, gapTree } from "../../utils/verification/verificationFigures";
+//   <SymExecTree code={gapCode} nodes={gapTree} title="Symbolic execution of gap(x, y)" />
+//   Optional: step={n} (step shown on load).
+import StepControls from "../compiler/StepControls.astro";
+import { type SymNode, layoutTree, summarize, validateTree } from "./symExec";
+
+interface Props {
+	code: string[];
+	nodes: SymNode[];
+	title?: string;
+	step?: number;
+}
+
+const { code, nodes, title, step = 0 } = Astro.props;
+const err = validateTree(nodes);
+if (err) throw new Error(`SymExecTree: ${err}`);
+const NW = 76;
+const NH = 38;
+const lay = layoutTree(nodes, 84, 64, NW, NH);
+const sum = summarize(nodes);
+const count = nodes.length + 1;
+const at = Math.max(0, Math.min(count - 1, step));
+const labels = [...nodes.map((n) => n.label), "summary"];
+const statusText: Record<SymNode["status"], string> = {
+	open: "start",
+	sat: "sat: feasible",
+	unsat: "unsat: infeasible, pruned",
+	bug: "sat: assertion can fail",
+	done: "sat: path returns",
+};
+const summaryText = `${sum.leaves} paths in all: ${sum.unsat} infeasible (pruned by the solver), ${sum.bugs} where the assertion fails, ${sum.leaves - sum.unsat - sum.bugs} that return normally. Every input follows exactly one of them, so together they cover every pair of Python ints, not just the ones a test happened to try.`;
+---
+
+<figure class="se" data-step={at} tabindex="-1">
+	{title && <figcaption class="se-title">{title}</figcaption>}
+	<StepControls labels={labels} step={at} />
+	<div class="se-body">
+		<pre class="se-code">{code.map((l, i) => <span class="se-line" data-line={i}>{l || " "}</span>)}</pre>
+		<div class="se-tree">
+			<svg viewBox={`0 0 ${lay.width} ${lay.height}`} style={`width: min(100%, ${lay.width}px)`} role="img" aria-label="Tree of explored paths">
+				{lay.edges.map((e) => <path class="se-edge" data-to={e.to} d={e.d} />)}
+				{
+					lay.nodes.map((n, i) => (
+						<g class={`se-node st-${n.status}`} data-i={i} data-line={n.line} tabindex="0" transform={`translate(${n.x - NW / 2},${n.y - NH / 2})`}>
+							<title>{`${n.pc}${n.model ? `  [${n.model}]` : ""}`}</title>
+							<rect width={NW} height={NH} rx="5" />
+							<text class="lab" x={NW / 2} y={n.effect ? 15 : 22}>
+								{n.label}
+							</text>
+							{n.effect && (
+								<text class="eff" x={NW / 2} y="29">
+									{n.effect}
+								</text>
+							)}
+						</g>
+					))
+				}
+			</svg>
+		</div>
+	</div>
+	<div class="se-info">
+		{
+			nodes.map((n, i) => (
+				<div class="se-step" data-i={i} hidden={i !== at}>
+					<p class="se-pc">
+						<span class="k">path condition</span> <code>{n.pc}</code>
+					</p>
+					<p class="se-pc">
+						<span class="k">solver</span> <span class={`badge st-${n.status}`}>{statusText[n.status]}</span>
+						{n.model && <code>{n.model}</code>}
+					</p>
+					<p class="se-text">{n.text}</p>
+				</div>
+			))
+		}
+		<div class="se-step" data-i={nodes.length} hidden={at !== nodes.length}>
+			<p class="se-text">{summaryText}</p>
+		</div>
+	</div>
+	<p class="se-hover" aria-live="polite"></p>
+	<ul class="se-legend">
+		<li><span class="sw st-sat"></span>feasible</li>
+		<li><span class="sw st-unsat"></span>infeasible (pruned)</li>
+		<li><span class="sw st-bug"></span>assertion fails</li>
+		<li><span class="sw st-done"></span>returns</li>
+	</ul>
+</figure>
+
+<script>
+	import { bindStepper } from "../compiler/stepper";
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".se")) {
+		const nodes = [...fig.querySelectorAll<SVGGElement>(".se-node")];
+		const edges = [...fig.querySelectorAll<SVGPathElement>(".se-edge")];
+		const lines = [...fig.querySelectorAll<HTMLElement>(".se-line")];
+		const steps = [...fig.querySelectorAll<HTMLElement>(".se-step")];
+		const hover = fig.querySelector<HTMLElement>(".se-hover");
+		bindStepper(fig, steps.length, (i) => {
+			const last = i === nodes.length;
+			nodes.forEach((g, k) => {
+				g.classList.toggle("shown", k <= i);
+				g.classList.toggle("cur", k === i);
+			});
+			// Edges are listed in node order without the root: edge k leads into node k + 1.
+			edges.forEach((e, k) => e.classList.toggle("shown", k + 1 <= i));
+			const line = last ? -1 : Number(nodes[i].dataset.line);
+			lines.forEach((l, k) => l.classList.toggle("on", k === line));
+			steps.forEach((s, k) => {
+				s.hidden = k !== i;
+			});
+			if (hover) hover.textContent = "";
+		}, 2600);
+		for (const g of nodes) {
+			const show = () => {
+				if (!hover || !g.classList.contains("shown")) return;
+				hover.textContent = g.querySelector("title")?.textContent ?? "";
+			};
+			const hide = () => {
+				if (hover) hover.textContent = "";
+			};
+			g.addEventListener("mouseenter", show);
+			g.addEventListener("focus", show);
+			g.addEventListener("mouseleave", hide);
+			g.addEventListener("blur", hide);
+		}
+	}
+</script>
+
+<style>
+	.se {
+		--sat: #dfe9f3;
+		--sat-l: #4f7fae;
+		--unsat: #ecebe6;
+		--unsat-l: #a3a196;
+		--bug: #f7dcd8;
+		--bug-l: #c0392b;
+		--done: #dcefe2;
+		--done-l: #2e7d4f;
+		--open: #f3f1ea;
+		margin: 1.6rem 0;
+		max-width: 100%;
+		font-family: var(--sans);
+	}
+	@media (prefers-color-scheme: dark) {
+		.se {
+			--sat: #1f3042;
+			--sat-l: #7fb0de;
+			--unsat: #26272b;
+			--unsat-l: #6c6c66;
+			--bug: #43221f;
+			--bug-l: #ef7b6c;
+			--done: #1d3427;
+			--done-l: #6cc596;
+			--open: #1b1d21;
+		}
+	}
+	@media (min-width: 1100px) {
+		.se {
+			width: calc(var(--measure) + var(--gap) + var(--note));
+			max-width: none;
+		}
+	}
+	.se-title {
+		font-size: 0.85rem;
+		color: var(--muted);
+		margin-bottom: 0.3rem;
+	}
+	.se-body {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.8rem;
+		align-items: flex-start;
+	}
+	.se-code {
+		flex: 0 1 auto;
+		max-width: 100%;
+		overflow-x: auto;
+		font-variant-ligatures: none;
+		margin: 0;
+		padding: 0.4rem 0;
+		font-size: 0.68rem;
+		line-height: 1.55;
+		background: var(--surface);
+		border-radius: 4px;
+	}
+	.se-line {
+		display: block;
+		padding: 0 0.6rem;
+		white-space: pre;
+	}
+	.se-line.on {
+		background: var(--accent-soft);
+		box-shadow: inset 3px 0 0 var(--accent);
+	}
+	.se-tree {
+		flex: 1 1 420px;
+		min-width: 0;
+		max-width: 100%;
+		overflow-x: auto;
+	}
+	.se-tree svg {
+		display: block;
+		min-width: 560px;
+	}
+	.se-edge {
+		fill: none;
+		stroke: var(--faint);
+		stroke-width: 1.3;
+		opacity: 0;
+		transition: opacity 0.25s;
+	}
+	.se-edge.shown {
+		opacity: 1;
+		stroke: var(--muted);
+	}
+	.se-node {
+		opacity: 0.12;
+		transition: opacity 0.25s;
+		outline: none;
+	}
+	.se-node.shown {
+		opacity: 1;
+	}
+	.se-node rect {
+		fill: var(--open);
+		stroke: var(--faint);
+		stroke-width: 1.2;
+	}
+	.se-node.cur rect {
+		stroke-width: 2.6;
+	}
+	.se-node text {
+		font-family: var(--mono);
+		font-variant-ligatures: none;
+		text-anchor: middle;
+		fill: var(--text);
+		pointer-events: none;
+	}
+	.se-node .lab {
+		font-size: 10.5px;
+		font-weight: 600;
+	}
+	.se-node .eff {
+		font-size: 9px;
+		fill: var(--muted);
+	}
+	.se-node.shown.st-sat rect,
+	.sw.st-sat {
+		fill: var(--sat);
+		stroke: var(--sat-l);
+	}
+	.se-node.shown.st-unsat rect,
+	.sw.st-unsat {
+		fill: var(--unsat);
+		stroke: var(--unsat-l);
+		stroke-dasharray: 4 2;
+	}
+	.se-node.shown.st-unsat text {
+		fill: var(--muted);
+		text-decoration: line-through;
+	}
+	.se-node.shown.st-bug rect,
+	.sw.st-bug {
+		fill: var(--bug);
+		stroke: var(--bug-l);
+	}
+	.se-node.shown.st-done rect,
+	.sw.st-done {
+		fill: var(--done);
+		stroke: var(--done-l);
+	}
+	.se-info {
+		display: grid;
+		margin-top: 0.4rem;
+	}
+	.se-step {
+		grid-area: 1 / 1;
+	}
+	.se-step[hidden] {
+		display: block;
+		visibility: hidden;
+	}
+	.se-step p {
+		margin: 0.15rem 0;
+		font-size: 0.8rem;
+		line-height: 1.5;
+	}
+	.se-pc .k {
+		display: inline-block;
+		min-width: 7.5rem;
+		color: var(--muted);
+		font-size: 0.72rem;
+	}
+	.se-pc code {
+		font-size: 0.74rem;
+		font-variant-ligatures: none;
+	}
+	.badge {
+		display: inline-block;
+		padding: 0 0.35rem;
+		margin-right: 0.4rem;
+		border-radius: 3px;
+		font-size: 0.72rem;
+		border: 1px solid var(--faint);
+	}
+	.badge.st-sat {
+		background: var(--sat);
+		border-color: var(--sat-l);
+	}
+	.badge.st-unsat {
+		background: var(--unsat);
+		border-color: var(--unsat-l);
+	}
+	.badge.st-bug {
+		background: var(--bug);
+		border-color: var(--bug-l);
+	}
+	.badge.st-done {
+		background: var(--done);
+		border-color: var(--done-l);
+	}
+	.se-hover {
+		min-height: 1.3em;
+		margin: 0.2rem 0 0;
+		font-family: var(--mono);
+		font-size: 0.68rem;
+		color: var(--muted);
+	}
+	.se-legend {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.2rem 0.9rem;
+		margin: 0.3rem 0 0;
+		padding: 0;
+		list-style: none;
+		font-size: 0.72rem;
+		color: var(--muted);
+	}
+	.se-legend li {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.3rem;
+		margin: 0;
+	}
+	.sw {
+		display: inline-block;
+		width: 0.9rem;
+		height: 0.6rem;
+		border: 1px solid;
+		border-radius: 2px;
+	}
+	span.sw.st-sat {
+		background: var(--sat);
+		border-color: var(--sat-l);
+	}
+	span.sw.st-unsat {
+		background: var(--unsat);
+		border: 1px dashed var(--unsat-l);
+	}
+	span.sw.st-bug {
+		background: var(--bug);
+		border-color: var(--bug-l);
+	}
+	span.sw.st-done {
+		background: var(--done);
+		border-color: var(--done-l);
+	}
+</style>

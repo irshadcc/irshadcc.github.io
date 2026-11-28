@@ -1,0 +1,35 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import TupleTree from "../../utils/cute/TupleTree.astro";
+
+const t = [[2, 3], 4, [5, [6, 7]]];
+---
+
+<Layout title="TupleTree demo">
+	<h1>TupleTree demo</h1>
+
+	<h2>One tree</h2>
+	<TupleTree trees={[{ label: "t", tuple: t }]} name="depth 3, rank 3" />
+
+	<h2>A transformation, followed by value colour</h2>
+	<TupleTree
+		trees={[
+			{ label: "t", tuple: t },
+			{ label: "flatten(t)", tuple: [2, 3, 4, 5, 6, 7], op: "flatten" },
+			{ label: "unflatten(..., ((0,0),(0,0),(0,0)))", tuple: [[2, 3], [4, 5], [6, 7]], op: "unflatten" },
+		]}
+	/>
+
+	<h2>Highlighted path (find)</h2>
+	<TupleTree trees={[{ label: "find(t, 6) = (2,1,0)", tuple: t, highlight: [[2, 1, 0]] }]} />
+
+	<h2>Colour by leaf position, several highlights, underscore and a scalar</h2>
+	<TupleTree
+		colorBy="index"
+		trees={[
+			{ label: "(1,None,(1,None))", tuple: [1, null, [1, null]], highlight: [[1], [2, 1]] },
+			{ label: "scalar", tuple: 5, op: "wrap⁻¹" },
+			{ label: "deep", tuple: [[[[1]]]], text: false },
+		]}
+	/>
+</Layout>

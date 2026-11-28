@@ -3,6 +3,7 @@
 // (nested modes are flattened colexicographically, and headers show the nested coordinate). Each cell looks up its offset in
 // `data` for the value and in `labels` for a small grey label underneath.
 // Cells sharing a label share a hue; without labels, the hue cycles with offset mod 8.
+// `caption` replaces the default "name = layout" caption, for grids whose layout only places cells.
 // Usage in .mdx:
 //   <Matrix2D layout={new CuteLayout([4, [2, 2]], [2, [1, 8]])} data={{ 0: "a" }} labels={{ 0: "T0" }} />
 import { type CuteLayout, formatTuple } from "../../component/Cute/CuteLayout";
@@ -12,9 +13,10 @@ interface Props {
 	data?: Record<number, string | number>;
 	labels?: Record<number, string>;
 	name?: string;
+	caption?: string;
 }
 
-const { layout, data = {}, labels = {}, name } = Astro.props;
+const { layout, data = {}, labels = {}, name, caption: captionProp } = Astro.props;
 if (layout.rank !== 2) {
 	throw new Error(`Matrix2D needs a rank-2 layout, got ${layout} (rank ${layout.rank})`);
 }
@@ -22,7 +24,7 @@ const rowMode = layout.mode(0);
 const colMode = layout.mode(1);
 const rows = rowMode.size;
 const cols = colMode.size;
-const caption = name ? `${name} = ${layout}` : `${layout}`;
+const caption = captionProp ?? (name ? `${name} = ${layout}` : `${layout}`);
 
 // Golden-angle steps keep neighbouring groups visually distinct.
 const hueOf = (k: number) => (25 + k * 137.508) % 360;

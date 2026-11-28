@@ -1,0 +1,205 @@
+---
+// Draws one or more nested CuTe tuples (shapes, strides, coordinates) as trees, side by side, with
+// an arrow into each tree that has an `op` (trees without one are just placed side by side). A tuple is a small dot, a leaf is a chip with its value, and
+// each edge carries the child's index, so the path to a leaf is its hierarchical coordinate.
+// Leaves are tinted by value (colorBy="value", default), so a leaf can be followed through
+// flatten / group_modes / unflatten, or by position in the flattened tuple (colorBy="index").
+// `highlight` lists paths (child indices from the root) whose nodes and edges are drawn in the
+// accent colour, e.g. the result of find. `op` labels the arrow that leads into a tree.
+// Build-time SVG, no script. Layout in tupleTree.ts.
+// Usage in .mdx:
+//   <TupleTree name="flatten" trees={[
+//     { label: "t", tuple: [[2, 3], 4, [5, [6, 7]]] },
+//     { label: "flatten(t)", tuple: [2, 3, 4, 5, 6, 7], op: "flatten" },
+//   ]} />
+//   <TupleTree trees={[{ label: "find(t, 6) = (2,1,0)", tuple: [[2, 3], 4, [5, [6, 7]]], highlight: [[2, 1, 0]] }]} />
+import { type Tup, formatTup, isPrefix, layoutTree } from "./tupleTree";
+
+interface TreeSpec {
+	label: string;
+	tuple: Tup;
+	highlight?: number[][];
+	op?: string;
+	/** Show the tuple's text under the tree (default true). */
+	text?: boolean;
+}
+
+interface Props {
+	trees: TreeSpec[];
+	name?: string;
+	colorBy?: "value" | "index";
+}
+
+const { trees, name, colorBy = "value" } = Astro.props;
+
+const hueOf = (k: number) => (25 + k * 137.508) % 360;
+// One hue per distinct leaf value across all trees, so the same value has the same colour everywhere.
+const valueKeys = new Map<string, number>();
+const laid = trees.map((spec) => {
+	const layout = layoutTree(spec.tuple);
+	for (const n of layout.nodes) {
+		if (n.label !== undefined && !valueKeys.has(n.label))
+			valueKeys.set(n.label, valueKeys.size);
+	}
+	return { spec, layout };
+});
+const leafHue = (label: string, leafIndex: number) =>
+	hueOf(colorBy === "index" ? leafIndex : (valueKeys.get(label) ?? 0));
+const lit = (spec: TreeSpec, path: number[]) =>
+	(spec.highlight ?? []).some((h) => isPrefix(path, h));
+const chipW = 28;
+const chipH = 24;
+---
+
+<figure class="tuple-tree">
+	<div class="tt-row">
+		{
+			laid.map(({ spec, layout }, ti) => (
+				<div class="tt-item">
+					{ti > 0 && spec.op !== undefined && (
+						<div class="tt-arrow" aria-hidden="true">
+							<span class="tt-op">{spec.op}</span>
+							<span class="tt-glyph">→</span>
+						</div>
+					)}
+					<div class="tt-tree">
+						<svg
+							viewBox={`0 0 ${layout.width} ${layout.height}`}
+							width={layout.width}
+							height={layout.height}
+							role="img"
+							aria-label={`${spec.label}: ${formatTup(spec.tuple)}`}
+						>
+							{layout.edges.map((e) => {
+								const on = lit(spec, e.to.path);
+								const mx = (e.from.x + e.to.x) / 2;
+								const my = (e.from.y + e.to.y) / 2;
+								return (
+									<g class={on ? "edge lit" : "edge"}>
+										<line x1={e.from.x} y1={e.from.y} x2={e.to.x} y2={e.to.y - (e.to.label !== undefined ? chipH / 2 : 0)} />
+										<text class="idx" x={mx + (e.to.x >= e.from.x ? 5 : -5)} y={my} text-anchor={e.to.x >= e.from.x ? "start" : "end"}>
+											{e.index}
+										</text>
+									</g>
+								);
+							})}
+							{layout.nodes.map((n) =>
+								n.label === undefined ? (
+									<circle class={lit(spec, n.path) ? "tup lit" : "tup"} cx={n.x} cy={n.y} r={5} />
+								) : (
+									<g class={lit(spec, n.path) ? "leaf lit" : "leaf"} style={`--hue: ${leafHue(n.label, n.leafIndex).toFixed(1)}`}>
+										<rect x={n.x - chipW / 2} y={n.y - chipH / 2} width={chipW} height={chipH} rx={6} />
+										<text x={n.x} y={n.y + 4} text-anchor="middle">
+											{n.label}
+										</text>
+									</g>
+								),
+							)}
+						</svg>
+						<div class="tt-label">{spec.label}</div>
+						{spec.text !== false && <div class="tt-text">{formatTup(spec.tuple)}</div>}
+					</div>
+				</div>
+			))
+		}
+	</div>
+	{name && <figcaption>{name}</figcaption>}
+</figure>
+
+<style>
+	.tuple-tree {
+		margin: 1.75rem 0;
+		overflow-x: auto;
+	}
+	.tt-row {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		flex-wrap: wrap;
+		gap: 1rem 1.5rem;
+	}
+	.tt-item {
+		display: flex;
+		align-items: center;
+		gap: 0.75rem;
+	}
+	.tt-tree {
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+	}
+	.tt-arrow {
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		color: var(--muted);
+		font-family: var(--mono);
+	}
+	.tt-op {
+		font-size: 0.68rem;
+	}
+	.tt-glyph {
+		font-size: 1.3rem;
+	}
+	.tt-label {
+		font-family: var(--mono);
+		font-size: 0.78rem;
+		color: var(--text);
+		margin-top: 0.2rem;
+	}
+	.tt-text {
+		font-family: var(--mono);
+		font-size: 0.7rem;
+		color: var(--muted);
+	}
+	svg {
+		overflow: visible;
+		font-family: var(--mono);
+	}
+	.edge line {
+		stroke: var(--faint);
+		stroke-width: 1.5;
+	}
+	.edge .idx {
+		fill: var(--muted);
+		font-size: 9px;
+	}
+	.edge.lit line {
+		stroke: var(--accent);
+		stroke-width: 2.5;
+	}
+	.edge.lit .idx {
+		fill: var(--accent);
+		font-weight: 600;
+	}
+	.tup {
+		fill: var(--muted);
+	}
+	.tup.lit {
+		fill: var(--accent);
+	}
+	.leaf {
+		--tint: oklch(0.72 0.15 var(--hue));
+	}
+	.leaf rect {
+		fill: color-mix(in oklch, var(--tint) 26%, var(--bg));
+		stroke: color-mix(in oklch, var(--tint) 60%, var(--bg));
+		stroke-width: 1;
+	}
+	.leaf text {
+		fill: var(--text);
+		font-size: 12px;
+		font-weight: 500;
+	}
+	.leaf.lit rect {
+		stroke: var(--accent);
+		stroke-width: 2.5;
+	}
+	figcaption {
+		text-align: center;
+		font-family: var(--mono);
+		font-size: 0.85rem;
+		color: var(--muted);
+		margin-top: 0.6rem;
+	}
+</style>

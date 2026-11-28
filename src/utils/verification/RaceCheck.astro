@@ -1,0 +1,322 @@
+---
+// A shared-memory tree reduction checked for data races and barrier divergence the way
+// GPUVerify does: choose two distinct threads t1 and t2 and compare only their accesses.
+// Rows are the rounds (stride s = n/2, ..., 1), columns are sdata[0..n-1]. In each round an
+// active thread t (t < s) reads sdata[t + s] and sdata[t] and writes sdata[t]; the arc goes from
+// the cell it reads to the cell it writes. t1's arcs are blue, t2's orange, the other threads'
+// grey. Dashed lines between rows are __syncthreads(). Conflicting cells get a red outline and
+// the readout lists each race (or the divergent barrier). "Find a bad pair" jumps to the next
+// pair with an error, as a solver's counterexample would. Logic in raceCheck.ts.
+// Usage in .mdx:
+//   import RaceCheck from "../../utils/verification/RaceCheck.astro";
+//   <RaceCheck n={8} variant="none" t1={0} t2={2} />
+//   Props: n (power of two, default 8), variant ("barrier" | "none" | "inside"), t1, t2, title.
+import { strides } from "./raceCheck";
+
+interface Props {
+	n?: number;
+	variant?: "barrier" | "none" | "inside";
+	t1?: number;
+	t2?: number;
+	title?: string;
+}
+
+const { n = 8, variant = "barrier", t1 = 0, t2 = 2, title } = Astro.props;
+strides(n); // throws on a bad n at build time
+const threads = Array.from({ length: n }, (_, i) => i);
+---
+
+<figure class="rc" data-n={n} data-variant={variant} data-t1={t1} data-t2={t2}>
+	{title && <figcaption class="rc-title">{title}</figcaption>}
+	<div class="rc-controls">
+		<label>
+			Kernel
+			<select data-ctl="variant">
+				<option value="barrier" selected={variant === "barrier"}>barrier after the if</option>
+				<option value="none" selected={variant === "none"}>no barrier</option>
+				<option value="inside" selected={variant === "inside"}>barrier inside the if</option>
+			</select>
+		</label>
+		<label>
+			<span class="rc-key k1"></span>t1
+			<select data-ctl="t1">
+				{threads.map((t) => <option value={t} selected={t === t1}>{t}</option>)}
+			</select>
+		</label>
+		<label>
+			<span class="rc-key k2"></span>t2
+			<select data-ctl="t2">
+				{threads.map((t) => <option value={t} selected={t === t2}>{t}</option>)}
+			</select>
+		</label>
+		<button type="button" data-ctl="find">Find a bad pair</button>
+	</div>
+	<pre class="rc-code" aria-hidden="true"></pre>
+	<div class="rc-canvas"></div>
+	<p class="rc-out" aria-live="polite"></p>
+</figure>
+
+<script>
+	import { checkPair, badPairs, describe, strides, type Variant } from "./raceCheck";
+
+	const CODE: Record<Variant, string> = {
+		barrier: "for (s = n/2; s > 0; s >>= 1) {\n  if (tid < s) sdata[tid] += sdata[tid + s];\n  __syncthreads();\n}",
+		none: "for (s = n/2; s > 0; s >>= 1) {\n  if (tid < s) sdata[tid] += sdata[tid + s];\n  // no barrier\n}",
+		inside: "for (s = n/2; s > 0; s >>= 1) {\n  if (tid < s) {\n    sdata[tid] += sdata[tid + s];\n    __syncthreads();   // only tid < s get here\n  }\n}",
+	};
+
+	for (const fig of document.querySelectorAll<HTMLElement>(".rc")) {
+		const n = Number(fig.dataset.n);
+		const S = strides(n);
+		const vSel = fig.querySelector<HTMLSelectElement>("[data-ctl=variant]")!;
+		const aSel = fig.querySelector<HTMLSelectElement>("[data-ctl=t1]")!;
+		const bSel = fig.querySelector<HTMLSelectElement>("[data-ctl=t2]")!;
+		const find = fig.querySelector<HTMLButtonElement>("[data-ctl=find]")!;
+		const canvas = fig.querySelector<HTMLElement>(".rc-canvas")!;
+		const code = fig.querySelector<HTMLElement>(".rc-code")!;
+		const out = fig.querySelector<HTMLElement>(".rc-out")!;
+
+		const CW = 46, CH = 26, LX = 64, TOP = 34, RH = 78;
+		const W = LX + n * CW + 8;
+		const H = TOP + S.length * RH;
+
+		const render = () => {
+			const variant = vSel.value as Variant;
+			const t1 = Number(aSel.value), t2 = Number(bSel.value);
+			const res = checkPair(n, variant, t1, t2);
+			code.textContent = CODE[variant];
+			const hot = new Set(res.conflicts.flatMap((c) => [`${c.a.round}:${c.a.addr}`, `${c.b.round}:${c.b.addr}`]));
+			const parts: string[] = [];
+			for (let c = 0; c < n; c++)
+				parts.push(`<text class="hd" x="${LX + c * CW + CW / 2}" y="12">${c}</text>`);
+			parts.push(`<text class="hd lft" x="4" y="12">sdata[ ]</text>`);
+			S.forEach((s, r) => {
+				const y = TOP + r * RH + 30;
+				parts.push(`<text class="rl" x="4" y="${y + CH / 2 + 4}">s = ${s}</text>`);
+				for (let c = 0; c < n; c++) {
+					const cls = ["cell", c < 2 * s ? "live" : "", hot.has(`${r}:${c}`) ? "hot" : ""].join(" ");
+					parts.push(`<rect class="${cls}" x="${LX + c * CW + 3}" y="${y}" width="${CW - 6}" height="${CH}" rx="3"/>`);
+				}
+				for (let t = 0; t < s; t++) {
+					const x0 = LX + (t + s) * CW + CW / 2, x1 = LX + t * CW + CW / 2;
+					const lift = 10 + 4 * Math.log2(s);
+					const who = t === t1 ? "a1" : t === t2 ? "a2" : "ao";
+					parts.push(`<path class="arc ${who}" d="M${x0},${y} C${x0},${y - lift - 8} ${x1},${y - lift - 8} ${x1},${y - 1}" marker-end="url(#rc-h-${who})"/>`);
+				}
+				for (const [t, k] of [[t1, "a1"], [t2, "a2"]] as const)
+					if (t < s) parts.push(`<text class="tl ${k}" x="${LX + t * CW + CW / 2}" y="${y + CH / 2 + 4}">t${t}</text>`);
+				if (r < S.length - 1) {
+					const yb = y + CH + 10;
+					if (variant === "barrier")
+						parts.push(`<line class="bar" x1="${LX}" x2="${LX + n * CW}" y1="${yb}" y2="${yb}"/><text class="bl" x="${LX + n * CW}" y="${yb + 11}">__syncthreads()</text>`);
+					if (variant === "inside") {
+						const bad = res.divergent.includes(r);
+						parts.push(`<line class="bar part ${bad ? "div" : ""}" x1="${LX}" x2="${LX + s * CW}" y1="${yb}" y2="${yb}"/><text class="bl ${bad ? "div" : ""}" x="${LX + n * CW}" y="${yb + 11}">barrier for tid &lt; ${s} only</text>`);
+					}
+				}
+			});
+			if (variant === "inside") {
+				const r = S.length - 1, s = S[r], yb = TOP + r * RH + 30 + CH + 10;
+				const bad = res.divergent.includes(r);
+				parts.push(`<line class="bar part ${bad ? "div" : ""}" x1="${LX}" x2="${LX + s * CW}" y1="${yb}" y2="${yb}"/><text class="bl ${bad ? "div" : ""}" x="${LX + n * CW}" y="${yb + 11}">barrier for tid &lt; ${s} only</text>`);
+			}
+			const defs = ["a1", "a2", "ao"].map((k) => `<marker id="rc-h-${k}" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto"><path class="hd-${k}" d="M0,0 L8,4 L0,8 z"/></marker>`).join("");
+			canvas.innerHTML = `<svg viewBox="0 0 ${W} ${H + 14}" style="width:min(100%, ${W}px)" role="img" aria-label="Reduction rounds with the accesses of t${t1} and t${t2}"><defs>${defs}</defs>${parts.join("")}</svg>`;
+
+			if (t1 === t2) {
+				out.innerHTML = "Pick two <em>different</em> threads.";
+			} else if (res.divergent.length > 0) {
+				const s = S[res.divergent[0]];
+				const [inT, outT] = t1 < s ? [t1, t2] : [t2, t1];
+				out.innerHTML = `<b class="err">Barrier divergence</b> in round s = ${s}: t${inT} &lt; ${s} reaches <code>__syncthreads()</code>, t${outT} does not. CUDA leaves this undefined.`;
+			} else if (res.conflicts.length > 0) {
+				out.innerHTML = `<b class="err">Data race</b> (${res.conflicts.length}): ` + res.conflicts.map((c) => describe(c)).join("; ") + ". No barrier separates them.";
+			} else {
+				const a = badPairs(n, variant).length;
+				out.innerHTML = `<b class="ok">No conflict</b> between t${t1} and t${t2}. ` + (a === 0 ? "No pair of threads conflicts, so the kernel is race-free for this n." : `${a} other pair${a > 1 ? "s" : ""} of threads do${a > 1 ? "" : "es"} conflict.`);
+			}
+		};
+		for (const el of [vSel, aSel, bSel]) el.addEventListener("change", render);
+		find.addEventListener("click", () => {
+			const pairs = badPairs(n, vSel.value as Variant);
+			if (pairs.length === 0) {
+				out.innerHTML = `<b class="ok">No bad pair exists</b> for this kernel at n = ${n}.`;
+				return;
+			}
+			const cur = pairs.findIndex(([a, b]) => a === Math.min(Number(aSel.value), Number(bSel.value)) && b === Math.max(Number(aSel.value), Number(bSel.value)));
+			const [a, b] = pairs[(cur + 1) % pairs.length];
+			aSel.value = String(a);
+			bSel.value = String(b);
+			render();
+		});
+		render();
+	}
+</script>
+
+<style>
+	.rc {
+		--c1: #1f6fb4;
+		--c2: #d9771e;
+		--err: #c0392b;
+		--ok: #2e7d4f;
+		margin: 1.6rem 0;
+		font-family: var(--sans);
+	}
+	@media (prefers-color-scheme: dark) {
+		.rc {
+			--c1: #6aaee8;
+			--c2: #f0a25a;
+			--err: #ef7b6c;
+			--ok: #6cc596;
+		}
+	}
+	.rc-title {
+		font-size: 0.85rem;
+		color: var(--muted);
+		margin-bottom: 0.4rem;
+	}
+	.rc-controls {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.4rem 0.9rem;
+		align-items: center;
+		font-size: 0.78rem;
+	}
+	.rc-controls label {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.3rem;
+	}
+	.rc-controls select,
+	.rc-controls button {
+		font: inherit;
+		color: var(--text);
+		background: var(--surface);
+		border: 1px solid var(--faint);
+		border-radius: 4px;
+		padding: 0.1rem 0.35rem;
+	}
+	.rc-controls button {
+		cursor: pointer;
+	}
+	.rc-controls button:hover {
+		border-color: var(--accent);
+	}
+	.rc-key {
+		display: inline-block;
+		width: 0.7rem;
+		height: 0.7rem;
+		border-radius: 2px;
+	}
+	.rc-key.k1 {
+		background: var(--c1);
+	}
+	.rc-key.k2 {
+		background: var(--c2);
+	}
+	.rc-code {
+		font-variant-ligatures: none;
+		margin: 0.5rem 0 0.3rem;
+		padding: 0.4rem 0.6rem;
+		font-size: 0.7rem;
+		line-height: 1.4;
+		background: var(--surface);
+		border-radius: 4px;
+		white-space: pre;
+		overflow-x: auto;
+	}
+	.rc-canvas {
+		overflow-x: auto;
+	}
+	.rc-canvas :global(svg) {
+		display: block;
+		min-width: 420px;
+	}
+	.rc-canvas :global(.hd),
+	.rc-canvas :global(.rl),
+	.rc-canvas :global(.bl),
+	.rc-canvas :global(.tl) {
+		font-family: var(--mono);
+		font-size: 10px;
+		fill: var(--muted);
+	}
+	.rc-canvas :global(.hd) {
+		text-anchor: middle;
+	}
+	.rc-canvas :global(.hd.lft) {
+		text-anchor: start;
+	}
+	.rc-canvas :global(.bl) {
+		text-anchor: end;
+		font-size: 9px;
+	}
+	.rc-canvas :global(.tl) {
+		text-anchor: middle;
+		font-weight: 700;
+	}
+	.rc-canvas :global(.tl.a1) {
+		fill: var(--c1);
+	}
+	.rc-canvas :global(.tl.a2) {
+		fill: var(--c2);
+	}
+	.rc-canvas :global(.cell) {
+		fill: var(--bg);
+		stroke: var(--faint);
+	}
+	.rc-canvas :global(.cell.live) {
+		fill: var(--surface);
+		stroke: var(--muted);
+	}
+	.rc-canvas :global(.cell.hot) {
+		stroke: var(--err);
+		stroke-width: 2.4;
+	}
+	.rc-canvas :global(.arc) {
+		fill: none;
+		stroke-width: 1.3;
+	}
+	.rc-canvas :global(.arc.ao) {
+		stroke: var(--faint);
+	}
+	.rc-canvas :global(.arc.a1) {
+		stroke: var(--c1);
+		stroke-width: 2.2;
+	}
+	.rc-canvas :global(.arc.a2) {
+		stroke: var(--c2);
+		stroke-width: 2.2;
+	}
+	.rc-canvas :global(.hd-ao) {
+		fill: var(--faint);
+	}
+	.rc-canvas :global(.hd-a1) {
+		fill: var(--c1);
+	}
+	.rc-canvas :global(.hd-a2) {
+		fill: var(--c2);
+	}
+	.rc-canvas :global(.bar) {
+		stroke: var(--accent);
+		stroke-dasharray: 5 3;
+	}
+	.rc-canvas :global(.bar.div) {
+		stroke: var(--err);
+		stroke-width: 2;
+	}
+	.rc-canvas :global(.bl.div) {
+		fill: var(--err);
+	}
+	.rc-out {
+		min-height: 2.8em;
+		margin: 0.3rem 0 0;
+		font-size: 0.8rem;
+		line-height: 1.5;
+	}
+	.rc-out :global(.err) {
+		color: var(--err);
+	}
+	.rc-out :global(.ok) {
+		color: var(--ok);
+	}
+</style>
