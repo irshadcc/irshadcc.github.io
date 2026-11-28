@@ -1,0 +1,302 @@
+---
+// Draws one or more layout grids behind tabs. Each panel is a rows × columns grid of cell values
+// with row/column headers, optional colour groups (null = dimmed), small sub-labels and a hover
+// readout. Hovering a cell lights up every cell in its group and shows its `tips` entry. Because
+// the cells are plain data, it can draw layouts Matrix2D cannot: coordinate-valued strides,
+// F2 (XOR) swizzles, letters, thread/value owners, TMEM lanes. Grids wider than 12 columns get
+// smaller cells. Data model and helpers in layoutPanels.ts.
+// Usage in .mdx:
+//   import LayoutPanels from "../../utils/cute/LayoutPanels.astro";
+//   import { cuteAlgebraFigures as G } from "../../utils/cute/cuteAlgebraFigures";
+//   <LayoutPanels panels={G.gallery3} label="Data layouts of shape (4,8)" />
+import {
+	type LayoutPanel,
+	cellHue,
+	groupIndex,
+	sharedSizes,
+	validatePanel,
+} from "./layoutPanels";
+
+interface Props {
+	panels: LayoutPanel[];
+	/** Accessible name for the tab list. */
+	label?: string;
+	/** Index of the panel shown first. */
+	initial?: number;
+}
+
+const { panels, label = "Choose a layout", initial = 0 } = Astro.props;
+for (const p of panels) {
+	const errs = validatePanel(p);
+	if (errs.length)
+		throw new Error(`LayoutPanels "${p.caption}": ${errs.join("; ")}`);
+}
+const sizes = sharedSizes(panels);
+const prepared = panels.map((p, k) => {
+	const keys = groupIndex(p);
+	return {
+		p,
+		size: sizes[k],
+		hues: p.cells.map((row, i) => row.map((_, j) => cellHue(p, keys, i, j))),
+	};
+});
+const tabbed = panels.length > 1;
+---
+
+<figure class="layout-panels">
+	{
+		tabbed && (
+			<div class="lp-tabs" role="tablist" aria-label={label}>
+				{panels.map((p, k) => (
+					<button type="button" role="tab" data-k={k} aria-selected={String(k === initial)}>
+						{p.tab ?? `${k + 1}`}
+					</button>
+				))}
+			</div>
+		)
+	}
+	{
+		prepared.map(({ p, size, hues }, k) => (
+			<div class="lp-panel" data-k={k} hidden={k !== initial} role={tabbed ? "tabpanel" : undefined}>
+				<div class="lp-scroll">
+					<table class={`lp-grid lp-${size}`}>
+						{p.colTitle && (
+							<caption class="lp-coltitle">{p.colTitle}</caption>
+						)}
+						<thead>
+							<tr>
+								<th class="lp-corner">{p.rowTitle ?? ""}</th>
+								{p.colHeads.map((h) => (
+									<th scope="col">{h}</th>
+								))}
+							</tr>
+						</thead>
+						<tbody>
+							{p.cells.map((row, i) => (
+								<tr>
+									<th scope="row">{p.rowHeads[i]}</th>
+									{row.map((v, j) => {
+										const hue = hues[i][j];
+										const g = p.groups?.[i]?.[j];
+										return (
+											<td
+												class={hue === null ? "lp-dim" : undefined}
+												style={hue === null ? undefined : `--hue: ${hue.toFixed(1)}`}
+												data-g={g ?? undefined}
+												data-tip={p.tips?.[i]?.[j]}
+												tabindex={p.tips ? 0 : undefined}
+											>
+												<span class="lp-value">{v}</span>
+												{p.subs?.[i]?.[j] && <span class="lp-sub">{p.subs[i][j]}</span>}
+											</td>
+										);
+									})}
+								</tr>
+							))}
+						</tbody>
+					</table>
+				</div>
+				{(p.tips || p.note) && (
+					<p class="lp-readout" aria-live="polite" data-note={p.note ?? "Hover a cell to see how it is computed."}>
+						{p.note ?? "Hover a cell to see how it is computed."}
+					</p>
+				)}
+				<figcaption>{p.caption}</figcaption>
+			</div>
+		))
+	}
+</figure>
+
+<script>
+	document.querySelectorAll<HTMLElement>(".layout-panels").forEach((root) => {
+		const tabs = [...root.querySelectorAll<HTMLButtonElement>("[role=tab]")];
+		const panels = [...root.querySelectorAll<HTMLElement>(".lp-panel")];
+		for (const tab of tabs)
+			tab.addEventListener("click", () => {
+				for (const t of tabs) t.setAttribute("aria-selected", String(t === tab));
+				for (const p of panels) p.hidden = p.dataset.k !== tab.dataset.k;
+			});
+
+		for (const panel of panels) {
+			const cells = [...panel.querySelectorAll<HTMLElement>("td")];
+			const readout = panel.querySelector<HTMLElement>(".lp-readout");
+			const show = (cell: HTMLElement) => {
+				const g = cell.dataset.g;
+				for (const c of cells) c.classList.toggle("lp-peer", g !== undefined && c.dataset.g === g);
+				cell.classList.add("lp-on");
+				if (readout && cell.dataset.tip) readout.textContent = cell.dataset.tip;
+			};
+			const clear = (cell: HTMLElement) => {
+				for (const c of cells) c.classList.remove("lp-peer");
+				cell.classList.remove("lp-on");
+				if (readout) readout.textContent = readout.dataset.note ?? "";
+			};
+			for (const cell of cells) {
+				cell.addEventListener("mouseenter", () => show(cell));
+				cell.addEventListener("focus", () => show(cell));
+				cell.addEventListener("mouseleave", () => clear(cell));
+				cell.addEventListener("blur", () => clear(cell));
+			}
+		}
+	});
+</script>
+
+<style>
+	.layout-panels {
+		margin: 1.75rem 0;
+		border: 1px solid var(--faint);
+		border-radius: 12px;
+		overflow: hidden;
+		background: var(--bg);
+	}
+	.lp-tabs {
+		display: flex;
+		flex-wrap: wrap;
+		border-bottom: 1px solid var(--faint);
+		background: var(--surface);
+	}
+	.lp-tabs button {
+		flex: 1 1 auto;
+		border: 0;
+		border-right: 1px solid var(--faint);
+		padding: 0.55rem 0.6rem;
+		background: transparent;
+		color: var(--muted);
+		font: 600 0.75rem var(--sans);
+		cursor: pointer;
+		font-feature-settings: "calt" 0;
+	}
+	.lp-tabs button:last-child {
+		border-right: 0;
+	}
+	.lp-tabs button[aria-selected="true"] {
+		background: var(--bg);
+		color: var(--accent);
+		box-shadow: inset 0 -2px var(--accent);
+	}
+	.lp-panel {
+		padding: 0.9rem 0.6rem 0.8rem;
+	}
+	.lp-panel[hidden] {
+		display: none;
+	}
+	.lp-scroll {
+		overflow-x: auto;
+	}
+	.lp-grid {
+		border-collapse: separate;
+		border-spacing: 3px;
+		font-family: var(--mono);
+		margin: 0 auto;
+		width: auto;
+	}
+	.lp-coltitle {
+		caption-side: top;
+		font: 0.72rem var(--sans);
+		color: var(--muted);
+		padding-bottom: 0.2rem;
+	}
+	.lp-grid th {
+		white-space: nowrap;
+		color: var(--muted);
+		font-size: 0.66rem;
+		font-weight: normal;
+		border: none;
+		background: none;
+		padding: 0 0.2rem;
+	}
+	.lp-grid .lp-corner {
+		font-family: var(--sans);
+		text-align: right;
+	}
+	.lp-grid td {
+		--tint: oklch(0.72 0.15 var(--hue));
+		text-align: center;
+		line-height: 1.1;
+		border: 1px solid color-mix(in oklch, var(--tint) 55%, var(--bg));
+		border-radius: 5px;
+		background: linear-gradient(
+			160deg,
+			color-mix(in oklch, var(--tint) 30%, var(--bg)),
+			color-mix(in oklch, var(--tint) 16%, var(--bg))
+		);
+		color: var(--text);
+		transition:
+			transform 120ms ease,
+			box-shadow 120ms ease;
+	}
+	.lp-normal td {
+		min-width: 2.6rem;
+		height: 2.6rem;
+		padding: 0.15rem 0.3rem;
+		font-size: 0.82rem;
+	}
+	.lp-small td {
+		min-width: 1.95rem;
+		height: 2.1rem;
+		padding: 0.1rem 0.15rem;
+		font-size: 0.68rem;
+	}
+	.lp-tiny td {
+		min-width: 1rem;
+		height: 1.5rem;
+		padding: 0 0.05rem;
+		font-size: 0.56rem;
+		border-radius: 3px;
+	}
+	.lp-tiny {
+		border-spacing: 2px;
+	}
+	.lp-tiny th {
+		font-size: 0.55rem;
+	}
+	.lp-grid td.lp-dim {
+		background: var(--surface);
+		border-color: var(--faint);
+		color: var(--muted);
+	}
+	.lp-grid td.lp-peer {
+		box-shadow: 0 0 0 2px color-mix(in oklch, var(--tint) 75%, var(--text));
+	}
+	.lp-grid td.lp-on,
+	.lp-grid td:focus-visible {
+		transform: scale(1.08);
+		position: relative;
+		z-index: 1;
+		outline: 2px solid var(--accent);
+		outline-offset: 1px;
+	}
+	.lp-value,
+	.lp-sub {
+		display: block;
+	}
+	.lp-value {
+		font-weight: 500;
+	}
+	.lp-sub {
+		font-size: 0.6rem;
+		color: color-mix(in oklch, var(--tint) 45%, var(--muted));
+		margin-top: 0.05rem;
+	}
+	.lp-small .lp-sub,
+	.lp-tiny .lp-sub {
+		font-size: 0.5rem;
+	}
+	.lp-dim .lp-sub {
+		color: var(--muted);
+	}
+	.lp-readout {
+		margin: 0.6rem 0.4rem 0;
+		min-height: 1.3em;
+		text-align: center;
+		font: 0.78rem var(--mono);
+		color: var(--text);
+	}
+	figcaption {
+		text-align: center;
+		font-family: var(--mono);
+		font-size: 0.8rem;
+		color: var(--muted);
+		margin-top: 0.45rem;
+	}
+</style>

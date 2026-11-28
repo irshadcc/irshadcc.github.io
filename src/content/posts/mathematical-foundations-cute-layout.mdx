@@ -9,6 +9,8 @@ import Sidenote from "../../components/Sidenote.astro";
 import LayoutGrid from "../../component/LayoutGrid.astro";
 import Matrix2D from "../../utils/matrix/Matrix2D.astro";
 import { cuteDslFigures as F } from "../../utils/matrix/cuteDslFigures";
+import LayoutPanels from "../../utils/cute/LayoutPanels.astro";
+import { cuteAlgebraFigures as G } from "../../utils/cute/cuteAlgebraFigures";
 
 ## Background
 
@@ -24,12 +26,27 @@ combining old ones. This matters because the same language can describe memory, 
 and hardware instructions. Index arithmetic that would otherwise be scattered through a kernel
 becomes data that the compiler can inspect and often evaluate at compile time.
 
-This post builds that language from the ground up. We first need functions, tuples, mixed-radix
-coordinates, and strides. We then define a CuTe layout, explain its hierarchy, and work through the
-main algebraic operations. Finally, we use composition to turn a thread-value ownership pattern into
-the offsets each GPU thread must load. For the programming interface, see
-[A Tour of the CuTe DSL](/blog/cute-dsl/); here the goal is to understand *why* its layout operations
-work.
+This post builds that language from the ground up, following the order of Cris Cecka's paper
+*CuTe Layout Representation and Algebra*. It has six parts:
+
+1. **Why layouts**: loops as shape–stride pairs, and tensor folding, which reduces every tensor
+   contraction to one batched GEMM.
+2. **Coordinates**: mixed-radix order, hierarchical tuples, and when two shapes share coordinates.
+3. **Layouts**: shapes and strides, a gallery of common layouts, strides that produce coordinates or
+   XOR swizzles, and two properties: semi-linearity and completeness.
+4. **Tensors**: slicing, and generic COPY and GEMM written once for every layout.
+5. **The layout algebra**: concatenation, coalescence, composition (with tilers), the two inverses
+   (with a vectorized copy and a Blackwell tensor-memory check), complements, products and divisions.
+6. **Thread-value layouts**: the Ampere FP64 tensor-core partition, followed by the categorical model
+   from a second paper and a complete worked example.
+
+For the programming interface, see [A Tour of the CuTe DSL](/blog/cute-dsl/); here the goal is to
+understand *why* its layout operations work. Every number in the figures was computed with
+PyCuTe, the paper's Python reference implementation.<Sidenote>PyCuTe lives at
+[github.com/NVlabs/CuTe](https://github.com/NVlabs/CuTe/tree/56cc3d0c0b3cc906dd8771b98181524b82781049)
+(commit `56cc3d0`). It mirrors the paper's definitions and post-conditions, and it is separate from
+the CuTe DSL and from the C++ headers in CUTLASS. Each figure's data was generated with it, and every
+table below was checked against its output.</Sidenote>
 
 ## The problem is an indexing function
 
@@ -82,6 +99,142 @@ for (int n = 0; n < 8; ++n)
 has shape $(4,8)$ and stride $(1,5)$. The loop describes *which logical coordinates exist*. The
 stride describes *where each one goes*. CuTe packages those two facts as $(4,8):(1,5)$, allowing an
 algorithm to keep its loops while replacing the access rule.
+
+Any loop with an affine bound and step can be put in this **canonical form**: one index, starting
+at zero, incremented by one, with a tight exclusive bound. The paper's first example is
+
+```cpp
+for (int m = 2; m <= 50; m += 3)
+  A[m] = e(m);
+```
+
+It touches $A[2],A[5],\ldots,A[50]$, which is $(50-2)/3+1=17$ elements. Moving the constant into the
+pointer and the step into a stride gives
+
+```cpp
+for (int i = 0; i < 17; ++i)
+  (A + 2)[3 * i] = g(i);   // g(i) = e(3*i + 2)
+```
+
+That is an **accessor** `A + 2` with layout $17:3$: a logical 17-element vector whose coordinate is
+scaled by 3. A two-level nest works the same way:
+
+```cpp
+for (int n = 3; n < 43; n += 2)
+  for (int m = 4; m <= 22; m += 5)
+    A[p * m + q * n] = e(m, n);
+```
+
+The inner loop takes $m=4,9,14,19$ (4 values) and the outer takes $n=3,5,\ldots,41$ (20 values).
+Substituting $m=4+5i$ and $n=3+2j$ gives $pm+qn=(4p+3q)+5p\,i+2q\,j$, so the nest is accessor
+`A + 4p + 3q` with layout $(4,20):(5p,2q)$.
+
+The same 80 iterations can also run as one loop:
+
+```cpp
+for (int k = 0; k < 80; ++k)
+  (A + 4*p + 3*q)[5*p*(k % 4) + 2*q*(k / 4)] = f(k);
+```
+
+The pair $(i,j)=(k\bmod4,\lfloor k/4\rfloor)$ is exactly the colexicographic order defined below, and
+it comes from the shape alone. So one shape accepts both 2-D and 1-D coordinates.
+
+This one-to-one match between loop nests and shape:stride pairs changes the question. Instead of
+asking how to split, permute, truncate or vectorize loops, we can ask which functions $P$ turn a
+layout $L$ into a new, meaningful layout
+
+$$
+L'=L\circ P.
+$$
+
+The paper's answer is that $P$ can itself be a layout. Composition, covered below, is that operation.
+
+### Tensors and folding
+
+Layouts that accept several coordinate systems also explain how one GEMM routine can run any tensor
+contraction. Write each tensor with its indices and sum over every index that appears only on the
+right-hand side (**Einstein notation**). For example,
+
+$$
+C_{stqp}=A_{stupr}\,B_{qtru}
+$$
+
+contracts a rank-5 tensor with a rank-4 tensor into a rank-4 tensor. Sort its indices by where they
+appear:
+
+| Kind | Appears in | Indices here |
+| --- | --- | --- |
+| **row** modes $\hat m$ | $A$ and $C$, not $B$ | $s,p$ |
+| **column** modes $\hat n$ | $B$ and $C$, not $A$ | $q$ |
+| **reduction** modes $\hat k$ | $A$ and $B$, not $C$ | $u,r$ |
+| **batch** modes $\hat\ell$ | $A$, $B$ and $C$ | $t$ |
+
+Grouping each kind into one **multi-mode** rewrites the contraction as
+
+$$
+C_{(sp)(q)(t)}=A_{(sp)(ur)(t)}\,B_{(q)(ur)(t)}.
+$$
+
+This grouping is called **tensor folding**. It changes the *view* of the data, not the data. The
+figure shows the paper's example: eight values $a\ldots h$ stored as a $2\times2\times2$ tensor with
+layout $(2,2,2):(2,1,4)$, folded into a $4\times2$ and a $2\times4$ matrix. The colour marks the third
+tensor coordinate, so you can see which mode it was folded into.
+
+<LayoutPanels panels={G.fold} label="Folding a 2×2×2 tensor" />
+
+| View | Flat shape : stride | CuTe shape : stride |
+| --- | :---: | :---: |
+| tensor $2\times2\times2$ | $(2,2,2):(2,1,4)$ | $(2,2,2):(2,1,4)$ |
+| $4\times2$, mode 2 folded into mode 0 | $(4,2):(2,1)$ | $((2,2),2):((2,4),1)$ |
+| $2\times4$, mode 2 folded into mode 1 | none | $(2,(2,2)):(2,(1,4))$ |
+
+The $4\times2$ fold happens to have a flat form, which is its *coalesced* layout (see Coalescence
+below). The $2\times4$ fold does not: walking along a row moves $+1$, then $+3$, then $+1$, so no
+single integer stride works. Its nested stride $(1,4)$ does. Check one entry: row 1, column 2 has
+natural coordinate $(1,(0,1))$, so its offset is $1\cdot2+0\cdot1+1\cdot4=6$, which holds $g$.
+
+Because every multi-mode can be iterated with one integer coordinate, any contraction becomes the
+canonical batched GEMM
+
+$$
+C_{\hat m\hat n\hat\ell}=A_{\hat m\hat k\hat\ell}\,B_{\hat n\hat k\hat\ell},
+$$
+
+with a four-loop reference implementation:
+
+```cpp
+for (int l = 0; l < L; ++l)
+  for (int m = 0; m < M; ++m)
+    for (int n = 0; n < N; ++n)
+      for (int k = 0; k < K; ++k)
+        C(m, n, l) += A(m, k, l) * B(n, k, l);
+```
+
+Here `m` may index a single mode $M$ or a folded mode $(M_0,M_1)$; the layout decides. Optimizations
+such as loop reordering, tiling and vectorization then become permutations of the coordinate
+spaces, which are again layouts composed with the data layouts.
+
+### Where CuTe sits among layout systems
+
+Most tensor libraries store a **flat shape and flat stride**: one integer extent and one integer
+stride per mode. NumPy's `ndarray([3,7,5])` of `float64` has strides `(280, 40, 8)` in bytes; PyTorch's
+`torch.empty(3,7,5)` has `stride() == (35, 5, 1)` in elements; C++ `std::mdspan` stores the same
+information. A CuTe layout of depth 1 with integer strides *is* that representation, so CuTe is a
+strict extension of it (see [Strided Tensors](/blog/strided-tensors/)). The extension adds nested
+shapes and strides, strides that are not integers, and codomains that are not offsets.
+
+Other generalizations exist. BLIS lets GEMM take a non-unit stride in both rows and columns, and
+strided-batched GEMM adds a batch mode. ThunderKittens defines a fixed set of tile types (row- or
+column-major tiles, tiles of subtiles) for each memory space. Triton's
+[linear layouts](/blog/linear-layouts/) describe layouts as matrices over $\mathbb F_2$, which limits
+them to power-of-two shapes and strides; CuTe can express them with the binary strides shown below.
+Independent analyses model CuTe layouts as
+[integer set relations](/blog/integer-set-relations/) or, in the categorical model discussed later in
+this post, as morphisms of a category.
+
+The paper gives one measurement of why a single representation matters: CUTLASS v2 contained nearly
+300 separately written layouts in 87 files, about 55,000 lines. CuTe's layout representation and
+algebra take about 3,000 lines and represent all of them.
 
 ## The coordinate mathematics
 
@@ -170,6 +323,82 @@ $(m_{\mathrm{inner}},m_{\mathrm{tile}})$ in shape $(2,2)$. Mixed-radix conversio
 $m=m_{\mathrm{inner}}+2m_{\mathrm{tile}}$. CuTe recursively applies the same rule at every node of
 the tuple tree.
 
+Three measurements describe a hierarchical tuple $X$. Its **rank** is the number of top-level
+children (1 for a single value). Its **depth** is 0 for a single value and one more than its deepest
+child otherwise. For example, $((4,6),(3,(2,2),8))$ has rank 2 and depth 3.
+
+Two relations compare profiles:
+
+- $P$ and $S$ are **congruent**, $P\sim S$, when they have exactly the same tree: both are single
+  values, or both are tuples of equal rank with congruent children. So $(4,8)\sim(5,7)$ and
+  $(4,(2,4))\sim(7,(3,2))$, but $(4,8)\not\sim(4,(2,4))$.
+- $P$ is **weakly congruent** to $S$, $P\lesssim S$, when $P$'s tree is a coarsening of $S$'s: $P$ is a
+  single value, or both are tuples of equal rank and each $P_i\lesssim S_i$. So
+  $30\lesssim(a,b)\lesssim(v,(0,\alpha))$, while $(a,b)$ and $(a,b,c)$ are not weakly congruent
+  because their ranks differ.
+
+Congruence is how a stride is matched to a shape. Weak congruence is how a coordinate is matched to a
+shape, because a coordinate may stop early and give one integer for a whole sub-tree.
+
+### Compatibility and coordinate sets
+
+A **coordinate set** is $\mathbb Z_N=\{0,1,\ldots,N-1\}$ or a Cartesian product of coordinate sets.
+For example $\mathbb Z_{(2,3)}=\mathbb Z_2\times\mathbb Z_3$ has six pairs. The coordinate set of a
+shape $S$, $\mathbb Z_S$, is the set of its **natural coordinates**: those with exactly the profile of
+$S$.
+
+Other shapes can share coordinates with $S$. Shape $P$ is **compatible** with $S$, written
+$P\preceq S$, when either $P$ is an integer equal to $|S|$, or both are tuples of equal rank and every
+$P_i\preceq S_i$. We say $P$ *coarsens* $S$ and $S$ *refines* $P$. Sizes must match, so
+$30\preceq(2,15)\preceq(2,(3,5))$ and $30\preceq(6,5)\preceq((3,2),5)$. But $(2,(3,5))$ and
+$((3,2),5)$ are not compatible with each other, even though both have size 30: the first splits 30 as
+$2\times15$ at the top level, the second as $6\times5$. They share only the coarsest shape, 30.
+
+The set of all coordinate sets a shape accepts is
+
+$$
+\mathcal Z(S)=\{\mathbb Z_{S'}\mid S'\preceq S\}.
+$$
+
+Every shape accepts its **integral coordinates** $\mathbb Z_{|S|}$, and every rank-$r$ shape accepts
+$r$-tuples. The table enumerates all three coordinate sets of $S=((2,3),2)$ in colexicographic order:
+
+| $\mathbb Z_{12}$ | $\mathbb Z_{(6,2)}$ | $\mathbb Z_{((2,3),2)}$ |
+| ---: | :---: | :---: |
+| 0 | $(0,0)$ | $((0,0),0)$ |
+| 1 | $(1,0)$ | $((1,0),0)$ |
+| 2 | $(2,0)$ | $((0,1),0)$ |
+| 3 | $(3,0)$ | $((1,1),0)$ |
+| 4 | $(4,0)$ | $((0,2),0)$ |
+| 5 | $(5,0)$ | $((1,2),0)$ |
+| 6 | $(0,1)$ | $((0,0),1)$ |
+| 7 | $(1,1)$ | $((1,0),1)$ |
+| 8 | $(2,1)$ | $((0,1),1)$ |
+| 9 | $(3,1)$ | $((1,1),1)$ |
+| 10 | $(4,1)$ | $((0,2),1)$ |
+| 11 | $(5,1)$ | $((1,2),1)$ |
+
+For $S=4$ there is only $\mathbb Z_4$; for $S=(2,3)$ there are $\mathbb Z_6$ and $\mathbb Z_{(2,3)}$. If
+$P\preceq S$, then $\mathcal Z(P)\subseteq\mathcal Z(S)$: any coordinate valid for the coarser shape
+is valid for the finer one. Repeated `idx2crd` moves a coordinate toward the natural one; repeated
+`crd2idx` moves it toward the integer.
+
+#### Out-of-bounds coordinates
+
+Arrays can be indexed out of bounds, and so can layouts. An **admissible** coordinate is any
+integer tuple weakly congruent to the shape. It is **out of bounds** when it is admissible but not in
+any coordinate set of the shape. The set of all integer tuples congruent to $S$, bounded or not, is
+written $\mathbb Z^{S}$; since the extents do not matter, the paper also writes
+$\mathbb Z^{(*,*)}=\{(a,b)\mid a,b\in\mathbb Z\}$.
+
+The two conversions treat these differently. `idx2crd` is defined for every integer and never wraps
+its last digit, so an index past the end gives an out-of-bounds coordinate: for shape $(4,3)$,
+$\operatorname{idx2crd}(14)=(14\bmod4,\lfloor14/4\rfloor)=(2,3)$, and $3$ is past the bound. `crd2idx`
+cannot detect overflow: $(5,1)$ and $(1,2)$ both map to $5+4\cdot1=1+4\cdot2=9$. The two functions
+are therefore inverses only on in-bounds coordinates. CuTe relies on the extended behaviour on
+purpose; the completeness construction and the composition rules below both evaluate layouts past
+their size.
+
 ## Shape, stride, and layout
 
 A **stride** is a hierarchical tuple with the same profile as its shape. Each stride leaf says how
@@ -231,12 +460,48 @@ Three measurements answer different questions:
 Rank concerns interface, size concerns iteration, and cosize concerns storage span. They coincide
 only for simple compact layouts.
 
+A layout's **domain** is the finite set $\mathcal Z(L)$ of in-bounds coordinates. Its **extended
+domain** is every admissible coordinate, in or out of bounds, the analogue of indexing an array past
+its end. The **codomain** is the semimodule its strides live in (often infinite, such as
+$\mathbb Z$). The **image** is the finite set of values it actually produces,
+$L(\mathcal Z(L))=L(\mathbb Z_{|L|})$.
+
+### A gallery of layouts
+
+The paper plots six layouts that all accept shape $(4,8)$. Use the tabs to compare them. The colour
+groups each run of four consecutive offsets, so you can follow how storage order moves through the
+logical $4\times8$ matrix; hover a cell to see its natural coordinate.
+
+<LayoutPanels panels={G.gallery3} label="Layouts compatible with shape (4,8)" />
+
+Column-major, row-major and padded storage are ordinary flat layouts. The **interleaved** layout
+$(4,(4,2)):(4,(1,16))$ stores two row-major $4\times4$ blocks one after the other; the **mixed** layout
+$((2,2),(4,2)):((1,8),(2,16))$ stores $2\times4$ blocks; the **blocked broadcast** layout gives each
+$2\times2$ block one shared value. None of the last three has a flat shape and stride, which is why
+grids of tiles need nested layouts.
+
+Evaluate the mixed layout at integral coordinate 22. In shape $(4,8)$, $22=(2,5)$; in the natural
+shape $((2,2),(4,2))$, it is $((0,1),(1,1))$. So
+
+$$
+L(22)=L(2,5)=L((0,1),(1,1))=0\cdot1+1\cdot8+1\cdot2+1\cdot16=26.
+$$
+
+That is the value in row 2, column 5 of the *mixed* tab.<Sidenote>In the paper's Figure 3e the second
+row reads `1 3 5 7 17 19 22 23`; evaluating the layout gives `... 17 19 21 23`, as shown here.
+Every other entry of Figures 3 and 4 matches PyCuTe.</Sidenote>
+
 ### Strides need not be integers
 
 The inner product needs addition and multiplication by integers, but its outputs do not have to be
-integer addresses. An **integer semimodule** is a set whose values can be added associatively and
-scaled by integers. This deliberately broad definition covers integers, coordinate tuples, and
-bitwise structures.
+integer addresses. An **integer semimodule** is a set $M$ with an associative addition $M+M\to M$ and
+a scaling $\mathbb Z\cdot M\to M$ that satisfies three rules: $1\cdot m=m$,
+$m+(n+p)=(m+n)+p$ and $a\cdot(b\cdot m)=(ab)\cdot m$. Additive identities and inverses are not
+required. This deliberately broad definition covers:
+
+- the integers $\mathbb Z$ and the rationals $\mathbb Q$;
+- $\mathbb F_2$-style bit strings, where "addition" is XOR;
+- tuples of any of these, added and scaled element by element.
 
 For example, let $e_0=(1,0)$ and $e_1=(0,1)$. The layout
 
@@ -245,14 +510,84 @@ $$
 $$
 
 returns $(m,n)$ rather than a memory offset. It is an identity coordinate layout. Such layouts are
-useful for boundary predicates and for hardware instructions that consume coordinates directly.
+useful for boundary predicates and for hardware instructions that consume coordinates directly, such
+as TMA on Hopper and Blackwell.
 
 <Matrix2D name="identity coordinate layout" {...F.identity} />
 
-The papers call layout evaluation **semi-linear** because it is linear in the stride after the shape
-has performed its piecewise quotient-and-remainder conversion. Within natural coordinates,
-$L(c)=\langle c,D\rangle$ looks like an ordinary dot product. Across a flattened coordinate, the
-modulo and floor operations create the boundaries between mixed-radix digits.
+The paper's Figure 4 has three such layouts. The **transposed block coordinate** layout
+$(4,(4,2)):(e_1,(e_0,6e_1))$ produces coordinates of a transposed $4\times4$ block, then jumps six
+columns. The **binary swizzle** $(4,(4,3)):(f_1,(f_5,f_{16}))$ uses integer strides $1,5,16$ but adds
+them with XOR. Hover a swizzle cell to see the XOR: row 1, column 2 is $(m,(a,b))=(1,(2,0))$, so
+$1\oplus2\cdot5\oplus0=1\oplus10=11$.
+
+<LayoutPanels panels={G.gallery4} label="Layouts with semimodule strides" />
+
+Look at the colours in the swizzle tab: they mark offset mod 4. Every row holds four different
+residues within each block of four columns, and so does every column. If offsets mod 4 were shared
+memory banks, neither a row access nor a column access would hit one bank twice. That is what
+swizzles are for (see [Inside a CuTe GEMM](/blog/cute-gemm-memory-access/)).<Sidenote>PyCuTe's `F2`
+type multiplies an integer and an $\mathbb F_2$ value carry-lessly. For the small coefficients here
+($a\le3$ times 5, $b\le2$ times 16) carry-less and ordinary products agree, so
+$3\cdot f_5=15=5\oplus10$.</Sidenote>
+
+#### Semi-linearity
+
+Writing $\tilde c=S(c)$ for the natural coordinate, a layout is
+
+$$
+L(c)=(D\circ S)(c)=d\cdot\tilde c.
+$$
+
+The shape function $S$ is a piecewise bijection built from quotients and remainders. The stride
+function is **linear** in natural coordinates: for natural $\tilde c_0,\tilde c_1$,
+$L(\alpha\tilde c_0+\beta\tilde c_1)=\alpha L(\tilde c_0)+\beta L(\tilde c_1)$. It is not linear in
+arbitrary coordinates, because $S$ is not: for $(4,8):(1,5)$, $L(3)+L(1)=3+1=4$ but $L(4)=5$, since
+index 4 carries into the second digit. The paper calls this combination **semi-linear**.
+
+In natural coordinates the inner product is a matrix–vector product, $L(c)=D\,\tilde c$, whose
+columns are the stride leaves:
+
+| Layout | Linear form | Matrix |
+| --- | --- | --- |
+| $((2,2),(4,2)):((1,8),(2,16))$ | $r=\begin{bmatrix}1&8&2&16\end{bmatrix}\tilde c$ | $1\times4$ over $\mathbb Z$ |
+| $(4,(4,2)):(e_1,(e_0,6e_1))$ | $\begin{bmatrix}r_0\\r_1\end{bmatrix}=\begin{bmatrix}0&1&0\\1&0&6\end{bmatrix}\tilde c$ | $2\times3$ over $\mathbb Z$ |
+| $(4,4):(f_1,f_5)\equiv((2,2),(2,2)):((f_1,f_2),(f_5,f_{10}))$ | $\begin{bmatrix}r_0\\r_1\\r_2\\r_3\end{bmatrix}=\begin{bmatrix}1&0&1&0\\0&1&0&1\\0&0&1&0\\0&0&0&1\end{bmatrix}\tilde c$ | $4\times4$ over $\mathbb F_2$ |
+
+In the binary row, each coordinate is split into bits so that every column is one stride and row
+$k$ is its bit $k$: $f_5=0101_2$ is the third column, with $r_0=r_2=1$. This is the bit-matrix form used
+by the bit-permute and bit-matrix-multiply transforms in earlier $\mathbb F_2$ work and by Triton's
+linear layouts. The algebra below generalizes those operations: composition plays the role of matrix
+multiplication, and the right and left inverses play the role of pseudo-inverses.
+
+#### Completeness
+
+How much can layouts express? Any function $f$ on a finite domain $\mathbb Z_N$ with $f(0)=0$ is a
+composition of a finite chain of layouts:
+
+$$
+f\equiv(2,2,2,\ldots):(f(1),f(2),f(3),\ldots)\circ(3,1):(1,4)\circ(4,1):(1,6)\circ\cdots\circ(N-1,1):(1,2(N-2)).
+$$
+
+The right-hand layouts send $i\mapsto2^{i-1}$, a one-hot bit; the left-most layout reads that bit and
+returns $f(i)$. The intermediate layouts are evaluated on their extended domains: $(4,1):(1,6)$ at
+$i=4$ gives $\operatorname{idx2crd}(4;(4,1))=(0,1)$, so $0\cdot1+1\cdot6=6$.
+
+Take $N=5$ and $f(i)=3i\bmod5$, which no single-mode layout $5:d$ can produce (its values
+$0,3,1,4,2$ are not evenly spaced). The chain is
+$(2,2,2,2):(3,1,4,2)\circ(3,1):(1,4)\circ(4,1):(1,6)$:
+
+| $i$ | after $(4,1):(1,6)$ | after $(3,1):(1,4)$ | after $(2,2,2,2):(3,1,4,2)$ | $3i\bmod5$ |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 0 | 0 | 0 | 0 |
+| 1 | 1 | 1 | 3 | 3 |
+| 2 | 2 | 2 | 1 | 1 |
+| 3 | 3 | 4 | 4 | 4 |
+| 4 | 6 | 8 | 2 | 2 |
+
+Check $i=4$: $6$ in shape $(3,1)$ is $(0,2)$, so $(3,1):(1,4)$ gives $8=1000_2$, whose only set bit
+selects stride $f(4)=2$. Completeness means layouts are a **generating set** under composition. It
+is a statement about expressiveness, not a recommended way to write kernels.
 
 ## Tensors and slicing
 
@@ -266,6 +601,16 @@ An accessor may be a pointer dereference, a register array, or another object th
 interpret offsets. This separation is why the same layout algebra can describe global memory,
 shared memory, registers, or even thread identifiers.
 
+Formally, an **accessor** $e$ supports two operations: offsetting, $e+d\to e'$ for $d$ in the
+layout's codomain, and dereferencing, $*e\to v$. Then $T(c)=*(e+L(c))=e[L(c)]$. Three accessors
+cover the figures in this post:
+
+- a **pointer** `{p}`: $\{p\}+b=\{p+b\}$ and $*\{p\}$ reads memory, so $\{p\}\circ L$ is a data tensor;
+- a **counting iterator** `{a}`: $\{a\}+b=\{a+b\}$ and $*\{a\}=a$, so $\{0\}\circ L$ is a tensor whose
+  values are the offsets themselves (every grid in this post);
+- a **coordinate accessor** `{(a,b)}`, which offsets and dereferences pairs, so it turns the
+  coordinate layouts above into tensors of coordinates.
+
 **Slicing** fixes some coordinates and leaves the others free. For a matrix layout
 $L=(M,N):(d_M,d_N)$, fixing column $j$ gives
 
@@ -277,11 +622,129 @@ with a base offset of $jd_N$. The remaining layout says how to move within the s
 coordinate changes the accessor's starting point. With hierarchical modes, a slice can fix an outer
 tile coordinate while preserving the inner-tile layout.
 
+In general, split a coordinate into its given part $c'$ and its unspecified part $c^*$ (written `_`).
+Then
+
+$$
+T(c'+c^*)=(e+L(c'))\circ L(c^*)=e'\circ L(c^*):
+$$
+
+the given part is evaluated and folded into the accessor, and the sublayout over the unspecified
+modes is what remains. The paper's example is a $6\times12$ tensor with a deep layout,
+
+$$
+A=\{0\}\circ((3,2),((2,3),2)):((4,1),((2,15),100)).
+$$
+
+Each tab slices it differently; the highlighted cells are the slice. The caption gives the new
+accessor and the remaining layout.
+
+<LayoutPanels panels={G.slices} label="Six slices of a 6×12 tensor" />
+
+Check `A(2,_)`: row 2 has natural row coordinate $(2,0)$, so the accessor moves to
+$2\cdot4+0\cdot1=8$ and the whole column mode $((2,3),2):((2,15),100)$ is left. The last tab keeps
+rows 1 and 4 and columns 0, 1, 6 and 7, a set that no row range combined with a column range can
+describe.
+
 This leads to a pattern used throughout CuTe:
 
 1. Compose a tensor's layout with a layout that reorganizes its coordinates.
 2. Slice one mode, often with a runtime block, warp, or thread identifier.
 3. Keep the remaining layout as a compile-time description of that worker's values.
+
+CuTe deliberately has no **ranged slicing** such as NumPy's `m[2:4, 1:3]`. The paper gives three
+reasons. Ranges cannot express slices like the last tab above. They encourage code such as
+`data[thr_id*TILE : (thr_id+1)*TILE]`, which mixes a static tile size with a dynamic thread index;
+the CuTe version separates them:
+
+```python
+tiled_data = logical_divide(my_data, TILE_SIZE)  # (TILE_SIZE, NumTiles)
+thr_data   = tiled_data[None, thr_id]            # TILE_SIZE elements for this thread
+```
+
+And ranges can request slices that no layout can represent. For $A$ above, `A(0, 0:2:12)` would be
+$\{0\}\circ(3,2):(15,100)$, but `A(0:2:6, 0)` has no layout at all, because rows $0,2,4$ have natural
+coordinates $(0,0),(2,0),(1,1)$ and offsets $0,8,5$, which are not evenly spaced. CuTe prefers to
+report that mismatch when the reshaping composition is built, not when the slice is taken.
+
+## Generic algorithms
+
+A layout separates *what an algorithm does* from *where its data lives*. So one implementation of
+an algorithm, written against logical coordinates, serves every layout that can be folded into its
+expected shape. The paper shows this with the two most basic algorithms. These versions are
+references, not tuned kernels; the layout algebra is what lets an optimized version inspect and
+rearrange the layouts.
+
+### COPY
+
+```python
+# @pre size(src) == size(dst)
+def copy(src: Tensor,   # N
+         dst: Tensor):  # N
+    for i in range(size(dst)):
+        dst[i] = src[i]
+```
+
+The only precondition is equal size: both tensors must be compatible with one shape $N$. Every
+tensor accepts an integral coordinate, so COPY is a rank-1 algorithm whatever the ranks of its
+arguments. Changing only the layouts gives many different operations. Each tab shows one: the
+columns are loop iterations $i$, the rows the offsets read and written.
+
+<LayoutPanels panels={G.copy} label="COPY applications" />
+
+| Application | Source layout | Destination layout |
+| --- | :---: | :---: |
+| 1-D arrays | $8:1$ | $8:1$ |
+| N-D arrays | $(8,2,3):(1,16,32)$ | $(8,2,3):(1,16,32)$ |
+| gather | $(2,3,2):(42,1,128)$ | $12:1$ |
+| scatter | $12:1$ | $(2,3,2):(42,1,128)$ |
+| broadcast | $7:0$ | $7:1$ |
+| constant | $7:0$ | $7:0$ |
+| transpose | $(8,3):(1,8)$ | $(8,3):(3,1)$ |
+| tensor transpose | $(8,(3,5)):(1,(57,8))$ | $(8,15):(1,8)$ |
+
+Check the gather at $i=3$: in shape $(2,3,2)$, $3=(1,1,0)$, so the source offset is
+$42+1=43$, written to destination offset 3. When the shapes are static, the compiler can unroll the
+loop and evaluate `idx2crd` at compile time, so the reference version costs nothing beyond its
+address arithmetic.
+
+### GEMM
+
+```python
+# @pre M: size[0](A) == size[0](C)
+# @pre N: size[0](B) == size[1](C)
+# @pre K: size[1](A) == size[1](B)
+def gemm(A: Tensor,   # (M, K)
+         B: Tensor,   # (N, K)
+         C: Tensor):  # (M, N)
+    for k in range(size[1](B)):
+        for n in range(size[0](B)):
+            for m in range(size[0](A)):
+                C[m, n] += A[m, k] * B[n, k]
+```
+
+Each tensor must be compatible with a rank-2 shape, and the sizes must agree. Choosing layouts
+yields the BLAS variants, BLIS's generally strided GEMM, tensor contractions (GETT) and, with an
+im2col layout, convolution:
+
+| Application | A layout | B layout | C layout |
+| --- | :---: | :---: | :---: |
+| NT GEMM | $(M,K):(1,\mathrm{lda})$ | $(N,K):(1,\mathrm{ldb})$ | $(M,N):(1,\mathrm{ldc})$ |
+| TN GEMM | $(M,K):(\mathrm{lda},1)$ | $(N,K):(\mathrm{ldb},1)$ | $(M,N):(1,\mathrm{ldc})$ |
+| NTT GEMM | $(N,K):(1,\mathrm{ldb})$ | $(M,K):(1,\mathrm{lda})$ | $(N,M):(1,\mathrm{ldc})$ |
+| BLIS GEMM | $(M,K):(d_{ma},d_{ka})$ | $(N,K):(d_{nb},d_{kb})$ | $(M,N):(d_{mc},d_{nc})$ |
+| GETT | $((M_1,M_2),K):((1,W),X)$ | $(N,K):(K,1)$ | $((M_1,M_2),N):((1,Y),Z)$ |
+| GETT | $(M,(K_1,K_2)):(1,(W,X))$ | $(N,(K_1,K_2)):(Y,(1,Z))$ | $(M,N):(1,M)$ |
+| CONV | $(K,(C,T,R,S)):D_A$ | $((N,Z,P,Q),(C,T,R,S)):D_B$ | $(K,(N,Z,P,Q)):D_C$ |
+
+As a check of the first GETT row, take $C_{m_1m_2n}=\sum_kA_{m_1km_2}B_{nk}$ with
+$M_1=2$, $M_2=3$, $N=2$, $K=4$, where $A$ is stored with $m_1$ fastest, then $k$, then $m_2$. Folding
+$(m_1,m_2)$ into one row mode gives $A=((2,3),4):((1,8),2)$, a row-major $B=(2,4):(4,1)$ and
+$C=((2,3),2):((1,4),2)$. Running the `gemm` loop nest above on random integers with these layouts
+gives exactly the result of the direct sum.<Sidenote>Checked in a script for all
+$2\cdot3\cdot2=12$ outputs. The strides follow from $A$'s storage order $m_1+2k+8m_2$ and $C$'s
+order $m_1+2n+4m_2$, the paper's $W=8$, $X=2$, $Y=4$, $Z=2$.</Sidenote> With the multiply-add and
+the tiling abstracted, the same loop nest also runs at each level of a GPU's hierarchy.
 
 ## The layout algebra
 
@@ -300,6 +763,20 @@ $$
 At coordinate $(a,b)$ the result is $A(a)+B(b)$. Concatenation is the basic constructor behind
 multi-mode layouts. It does not mean "append the images in memory"; the strides decide whether the
 two modes are contiguous, interleaved, broadcast, or separated by gaps.
+
+Every layout is the concatenation of its sublayouts, $L=(L_0,L_1,\ldots,L_n)$ with
+$L(c)=L_0(c_0)+L_1(c_1)+\cdots+L_n(c_n)$. That sum requires all sublayouts to share one codomain:
+$4:2$ and $3:e_0$ cannot be concatenated, because an integer and a coordinate cannot be added.
+
+Since every sublayout is itself a layout, any operation in this section can also be applied
+**by mode**. The paper writes a tuple of layouts with angle brackets, to tell it apart from a
+concatenation, and defines
+
+$$
+A\star\langle B,C\rangle=(A_0,A_1)\star\langle B,C\rangle=(A_0\star B,\ A_1\star C)
+$$
+
+for any operation $\star$. A `*` in the tuple means "leave this mode alone".
 
 ### Coalescence
 
@@ -327,6 +804,22 @@ rules.
 
 Coalescence changes syntax, not behavior. This is important before composition: simplifying a layout
 can reveal divisibility that was hidden by unnecessary mode boundaries.
+
+Precisely, a coalesced layout $R$ of $A$ keeps the same size, $|R|=|A|$, has depth at most 1, and
+agrees with $A$ on every integral coordinate: $R(c)=A(c)$ for $c\in\mathbb Z_{|A|}$. It may lose
+rank and hierarchy; "the" coalesced layout means the one of minimal rank. Coalescing by mode keeps
+the top-level modes and simplifies inside each one:
+
+| Layout | `coalesce` | by mode, `coalesce(·, ⟨*,*⟩)` |
+| --- | :---: | :---: |
+| $(2,(1,6)):(1,(6,2))$ | $12:1$ | $(2,6):(1,2)$ |
+| $((4,3),5):((15,1),3)$ | $(4,15):(15,1)$ | $((4,3),5):((15,1),3)$ |
+| $(4,(3,5)):(15,(1,3))$ | $(4,15):(15,1)$ | $(4,15):(15,1)$ |
+
+In the second row, the inner pair $(4,3):(15,1)$ cannot merge ($1\ne4\cdot15$), but the modes $3:1$
+and $5:3$ can once they are adjacent. Coalescing all modes together finds that merge; coalescing by
+mode cannot, because they sit in different top-level modes. In the third row they share a mode, so
+both versions find it.
 
 ### Composition
 
@@ -357,6 +850,34 @@ $(2i, j)$, so $A(B(i,j))=2i+8j$. The result selects every other row from the fir
 Check the result at $(i,j)=(3,2)$: $B(3,2)=22$;
 $\operatorname{idx2crd}(22;(8,8))=(6,2)$; and $A(6,2)=6+8\cdot2=22$.
 
+Formally, $R=A\circ B$ must satisfy two conditions. **Domain compatibility**: $B\preceq R$, so every
+coordinate of $B$ is also a coordinate of $R$. **Functional composition**: $R(c)=A(B(c))$ for all
+$c\in\mathcal Z(B)$. For this to make sense, $B$'s outputs must be coordinates $A$ accepts: integers
+(which every layout accepts) or coordinate tuples congruent to one of $A$'s coordinate sets.
+
+#### Identity layouts and associativity
+
+An **identity layout** $I_S$ satisfies $I_S(c)=c$. Its own shape may be any refinement of $S$. All
+three of $24:1$, $(4,6):(1,4)$ and $(3,(4,2)):(1,(3,12))$ are $I_{24}$; both $(4,6):(e_0,e_1)$ and
+$(4,(3,2)):(e_0,(e_1,3e_1))$ are $I_{(4,6)}$. An identity on $B$'s codomain is a left identity,
+$I_D\circ B=B$, and an identity with $A$'s shape is a right identity, $A\circ I_S=A$.
+
+Composition is **associative**, $A\circ(B\circ C)=(A\circ B)\circ C$, when each layout's image lies in
+the next one's domain: $\operatorname{image}(C)\subseteq\mathcal Z(B)$ and
+$\operatorname{image}(B)\subseteq\mathcal Z(A)$. Without that, both sides can exist and still
+differ:
+
+$$
+\begin{aligned}
+(5,3):(1,7)\circ[4:1\circ2:5]&=(5,3):(1,7)\circ2:5=2:7,\\
+[(5,3):(1,7)\circ4:1]\circ2:5&=4:1\circ2:5=2:5.
+\end{aligned}
+$$
+
+The image of $2:5$ is $\{0,5\}$, and 5 is outside the domain of $4:1$. On the first line, 5 reaches
+$(5,3):(1,7)$ directly and becomes the coordinate $(0,1)$, offset 7. On the second, $(5,3):(1,7)\circ4:1$
+was truncated to its first four entries, $4:1$, which extends linearly to $5\mapsto5$.
+
 #### Why composition needs divisibility
 
 Sampling a mixed-radix function must align with its digit boundaries. In the rank-one base case,
@@ -365,25 +886,108 @@ $$
 (S_0:D_0)\circ(s:d)=s:(dD_0),
 $$
 
-so composition is always representable. With several modes, sampling every $d$-th input may carry
-across a digit boundary. CuTe requires each prefix product $P_k$ of the left layout to divide $d$, or
-$d$ to divide $P_k$, for the relevant modes. It also requires the requested result size to end at a
-representable boundary.
+so composition is always representable, with no conditions at all. It even works when $B$ leaves
+$A$'s domain: $7:11\circ3:4=3:44$, although $B$ produces 8 and $A$ has only 7 entries.
 
-For intuition, sequence $0,1,2,3$ reshaped into digits of base 4 has one simple mode. Taking every
-second entry gives $0,2$, still a strided layout. But taking every third entry from a layout whose
-stride pattern changes every four coordinates can alternate between incompatible stride rules. One
-constant hierarchical stride may no longer describe the sampled function.
+With several modes, sampling every $d$-th input may carry across a digit boundary. The paper
+derives the result from the base case $B=s:d$ and a coalesced $A=(S_0,\ldots,S_R):(D_0,\ldots,D_R)$,
+using the exclusive prefix products $\bar S_r=S_0S_1\cdots S_{r-1}$. Two steps build $A\circ B$:
+
+1. **Divide out** the first $d$ elements of $A$, so that one step of the new layout is $d$ steps of
+   $A$. Modes that fit inside $d$ disappear; the mode where $d$ lands is shortened and its stride
+   scaled.
+2. **Keep** the first $s$ elements of what is left.
+
+Work the paper's example $A=(4,6,8,10):(2,3,5,7)$ and $B=6:12$:
+
+| Step | Layout | Why |
+| --- | --- | --- |
+| start | $(4,6,8,10):(2,3,5,7)$ | prefix products $\bar S=(1,4,24,192)$ |
+| divide out 12 | $(1,2,8,10):(\text{–},9,5,7)$ | $12=4\cdot3$: mode 0 is used up, mode 1 keeps $6/3=2$ entries of stride $3\cdot3$ |
+| keep 6 | $(2,3):(9,5)$ | $6=2\cdot3$: all of mode 1, then 3 entries of mode 2 |
+
+Check one entry: $(A\circ B)(4)=A(48)$. In shape $(4,6,8,10)$, $48=(0,0,2,0)$, so $A(48)=2\cdot5=10$.
+In $(2,3):(9,5)$, $4=(0,2)$, giving $2\cdot5=10$. The two steps can also run in the other order: keep
+$6\cdot12=72$ elements, $(4,6,3):(2,3,5)$, then divide out 12.
+
+Both steps must produce whole numbers of entries. That gives two conditions, checked on each mode $r$
+that the composition reaches:
+
+$$
+\textbf{stride divisibility:}\ \ \bar S_r\mid d\ \text{ or }\ d\mid\bar S_r,
+\qquad
+\textbf{shape divisibility:}\ \ \left\lceil\bar S_r/d\right\rceil\mid s .
+$$
+
+A mode $r$ is not reached when $(s-1)d<\bar S_r$, because no sampled index gets that far; such modes
+can be dropped (truncated) first. In the example, $(6-1)\cdot12=60<192$, so mode 3 is never tested.
+
+Two compositions show the conditions failing:
+
+- $(4,6,8):(2,3,5)\circ6:3$ breaks stride divisibility: $\bar S_1=4$ and $d=3$ do not divide each
+  other. No layout lists every third element of $(4,6,8):(2,3,5)$.
+- $(4,6,8):(2,3,5)\circ6:1$ breaks shape divisibility: $\lceil4/1\rceil=4$ does not divide 6. No
+  layout lists the first six elements, $0,2,4,6,3,5$: they stop part-way through the second mode.
+
+A violation can also be only apparent. $(4,2,8):(3,12,97)\circ3:3$ seems to fail, since $\bar S_1=4$ and
+$3$ are coprime. But $A$ coalesces to $(8,8):(3,97)$, and $(3-1)\cdot3=6<8$ lets us drop its second
+mode, leaving $8:3\circ3:3=3:9$. By contrast, $(4,2,8):(3,12,97)\circ4:3$ needs index 9 and cannot be
+truncated, and $(4,2,8):(3,15,97)\circ3:3$ cannot be coalesced; both fail. PyCuTe rejects all four
+failing compositions in this list and returns $3:9$ for the apparent one.
+
+Two reductions extend the base case to general $B$:
+
+- **Distributive case.** For $B=(B_0,B_1,\ldots)$,
+  $A\circ B=(A\circ B_0,A\circ B_1,\ldots)$. This holds when $B$'s codomain is congruent to $A$'s
+  shape, or when every $B_i=s_i:d_i$ meets stride divisibility and the sublayouts' images are
+  *segregated*: for all $i,j$, $s_id_i\le d_j$ or $s_jd_j\le d_i$. A rank-1 $A$ always distributes, so
+  $7:11\circ(3,5):(6,3)=(3,5):(66,33)$ even though $3:6$ and $5:3$ overlap.
+- **Coordinate case.** If $B$'s strides are scaled basis elements $a\,e_i$, then
+  $A\circ(s:a\,e_i)=A_i\circ(s:a)$: the basis element simply picks mode $i$ of $A$, and the base case
+  applies to that mode.
 
 These restrictions are useful. A failed composition often exposes a tile that does not align with a
 hardware layout, rather than silently generating complicated runtime index arithmetic. For a deeper
 worked derivation, see
 [Working Backwards Through CuTe Layout Composition](/blog/cute-layout-composition/).
 
+### By-mode composition and tilers
+
+It is often useful to compose the rows and the columns of a matrix separately. Using the by-mode
+combinator, $L\circ\langle T_0,T_1\rangle=(L_0\circ T_0,\ L_1\circ T_1)$. The tuple of layouts is
+called a **tiler**: a hierarchical tuple whose leaves are layouts $S:D$ or plain integers $S$, an
+integer meaning $S:1$. So every layout is a tiler, every integer is a tiler, and a shape such as
+$(4,8)$ is a tiler that takes the first 4 rows and the first 8 columns.
+
+The tabs apply four tilers to an $8\times16$ layout $L$. Each one extracts a $4\times8$ sublayout,
+and the cells it selects are labelled with their coordinate in that sublayout:
+
+- $\langle4:1,8:1\rangle$ takes the first 4 rows and first 8 columns;
+- $\langle(2,2):(1,4),8:1\rangle$ takes rows $0,1,4,5$;
+- $\langle(2,2):(1,4),8:2\rangle$ also takes every other column;
+- $\langle4:2,8:2\rangle$ takes every other row and every other column.
+
+<LayoutPanels panels={G.tilers} label="Four tilers on an 8×16 layout" />
+
+The figure does not depend on $L$'s strides. For $L=(M,N):(X,Y)$,
+
+$$
+L\circ T\equiv L\circ(M,N):(e_0,e_1)\circ T,
+$$
+
+so the tiler acts on the identity coordinate layout first, which is what the cells show. That is
+also why the following are interchangeable inside a composition:
+
+$$
+(4,8)\equiv\langle4,8\rangle\equiv(4:1,8:1)\equiv(4,8):(e_0,e_1).
+$$
+
+A shape *is* a map from coordinates to natural coordinates, exactly as in the definition $L=D\circ S$.
+
 ### Inverses
 
 An inverse asks for coordinates from offsets. Because layouts can skip or repeat offsets, CuTe uses
-two pseudo-inverses.
+two pseudo-inverses, much like the Moore–Penrose pseudo-inverses of linear algebra.
 
 A **right inverse** $L^\ddagger$ satisfies
 
@@ -409,6 +1013,140 @@ The words *left* and *right* record where the inverse appears in the composition
 that both sides undo the function. A broadcast layout cannot recover which of several coordinates
 produced a repeated offset.
 
+#### Right inverse in detail
+
+For a general codomain $D$, the paper defines a right inverse as an *injective* layout
+$L^\ddagger:D_{L^\ddagger}\to\mathbb Z_{|L|}$ with $L^\ddagger(L(L^\ddagger(k)))=L^\ddagger(k)$. When
+$D=\mathbb Z$ this is the usual $L(L^\ddagger(k))=k$. For coordinate codomains it implies that
+$L^\ddagger$ accepts coordinates of the same profile as $L$'s outputs. The size of a right inverse is
+at most $|L|$, and "the" right inverse is the largest one. It walks $L$'s strides upward from 1 and
+stops at the first gap.
+
+| $L$ | $L^\ddagger$ | Comment |
+| --- | --- | --- |
+| $(4,8):(1,4)$ | $32:1$ | |
+| $(4,8):(8,1)$ | $(8,4):(4,1)$ | |
+| $(3,7,5):(5,15,1)$ | $(5,21):(21,1)$ | non-power-of-two sizes are fine |
+| $(4,8):(1,5)$ | $4:1$ | smaller: offset 4 is a hole |
+| $(4,(4,2)):(4,(1,16))$ | $(4,4,2):(4,1,16)$ | domain congruent with codomain $\mathbb Z$ |
+| $((2,2),(4,2)):((1,8),(2,16))$ | $(2,4,2,2):(1,4,2,16)$ | |
+| $((2,2),(2,4)):((0,1),(0,2))$ | $(2,4):(2,8)$ | stride-0 modes do not contribute |
+| $((2,2),(2,4)):((0,2),(0,4))$ | $1:0$ | trivial: offset 1 never occurs |
+| $(4,8):(e_0,e_1)$ | $(4,8):(1,4)$ | domain congruent with codomain $\mathbb Z^{(*,*)}$ |
+| $(4,(4,2)):(e_1,(e_0,6e_1))$ | $(4,4):(4,1)$ | smaller, domain compatible |
+| $(4,(4,3)):(f_1,(f_5,f_{16}))$ | $(4,4,3):(f_1,f_5,f_{16})$ | works for XOR strides too |
+
+Check row 4: $(4,8):(1,5)$ produces offsets $0,1,2,3$ and then 5, so only $0\ldots3$ can be inverted.
+Check row 2: $(8,4):(4,1)$ sends $k=9=(1,1)$ to $4+1=5$, the integral coordinate $(1,1)$ of the
+row-major layout, whose offset is $1\cdot8+1=9$. When $L$ is a bijection onto $\mathbb Z_{|L|}$, the
+right inverse is a true inverse $L^{-1}$, and the paper calls $L$ **compact**.
+
+#### Application: vectorizing a copy
+
+The reference COPY above moves one element per iteration. A **vectorizing copy** moves $K$ elements
+per instruction, which is only correct if those $K$ elements are contiguous in *both* the source and
+the destination, at the same logical coordinates. For $A$ and $B$ of equal size, we want the largest
+$K$ with
+
+$$
+A^\ddagger(k)=B^\ddagger(k)\quad\text{for all }k<K.
+$$
+
+Composition finds it: $K$ is the size of the leading stride-1 (identity) mode of $A\circ B^\ddagger$
+(or of $B\circ A^\ddagger$). The coordinates of those $K$ elements are $A^\ddagger$ truncated to size
+$K$. The tabs show the paper's two examples; each colour is one vector, and its cells are contiguous
+in both tabs of the pair.
+
+<LayoutPanels panels={G.vector} label="Common vectors of two layouts" />
+
+| | Source $A$ | Destination $B$ | $A\circ B^\ddagger$ | $K$ | coordinates |
+| --- | --- | --- | --- | ---: | --- |
+| 8a | $(4,4):(1,4)$ | $((2,2),4):((1,8),2)$ | $(2,4,2):(1,4,2)$ | 2 | $0,1$ |
+| 8b | $((2,2),(2,2)):((8,2),(4,1))$ | $((2,2),(2,2)):((4,2),(8,1))$ | $(4,2,2):(1,8,4)$ | 4 | $0,8,2,10$ |
+
+In 8b, the integral coordinates $0,8,2,10$ are the cells $(0,0),(0,2),(2,0),(2,2)$; the source stores
+them at offsets $0,1,2,3$ and so does the destination, so one 4-wide instruction can move them. A
+COPY may reorder its iterations freely, so it can permute both layouts by this coordinate layout and
+put every vector in the first mode. Combined with the pointers' alignment and the hardware's widest
+access, this lets CuTe choose the vector width algebraically.
+
+#### Left inverse in detail
+
+A **left inverse** is a layout $L^\dagger:D_{L^\dagger}\to\mathbb Z_{|L|}$ with
+$L(L^\dagger(L(k)))=L(k)$ for every $k<|L|$. It may take any value on inputs that are not in $L$'s
+image, so it need not be unique. When $L$ is injective, $L^\dagger(L(k))=k$. Unlike the right
+inverse, it grows to cover holes:
+
+| $L$ | $L^\dagger$ | Comment |
+| --- | --- | --- |
+| $(4,8):(1,4)$ | $32:1$ | |
+| $(4,8):(8,1)$ | $(8,4):(4,1)$ | same as the right inverse for contiguous images |
+| $(3,7,5):(5,15,1)$ | $(5,21):(21,1)$ | non-power-of-two sizes are fine |
+| $(4,8):(1,5)$ | $(5,8):(1,4)$ | larger: spans the holes at $4,9,14,\ldots$ |
+| $(4,(4,2)):(4,(1,16))$ | $(4,4,2):(4,1,16)$ | domain congruent with codomain $\mathbb Z$ |
+| $((2,2),(4,2)):((1,8),(2,16))$ | $(2,4,2,2):(1,4,2,16)$ | |
+| $((2,2),(2,4)):((0,2),(0,4))$ | $(2,2,4):(0,2,8)$ | not unique: any stride works for the hole mode |
+| $((2,2),(2,4)):((0,1),(0,2))$ | $(2,4):(2,8)$ | |
+| $(4,8):(e_0,e_1)$ | $(4,8):(1,4)$ | domain congruent with codomain $\mathbb Z^{(*,*)}$ |
+| $(4,(4,2)):(e_1,(e_0,6e_1))$ | $(4,(6,2)):(4,(1,16))$ | larger, domain compatible |
+| $(4,(4,3)):(f_1,(f_5,f_{16}))$ | $(4,4,3):(f_1,f_5,f_{16})$ | works for XOR strides too |
+
+Check row 4: offset 11 of $(4,8):(1,5)$ is $11=1+2\cdot5$, coordinate $(1,2)$, integral coordinate
+$1+4\cdot2=9$. The left inverse $(5,8):(1,4)$ reads 11 as $(1,2)$ in shape $(5,8)$ and returns
+$1+2\cdot4=9$.<Sidenote>PyCuTe computes every row of this table except the last, where its
+`left_inverse` raises "Strides do not form an ordered chain"; its $\mathbb F_2$ support is limited to
+simpler stride patterns. Checking the paper's answer directly, $(4,4,3):(f_1,f_5,f_{16})$ satisfies
+$L^\dagger(L(k))=k$ for all 48 coordinates. The swizzle is a bijection on $0\ldots47$ and is its own
+inverse: applying it twice returns $k$.</Sidenote>
+
+#### Application: checking a tensor-memory instruction
+
+Blackwell's **tensor memory** (TMEM) holds MMA accumulators as a grid of 128 lanes by up to 512
+32-bit columns (see [Blackwell's tcgen05 MMA](/blog/cute-dsl-tcgen05-mma/)). The `tcgen05.ld` and
+`tcgen05.st` instructions read and write fixed sets of TMEM cells. In the paper's addressing, a
+column step adds 1 and a lane step adds 16384, so each instruction's cells are a layout from
+instruction coordinates to TMEM offsets:<Sidenote>The PTX address format puts the lane in the upper
+16 bits, so a lane step there is $2^{16}$, as in the tcgen05 post. The paper's constant 16384 is a
+different encoding of the same grid; the check below works for either constant, since it only
+compares offsets.</Sidenote>
+
+| Instruction | (InstrCOL, InstrLANE) → TMEM offset |
+| --- | --- |
+| `tcgen05{.ld,.st}.32x32b.x1` | $(1,128):(1,16384)$ |
+| `tcgen05{.ld,.st}.32x32b.x2` | $(2,128):(1,16384)$ |
+| `tcgen05{.ld,.st}.16x256b.x1` | $(8,(16,4)):(1,(16384,32\cdot16384))$ |
+
+Each instruction runs on four warps, and warp $w$ reaches lanes $32w$ to $32w+31$, so the pattern of
+one 32-lane subpartition repeats four times. The figure draws one subpartition, lanes 0–31 and
+columns 0–7, with the instruction coordinate in every cell it touches.
+
+<LayoutPanels panels={G.tmem} label="Which TMEM cells each instruction accesses" />
+
+Lanes and columns need not be matrix rows and columns: a data layout $A$ maps logical coordinates to
+TMEM offsets, and it can be any layout. So before issuing instruction $T$, we must answer two
+questions: does $A$'s image contain every offset $T$ touches, and at which logical coordinates? The
+left inverse answers both. Compute $A^\dagger$ and check, for every $i<|T|$,
+
+$$
+A(A^\dagger(T(i)))=T(i),
+$$
+
+with every $A^\dagger(T(i))$ distinct and inside $A$'s domain. Then $A^\dagger\circ T$ maps
+instruction coordinates to logical coordinates, and a `zipped_divide` by it splits $A$ into the
+pieces each instruction moves. Two data layouts, checked with PyCuTe:
+
+| Data layout $A$ | $A^\dagger$ | `32x32b.x1` | `32x32b.x2` | `16x256b.x1` |
+| --- | --- | :---: | :---: | :---: |
+| M = 128: $(128,16):(16384,1)$ | $(16384,128):(128,1)$ | ✓ $(1,128):(128,1)$ | ✓ $(2,128):(128,1)$ | ✓ $(8,(16,4)):(128,(1,32))$ |
+| M = 64: $((16,4),16):((16384,32\cdot16384),1)$ | $(16384,32,4):(64,1,16)$ | ✗ | ✗ | ✓ $(8,(16,4)):(64,(1,16))$ |
+
+The first is a $128\times16$ accumulator with row $m$ in lane $m$. Every instruction fits, and
+$A^\dagger\circ T$ says, for example, that `16x256b.x1`'s column $c$, lane $l$ and subpartition $q$
+hold logical element $(l+32q,\ c)$. The second is a $64\times16$ accumulator as a one-CTA M = 64 MMA
+writes it: row $m$ in lane $(m\bmod16)+32\lfloor m/16\rfloor$, so lanes 16–31 of each subpartition are
+empty. The `32x32b` shapes would read those empty lanes, and the check rejects them; `16x256b` touches
+only lanes 0–15 of each subpartition and passes.
+
 ### Complements
 
 The **complement** $L^*$ describes the directions missing from $L$. Its image is disjoint from the
@@ -423,6 +1161,36 @@ This one construction powers both product and division:
 
 - Product uses the complement to find how to place another non-overlapping copy.
 - Division uses the complement to recover the coordinates a tiler did not specify.
+
+Formally, for $L$ with an integer or coordinate codomain $D$, the complement $L^*$ is the layout
+that satisfies three conditions:
+
+1. **Weak congruence with the codomain**, $D\lesssim L^*$: its coordinates have the profile of $L$'s
+   outputs.
+2. **Disjoint images**: $L(b)\ne L^*(a)$ for every in-bounds $b$ and every $a\ne0$ in $L^*$'s
+   *extended* domain. Using the extended domain means that $L^*$ stays disjoint from $L$ however far
+   it is extended later, which products and divisions rely on.
+3. **Ordered image**: $L^*(a-1)<L^*(a)$, which makes the complement unique.
+
+| $L$ | $L^*$ | Comment |
+| --- | --- | --- |
+| $(4,8):(1,4)$ | $1:32$ | $L^*(i)$ lies beyond every offset of $L$ |
+| $(4,8):(8,1)$ | $1:32$ | the order of $L$'s modes does not matter |
+| $(4,(4,2)):(4,(1,16))$ | $1:32$ | nor does their hierarchy |
+| $(4,8):(1,5)$ | $1:40$ | |
+| $(4,8):(1,8)$ | $(2,1):(4,64)$ | disjoint, filling the holes of $L$ first |
+| $((2,2),(2,4)):((0,1),(0,2))$ | $1:8$ | stride-0 modes do not contribute |
+| $((2,2),(2,4)):((0,2),(0,4))$ | $(2,1):(1,16)$ | |
+| $(4,8):(e_0,e_1)$ | $(1,1):(4e_0,8e_1)$ | domain congruent with codomain $\mathbb Z^{(*,*)}$ |
+| $(4,(4,2)):(e_1,(e_0,12e_1))$ | $(1,(3,1)):(4e_0,(4e_1,24e_1))$ | weakly congruent, disjoint and ordered |
+
+A size-1 mode with a nonzero stride, such as the trailing $1:32$, does nothing in bounds but says
+where the next copy starts once the complement is extended. The fifth row shows both behaviours.
+$L=(4,8):(1,8)$ uses offsets $0\ldots3$ of every block of 8. Its complement $(2,1):(4,64)$ first fills
+the hole, $L^*(1)=4$, and then, extended, jumps past $L$'s whole span: $L^*(2)=64$ and $L^*(3)=68$.
+In the figure, colour $a$ marks offsets $L(b)+L^*(a)$:
+
+<LayoutPanels panels={G.complement} label="A complement filling holes" />
 
 ### Logical product
 
@@ -442,6 +1210,48 @@ rearrange the nesting. A **blocked product** pairs each tile mode with the match
 small tile remains visibly blocked. A **raked product** puts the grid coordinate first within each
 mode, interleaving corresponding positions from different tiles. They contain the same ingredients
 but choose different coordinate orderings.
+
+The paper's example repeats a row-major $3\times4$ tile $(3,4):(4,1)$ over a column-major $2\times5$
+grid $(2,5):(1,2)$. The tile covers offsets $0\ldots11$ exactly, so its complement is $1:12$, and
+
+$$
+(3,4):(4,1)\otimes(2,5):(1,2)=\big((3,4):(4,1),\ 1:12\circ(2,5):(1,2)\big)=((3,4),(2,5)):((4,1),(12,24)).
+$$
+
+The first mode is the original tile; the second places ten copies, 12 offsets apart, in column-major
+grid order. The logical product accepts any ranks. The blocked and raked products need equal ranks,
+because they zip like modes together: row modes with row modes and
+column modes with column modes, so a $3\times4$ tile times a $2\times5$ grid is a $6\times20$ matrix:
+
+$$
+\begin{aligned}
+\texttt{blocked\_product}&:\ ((3,2),(4,5)):((4,12),(1,24)),\\
+\texttt{raked\_product}&:\ ((2,3),(5,4)):((12,4),(24,1)).
+\end{aligned}
+$$
+
+Compare the tabs. The colour is the copy, offset $\div12$. In the blocked product every $3\times4$ block
+is one shifted copy of the tile; in the raked product the same ten copies are dealt out cell by cell,
+so neighbouring cells belong to different copies.
+
+<LayoutPanels panels={G.products} label="Logical, blocked and raked products" />
+
+Check a raked cell: row 1, column 2 has natural coordinate $((1,0),(2,0))$, so its offset is
+$1\cdot12+0\cdot4+2\cdot24+0=60$, copy 5, tile element 0.
+
+The complement also decides how tightly copies pack. Take a tile with holes, $(4,8):(20,2)$, and a
+row-major grid $(3,2):(2,1)$. The tile uses even offsets $0\ldots14$ of rows of 20, so its complement
+is $(2,1):(1,80)$: the next copy fills the odd offsets, and later copies start at 80:
+
+$$
+(4,8):(20,2)\otimes(3,2):(2,1)=((4,8),(3,2)):((20,2),(80,1)).
+$$
+
+<LayoutPanels panels={G.productInterleave} label="Interleaved copies of a tile with holes" />
+
+The grid's own layout orders the copies: grid coordinate $(i,j)$ is index $2i+j$, which the
+complement $(2,1):(1,80)$ splits into $(j,i)$ and sends to offset $j+80i$. So copies $0,1$ start at
+$0,1$, copies $2,3$ at $80,81$, and copies $4,5$ at $160,161$.
 
 ### Logical division
 
@@ -468,6 +1278,76 @@ together. The result has the especially useful interface `(tile_coordinate, tile
 `tile_id` then produces one tile without changing its internal layout.
 
 <Matrix2D name="zipped division result" {...F.zipped} />
+
+The paper states division with the complement taken *relative to the size of* $A$:
+
+$$
+A\oslash B=A\circ(B,\ B^{*|A|})=A\circ B^\star.
+$$
+
+Division must keep every element of $A$, so the completed tiler $B^\star=(B,B^{*|A|})$ must be
+surjective onto $\mathbb Z_{|A|}$, which often means extending the complement. It must also have a
+reflexive generalized inverse $B^+$, with $B^\star B^+B^\star=B^\star$ and $B^+B^\star B^+=B^+$, so that
+$B^\star$ really splits $A$ into "selected" and "rest" with nothing lost or repeated.
+
+Composition alone keeps only the selected part. With $A=24:3$, composing with $8:3$ gives every third
+element, $8:9$. Division also keeps the rest:
+
+$$
+\begin{aligned}
+24:3\circ8:3&=8:9, & 24:3\oslash8:3&=24:3\circ(8,3):(3,1)=(8,3):(9,3),\\
+(6,2,2):(2,1,20)\circ8:3&=(2,2,2):(6,1,20), & (6,2,2):(2,1,20)\oslash8:3&=((2,2,2),3):((6,1,20),2).
+\end{aligned}
+$$
+
+Here $3:1$ is the complement of $8:3$ within 24. In the figure, row 0 is the composition, the "tile";
+rows 1 and 2 are the two other residues mod 3 that the complement adds back, the "rest".
+
+<LayoutPanels panels={G.divide1d} label="Logical division in one dimension" />
+
+Check the second tab at tile element 5, rest 2: integral coordinate $3\cdot5+2=17$ of
+$(6,2,2):(2,1,20)$ is $(5,0,1)$, so the offset is $5\cdot2+0+20=30$; the result gives
+$((1,0,1),2)\mapsto1\cdot6+0+1\cdot20+2\cdot2=30$.
+
+Division is usually applied by mode, $A\oslash\langle B,C\rangle=(A_0\oslash B,\ A_1\oslash C)$. Take
+$A=(8,16):(20,1)$ and ask for 4 consecutive rows and every other column:
+
+$$
+(8,16):(20,1)\oslash\langle4:1,\ 8:2\rangle
+=(8,16):(20,1)\circ\langle(4,2):(1,4),\ (8,2):(2,1)\rangle
+=((4,2),(8,2)):((20,80),(2,1)).
+$$
+
+Each mode is now `(tile, rest)`. The result is still an $8\times16$ layout over the same 128 offsets,
+but the selected elements have moved to the first $4\times8$ block. `zipped_divide` then gathers the
+tile modes and the rest modes:
+
+$$
+\texttt{zipped\_divide}:\ ((4,8),(2,2)):((20,2),(80,1)).
+$$
+
+Its first mode is exactly $A\circ\langle4:1,8:2\rangle$; its second walks over the $2\times2$ tiles.
+
+<LayoutPanels panels={G.divide2d} label="By-mode logical division" />
+
+Returning to the four tilers of the composition section, dividing instead of composing gives the
+$2\times2$ grid of $4\times8$ tiles each tiler implies. Colour is the tile; the text is the position
+inside it.
+
+<LayoutPanels panels={G.tilerDivide} label="Tilers cutting an 8×16 layout into tiles" />
+
+The usual code for tiling over thread blocks is then
+
+```python
+data    = Tensor(MyPtr, MyLayoutMxN)  # Tensor:  Crd -> Offset
+tiler   = (4, 8)                      # Tiler:   TileCrd -> Crd
+data_vt = zipped_divide(data, tiler)  # (TileCrd, GridCrd) -> Offset
+tile    = data_vt[:, blk_id]          # slice by a 1-D block id
+tile    = data_vt[:, (blk_x, blk_y)]  # or by a 2-D block id
+```
+
+This is the same compose-and-slice pattern as thread-value partitioning, except that only the tile
+mode is given. The grid mode comes from the complement of the tiler.
 
 ## Thread-value layouts
 
@@ -503,6 +1383,57 @@ This gives CuTe a clean separation of concerns:
 Change column-major storage to padded storage and only the first layout changes. Change the
 instruction's ownership pattern and only the second changes. The algorithm that copies or computes
 over each thread's values stays the same.
+
+### Partitioning the Ampere FP64 accumulator
+
+The paper's full-size example is the $8\times8$ C matrix of an Ampere FP64 tensor-core instruction.
+Its 32 threads each own two values, in the pattern
+
+$$
+\text{ThrValLayoutC}=((4,8),2):((16,1),8),
+$$
+
+a map from `(thread_idx, value_idx)` to the 1-D coordinate of the $8\times8$ matrix. Before CuTe,
+this pattern existed only as a picture in the instruction set manual. The first tab draws that
+picture, which is the *inverse* of the layout: each matrix cell shows its owning thread and value.
+
+<LayoutPanels panels={G.tv} label="Ampere FP64 C partition composed with six data layouts" />
+
+Check thread 5. As a coordinate of shape $(4,8)$, $5=(1,1)$, so value 0 is at
+$1\cdot16+1\cdot1+0\cdot8=17$ and value 1 at $25$. In an $8\times8$ column-major matrix, 1-D
+coordinates 17 and 25 are $(1,2)$ and $(1,3)$, the two cells labelled T5.
+
+Composing any $8\times8$ data layout $D$ with this TV layout gives $D\circ\text{TV}$, a layout of shape
+$(32,2)$ from `(thread, value)` to data offset. The other tabs show it for six data layouts; the big
+number is $D$'s offset and the small label its owner:
+
+| Data | Data layout $D$ ($8\times8$) | $D\circ\text{ThrValLayoutC}$ ($32\times2$) |
+| --- | --- | --- |
+| column-major | $(8,8):(1,8)$ | $((4,8),2):((16,1),8)$ |
+| row-major | $(8,8):(8,1)$ | $((4,8),2):((2,8),1)$ |
+| padded | $(8,8):(1,9)$ | $((4,8),2):((18,1),9)$ |
+| column-interleaved | $((4,2),(2,4)):((2,16),(1,8))$ | $((4,(4,2)),2):((8,(2,16)),1)$ |
+| swizzled | $(8,8):(f_1,f_9)$ | $((4,8),2):((f_{18},f_1),f_9)$ |
+| coordinate | $(8,8):(e_0,e_1)$ | $((4,8),2):((2e_1,e_0),e_1)$ |
+
+Read the row-major result: value 0 of thread $(t_0,t_1)$ is at $2t_0+8t_1$ and value 1 is the next
+offset. So in row-major storage each thread's two values are contiguous, which a 2-wide load can
+exploit; in column-major storage they are 8 apart. The coordinate row recovers the picture: thread
+$(t_0,t_1)$, value $v$ owns $(t_1,\ 2t_0+v)$.
+
+In code, the pattern is compose, then slice:
+
+```python
+smem_data = Tensor(MyAccessor, MyLayout8x8)            # Coord -> Offset
+tv_layout = Layout(((4, 8), 2), ((16, 1), 8))          # (Thr, Val) -> Coord
+smem_tv   = composition(smem_data, tv_layout)          # (Thr, Val) -> Offset
+smem_v    = smem_tv[thr_id, None]                      # this thread's values
+copy(smem_v, rmem_data)                                # into registers
+```
+
+The partitioning pattern is static metadata of the instruction; only `thr_id` is a runtime value.
+Keeping them apart is what lets the compiler know, for instance, that `smem_v` has exactly two
+elements.
 
 ## What category theory adds
 
@@ -1046,11 +1977,15 @@ storage order, and algorithmic work.
 ## Summary
 
 - A CuTe layout is a function. Its hierarchical shape interprets coordinates; its congruent stride
-  maps the resulting mixed-radix digits to offsets or other outputs.
+  maps the resulting mixed-radix digits to offsets, coordinates or XOR swizzles. Folding modes this
+  way turns any tensor contraction into one batched GEMM, and one COPY or GEMM routine serves every
+  layout.
 - Quotient and remainder connect linear, multidimensional, and nested coordinates. Hierarchy adds
   semantic boundaries such as within-tile and which-tile without inventing new arithmetic.
-- Coalescence simplifies a representation, composition applies an indirection, inverses recover
-  coordinates from offsets, and complements describe missing independent directions.
+- Coalescence simplifies a representation, composition applies an indirection (when the stride and
+  shape divisibility conditions hold), and complements describe missing independent directions. The
+  right inverse finds the widest common vector of two layouts; the left inverse checks that a data
+  layout contains every offset a hardware instruction touches.
 - Logical product repeats a tile. Logical division factors a layout into a tile and a grid of tiles.
 - Thread-value layouts turn hardware ownership into ordinary layout composition, keeping storage,
   instruction metadata, and kernel logic separate.
@@ -1060,3 +1995,5 @@ storage order, and algorithmic work.
 1. Cris Cecka, [“CuTe Layout Representation and Algebra,” arXiv:2603.02298v2](https://arxiv.org/abs/2603.02298v2), 2026.
 2. Jack Carlisle, Jay Shah, Reuben Stern, and Paul VanKoughnett,
    [“Categorical Foundations for CuTe Layouts,” arXiv:2601.05972v1](https://arxiv.org/abs/2601.05972v1), 2026.
+3. NVIDIA, [PyCuTe, the Python reference implementation of CuTe](https://github.com/NVlabs/CuTe/tree/56cc3d0c0b3cc906dd8771b98181524b82781049),
+   commit `56cc3d0`. Used to compute and check every figure and table in this post.

@@ -1,0 +1,50 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import LayoutPanels from "../../utils/cute/LayoutPanels.astro";
+import { cuteAlgebraFigures as G } from "../../utils/cute/cuteAlgebraFigures";
+import type { LayoutPanel } from "../../utils/cute/layoutPanels";
+
+const handMade: LayoutPanel = {
+	caption: "a hand-written 2×3 panel: one group dimmed, sub-labels and tips",
+	rowHeads: ["0", "1"],
+	colHeads: ["0", "1", "2"],
+	cells: [
+		["0", "2", "4"],
+		["1", "3", "5"],
+	],
+	groups: [
+		["even", "even", null],
+		["odd", "odd", null],
+	],
+	subs: [
+		["a", "b", "c"],
+		["d", "e", "f"],
+	],
+	tips: [
+		["(0,0) → 0", "(0,1) → 2", "(0,2) is left out"],
+		["(1,0) → 1", "(1,1) → 3", "(1,2) is left out"],
+	],
+	rowTitle: "m",
+	colTitle: "n",
+};
+---
+
+<Layout title="LayoutPanels demo">
+	<h1>LayoutPanels demo</h1>
+
+	<h2>One panel, no tabs</h2>
+	<LayoutPanels panels={[handMade]} />
+
+	<h2>Tabs, value tint without groups (COPY applications)</h2>
+	<LayoutPanels panels={G.copy} label="COPY applications" />
+
+	<h2>Coordinate and XOR strides</h2>
+	<LayoutPanels panels={G.gallery4} />
+
+	<h2>Owners with sub-labels, opening on the third tab</h2>
+	<LayoutPanels panels={G.tv} initial={2} />
+
+	<h2>Small cells (16 columns) and tiny cells (32 columns)</h2>
+	<LayoutPanels panels={G.tilerDivide} />
+	<LayoutPanels panels={G.tmem} />
+</Layout>
